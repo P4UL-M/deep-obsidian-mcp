@@ -15,7 +15,8 @@
     "verify:config": "node scripts/verify-config-contract.mjs",
     "verify:fixtures": "node scripts/verify-fixture-vault.mjs",
     "verify:http": "node scripts/verify-service-http.mjs",
-    "verify:launch": "node scripts/verify-service-launch.mjs"
+    "verify:launch": "node scripts/verify-service-launch.mjs",
+    "verify:rust": "node scripts/verify-rust-prototype.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
