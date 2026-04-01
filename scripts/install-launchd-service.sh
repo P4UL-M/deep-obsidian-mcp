@@ -3,11 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname "$0")/.." && pwd)"
 VAULT_PATH="${1:-${OBSIDIAN_VAULT_PATH:-}}"
-
-if [[ -z "${VAULT_PATH}" ]]; then
-  echo "Usage: $0 <vault-path>" >&2
-  exit 1
-fi
+CONFIG_PATH="${DEEP_OBSIDIAN_CONFIG_PATH:-}"
 
 LABEL="${DEEP_OBSIDIAN_LABEL:-io.deep-obsidian-mcp}"
 HOST="${DEEP_OBSIDIAN_HOST:-127.0.0.1}"
@@ -60,6 +56,34 @@ ENV_BLOCK="$(printf '%s\n' "${env_entries[@]}")"
 
 mkdir -p "${LAUNCH_AGENTS_DIR}" "${LOG_DIR}"
 
+typeset -a program_arguments
+program_arguments=(
+  "    <string>${NODE_BIN}</string>"
+  "    <string>${ROOT_DIR}/dist/index.js</string>"
+  "    <string>serve</string>"
+  "    <string>--transport</string>"
+  "    <string>http</string>"
+  "    <string>--host</string>"
+  "    <string>${HOST}</string>"
+  "    <string>--port</string>"
+  "    <string>${PORT}</string>"
+  "    <string>--mcp-path</string>"
+  "    <string>${MCP_PATH}</string>"
+  "    <string>--health-path</string>"
+  "    <string>${HEALTH_PATH}</string>"
+)
+
+if [[ -n "${CONFIG_PATH}" ]]; then
+  program_arguments+=("    <string>--config</string>")
+  program_arguments+=("    <string>${CONFIG_PATH}</string>")
+fi
+if [[ -n "${VAULT_PATH}" ]]; then
+  program_arguments+=("    <string>--vault</string>")
+  program_arguments+=("    <string>${VAULT_PATH}</string>")
+fi
+
+PROGRAM_ARGUMENTS_BLOCK="$(printf '%s\n' "${program_arguments[@]}")"
+
 cat > "${PLIST_PATH}" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -69,19 +93,7 @@ cat > "${PLIST_PATH}" <<PLIST
   <string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${NODE_BIN}</string>
-    <string>${ROOT_DIR}/dist/index.js</string>
-    <string>${VAULT_PATH}</string>
-    <string>--transport</string>
-    <string>http</string>
-    <string>--host</string>
-    <string>${HOST}</string>
-    <string>--port</string>
-    <string>${PORT}</string>
-    <string>--mcp-path</string>
-    <string>${MCP_PATH}</string>
-    <string>--health-path</string>
-    <string>${HEALTH_PATH}</string>
+${PROGRAM_ARGUMENTS_BLOCK}
   </array>
   <key>WorkingDirectory</key>
   <string>${ROOT_DIR}</string>
@@ -107,6 +119,13 @@ launchctl kickstart -k "gui/$(id -u)/${LABEL}"
 
 echo "Installed ${LABEL}"
 echo "plist: ${PLIST_PATH}"
+if [[ -n "${CONFIG_PATH}" ]]; then
+  echo "config: ${CONFIG_PATH}"
+elif [[ -n "${VAULT_PATH}" ]]; then
+  echo "vault override: ${VAULT_PATH}"
+else
+  echo "config: default deep-obsidian-mcp config path"
+fi
 echo "mcp endpoint: http://${HOST}:${PORT}${MCP_PATH}"
 echo "health endpoint: http://${HOST}:${PORT}${HEALTH_PATH}"
 if [[ -n "${EMBEDDING_PROVIDER_VALUE}" && -n "${EMBEDDING_MODEL_VALUE}" ]]; then

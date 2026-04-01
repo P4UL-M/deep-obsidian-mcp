@@ -3,11 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname "$0")/.." && pwd)"
 VAULT_PATH="${1:-${OBSIDIAN_VAULT_PATH:-}}"
-
-if [[ -z "${VAULT_PATH}" ]]; then
-  echo "Usage: $0 <vault-path>" >&2
-  exit 1
-fi
+CONFIG_PATH="${DEEP_OBSIDIAN_CONFIG_PATH:-}"
 
 HOST="${DEEP_OBSIDIAN_HOST:-127.0.0.1}"
 PORT="${DEEP_OBSIDIAN_PORT:-4100}"
@@ -35,10 +31,21 @@ if [[ -n "${EMBEDDING_API_KEY_VALUE}" ]]; then
   export EMBEDDING_API_KEY="${EMBEDDING_API_KEY_VALUE}"
 fi
 
-exec node "${ROOT_DIR}/dist/index.js" \
-  "${VAULT_PATH}" \
-  --transport http \
-  --host "${HOST}" \
-  --port "${PORT}" \
-  --mcp-path "${MCP_PATH}" \
-  --health-path "${HEALTH_PATH}"
+typeset -a args
+args=(
+  "serve"
+  "--transport" "http"
+  "--host" "${HOST}"
+  "--port" "${PORT}"
+  "--mcp-path" "${MCP_PATH}"
+  "--health-path" "${HEALTH_PATH}"
+)
+
+if [[ -n "${CONFIG_PATH}" ]]; then
+  args+=("--config" "${CONFIG_PATH}")
+fi
+if [[ -n "${VAULT_PATH}" ]]; then
+  args+=("--vault" "${VAULT_PATH}")
+fi
+
+exec node "${ROOT_DIR}/dist/index.js" "${args[@]}"
