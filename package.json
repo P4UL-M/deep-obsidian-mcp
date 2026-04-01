@@ -11,7 +11,11 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "dev:http": "tsx src/index.ts --transport http",
-    "check": "tsc --noEmit -p tsconfig.json"
+    "check": "tsc --noEmit -p tsconfig.json",
+    "verify:config": "node scripts/verify-config-contract.mjs",
+    "verify:fixtures": "node scripts/verify-fixture-vault.mjs",
+    "verify:http": "node scripts/verify-service-http.mjs",
+    "verify:launch": "node scripts/verify-service-launch.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

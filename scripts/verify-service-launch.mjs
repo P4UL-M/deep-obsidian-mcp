@@ -113,23 +113,34 @@ function spawnService({ command, entrypoint, vault, indexDir, host, port, mcpPat
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  await access(args.vault);
+  const resolvedVault = path.resolve(ROOT_DIR, args.vault);
+  const resolvedEntrypoint = path.resolve(ROOT_DIR, args.entrypoint);
+  const resolvedIndexDir = args.indexDir ? path.resolve(ROOT_DIR, args.indexDir) : undefined;
+  const resolvedExpectVault = args.expectVault ? path.resolve(ROOT_DIR, args.expectVault) : resolvedVault;
+
+  await access(resolvedVault);
 
   const port = args.port ?? await getFreePort(args.host);
-  const child = spawnService({ ...args, port });
+  const child = spawnService({
+    ...args,
+    port,
+    vault: resolvedVault,
+    entrypoint: resolvedEntrypoint,
+    indexDir: resolvedIndexDir,
+  });
   const exitPromise = new Promise((resolve) => child.once("exit", resolve));
 
   try {
     const summary = await verifyServiceHttp({
       url: `http://${args.host}:${port}${args.mcpPath}`,
       healthUrl: `http://${args.host}:${port}${args.healthPath}`,
-      vault: args.vault,
-      expectVault: args.expectVault ?? args.vault,
+      vault: resolvedVault,
+      expectVault: resolvedExpectVault,
     });
     console.log(JSON.stringify({
       command: args.command,
-      entrypoint: args.entrypoint,
-      vault: args.vault,
+      entrypoint: resolvedEntrypoint,
+      vault: resolvedVault,
       port,
       healthPath: args.healthPath,
       mcpPath: args.mcpPath,
