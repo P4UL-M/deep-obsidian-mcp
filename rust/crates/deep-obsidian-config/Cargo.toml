@@ -1,0 +1,12 @@
+[package]
+name = "deep-obsidian-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+deep-obsidian-types = { path = "../deep-obsidian-types" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
