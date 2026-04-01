@@ -4,18 +4,18 @@ Date: 2026-04-01
 
 ## Phase 3: Prototype
 
-- [ ] Rust workspace exists.
-- [ ] Shared config model matches the Node contract.
-- [ ] CLI accepts the service commands.
-- [ ] HTTP bootstrap starts successfully.
-- [ ] `GET /healthz` returns `ok`.
-- [ ] MCP endpoint responds.
-- [ ] `vault_info` is exposed.
-- [ ] Rust launch verifier passes.
+- [x] Rust workspace exists.
+- [x] Shared config model matches the Node contract for the prototype scope.
+- [x] CLI accepts the service commands.
+- [x] HTTP bootstrap starts successfully.
+- [x] `GET /healthz` returns `ok`.
+- [x] MCP endpoint responds.
+- [x] `vault_info` is exposed.
+- [x] Rust launch verifier passes.
 
 ## Phase 4: Parity
 
-- [ ] `read_file` works.
+- [x] `read_file` works.
 - [ ] `read_chunk` works.
 - [ ] `find_files` works.
 - [ ] `grep_search` works.

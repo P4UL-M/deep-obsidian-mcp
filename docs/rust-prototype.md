@@ -59,7 +59,7 @@ npm run verify:rust -- --launcher cargo
 If you already have a built binary, point the verifier at it:
 
 ```bash
-npm run verify:rust -- --launcher binary --binary rust/target/debug/deep-obsidian-cli
+npm run verify:rust -- --launcher binary --binary rust/target/debug/deep-obsidian-mcp
 ```
 
 The verifier intentionally uses the same HTTP probe pattern as the Node service checks so the prototype can be compared against the existing service behavior.
