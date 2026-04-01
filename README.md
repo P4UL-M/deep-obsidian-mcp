@@ -17,6 +17,7 @@ Current capabilities:
 - traverse outgoing links and backlinks as a graph
 - answer both newline-delimited and framed stdio MCP clients from the same binary
 - expose vault, note, heading, and block resources for MCP clients
+- provide a long-lived HTTP service mode for background operation and MCP clients that prefer a stable endpoint
 
 This server supports two semantic modes:
 
@@ -39,7 +40,7 @@ node dist/index.js /path/to/obsidian-vault --index-dir /path/to/index-cache
 
 ## Service Mode
 
-`deep-obsidian-mcp` can now run as a long-lived Streamable HTTP service instead of only as a stdio subprocess.
+`deep-obsidian-mcp` can run as a long-lived Streamable HTTP service instead of only as a stdio subprocess.
 
 Start it directly:
 
@@ -90,6 +91,37 @@ Quick HTTP probe:
 node scripts/probe_http_service.mjs http://127.0.0.1:4100/mcp
 ```
 
+## Config-Driven Service Flow
+
+The refactor now includes a first-class service-oriented CLI in the Node codebase.
+
+Available commands:
+
+- `deep-obsidian-mcp setup-service`
+- `deep-obsidian-mcp doctor`
+- `deep-obsidian-mcp print-config`
+- `deep-obsidian-mcp probe`
+- `deep-obsidian-mcp serve`
+
+`setup-service` persists normalized JSON config at `~/.config/deep-obsidian-mcp/config.json` by default. Config precedence is:
+
+1. CLI flags
+2. config file
+3. environment variables
+4. defaults
+
+Example flow from the source tree:
+
+```bash
+npm install
+npm run build
+node dist/index.js setup-service --vault ~/Vault
+node dist/index.js doctor
+node dist/index.js serve
+```
+
+See [docs/homebrew-service.md](./docs/homebrew-service.md) for the Homebrew-oriented workflow and [Formula/deep-obsidian-mcp.rb](./Formula/deep-obsidian-mcp.rb) for the current formula scaffold.
+
 ## macOS launchd
 
 Install as a user service:
@@ -113,6 +145,8 @@ Remove it:
 ```
 
 The installer writes a user LaunchAgent plist under `~/Library/LaunchAgents/`, starts it with `launchctl`, and keeps it running across terminal sessions.
+
+This is a transitional path. The Homebrew service flow in [docs/homebrew-service.md](./docs/homebrew-service.md) is the target UX.
 
 Automatic reindexing is enabled by default. The server performs:
 
@@ -212,6 +246,8 @@ args = [
 If your client runs MCP servers in a sandbox, the vault path must be accessible to that sandbox.
 
 HTTP service clients should point to `http://127.0.0.1:4100/mcp` instead of spawning the binary directly.
+
+For the planned Homebrew setup, `deep-obsidian-mcp print-config` should become the authoritative way to inspect the resolved config, and `deep-obsidian-mcp doctor` should be the first troubleshooting step.
 
 ## Current Indexing Model
 
