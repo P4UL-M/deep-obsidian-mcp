@@ -2,13 +2,13 @@ use std::fmt::Write as _;
 use std::fs;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 use deep_obsidian_config::{
     build_service_endpoints, to_persisted_config, write_config_file,
 };
-use deep_obsidian_server::run_http_service;
+use deep_obsidian_server::{node_serve_invocation, run_http_service};
 use deep_obsidian_types::{PersistedServiceConfig, ResolvedServiceConfig, ServiceEndpoints, TransportMode};
 use reqwest::Client;
 use serde::Serialize;
@@ -74,8 +74,7 @@ pub async fn run() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
-            let report = serve(&resolved).await?;
-            println!("{}", report.message);
+            serve(&resolved).await?;
             Ok(())
         }
         Command::SetupService { dry_run, overwrite } => {
@@ -243,18 +242,28 @@ pub async fn probe(resolved: &ResolvedRuntimeConfig, timeout_ms: u64) -> Result<
 }
 
 pub async fn serve(resolved: &ResolvedRuntimeConfig) -> Result<ServeReport> {
-    let service = ensure_service_transport_http(resolved.service.clone())?;
-    let endpoints = build_service_endpoints(&service);
-    let report = endpoint_report(&endpoints);
-    run_http_service(service).await?;
-    tokio::signal::ctrl_c().await?;
-    Ok(ServeReport {
-        message: format!(
-            "Rust prototype service running at {} (health={})",
-            report.mcp, report.health
-        ),
-        endpoints: report,
-    })
+    match resolved.service.transport {
+        TransportMode::Http => {
+            let service = ensure_service_transport_http(resolved.service.clone())?;
+            let endpoints = build_service_endpoints(&service);
+            let report = endpoint_report(&endpoints);
+            let bootstrap = run_http_service(service).await?;
+            eprintln!(
+                "deep-obsidian-mcp compatibility proxy running at {} (health={}, backendPid={:?})",
+                report.mcp, report.health, bootstrap.backend_pid
+            );
+            wait_for_shutdown_signal().await?;
+            drop(bootstrap);
+            Ok(ServeReport {
+                message: format!(
+                    "Rust compatibility proxy stopped for {} (health={})",
+                    report.mcp, report.health
+                ),
+                endpoints: report,
+            })
+        }
+        TransportMode::Stdio => serve_stdio_compat(&resolved.service),
+    }
 }
 
 fn ensure_service_transport_http(config: ResolvedServiceConfig) -> Result<ResolvedServiceConfig> {
@@ -267,6 +276,54 @@ fn ensure_service_transport_http(config: ResolvedServiceConfig) -> Result<Resolv
         ..config
     })
     .map_err(Into::into)
+}
+
+fn serve_stdio_compat(config: &ResolvedServiceConfig) -> Result<ServeReport> {
+    let mut command = node_serve_invocation(config, TransportMode::Stdio, None, None)?
+        .into_std_command();
+    let status = command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to launch the TypeScript stdio compatibility backend")?;
+
+    if !status.success() {
+        return Err(anyhow!(
+            "TypeScript stdio compatibility backend exited with status {status}"
+        ));
+    }
+
+    Ok(ServeReport {
+        message: "TypeScript stdio compatibility backend exited successfully".to_string(),
+        endpoints: EndpointReport {
+            mcp: "stdio".to_string(),
+            health: "n/a".to_string(),
+        },
+    })
+}
+
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("failed to register SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed to wait for SIGINT")?;
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to wait for shutdown signal")?;
+    }
+
+    Ok(())
 }
 
 fn validate_vault(config: &ResolvedServiceConfig) -> Result<()> {

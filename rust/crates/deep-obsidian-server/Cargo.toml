@@ -9,6 +9,7 @@ axum.workspace = true
 clap.workspace = true
 deep-obsidian-config = { path = "../deep-obsidian-config" }
 deep-obsidian-types = { path = "../deep-obsidian-types" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

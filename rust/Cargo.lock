@@ -251,6 +251,7 @@ dependencies = [
  "clap",
  "deep-obsidian-config",
  "deep-obsidian-types",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
