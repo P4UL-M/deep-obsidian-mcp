@@ -1,0 +1,44 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname "$0")/.." && pwd)"
+VAULT_PATH="${1:-${OBSIDIAN_VAULT_PATH:-}}"
+
+if [[ -z "${VAULT_PATH}" ]]; then
+  echo "Usage: $0 <vault-path>" >&2
+  exit 1
+fi
+
+HOST="${DEEP_OBSIDIAN_HOST:-127.0.0.1}"
+PORT="${DEEP_OBSIDIAN_PORT:-4100}"
+MCP_PATH="${DEEP_OBSIDIAN_MCP_PATH:-/mcp}"
+HEALTH_PATH="${DEEP_OBSIDIAN_HEALTH_PATH:-/healthz}"
+EMBEDDING_PROVIDER_VALUE="${DEEP_OBSIDIAN_EMBEDDING_PROVIDER:-${EMBEDDING_PROVIDER:-}}"
+EMBEDDING_MODEL_VALUE="${DEEP_OBSIDIAN_EMBEDDING_MODEL:-${EMBEDDING_MODEL:-${OPENAI_EMBEDDING_MODEL:-}}}"
+EMBEDDING_BASE_URL_VALUE="${DEEP_OBSIDIAN_EMBEDDING_BASE_URL:-${EMBEDDING_BASE_URL:-${OPENAI_BASE_URL:-}}}"
+EMBEDDING_API_KEY_VALUE="${DEEP_OBSIDIAN_EMBEDDING_API_KEY:-${EMBEDDING_API_KEY:-${OPENAI_API_KEY:-}}}"
+
+if [[ -z "${EMBEDDING_PROVIDER_VALUE}" && -n "${EMBEDDING_MODEL_VALUE}" ]]; then
+  EMBEDDING_PROVIDER_VALUE="openai-compatible"
+fi
+
+if [[ -n "${EMBEDDING_PROVIDER_VALUE}" ]]; then
+  export EMBEDDING_PROVIDER="${EMBEDDING_PROVIDER_VALUE}"
+fi
+if [[ -n "${EMBEDDING_MODEL_VALUE}" ]]; then
+  export EMBEDDING_MODEL="${EMBEDDING_MODEL_VALUE}"
+fi
+if [[ -n "${EMBEDDING_BASE_URL_VALUE}" ]]; then
+  export EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL_VALUE}"
+fi
+if [[ -n "${EMBEDDING_API_KEY_VALUE}" ]]; then
+  export EMBEDDING_API_KEY="${EMBEDDING_API_KEY_VALUE}"
+fi
+
+exec node "${ROOT_DIR}/dist/index.js" \
+  "${VAULT_PATH}" \
+  --transport http \
+  --host "${HOST}" \
+  --port "${PORT}" \
+  --mcp-path "${MCP_PATH}" \
+  --health-path "${HEALTH_PATH}"
