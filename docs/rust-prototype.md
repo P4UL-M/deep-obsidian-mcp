@@ -2,39 +2,39 @@
 
 Date: 2026-04-01
 
-This document defines the current Rust feasibility prototype scope for `deep-obsidian-mcp`.
+This document defines the current Rust feasibility and compatibility scope for `deep-obsidian-mcp`.
 
 ## Covers
 
 - A Rust workspace skeleton that is intended to mirror the Node-side service boundary.
 - Shared config and type modeling for the current service shape.
-- A CLI surface that should eventually mirror:
+- A CLI surface that mirrors:
   - `serve`
   - `setup-service`
   - `doctor`
   - `print-config`
   - `probe`
-- A minimal HTTP service bootstrap with:
-  - `GET /healthz`
-  - an MCP HTTP endpoint
-- Feasibility verification that starts the Rust binary and probes the live HTTP endpoint.
+- A Rust HTTP compatibility proxy that:
+  - serves `GET /healthz`
+  - serves an MCP HTTP endpoint
+  - launches the TypeScript implementation as an internal compatibility backend
+  - preserves the full TypeScript MCP tool and resource surface through the Rust entrypoint
+- A Rust stdio compatibility path that delegates stdio transport to the TypeScript implementation.
+- Verification that starts the Rust binary and probes the live HTTP endpoint plus MCP resources.
 
 ## Does Not Cover
 
-- Full indexing parity.
-- Full search parity.
-- Full MCP tool parity.
-- Graph traversal parity.
-- Embedded vector search parity.
+- Native Rust implementations of the full indexing and search stack.
+- Native Rust implementations of graph traversal and embedding-backed retrieval.
 - Release packaging parity.
 - Homebrew formula cutover.
 - Config migration from Node to Rust.
 
 ## Prototype Rules
 
-- The Rust prototype is a decision aid, not a rewrite commitment.
-- The prototype should prove process shape, config loading, and service startup before search/indexing work.
-- The Node implementation remains the production path until the Rust prototype proves it is simpler and safer to maintain.
+- The Rust entrypoint now provides behavioral parity by running the TypeScript implementation as a managed compatibility backend.
+- This is still not a native-Rust parity result; the search/indexing logic still lives in the TypeScript sidecar.
+- The Node implementation remains the production logic path until the compatibility backend is progressively replaced or the project explicitly accepts that architecture.
 
 ## Acceptance Signal
 
@@ -43,8 +43,9 @@ The prototype is useful if it can:
 1. Parse the current service config shape.
 2. Start an HTTP service.
 3. Serve `/healthz`.
-4. Answer a minimal MCP probe.
-5. Pass the Rust launch verifier.
+4. Preserve the current MCP tool and resource surface through the Rust entrypoint.
+5. Support stdio compatibility mode.
+6. Pass the Rust launch verifier.
 
 If any of those are missing, the prototype is not yet ready to justify migration.
 

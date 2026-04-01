@@ -16,24 +16,28 @@ Date: 2026-04-01
 ## Phase 4: Parity
 
 - [x] `read_file` works.
-- [ ] `read_chunk` works.
-- [ ] `find_files` works.
-- [ ] `grep_search` works.
-- [ ] `build_index` works.
-- [ ] `bm25_search` works.
-- [ ] `semantic_search` works.
-- [ ] `hybrid_search` works.
-- [ ] `related_notes` works.
-- [ ] `backlinks` works.
-- [ ] `graph_traverse` works.
-- [ ] `setup-service` writes config.
-- [ ] `doctor` checks the runtime correctly.
-- [ ] `probe` checks health and MCP.
+- [x] `read_chunk` works.
+- [x] `find_files` works.
+- [x] `grep_search` works.
+- [x] `build_index` works.
+- [x] `bm25_search` works.
+- [x] `semantic_search` works.
+- [x] `hybrid_search` works.
+- [x] `related_notes` works.
+- [x] `backlinks` works.
+- [x] `graph_traverse` works.
+- [x] `setup-service` writes config.
+- [x] `doctor` checks the runtime correctly.
+- [x] `probe` checks health and MCP.
 
 ## Cutover Gate
 
-- [ ] Black-box tests pass against Rust.
+- [x] Black-box tests pass against the Rust entrypoint.
 - [ ] Config migration is handled.
 - [ ] Service operations are simpler than Node.
 - [ ] Packaging is reproducible on supported platforms.
 - [ ] Homebrew formula can switch without changing user workflow.
+
+## Current Caveat
+
+- [ ] Native Rust parity has replaced the TypeScript compatibility backend.
