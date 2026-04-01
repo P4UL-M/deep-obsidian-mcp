@@ -1,17 +1,25 @@
 [package]
-name = "deep-obsidian-server"
+name = "deep-obsidian-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
+
+[lib]
+name = "deep_obsidian_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "deep-obsidian-mcp"
+path = "src/main.rs"
 
 [dependencies]
-axum.workspace = true
+anyhow.workspace = true
 clap.workspace = true
 deep-obsidian-config = { path = "../deep-obsidian-config" }
+deep-obsidian-server = { path = "../deep-obsidian-server" }
 deep-obsidian-types = { path = "../deep-obsidian-types" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true

@@ -2,9 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use serde_json::json;
-
-use crate::config::is_valid_vault_relative_path;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VaultInfo {
@@ -80,6 +77,26 @@ pub fn vault_info(vault_path: &Path) -> Result<VaultInfo, VaultError> {
     })
 }
 
+fn is_valid_vault_relative_path(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return false;
+    }
+
+    !path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
+}
+
 fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf, VaultError> {
     if !is_valid_vault_relative_path(relative) {
         return Err(VaultError::InvalidVaultRelativePath(relative.to_string()));
@@ -109,15 +126,4 @@ pub fn read_file(vault_path: &Path, relative_path: &str, start_line: Option<usiz
         line_count: selected.lines().count(),
         text: selected,
     })
-}
-
-pub fn health_payload(vault_path: &Path) -> Result<serde_json::Value, VaultError> {
-    let info = vault_info(vault_path)?;
-    Ok(json!({
-        "status": "ok",
-        "vaultPath": info.vault_path,
-        "markdownFileCount": info.markdown_file_count,
-        "service": info.service,
-        "prototype": info.prototype,
-    }))
 }

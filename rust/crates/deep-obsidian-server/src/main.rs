@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use deep_obsidian_config::normalize_service_config;
+use deep_obsidian_types::{HttpConfigInput, ServiceConfigInput, TransportMode};
 use tracing_subscriber::EnvFilter;
 
 use deep_obsidian_server::bootstrap::run_http_service;
-use deep_obsidian_server::config::{normalize_service_config, HttpConfigInput, ServiceConfigInput, TransportMode};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "deep-obsidian-server prototype")]
@@ -34,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         vault_path: Some(args.vault),
         index_dir: args.index_dir,
         transport: Some(TransportMode::Http),
+        stdio_mode: None,
         http: Some(HttpConfigInput {
             host: Some(args.host),
             port: Some(args.port),

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use deep_obsidian_types::ResolvedServiceConfig;
 use serde_json::{json, Value};
 
-use crate::config::ResolvedServiceConfig;
 use crate::protocol::{
     InitializeResult, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, ServerInfo, ToolCallResult,
     ToolContent, ToolDefinition, ToolListResult,
@@ -162,4 +162,3 @@ pub async fn handle_request(state: AppState, request: JsonRpcRequest) -> Result<
         _ => Err(json_error_response(id, -32601, format!("unsupported method: {}", request.method))),
     }
 }
-

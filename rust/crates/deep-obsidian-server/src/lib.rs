@@ -1,12 +1,14 @@
 pub mod bootstrap;
-pub mod config;
 pub mod mcp;
 pub mod protocol;
 pub mod vault;
 
-pub use bootstrap::{build_endpoints, run_http_service, ServiceBootstrapContext, ServiceEndpoints};
-pub use config::{
-    normalize_http_path, normalize_service_config, AutoReindexConfig, EmbeddingConfig, HttpConfig,
-    ResolvedServiceConfig, ServiceConfigInput, TransportMode,
+pub use bootstrap::{run_http_service, ServiceBootstrapContext};
+pub use deep_obsidian_config::{
+    build_service_endpoints, default_config_path, ensure_http_service_config, normalize_http_path,
+    normalize_service_config,
 };
-
+pub use deep_obsidian_types::{
+    AutoReindexConfig, EmbeddingConfig, HttpConfig, ResolvedServiceConfig, ServiceConfigInput,
+    ServiceEndpoints, TransportMode,
+};
