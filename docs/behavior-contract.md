@@ -1,6 +1,6 @@
 # Behavior Contract
 
-This document defines the service surface that must stay stable across the current Node implementation and any later Rust replacement.
+This document defines the maintained Rust service surface.
 
 ## Scope
 
@@ -10,7 +10,7 @@ The contract covers:
 - service startup and health probing
 - MCP tool and resource availability
 - vault-relative note reads and graph traversal
-- fixture-based verification assets
+- fixture-based verification assets used by Rust tests
 
 It does not define internal module layout.
 
@@ -74,6 +74,8 @@ The black-box surface must preserve:
 - `vault_info`
 - `load_knowledge`
 - `recommend_folder`
+- `list_children`
+- `list_folders`
 - `read_file`
 - `read_chunk`
 - `find_files`
@@ -83,9 +85,17 @@ The black-box surface must preserve:
 - `semantic_search`
 - `hybrid_search`
 - `related_notes`
+- `find_similar_notes`
 - `backlinks`
 - `graph_traverse`
+- `upsert_note`
+- `update_note_section`
+- `write_file_to_vault`
 - `upsert_session_note`
+
+`upsert_note` must preserve explicit author control. If `content` is provided, it must be written as-is. If `title` or `frontmatter` are provided, they must only be written when explicitly requested.
+
+`upsert_session_note` must preserve the provided markdown body as-is, except for optional trailing `## Manual Notes` preservation when requested. It must not inject an implicit title or heading.
 
 Resources must preserve:
 
@@ -103,7 +113,7 @@ Verification scripts use a tiny fixture vault with these invariants:
 - the fixture names are stable and predictable
 - the fixture is readable without any user-specific configuration
 
-Expected fixture root:
+Expected fixture root for CLI and integration tests:
 
 - `tests/fixtures/vault`
 
@@ -111,9 +121,9 @@ Expected fixture root:
 
 Preferred verification commands:
 
-- `node scripts/verify-config-contract.mjs`
-- `node scripts/verify-fixture-vault.mjs`
-- `node scripts/verify-service-http.mjs --url http://127.0.0.1:4100/mcp --vault tests/fixtures/vault`
-- `node scripts/verify-service-launch.mjs --vault tests/fixtures/vault --command node --entrypoint dist/index.js`
+- `cargo test --workspace`
+- `cargo run -p deep-obsidian-cli --bin deep-obsidian-mcp -- doctor --vault tests/fixtures/vault`
+- `cargo run -p deep-obsidian-cli --bin deep-obsidian-mcp -- print-config --vault tests/fixtures/vault`
+- `cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp`
 
-These scripts are intentionally framework-free so they can be reused during the Node-to-Rust migration.
+The maintained runtime path is Rust only.

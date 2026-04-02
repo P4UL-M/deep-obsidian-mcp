@@ -4,20 +4,24 @@ use deep_obsidian_types::ResolvedServiceConfig;
 use serde_json::{json, Value};
 
 use crate::protocol::{
-    InitializeResult, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, ServerInfo, ToolCallResult,
-    ToolContent, ToolDefinition, ToolListResult,
+    InitializeResult, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
+    ResourceListResult, ResourceReadResult, ResourceTemplateListResult, ServerInfo, ToolCallResult,
+    ToolListResult,
 };
-use crate::vault::{read_file, vault_info};
+use crate::{resources, tools};
+use crate::runtime::RuntimeState;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ResolvedServiceConfig>,
+    pub runtime: Arc<RuntimeState>,
 }
 
 impl AppState {
-    pub fn new(config: ResolvedServiceConfig) -> Self {
+    pub fn new(config: ResolvedServiceConfig, runtime: Arc<RuntimeState>) -> Self {
         Self {
             config: Arc::new(config),
+            runtime,
         }
     }
 }
@@ -41,48 +45,22 @@ fn json_error_response(id: Value, code: i64, message: impl Into<String>) -> Json
     }
 }
 
-fn tool_definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "vault_info".to_string(),
-            description: "Return basic metadata about the configured vault.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
+fn initialize_result() -> InitializeResult {
+    InitializeResult {
+        protocol_version: "2025-03-26",
+        capabilities: json!({
+            "tools": {},
+            "resources": {}
+        }),
+        server_info: ServerInfo {
+            name: "deep-obsidian-mcp",
+            version: "0.1.0",
         },
-        ToolDefinition {
-            name: "read_file".to_string(),
-            description: "Read a file from the vault, optionally constrained to a line range.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "startLine": { "type": "integer", "minimum": 1 },
-                    "endLine": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-        },
-    ]
+    }
 }
 
 pub fn initialize_response() -> JsonRpcResponse<InitializeResult> {
-    json_response(
-        json!(1),
-        InitializeResult {
-            protocol_version: "2025-03-26",
-            capabilities: json!({
-                "tools": {}
-            }),
-            server_info: ServerInfo {
-                name: "deep-obsidian-server",
-                version: "0.1.0",
-            },
-        },
-    )
+    json_response(json!(1), initialize_result())
 }
 
 pub async fn handle_request(state: AppState, request: JsonRpcRequest) -> Result<Option<Value>, JsonRpcErrorResponse> {
@@ -90,25 +68,19 @@ pub async fn handle_request(state: AppState, request: JsonRpcRequest) -> Result<
 
     match request.method.as_str() {
         "notifications/initialized" => Ok(None),
-        "initialize" => Ok(Some(serde_json::to_value(json_response(
-            id,
-            InitializeResult {
-                protocol_version: "2025-03-26",
-                capabilities: json!({ "tools": {} }),
-                server_info: ServerInfo {
-                    name: "deep-obsidian-server",
-                    version: "0.1.0",
+        "initialize" => Ok(Some(
+            serde_json::to_value(json_response(id, initialize_result()))
+                .expect("initialize response to serialize"),
+        )),
+        "tools/list" => Ok(Some(
+            serde_json::to_value(json_response(
+                id,
+                ToolListResult {
+                    tools: tools::list_tools(),
                 },
-            },
-        ))
-        .expect("initialize response to serialize"))),
-        "tools/list" => Ok(Some(serde_json::to_value(json_response(
-            id,
-            ToolListResult {
-                tools: tool_definitions(),
-            },
-        ))
-        .expect("tool list response to serialize"))),
+            ))
+            .expect("tool list response to serialize"),
+        )),
         "tools/call" => {
             let tool_name = request
                 .params
@@ -116,49 +88,45 @@ pub async fn handle_request(state: AppState, request: JsonRpcRequest) -> Result<
                 .and_then(Value::as_str)
                 .ok_or_else(|| json_error_response(id.clone(), -32602, "missing tool name"))?;
             let arguments = request.params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-
-            let result = match tool_name {
-                "vault_info" => {
-                    let info = vault_info(&state.config.vault_path).map_err(|error| json_error_response(id.clone(), -32000, error.to_string()))?;
-                    let payload = json!({
-                        "vaultPath": info.vault_path,
-                        "markdownFileCount": info.markdown_file_count,
-                        "service": info.service,
-                        "prototype": info.prototype,
-                    });
-                    ToolCallResult {
-                        content: vec![ToolContent {
-                            kind: "text",
-                            text: serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string()),
-                        }],
-                        structured_content: payload,
-                    }
-                }
-                "read_file" => {
-                    let path = arguments
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| json_error_response(id.clone(), -32602, "missing path"))?;
-                    let start_line = arguments.get("startLine").and_then(Value::as_u64).map(|value| value as usize);
-                    let end_line = arguments.get("endLine").and_then(Value::as_u64).map(|value| value as usize);
-                    let file = read_file(&state.config.vault_path, path, start_line, end_line)
-                        .map_err(|error| json_error_response(id.clone(), -32000, error.to_string()))?;
-                    let payload = serde_json::to_value(&file).map_err(|error| json_error_response(id.clone(), -32000, error.to_string()))?;
-                    ToolCallResult {
-                        content: vec![ToolContent {
-                            kind: "text",
-                            text: serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string()),
-                        }],
-                        structured_content: payload,
-                    }
-                }
-                _ => {
-                    return Err(json_error_response(id, -32601, format!("unknown tool: {tool_name}")));
-                }
-            };
-
-            Ok(Some(serde_json::to_value(json_response(id, result)).expect("tool response to serialize")))
+            let result: ToolCallResult = tools::call_tool(&state, tool_name, &arguments)
+                .await
+                .map_err(|error| json_error_response(id.clone(), -32000, error))?;
+            Ok(Some(
+                serde_json::to_value(json_response(id, result)).expect("tool response to serialize"),
+            ))
         }
-        _ => Err(json_error_response(id, -32601, format!("unsupported method: {}", request.method))),
+        "resources/list" => {
+            let result: ResourceListResult = resources::list_resources(&state)
+                .await
+                .map_err(|error| json_error_response(id.clone(), -32000, error))?;
+            Ok(Some(
+                serde_json::to_value(json_response(id, result)).expect("resource list response to serialize"),
+            ))
+        }
+        "resources/templates/list" => {
+            let result: ResourceTemplateListResult = resources::list_resource_templates();
+            Ok(Some(
+                serde_json::to_value(json_response(id, result))
+                    .expect("resource template list response to serialize"),
+            ))
+        }
+        "resources/read" => {
+            let uri = request
+                .params
+                .get("uri")
+                .and_then(Value::as_str)
+                .ok_or_else(|| json_error_response(id.clone(), -32602, "missing resource uri"))?;
+            let result: ResourceReadResult = resources::read_resource(&state, uri)
+                .await
+                .map_err(|error| json_error_response(id.clone(), -32000, error))?;
+            Ok(Some(
+                serde_json::to_value(json_response(id, result)).expect("resource read response to serialize"),
+            ))
+        }
+        _ => Err(json_error_response(
+            id,
+            -32601,
+            format!("unsupported method: {}", request.method),
+        )),
     }
 }

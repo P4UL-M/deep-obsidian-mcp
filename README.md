@@ -2,6 +2,14 @@
 
 Filesystem-first MCP server for deep Obsidian vault access.
 
+## Maintenance Status
+
+This repository is Rust-only.
+
+- Use `cargo` from the repository root.
+- Use [bin/deep-obsidian-mcp](/Users/paul.mairesse/Documents/Playground/deep-obsidian-mcp/bin/deep-obsidian-mcp) or the compiled Rust binary for local and production use.
+- The old Node and TypeScript runtime has been removed from the maintained worktree.
+
 Current capabilities:
 
 - read a full note or a line range
@@ -27,15 +35,22 @@ This server supports two semantic modes:
 ## Usage
 
 ```bash
-npm install
-npm run build
-node dist/index.js /path/to/obsidian-vault
+cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp
+./bin/deep-obsidian-mcp /path/to/obsidian-vault
 ```
 
 Optional:
 
 ```bash
-node dist/index.js /path/to/obsidian-vault --index-dir /path/to/index-cache
+./bin/deep-obsidian-mcp /path/to/obsidian-vault --index-dir /path/to/index-cache
+```
+
+Rust workspace commands:
+
+```bash
+cargo check --workspace
+cargo test --workspace
+cargo run -p deep-obsidian-cli --bin deep-obsidian-mcp -- --vault tests/fixtures/vault
 ```
 
 ## Service Mode
@@ -45,7 +60,7 @@ node dist/index.js /path/to/obsidian-vault --index-dir /path/to/index-cache
 Start it directly:
 
 ```bash
-node dist/index.js /path/to/obsidian-vault \
+./bin/deep-obsidian-mcp /path/to/obsidian-vault \
   --transport http \
   --host 127.0.0.1 \
   --port 4100 \
@@ -88,12 +103,12 @@ Useful endpoints:
 Quick HTTP probe:
 
 ```bash
-node scripts/probe_http_service.mjs http://127.0.0.1:4100/mcp
+./bin/deep-obsidian-mcp probe --vault /path/to/obsidian-vault
 ```
 
 ## Config-Driven Service Flow
 
-The refactor now includes a first-class service-oriented CLI in the Node codebase.
+The maintained CLI now includes first-class service commands in Rust.
 
 Available commands:
 
@@ -113,14 +128,13 @@ Available commands:
 Example flow from the source tree:
 
 ```bash
-npm install
-npm run build
-node dist/index.js setup-service --vault ~/Vault
-node dist/index.js doctor
-node dist/index.js serve
+cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp
+./bin/deep-obsidian-mcp setup-service --vault ~/Vault
+./bin/deep-obsidian-mcp doctor
+./bin/deep-obsidian-mcp serve
 ```
 
-See [docs/homebrew-service.md](./docs/homebrew-service.md) for the Homebrew-oriented workflow and [Formula/deep-obsidian-mcp.rb](./Formula/deep-obsidian-mcp.rb) for the current formula scaffold.
+See [docs/homebrew-service.md](./docs/homebrew-service.md) for the intended Homebrew workflow, [docs/homebrew-gap-todo.md](./docs/homebrew-gap-todo.md) for the current packaging gaps, and [Formula/deep-obsidian-mcp.rb](./Formula/deep-obsidian-mcp.rb) for the current formula scaffold.
 
 ## macOS launchd
 
@@ -146,7 +160,7 @@ Remove it:
 
 The installer writes a user LaunchAgent plist under `~/Library/LaunchAgents/`, starts it with `launchctl`, and keeps it running across terminal sessions.
 
-This is a transitional path. The Homebrew service flow in [docs/homebrew-service.md](./docs/homebrew-service.md) is the target UX.
+This is still a local operational path. The Homebrew service flow in [docs/homebrew-service.md](./docs/homebrew-service.md) is the target packaged UX.
 
 Automatic reindexing is enabled by default. The server performs:
 
@@ -157,7 +171,7 @@ Automatic reindexing is enabled by default. The server performs:
 You can tune or disable it:
 
 ```bash
-node dist/index.js /path/to/obsidian-vault \
+./bin/deep-obsidian-mcp /path/to/obsidian-vault \
   --auto-reindex true \
   --reindex-debounce-ms 1500 \
   --reindex-interval-ms 30000
@@ -166,15 +180,15 @@ node dist/index.js /path/to/obsidian-vault \
 Or disable it entirely:
 
 ```bash
-node dist/index.js /path/to/obsidian-vault --auto-reindex false
+./bin/deep-obsidian-mcp /path/to/obsidian-vault --auto-reindex false
 ```
 
 Explicit stdio mode:
 
 ```bash
-node dist/index.js /path/to/obsidian-vault --stdio-mode auto
-node dist/index.js /path/to/obsidian-vault --stdio-mode framed
-node dist/index.js /path/to/obsidian-vault --stdio-mode newline
+./bin/deep-obsidian-mcp /path/to/obsidian-vault --stdio-mode auto
+./bin/deep-obsidian-mcp /path/to/obsidian-vault --stdio-mode framed
+./bin/deep-obsidian-mcp /path/to/obsidian-vault --stdio-mode newline
 ```
 
 Embedding-backed mode:
@@ -183,13 +197,13 @@ Embedding-backed mode:
 EMBEDDING_PROVIDER=openai-compatible \
 EMBEDDING_MODEL=text-embedding-3-small \
 OPENAI_API_KEY=... \
-node dist/index.js /path/to/obsidian-vault
+./bin/deep-obsidian-mcp /path/to/obsidian-vault
 ```
 
 Or with explicit flags:
 
 ```bash
-node dist/index.js /path/to/obsidian-vault \
+./bin/deep-obsidian-mcp /path/to/obsidian-vault \
   --embedding-provider openai-compatible \
   --embedding-model text-embedding-3-small \
   --embedding-base-url https://api.openai.com/v1 \
@@ -201,6 +215,8 @@ node dist/index.js /path/to/obsidian-vault \
 - `vault_info`
 - `load_knowledge`
 - `recommend_folder`
+- `list_children`
+- `list_folders`
 - `read_file`
 - `read_chunk`
 - `find_files`
@@ -210,8 +226,12 @@ node dist/index.js /path/to/obsidian-vault \
 - `semantic_search`
 - `hybrid_search`
 - `related_notes`
+- `find_similar_notes`
 - `backlinks`
 - `graph_traverse`
+- `upsert_note`
+- `update_note_section`
+- `write_file_to_vault`
 - `upsert_session_note`
 
 `upsert_session_note` accepts either:
@@ -221,6 +241,16 @@ node dist/index.js /path/to/obsidian-vault \
 
 When `path` is provided, it takes precedence over `topic` and `folder`. This is useful for follow-up updates from clients that already know the exact note created earlier in the conversation.
 
+`upsert_session_note` writes the provided markdown body as-is. It does not auto-insert a top-level title; clients should include one explicitly only when they want one saved.
+
+Additional authoring helpers:
+
+- `upsert_note`: generic markdown note create/update with explicit `content` or explicit `frontmatter` + `title` + `body`
+- `update_note_section`: replace the preamble or a named heading section without rewriting the full note
+- `write_file_to_vault`: create or update non-markdown files using `utf-8` or `base64`
+- `list_children` / `list_folders`: inspect actual vault structure instead of guessing from search
+- `find_similar_notes`: rank notes by editorial style, structure, tone, or format
+
 ## MCP Resources
 
 - `obsidian://vault/info`
@@ -228,15 +258,16 @@ When `path` is provided, it takes precedence over `topic` and `folder`. This is 
 - `obsidian://heading?path=...&slug=...`
 - `obsidian://block?path=...&id=...`
 
+For the recommended pattern for snippet-backed writing conventions, see [docs/writing-conventions-pattern.md](docs/writing-conventions-pattern.md).
+
 ## Example Codex Config
 
 Local stdio subprocess:
 
 ```toml
 [mcp_servers.deep_obsidian]
-command = "node"
+command = "/absolute/path/to/deep-obsidian-mcp/bin/deep-obsidian-mcp"
 args = [
-  "/absolute/path/to/deep-obsidian-mcp/dist/index.js",
   "/absolute/path/to/your/vault",
   "--stdio-mode",
   "auto",
@@ -282,3 +313,19 @@ This gives you:
 - support denser graph APIs such as shortest path and strongly connected neighborhoods
 - support BM25 plus embedding hybrid ranking at note level, not only chunk level
 - add a bundled `sqlite-vec` distribution strategy for environments where extension loading is restricted
+
+### Recently Added Authoring Tools
+
+The Rust runtime now includes the authoring and structure tools that were previously missing:
+
+- `upsert_note`
+  - generic note create/update with explicit control over `content` or `frontmatter` + `title` + `body`
+  - no implicit title injection
+- `update_note_section`
+  - patch the note preamble or a named heading section without rewriting the whole note
+- `write_file_to_vault`
+  - write non-note files in `utf-8` or `base64`
+- `list_children` and `list_folders`
+  - inspect the actual vault structure directly
+- `find_similar_notes`
+  - rank notes by editorial `style`, `structure`, `tone`, or `format`

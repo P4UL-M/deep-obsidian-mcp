@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname "$0")/.." && pwd)"
 VAULT_PATH="${1:-${OBSIDIAN_VAULT_PATH:-}}"
 CONFIG_PATH="${DEEP_OBSIDIAN_CONFIG_PATH:-}"
+SERVER_BIN="${DEEP_OBSIDIAN_SERVER_BIN:-${ROOT_DIR}/bin/deep-obsidian-mcp}"
 
 HOST="${DEEP_OBSIDIAN_HOST:-127.0.0.1}"
 PORT="${DEEP_OBSIDIAN_PORT:-4100}"
@@ -48,4 +49,4 @@ if [[ -n "${VAULT_PATH}" ]]; then
   args+=("--vault" "${VAULT_PATH}")
 fi
 
-exec node "${ROOT_DIR}/dist/index.js" "${args[@]}"
+exec "${SERVER_BIN}" "${args[@]}"

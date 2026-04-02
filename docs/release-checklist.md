@@ -4,8 +4,8 @@ Use this checklist when preparing a Homebrew-ready release artifact.
 
 ## Build And Verify
 
-- [ ] Build the Node package successfully.
-- [ ] Confirm the service CLI and config resolution match the plan in `docs/brew-service-refactor-plan.md`.
+- [ ] Build the Rust workspace successfully with `cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp`.
+- [ ] Confirm the service CLI and config resolution match the maintained behavior contract in [docs/behavior-contract.md](/Users/paul.mairesse/Documents/Playground/deep-obsidian-mcp/docs/behavior-contract.md).
 - [ ] Verify `setup-service` can persist a config file without editing a plist.
 - [ ] Verify `doctor` reports the resolved config, vault path, and writable index directory.
 - [ ] Verify `probe` succeeds against a running HTTP service.
@@ -34,4 +34,4 @@ Use this checklist when preparing a Homebrew-ready release artifact.
 
 ## Notes
 
-The checklist is intentionally stricter than the current implementation. Some items will remain manual until the Node service refactor lands the new command surface and the formula stops depending on the developer checkout layout.
+The checklist is intentionally stricter than the current implementation. Some items will remain manual until the Rust release packaging flow is finished and the formula stops depending on placeholder artifact metadata.

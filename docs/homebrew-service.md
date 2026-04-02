@@ -2,7 +2,7 @@
 
 This document describes the Homebrew operating model for `deep-obsidian-mcp`.
 
-The Node implementation now exposes the service-oriented commands needed for this workflow. The remaining gap is packaging: the formula and release artifact story are still scaffolding rather than a finished distribution.
+The Rust implementation exposes the service-oriented commands needed for this workflow. The remaining gap is packaging: the formula, release artifact, and `brew services` validation story are still incomplete.
 
 ## Target Workflow
 
@@ -30,8 +30,6 @@ deep-obsidian-mcp probe
 - `serve` starts the long-lived HTTP service using the resolved config.
 
 ## Configuration Model
-
-The plan in `docs/brew-service-refactor-plan.md` treats configuration as the shared contract across the Node and Rust implementations.
 
 Expected fields:
 
@@ -73,4 +71,6 @@ The Homebrew service should:
 
 The existing `scripts/install-launchd-service.sh` and `scripts/run-http-service.sh` now delegate to the same `serve` command and are still useful for local development, but they are not the target product workflow.
 
-The formula scaffold in `Formula/deep-obsidian-mcp.rb` is intentionally conservative until the Node refactor lands the service CLI and config loader.
+The formula scaffold in `Formula/deep-obsidian-mcp.rb` is intentionally conservative until the Rust release packaging flow is finished.
+
+Current packaging gaps are tracked in [docs/homebrew-gap-todo.md](./homebrew-gap-todo.md).

@@ -1,0 +1,27 @@
+#!/bin/zsh
+set -euo pipefail
+
+SCRIPT_PATH="${0:A}"
+ROOT_DIR="${SCRIPT_PATH:h:h}"
+
+typeset -a candidates
+candidates=()
+
+if [[ -n "${DEEP_OBSIDIAN_SERVER_BIN:-}" ]]; then
+  candidates+=("${DEEP_OBSIDIAN_SERVER_BIN}")
+fi
+
+candidates+=(
+  "${ROOT_DIR}/target/release/deep-obsidian-mcp"
+  "${ROOT_DIR}/target/debug/deep-obsidian-mcp"
+)
+
+for candidate in "${candidates[@]}"; do
+  if [[ -n "${candidate}" && "${candidate:A}" != "${SCRIPT_PATH}" && -x "${candidate}" ]]; then
+    exec "${candidate}" "$@"
+  fi
+done
+
+echo "deep-obsidian-mcp Rust binary not found." >&2
+echo "Build it first with: cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp" >&2
+exit 1

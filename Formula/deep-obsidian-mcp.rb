@@ -9,23 +9,21 @@ class DeepObsidianMcp < Formula
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
-  depends_on "node@22"
+  depends_on "rust" => :build
   depends_on "ripgrep"
 
   def install
-    # TODO: install the release artifact layout rather than the developer tree.
-    # The intended final shape is:
-    # - a compiled executable under bin/
-    # - support files under libexec/
-    # - a config template under etc/
-    bin.install_symlink "deep-obsidian-mcp"
+    # TODO: switch to the released source or bottle artifact once packaging is finalized.
+    system "cargo", "install", *std_cargo_args(path: "rust/crates/deep-obsidian-cli")
   end
 
   def caveats
     <<~EOS
-      This formula is a scaffold for the planned Homebrew service workflow.
-      The Node refactor still needs to land `setup-service`, `doctor`, `print-config`, and `probe`
-      before this formula becomes a real end-user package.
+      This formula is still scaffolding.
+      The service commands exist, but Homebrew packaging is not complete until the project ships:
+      - a real release artifact and checksum
+      - validated brew service install/start/upgrade coverage
+      - finalized config and log path expectations
     EOS
   end
 
@@ -37,7 +35,7 @@ class DeepObsidianMcp < Formula
   end
 
   test do
-    # TODO: replace with a real smoke test against the packaged binary.
+    # TODO: replace with a real packaged-binary smoke test once release artifacts exist.
     assert_match "Usage:", shell_output("#{bin}/deep-obsidian-mcp help")
   end
 end

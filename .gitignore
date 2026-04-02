@@ -1,5 +1,2 @@
-node_modules/
-dist/
 **/.deep-obsidian-mcp/
-rust/target/
-rust/**/target/
+target/

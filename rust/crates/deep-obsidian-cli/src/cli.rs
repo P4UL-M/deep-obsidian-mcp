@@ -16,7 +16,13 @@ pub enum StdioMode {
 }
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "deep-obsidian-mcp", version, about = "Rust prototype CLI for deep-obsidian-mcp")]
+#[command(
+    name = "deep-obsidian-mcp",
+    version,
+    about = "Rust prototype CLI for deep-obsidian-mcp",
+    disable_help_subcommand = true,
+    disable_version_flag = true
+)]
 pub struct Cli {
     #[command(flatten)]
     pub options: ServiceOptions,
@@ -29,6 +35,18 @@ pub struct Cli {
 pub struct ServiceOptions {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
+
+    #[arg(long = "dry-run", global = true, action = clap::ArgAction::SetTrue, overrides_with = "no_dry_run")]
+    pub dry_run: bool,
+
+    #[arg(long = "no-dry-run", global = true, action = clap::ArgAction::SetTrue)]
+    pub no_dry_run: bool,
+
+    #[arg(long, global = true, action = clap::ArgAction::SetTrue, overrides_with = "no_json")]
+    pub json: bool,
+
+    #[arg(long = "no-json", global = true, action = clap::ArgAction::SetTrue)]
+    pub no_json: bool,
 
     #[arg(long = "vault", global = true)]
     pub vault_path: Option<PathBuf>,
@@ -87,17 +105,11 @@ pub enum Command {
     Serve,
     SetupService {
         #[arg(long)]
-        dry_run: bool,
-
-        #[arg(long)]
         overwrite: bool,
     },
     Doctor {
         #[arg(long = "probe-timeout-ms", default_value_t = 5_000)]
         probe_timeout_ms: u64,
-
-        #[arg(long)]
-        json: bool,
     },
     PrintConfig {
         #[arg(long)]
@@ -106,8 +118,7 @@ pub enum Command {
     Probe {
         #[arg(long = "timeout-ms", default_value_t = 5_000)]
         timeout_ms: u64,
-
-        #[arg(long)]
-        json: bool,
     },
+    Help,
+    Version,
 }

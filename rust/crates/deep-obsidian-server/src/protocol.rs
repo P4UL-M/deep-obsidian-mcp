@@ -34,6 +34,10 @@ pub struct JsonRpcError {
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<Value>,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
 }
@@ -58,6 +62,55 @@ pub struct ToolCallResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ResourceDefinition {
+    pub uri: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceListResult {
+    pub resources: Vec<ResourceDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceTemplateDefinition {
+    #[serde(rename = "uriTemplate")]
+    pub uri_template: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceTemplateListResult {
+    #[serde(rename = "resourceTemplates")]
+    pub resource_templates: Vec<ResourceTemplateDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceContents {
+    pub uri: String,
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceReadResult {
+    pub contents: Vec<ResourceContents>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct InitializeResult {
     #[serde(rename = "protocolVersion")]
     pub protocol_version: &'static str,
@@ -71,4 +124,3 @@ pub struct ServerInfo {
     pub name: &'static str,
     pub version: &'static str,
 }
-

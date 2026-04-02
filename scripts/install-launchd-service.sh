@@ -4,13 +4,23 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname "$0")/.." && pwd)"
 VAULT_PATH="${1:-${OBSIDIAN_VAULT_PATH:-}}"
 CONFIG_PATH="${DEEP_OBSIDIAN_CONFIG_PATH:-}"
+SERVER_BIN="${DEEP_OBSIDIAN_SERVER_BIN:-${ROOT_DIR}/bin/deep-obsidian-mcp}"
+if [[ "${SERVER_BIN}" == "${ROOT_DIR}/bin/deep-obsidian-mcp" ]]; then
+  for candidate in \
+    "${ROOT_DIR}/target/release/deep-obsidian-mcp" \
+    "${ROOT_DIR}/target/debug/deep-obsidian-mcp"; do
+    if [[ -x "${candidate}" ]]; then
+      SERVER_BIN="${candidate}"
+      break
+    fi
+  done
+fi
 
 LABEL="${DEEP_OBSIDIAN_LABEL:-io.deep-obsidian-mcp}"
 HOST="${DEEP_OBSIDIAN_HOST:-127.0.0.1}"
 PORT="${DEEP_OBSIDIAN_PORT:-4100}"
 MCP_PATH="${DEEP_OBSIDIAN_MCP_PATH:-/mcp}"
 HEALTH_PATH="${DEEP_OBSIDIAN_HEALTH_PATH:-/healthz}"
-NODE_BIN="${DEEP_OBSIDIAN_NODE_BIN:-$(command -v node)}"
 EMBEDDING_PROVIDER_VALUE="${DEEP_OBSIDIAN_EMBEDDING_PROVIDER:-${EMBEDDING_PROVIDER:-}}"
 EMBEDDING_MODEL_VALUE="${DEEP_OBSIDIAN_EMBEDDING_MODEL:-${EMBEDDING_MODEL:-${OPENAI_EMBEDDING_MODEL:-}}}"
 EMBEDDING_BASE_URL_VALUE="${DEEP_OBSIDIAN_EMBEDDING_BASE_URL:-${EMBEDDING_BASE_URL:-${OPENAI_BASE_URL:-}}}"
@@ -34,9 +44,17 @@ function xml_escape() {
 }
 
 typeset -a env_entries
+typeset -a path_entries
+path_entries=()
+for path_dir in /opt/homebrew/bin /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
+  if [[ -d "${path_dir}" ]]; then
+    path_entries+=("${path_dir}")
+  fi
+done
+PATH_VALUE="${(j/:/)path_entries}"
 env_entries=(
   "    <key>PATH</key>"
-  "    <string>$(xml_escape "$(dirname "${NODE_BIN}"):/usr/bin:/bin:/usr/sbin:/sbin")</string>"
+  "    <string>${PATH_VALUE}</string>"
 )
 
 function add_env_entry() {
@@ -58,8 +76,7 @@ mkdir -p "${LAUNCH_AGENTS_DIR}" "${LOG_DIR}"
 
 typeset -a program_arguments
 program_arguments=(
-  "    <string>${NODE_BIN}</string>"
-  "    <string>${ROOT_DIR}/dist/index.js</string>"
+  "    <string>${SERVER_BIN}</string>"
   "    <string>serve</string>"
   "    <string>--transport</string>"
   "    <string>http</string>"

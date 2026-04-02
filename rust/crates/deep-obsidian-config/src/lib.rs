@@ -75,6 +75,22 @@ pub fn default_index_dir(vault_path: &Path) -> PathBuf {
     vault_path.join(".deep-obsidian-mcp")
 }
 
+pub fn expand_home_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+
+    if raw == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        return home_dir().join(rest);
+    }
+
+    path.to_path_buf()
+}
+
 pub fn normalize_http_path(value: Option<&str>, fallback: &str) -> String {
     let candidate = value.unwrap_or(fallback).trim();
     if candidate.is_empty() || candidate == "/" {
@@ -89,9 +105,10 @@ pub fn normalize_http_path(value: Option<&str>, fallback: &str) -> String {
 pub fn normalize_service_config(
     input: ServiceConfigInput,
 ) -> Result<ResolvedServiceConfig, ConfigError> {
-    let vault_path = input.vault_path.ok_or(ConfigError::MissingVaultPath)?;
+    let vault_path = expand_home_path(input.vault_path.ok_or(ConfigError::MissingVaultPath)?);
     let index_dir = input
         .index_dir
+        .map(expand_home_path)
         .unwrap_or_else(|| default_index_dir(&vault_path));
     let transport = input.transport.unwrap_or(TransportMode::Http);
     let stdio_mode = input.stdio_mode.unwrap_or(StdioMode::Auto);
@@ -107,7 +124,7 @@ pub fn normalize_service_config(
         http,
         auto_reindex,
         embedding,
-        config_file_path: input.config_file_path,
+        config_file_path: input.config_file_path.map(expand_home_path),
     })
 }
 
@@ -173,7 +190,7 @@ pub fn ensure_http_service_config(
 pub fn read_config_file(
     path: impl AsRef<Path>,
 ) -> Result<Option<PersistedServiceConfig>, ConfigError> {
-    let path = path.as_ref().to_path_buf();
+    let path = expand_home_path(path);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -187,7 +204,7 @@ pub fn write_config_file(
     path: impl AsRef<Path>,
     config: &PersistedServiceConfig,
 ) -> Result<(), ConfigError> {
-    let path = path.as_ref().to_path_buf();
+    let path = expand_home_path(path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ConfigError::WriteFailed {
             path: parent.to_path_buf(),
@@ -303,4 +320,17 @@ fn serialize_toml<T: Serialize>(path: &Path, value: &T) -> Result<String, Config
         path: path.to_path_buf(),
         source: Box::new(source),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_home_path;
+
+    #[test]
+    fn expand_home_path_expands_tilde_prefix() {
+        let home = std::env::var("HOME").expect("HOME");
+        let home_path = std::path::PathBuf::from(home);
+        assert_eq!(expand_home_path("~/vault"), home_path.join("vault"));
+        assert_eq!(expand_home_path("~"), home_path);
+    }
 }

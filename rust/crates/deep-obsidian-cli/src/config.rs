@@ -3,12 +3,13 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use deep_obsidian_config::{
-    default_config_path, normalize_http_path, normalize_service_config, read_config_file,
+    default_config_path, expand_home_path, normalize_http_path, normalize_service_config,
+    read_config_file,
 };
 use deep_obsidian_types::{
     AutoReindexConfigInput, EmbeddingConfigInput, EmbeddingProvider, HttpConfigInput,
-    PersistedServiceConfig, ResolvedServiceConfig, ServiceConfigInput, StdioMode as SharedStdioMode,
-    TransportMode as SharedTransportMode,
+    PersistedServiceConfig, ResolvedServiceConfig, ServiceConfigInput,
+    StdioMode as SharedStdioMode, TransportMode as SharedTransportMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,18 +52,26 @@ pub struct ResolvedRuntimeConfig {
 }
 
 pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntimeConfig> {
-    let config_path = options.config.clone().unwrap_or_else(default_config_path);
+    let config_path = options
+        .config
+        .clone()
+        .map(expand_home_path)
+        .unwrap_or_else(default_config_path);
     let config_file = read_config_file(&config_path)
         .with_context(|| format!("failed to load config file {}", config_path.display()))?;
 
     let (vault_path, vault_path_source) = first_path(
         options.vault_path.clone(),
-        config_file.as_ref().and_then(|config| config.vault_path.clone()),
+        config_file
+            .as_ref()
+            .and_then(|config| config.vault_path.clone()),
         env_path(&["DEEP_OBSIDIAN_VAULT_PATH", "OBSIDIAN_VAULT_PATH"]),
     );
     let (index_dir, index_dir_source) = first_path(
         options.index_dir.clone(),
-        config_file.as_ref().and_then(|config| config.index_dir.clone()),
+        config_file
+            .as_ref()
+            .and_then(|config| config.index_dir.clone()),
         env_path(&["DEEP_OBSIDIAN_INDEX_DIR", "INDEX_DIR"]),
     );
     let (transport, transport_source) = first_transport(
@@ -83,7 +92,11 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
         config_file
             .as_ref()
             .and_then(|config| config.http.as_ref().and_then(|http| http.host.clone())),
-        env_string(&["MCP_HTTP_HOST", "DEEP_OBSIDIAN_HOST", "DEEP_OBSIDIAN_HTTP_HOST"]),
+        env_string(&[
+            "MCP_HTTP_HOST",
+            "DEEP_OBSIDIAN_HOST",
+            "DEEP_OBSIDIAN_HTTP_HOST",
+        ]),
         Some("127.0.0.1".to_string()),
     );
     let (http_port, http_port_source) = first_u16(
@@ -91,7 +104,11 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
         config_file
             .as_ref()
             .and_then(|config| config.http.as_ref().and_then(|http| http.port)),
-        env_u16(&["MCP_HTTP_PORT", "DEEP_OBSIDIAN_PORT", "DEEP_OBSIDIAN_HTTP_PORT"]),
+        env_u16(&[
+            "MCP_HTTP_PORT",
+            "DEEP_OBSIDIAN_PORT",
+            "DEEP_OBSIDIAN_HTTP_PORT",
+        ]),
         4100,
     );
     let (http_mcp_path_raw, http_mcp_path_source) = first_string(
@@ -104,9 +121,12 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
     );
     let (http_health_path_raw, http_health_path_source) = first_string(
         options.health_path.clone(),
-        config_file
-            .as_ref()
-            .and_then(|config| config.http.as_ref().and_then(|http| http.health_path.clone())),
+        config_file.as_ref().and_then(|config| {
+            config
+                .http
+                .as_ref()
+                .and_then(|http| http.health_path.clone())
+        }),
         env_string(&["MCP_HTTP_HEALTH_PATH", "DEEP_OBSIDIAN_HEALTH_PATH"]),
         Some("/healthz".to_string()),
     );
@@ -128,51 +148,80 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
     );
     let (auto_reindex_debounce_ms, auto_reindex_debounce_ms_source) = first_u64(
         options.reindex_debounce_ms,
-        config_file
-            .as_ref()
-            .and_then(|config| config.auto_reindex.as_ref().and_then(|value| value.debounce_ms)),
+        config_file.as_ref().and_then(|config| {
+            config
+                .auto_reindex
+                .as_ref()
+                .and_then(|value| value.debounce_ms)
+        }),
         env_u64(&["REINDEX_DEBOUNCE_MS", "DEEP_OBSIDIAN_REINDEX_DEBOUNCE_MS"]),
         1500,
     );
     let (auto_reindex_interval_ms, auto_reindex_interval_ms_source) = first_u64(
         options.reindex_interval_ms,
-        config_file
-            .as_ref()
-            .and_then(|config| config.auto_reindex.as_ref().and_then(|value| value.interval_ms)),
+        config_file.as_ref().and_then(|config| {
+            config
+                .auto_reindex
+                .as_ref()
+                .and_then(|value| value.interval_ms)
+        }),
         env_u64(&["REINDEX_INTERVAL_MS", "DEEP_OBSIDIAN_REINDEX_INTERVAL_MS"]),
         30000,
     );
 
     let (embedding_model, embedding_model_source) = first_string(
         options.embedding_model.clone(),
-        config_file
-            .as_ref()
-            .and_then(|config| config.embedding.as_ref().and_then(|value| value.model.clone())),
-        env_string(&["DEEP_OBSIDIAN_EMBEDDING_MODEL", "EMBEDDING_MODEL", "OPENAI_EMBEDDING_MODEL"]),
+        config_file.as_ref().and_then(|config| {
+            config
+                .embedding
+                .as_ref()
+                .and_then(|value| value.model.clone())
+        }),
+        env_string(&[
+            "DEEP_OBSIDIAN_EMBEDDING_MODEL",
+            "EMBEDDING_MODEL",
+            "OPENAI_EMBEDDING_MODEL",
+        ]),
         None,
     );
     let (embedding_provider, embedding_provider_source) = first_embedding_provider(
         options.embedding_provider.clone(),
-        config_file
-            .as_ref()
-            .and_then(|config| config.embedding.as_ref().and_then(|value| value.provider.clone())),
+        config_file.as_ref().and_then(|config| {
+            config
+                .embedding
+                .as_ref()
+                .and_then(|value| value.provider.clone())
+        }),
         env_embedding_provider(&["DEEP_OBSIDIAN_EMBEDDING_PROVIDER", "EMBEDDING_PROVIDER"]),
         embedding_model.is_some(),
     );
     let (embedding_base_url, embedding_base_url_source) = first_string(
         options.embedding_base_url.clone(),
-        config_file
-            .as_ref()
-            .and_then(|config| config.embedding.as_ref().and_then(|value| value.base_url.clone())),
-        env_string(&["DEEP_OBSIDIAN_EMBEDDING_BASE_URL", "EMBEDDING_BASE_URL", "OPENAI_BASE_URL"]),
+        config_file.as_ref().and_then(|config| {
+            config
+                .embedding
+                .as_ref()
+                .and_then(|value| value.base_url.clone())
+        }),
+        env_string(&[
+            "DEEP_OBSIDIAN_EMBEDDING_BASE_URL",
+            "EMBEDDING_BASE_URL",
+            "OPENAI_BASE_URL",
+        ]),
         None,
     );
     let (embedding_api_key_env, embedding_api_key_source) = first_string(
         options.embedding_api_key_env.clone(),
-        config_file
-            .as_ref()
-            .and_then(|config| config.embedding.as_ref().and_then(|value| value.api_key_env.clone())),
-        env_string(&["DEEP_OBSIDIAN_EMBEDDING_API_KEY_ENV", "EMBEDDING_API_KEY_ENV"]),
+        config_file.as_ref().and_then(|config| {
+            config
+                .embedding
+                .as_ref()
+                .and_then(|value| value.api_key_env.clone())
+        }),
+        env_string(&[
+            "DEEP_OBSIDIAN_EMBEDDING_API_KEY_ENV",
+            "EMBEDDING_API_KEY_ENV",
+        ]),
         if env::var("OPENAI_API_KEY").is_ok() {
             Some("OPENAI_API_KEY".to_string())
         } else {
@@ -183,11 +232,20 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
         .embedding_api_key
         .clone()
         .or_else(|| {
-            config_file
-                .as_ref()
-                .and_then(|config| config.embedding.as_ref().and_then(|value| value.api_key.clone()))
+            config_file.as_ref().and_then(|config| {
+                config
+                    .embedding
+                    .as_ref()
+                    .and_then(|value| value.api_key.clone())
+            })
         })
-        .or_else(|| env_string(&["DEEP_OBSIDIAN_EMBEDDING_API_KEY", "EMBEDDING_API_KEY", "OPENAI_API_KEY"]));
+        .or_else(|| {
+            env_string(&[
+                "DEEP_OBSIDIAN_EMBEDDING_API_KEY",
+                "EMBEDDING_API_KEY",
+                "OPENAI_API_KEY",
+            ])
+        });
 
     let input = ServiceConfigInput {
         vault_path,
@@ -198,7 +256,10 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
             host: http_host,
             port: Some(http_port),
             mcp_path: Some(normalize_http_path(http_mcp_path_raw.as_deref(), "/mcp")),
-            health_path: Some(normalize_http_path(http_health_path_raw.as_deref(), "/healthz")),
+            health_path: Some(normalize_http_path(
+                http_health_path_raw.as_deref(),
+                "/healthz",
+            )),
         }),
         auto_reindex: Some(AutoReindexConfigInput {
             enabled: Some(auto_reindex_enabled),
@@ -396,7 +457,10 @@ fn first_embedding_provider(
         return (Some(value), ResolvedSource::Env);
     }
     if infer_from_model {
-        return (Some(EmbeddingProvider::OpenAiCompatible), ResolvedSource::Default);
+        return (
+            Some(EmbeddingProvider::OpenAiCompatible),
+            ResolvedSource::Default,
+        );
     }
     (None, ResolvedSource::Default)
 }
@@ -466,5 +530,7 @@ fn env_embedding_provider(keys: &[&str]) -> Option<EmbeddingProvider> {
 }
 
 fn trim_optional(value: Option<String>) -> Option<String> {
-    value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
