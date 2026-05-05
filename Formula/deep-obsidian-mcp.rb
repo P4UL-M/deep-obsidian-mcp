@@ -13,6 +13,7 @@ class DeepObsidianMcp < Formula
 
   def install
     system "cargo", "install", *std_cargo_args(path: "rust/crates/deep-obsidian-cli")
+    pkgshare.install "assets"
     pkgshare.install "skills"
     pkgshare.install "obsidian-snippets"
     (var/"log/deep-obsidian-mcp").mkpath
@@ -36,6 +37,9 @@ class DeepObsidianMcp < Formula
 
       Obsidian CSS snippets are installed under:
         #{opt_pkgshare}/obsidian-snippets
+
+      Project icons and logo assets are installed under:
+        #{opt_pkgshare}/assets
 
       setup-service --skills copies them into Codex and Claude Code skill directories.
       setup-service --mcp configures Codex and Claude Code MCP client entries.

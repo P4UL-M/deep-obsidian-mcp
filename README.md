@@ -166,7 +166,15 @@ Packaged agent skill templates live in [skills](./skills) for operational workfl
 
 Packaged Obsidian CSS snippets live in [obsidian-snippets](./obsidian-snippets). The default snippet hides `_Agent` and `_Wiki` from the Obsidian file explorer while keeping those folders available to Deep Obsidian through MCP.
 
-Homebrew installs packaged skills under the formula `pkgshare/skills` directory and snippets under `pkgshare/obsidian-snippets`. Source users can install both through `setup-service` from the repository root.
+Project logo and icon assets live in [assets](./assets):
+
+- `deep-obsidian-logo.svg`: full-color vector logo
+- `deep-obsidian-menubar.svg`: monochrome `currentColor` icon for taskbar and menubar use
+- `icons/deep-obsidian-favicon.ico`: favicon-sized multi-resolution ICO
+- `icons/deep-obsidian-app.ico`: app-sized multi-resolution ICO
+- `icons/png/`: generated PNG exports
+
+Homebrew installs packaged skills under the formula `pkgshare/skills` directory, snippets under `pkgshare/obsidian-snippets`, and icons under `pkgshare/assets`. Source users can install skills and snippets through `setup-service` from the repository root.
 
 ## macOS launchd
 

@@ -120,6 +120,6 @@ Readiness is the packaging gate: `/healthz` can be healthy while the index is st
 
 The existing `scripts/install-launchd-service.sh` and `scripts/run-http-service.sh` now delegate to the same `serve` command and are still useful for local development, but they are not the target product workflow.
 
-The formula in `Formula/deep-obsidian-mcp.rb` installs the CLI, installs packaged agent skills under `pkgshare/skills`, installs packaged Obsidian CSS snippets under `pkgshare/obsidian-snippets`, creates the Homebrew log directory, runs `serve --packaged --transport http`, sets `DEEP_OBSIDIAN_PACKAGED=1`, and validates the packaged binary with `help` and `version` smoke tests. Users can then run `setup-service --mcp --skills --vault-snippets` to install the MCP client entries, agent skills, and vault snippets from the packaged assets.
+The formula in `Formula/deep-obsidian-mcp.rb` installs the CLI, installs project icon assets under `pkgshare/assets`, installs packaged agent skills under `pkgshare/skills`, installs packaged Obsidian CSS snippets under `pkgshare/obsidian-snippets`, creates the Homebrew log directory, runs `serve --packaged --transport http`, sets `DEEP_OBSIDIAN_PACKAGED=1`, and validates the packaged binary with `help` and `version` smoke tests. Users can then run `setup-service --mcp --skills --vault-snippets` to install the MCP client entries, agent skills, and vault snippets from the packaged assets.
 
 Current packaging gaps are tracked in [docs/homebrew-gap-todo.md](./homebrew-gap-todo.md).
