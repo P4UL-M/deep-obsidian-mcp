@@ -127,11 +127,22 @@ Available commands:
 3. environment variables
 4. defaults
 
+Use `--mcp` and `--skills` during setup to connect local coding agents at the same time:
+
+```bash
+deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills
+```
+
+- `--mcp` configures Codex in `~/.codex/config.toml` and, when the `claude` CLI is available, runs `claude mcp add --transport http --scope user deep-obsidian <mcp-url>`.
+- `--skills` installs packaged skills into `~/.codex/skills` and `~/.claude/skills`.
+- `--dry-run` validates and reports these changes without writing them.
+- `--overwrite` replaces an existing service config, Codex MCP entry, Claude MCP entry, or installed skill directories.
+
 Example flow from the source tree:
 
 ```bash
 cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp
-./bin/deep-obsidian-mcp setup-service --vault ~/Vault
+./bin/deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills
 ./bin/deep-obsidian-mcp doctor
 ./bin/deep-obsidian-mcp serve
 ```

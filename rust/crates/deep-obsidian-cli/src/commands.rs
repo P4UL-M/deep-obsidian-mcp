@@ -30,14 +30,14 @@ const CONFIG_PRECEDENCE: [&str; 4] = ["cli", "config", "env", "default"];
 const HELP_TEXT: &str = "\
 Usage:
   deep-obsidian-mcp [serve] [--config <path>] [--vault <path>] [--transport stdio|http] [--packaged]
-  deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--dry-run]
+  deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--dry-run]
   deep-obsidian-mcp doctor [--config <path>] [--json]
   deep-obsidian-mcp print-config [--config <path>]
   deep-obsidian-mcp probe [--config <path>] [--json]
 
 Commands:
   serve          Start the MCP server using resolved config.
-  setup-service  Validate and persist HTTP service config.
+  setup-service  Validate service config and optionally install MCP client entries or skills.
   doctor         Diagnose config, vault access, dependencies, and health.
   print-config   Print the normalized persisted config.
   probe          Probe the configured HTTP health and MCP endpoints.
@@ -117,6 +117,18 @@ pub struct SetupServiceReport {
     pub endpoints: EndpointReport,
     pub persisted_config: PersistedServiceConfig,
     pub messages: Vec<String>,
+    pub mcp: Vec<SetupActionReport>,
+    pub skills: Vec<SetupActionReport>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupActionReport {
+    pub target: String,
+    pub path: Option<PathBuf>,
+    pub changed: bool,
+    pub status: String,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -219,9 +231,13 @@ pub async fn run() -> Result<()> {
             serve(&resolved).await?;
             Ok(())
         }
-        Command::SetupService { overwrite } => {
+        Command::SetupService {
+            overwrite,
+            mcp,
+            skills,
+        } => {
             let resolved = crate::config::resolve_runtime_config(&cli.options)?;
-            let report = setup_service(&resolved, dry_run, overwrite)?;
+            let report = setup_service(&resolved, dry_run, overwrite, mcp, skills)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -572,6 +588,8 @@ pub fn setup_service(
     resolved: &ResolvedRuntimeConfig,
     dry_run: bool,
     overwrite: bool,
+    install_mcp: bool,
+    install_skills: bool,
 ) -> Result<SetupServiceReport> {
     let mut service = ensure_service_transport_http(resolved.service.clone())?;
     service.vault_path = absolute_path(&service.vault_path)?;
@@ -594,11 +612,22 @@ pub fn setup_service(
     if dry_run {
         assert_creatable_directory(&service.index_dir)?;
         assert_creatable_directory(&config_dir)?;
+        let endpoints = endpoint_report(&build_service_endpoints(&service));
+        let mcp = if install_mcp {
+            setup_mcp_clients(&endpoints, true, overwrite)?
+        } else {
+            Vec::new()
+        };
+        let skills = if install_skills {
+            setup_agent_skills(true, overwrite)?
+        } else {
+            Vec::new()
+        };
         return Ok(SetupServiceReport {
             config_file_path: config_path,
             written: false,
             dry_run: true,
-            endpoints: endpoint_report(&build_service_endpoints(&service)),
+            endpoints,
             persisted_config: config,
             messages: vec![
                 messages[0].clone(),
@@ -606,34 +635,395 @@ pub fn setup_service(
                 messages[2].clone(),
                 "dry-run: config validated but not written".to_string(),
             ],
+            mcp,
+            skills,
         });
     }
 
     ensure_writable_directory(&service.index_dir)?;
     ensure_writable_directory(&config_dir)?;
-    if !dry_run {
-        if config_path.exists() && !overwrite {
+    let mut wrote_config = false;
+    let mut final_messages = messages.clone();
+    if config_path.exists() && !overwrite {
+        if !(install_mcp || install_skills) {
             return Err(anyhow!(
                 "config file already exists: {}",
                 config_path.display()
             ));
         }
+        final_messages.push(format!(
+            "config exists, skipped write: {} (use --overwrite to replace it)",
+            config_path.display()
+        ));
+    } else {
         write_config_file(&config_path, &config)?;
+        wrote_config = true;
+        final_messages.push(format!("wrote config: {}", config_path.display()));
     }
+
+    let endpoints = endpoint_report(&build_service_endpoints(&service));
+    let mcp = if install_mcp {
+        setup_mcp_clients(&endpoints, false, overwrite)?
+    } else {
+        Vec::new()
+    };
+    let skills = if install_skills {
+        setup_agent_skills(false, overwrite)?
+    } else {
+        Vec::new()
+    };
 
     Ok(SetupServiceReport {
         config_file_path: config_path.clone(),
-        written: !dry_run,
+        written: wrote_config,
         dry_run,
-        endpoints: endpoint_report(&build_service_endpoints(&service)),
+        endpoints,
         persisted_config: config,
-        messages: vec![
-            messages[0].clone(),
-            messages[1].clone(),
-            messages[2].clone(),
-            format!("wrote config: {}", config_path.display()),
-        ],
+        messages: final_messages,
+        mcp,
+        skills,
     })
+}
+
+fn setup_mcp_clients(
+    endpoints: &EndpointReport,
+    dry_run: bool,
+    overwrite: bool,
+) -> Result<Vec<SetupActionReport>> {
+    Ok(vec![
+        setup_codex_mcp(&endpoints.mcp, dry_run, overwrite)?,
+        setup_claude_mcp(&endpoints.mcp, dry_run, overwrite),
+    ])
+}
+
+fn setup_codex_mcp(mcp_url: &str, dry_run: bool, overwrite: bool) -> Result<SetupActionReport> {
+    let config_path = codex_config_path()?;
+    if dry_run {
+        assert_creatable_directory(config_path.parent().unwrap_or_else(|| Path::new(".")))?;
+        return Ok(SetupActionReport {
+            target: "codex mcp".into(),
+            path: Some(config_path),
+            changed: false,
+            status: "dry-run".into(),
+            message: format!("would configure Codex MCP server `deep_obsidian` -> {mcp_url}"),
+        });
+    }
+
+    let existing = fs::read_to_string(&config_path).unwrap_or_default();
+    let mut config = if existing.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        existing
+            .parse::<toml::Value>()
+            .with_context(|| format!("failed to parse Codex config: {}", config_path.display()))?
+    };
+    let root = config.as_table_mut().ok_or_else(|| {
+        anyhow!(
+            "Codex config root must be a TOML table: {}",
+            config_path.display()
+        )
+    })?;
+    let mcp_servers = root
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let mcp_servers = mcp_servers.as_table_mut().ok_or_else(|| {
+        anyhow!(
+            "Codex config key `mcp_servers` must be a table: {}",
+            config_path.display()
+        )
+    })?;
+
+    if mcp_servers.contains_key("deep_obsidian") && !overwrite {
+        return Ok(SetupActionReport {
+            target: "codex mcp".into(),
+            path: Some(config_path),
+            changed: false,
+            status: "skipped".into(),
+            message:
+                "Codex MCP server `deep_obsidian` already exists; use --overwrite to replace it"
+                    .into(),
+        });
+    }
+
+    let mut server = toml::map::Map::new();
+    server.insert("url".to_string(), toml::Value::String(mcp_url.to_string()));
+    server.insert("enabled".to_string(), toml::Value::Boolean(true));
+    mcp_servers.insert("deep_obsidian".to_string(), toml::Value::Table(server));
+
+    if let Some(parent) = config_path.parent() {
+        ensure_writable_directory(parent)?;
+    }
+    fs::write(&config_path, toml::to_string_pretty(&config)?)
+        .with_context(|| format!("failed to write Codex config: {}", config_path.display()))?;
+
+    Ok(SetupActionReport {
+        target: "codex mcp".into(),
+        path: Some(config_path),
+        changed: true,
+        status: "ok".into(),
+        message: format!("configured Codex MCP server `deep_obsidian` -> {mcp_url}"),
+    })
+}
+
+fn setup_claude_mcp(mcp_url: &str, dry_run: bool, overwrite: bool) -> SetupActionReport {
+    let scope = "user";
+    if dry_run {
+        return SetupActionReport {
+            target: "claude mcp".into(),
+            path: None,
+            changed: false,
+            status: "dry-run".into(),
+            message: format!(
+                "would run: claude mcp add --transport http --scope {scope} deep-obsidian {mcp_url}"
+            ),
+        };
+    }
+
+    if ProcessCommand::new("claude")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return SetupActionReport {
+            target: "claude mcp".into(),
+            path: None,
+            changed: false,
+            status: "skipped".into(),
+            message: "Claude Code CLI not found in PATH; run `claude mcp add --transport http --scope user deep-obsidian <mcp-url>` manually".into(),
+        };
+    }
+
+    if overwrite {
+        let _ = ProcessCommand::new("claude")
+            .args(["mcp", "remove", "deep-obsidian", "--scope", scope])
+            .output();
+    }
+
+    let output = ProcessCommand::new("claude")
+        .args([
+            "mcp",
+            "add",
+            "--transport",
+            "http",
+            "--scope",
+            scope,
+            "deep-obsidian",
+            mcp_url,
+        ])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => SetupActionReport {
+            target: "claude mcp".into(),
+            path: None,
+            changed: true,
+            status: "ok".into(),
+            message: format!("configured Claude Code MCP server `deep-obsidian` -> {mcp_url}"),
+        },
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            SetupActionReport {
+                target: "claude mcp".into(),
+                path: None,
+                changed: false,
+                status: "skipped".into(),
+                message: if stderr.is_empty() {
+                    "Claude Code MCP configuration command failed".into()
+                } else {
+                    format!("Claude Code MCP configuration command failed: {stderr}")
+                },
+            }
+        }
+        Err(error) => SetupActionReport {
+            target: "claude mcp".into(),
+            path: None,
+            changed: false,
+            status: "skipped".into(),
+            message: format!("failed to run Claude Code CLI: {error}"),
+        },
+    }
+}
+
+fn setup_agent_skills(dry_run: bool, overwrite: bool) -> Result<Vec<SetupActionReport>> {
+    let source_dir = packaged_skills_dir()?;
+    Ok(vec![
+        install_skills_for_target(
+            "codex skills",
+            &source_dir,
+            &codex_skills_dir()?,
+            dry_run,
+            overwrite,
+        )?,
+        install_skills_for_target(
+            "claude skills",
+            &source_dir,
+            &claude_skills_dir()?,
+            dry_run,
+            overwrite,
+        )?,
+    ])
+}
+
+fn install_skills_for_target(
+    target: &str,
+    source_dir: &Path,
+    destination_dir: &Path,
+    dry_run: bool,
+    overwrite: bool,
+) -> Result<SetupActionReport> {
+    let skills = packaged_skill_names(source_dir)?;
+    if dry_run {
+        assert_creatable_directory(destination_dir)?;
+        return Ok(SetupActionReport {
+            target: target.into(),
+            path: Some(destination_dir.to_path_buf()),
+            changed: false,
+            status: "dry-run".into(),
+            message: format!(
+                "would install {} skills from {}",
+                skills.len(),
+                source_dir.display()
+            ),
+        });
+    }
+
+    ensure_writable_directory(destination_dir)?;
+    let mut installed = 0usize;
+    let mut skipped = 0usize;
+    for skill in skills {
+        let source = source_dir.join(&skill);
+        let destination = destination_dir.join(&skill);
+        if destination.exists() {
+            if !overwrite {
+                skipped += 1;
+                continue;
+            }
+            fs::remove_dir_all(&destination)
+                .with_context(|| format!("failed to replace skill: {}", destination.display()))?;
+        }
+        copy_dir_recursive(&source, &destination)?;
+        installed += 1;
+    }
+
+    Ok(SetupActionReport {
+        target: target.into(),
+        path: Some(destination_dir.to_path_buf()),
+        changed: installed > 0,
+        status: if skipped > 0 && installed == 0 {
+            "skipped".into()
+        } else {
+            "ok".into()
+        },
+        message: format!("installed {installed} skills, skipped {skipped} existing skills"),
+    })
+}
+
+fn packaged_skill_names(source_dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(source_dir)
+        .with_context(|| format!("failed to read skills directory: {}", source_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() && path.join("SKILL.md").is_file() {
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        return Err(anyhow!(
+            "no packaged skills found under {}",
+            source_dir.display()
+        ));
+    }
+    Ok(names)
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create directory: {}", destination.display()))?;
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("failed to read directory: {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_recursive(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn packaged_skills_dir() -> Result<PathBuf> {
+    if let Ok(path) = env::var("DEEP_OBSIDIAN_SKILLS_DIR") {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return Ok(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push(env::current_dir()?.join("skills"));
+    if let Ok(exe) = env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            candidates.push(bin_dir.join("../share/deep-obsidian-mcp/skills"));
+            candidates.push(bin_dir.join("../share/skills"));
+        }
+        if let Some(prefix) = exe.parent().and_then(Path::parent) {
+            candidates.push(prefix.join("share/deep-obsidian-mcp/skills"));
+        }
+    }
+
+    for candidate in candidates {
+        let candidate = absolute_path(&candidate)?;
+        if candidate.is_dir()
+            && !packaged_skill_names(&candidate)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "packaged skills directory not found; set DEEP_OBSIDIAN_SKILLS_DIR"
+    ))
+}
+
+fn codex_config_path() -> Result<PathBuf> {
+    Ok(codex_home_dir()?.join("config.toml"))
+}
+
+fn codex_skills_dir() -> Result<PathBuf> {
+    Ok(codex_home_dir()?.join("skills"))
+}
+
+fn codex_home_dir() -> Result<PathBuf> {
+    if let Ok(path) = env::var("CODEX_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(home_dir()?.join(".codex"))
+}
+
+fn claude_skills_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".claude").join("skills"))
+}
+
+fn home_dir() -> Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("HOME is not set"))
 }
 
 pub async fn doctor(
@@ -1668,6 +2058,18 @@ fn render_setup_service_report(report: &SetupServiceReport) -> String {
     let _ = writeln!(&mut output, "health endpoint: {}", report.endpoints.health);
     if let Some(readiness) = &report.endpoints.readiness {
         let _ = writeln!(&mut output, "readiness endpoint: {}", readiness);
+    }
+    for action in report.mcp.iter().chain(report.skills.iter()) {
+        let path = action
+            .path
+            .as_ref()
+            .map(|path| format!(" ({})", path.display()))
+            .unwrap_or_default();
+        let _ = writeln!(
+            &mut output,
+            "{} [{}]{}: {}",
+            action.target, action.status, path, action.message
+        );
     }
     output.trim_end().to_string()
 }

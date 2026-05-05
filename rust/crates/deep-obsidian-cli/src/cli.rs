@@ -109,6 +109,10 @@ pub enum Command {
     SetupService {
         #[arg(long)]
         overwrite: bool,
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        mcp: bool,
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        skills: bool,
     },
     Doctor {
         #[arg(long = "probe-timeout-ms", default_value_t = 5_000)]

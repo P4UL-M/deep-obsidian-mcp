@@ -22,7 +22,7 @@ class DeepObsidianMcp < Formula
   def caveats
     <<~EOS
       Configure the service before starting it:
-        deep-obsidian-mcp setup-service --vault ~/Vault
+        deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills
 
       Then start and validate:
         brew services start deep-obsidian-mcp
@@ -34,6 +34,9 @@ class DeepObsidianMcp < Formula
 
       Agent skill templates are installed under:
         #{opt_pkgshare}/skills
+
+      setup-service --skills copies them into Codex and Claude Code skill directories.
+      setup-service --mcp configures Codex and Claude Code MCP client entries.
     EOS
   end
 
