@@ -2,18 +2,16 @@
 
 class DeepObsidianMcp < Formula
   desc "Filesystem-first MCP server for deep Obsidian vault access"
-  homepage "https://github.com/<owner>/deep-obsidian-mcp"
-
-  # TODO: replace with a real release tarball once the packaging flow is finalized.
-  url "https://example.com/deep-obsidian-mcp-0.1.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  homepage "https://github.com/P4UL-M/deep-obsidian-mcp"
+  url "https://github.com/P4UL-M/deep-obsidian-mcp/archive/refs/tags/v0.1.0-alpha.1.tar.gz"
+  sha256 "082c9a8eccaf2c72cb692cb94991c568e08bce971f3fb03c55a42e22a2b75d4e"
   license "MIT"
+  version "0.1.0-alpha.1"
 
   depends_on "rust" => :build
   depends_on "ripgrep"
 
   def install
-    # TODO: switch to the released source or bottle artifact once packaging is finalized.
     system "cargo", "install", *std_cargo_args(path: "rust/crates/deep-obsidian-cli")
     pkgshare.install "skills"
     (var/"log/deep-obsidian-mcp").mkpath
@@ -25,7 +23,7 @@ class DeepObsidianMcp < Formula
         deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills
 
       Then start and validate:
-        brew services start deep-obsidian-mcp
+        brew services start P4UL-M/tap/deep-obsidian-mcp
         deep-obsidian-mcp doctor
         curl -fsS http://127.0.0.1:4100/readyz
 
