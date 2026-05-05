@@ -76,6 +76,8 @@ pub struct ResourceDefinition {
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceListResult {
     pub resources: Vec<ResourceDefinition>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +110,49 @@ pub struct ResourceContents {
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceReadResult {
     pub contents: Vec<ResourceContents>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptArgument {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptDefinition {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<PromptArgument>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptListResult {
+    pub prompts: Vec<PromptDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptContent {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptMessage {
+    pub role: &'static str,
+    pub content: PromptContent,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptGetResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub messages: Vec<PromptMessage>,
 }
 
 #[derive(Debug, Clone, Serialize)]

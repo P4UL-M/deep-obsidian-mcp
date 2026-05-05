@@ -86,6 +86,12 @@ CREATE TABLE IF NOT EXISTS chunks (
   UNIQUE (path, chunk_index)
 );
 
+CREATE TABLE IF NOT EXISTS chunk_terms (
+  term TEXT NOT NULL,
+  chunk_id INTEGER NOT NULL,
+  PRIMARY KEY (term, chunk_id)
+);
+
 CREATE TABLE IF NOT EXISTS embedding_config (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -93,9 +99,13 @@ CREATE TABLE IF NOT EXISTS embedding_config (
 
 CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
 CREATE INDEX IF NOT EXISTS idx_notes_path ON notes(path);
+CREATE INDEX IF NOT EXISTS idx_chunk_terms_chunk_id ON chunk_terms(chunk_id);
 "#;
 
-pub fn recreate_vector_tables(conn: &Connection, embedding_dimensions: Option<usize>) -> rusqlite::Result<()> {
+pub fn recreate_vector_tables(
+    conn: &Connection,
+    embedding_dimensions: Option<usize>,
+) -> rusqlite::Result<()> {
     conn.execute_batch(
         r#"
         DROP TABLE IF EXISTS note_embeddings_vec;

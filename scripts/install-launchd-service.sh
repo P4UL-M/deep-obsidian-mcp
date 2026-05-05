@@ -55,6 +55,8 @@ PATH_VALUE="${(j/:/)path_entries}"
 env_entries=(
   "    <key>PATH</key>"
   "    <string>${PATH_VALUE}</string>"
+  "    <key>DEEP_OBSIDIAN_PACKAGED</key>"
+  "    <string>1</string>"
 )
 
 function add_env_entry() {
@@ -78,6 +80,7 @@ typeset -a program_arguments
 program_arguments=(
   "    <string>${SERVER_BIN}</string>"
   "    <string>serve</string>"
+  "    <string>--packaged</string>"
   "    <string>--transport</string>"
   "    <string>http</string>"
   "    <string>--host</string>"

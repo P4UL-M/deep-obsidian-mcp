@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod health;
 pub mod mcp;
+pub mod prompts;
 pub mod protocol;
 pub mod resources;
 pub mod runtime;

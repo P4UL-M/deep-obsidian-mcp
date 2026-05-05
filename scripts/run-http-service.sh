@@ -31,10 +31,12 @@ fi
 if [[ -n "${EMBEDDING_API_KEY_VALUE}" ]]; then
   export EMBEDDING_API_KEY="${EMBEDDING_API_KEY_VALUE}"
 fi
+export DEEP_OBSIDIAN_PACKAGED="${DEEP_OBSIDIAN_PACKAGED:-1}"
 
 typeset -a args
 args=(
   "serve"
+  "--packaged"
   "--transport" "http"
   "--host" "${HOST}"
   "--port" "${PORT}"

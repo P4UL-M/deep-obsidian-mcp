@@ -24,10 +24,7 @@ pub struct ReindexPlan {
     pub snapshot_count: usize,
 }
 
-pub fn plan_reindex(
-    vault_path: &Path,
-    current_index: Option<&SearchIndex>,
-) -> Result<ReindexPlan> {
+pub fn plan_reindex(vault_path: &Path, current_index: Option<&SearchIndex>) -> Result<ReindexPlan> {
     let snapshots = collect_snapshots(vault_path)?;
     let should_rebuild = match current_index {
         Some(index) => {
@@ -55,9 +52,6 @@ pub fn plan_reindex(
     })
 }
 
-pub fn needs_reindex(
-    vault_path: &Path,
-    current_index: Option<&SearchIndex>,
-) -> Result<bool> {
+pub fn needs_reindex(vault_path: &Path, current_index: Option<&SearchIndex>) -> Result<bool> {
     Ok(plan_reindex(vault_path, current_index)?.should_rebuild)
 }

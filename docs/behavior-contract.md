@@ -47,7 +47,10 @@ Rules:
 - `transport` must default to `stdio` for subprocess use and `http` for service wrappers.
 - `http.mcpPath` and `http.healthPath` must normalize to leading-slash paths.
 - `embedding.apiKeyEnv` stores the environment variable name, not the secret itself.
+- `doctor` and other diagnostic commands must redact inline embedding API keys.
 - legacy environment names remain acceptable where they already exist, but the normalized config must be the single runtime input.
+- `setup-service` and packaged mode choose an index directory outside the vault when no index directory is explicitly resolved; explicit CLI, config file, or environment values must be preserved.
+- Packaged mode is opt-in through `--packaged` or `DEEP_OBSIDIAN_PACKAGED=1`; ad-hoc dev commands without that opt-in keep the vault-local default index directory for compatibility.
 
 ## Service Contract
 
@@ -64,6 +67,18 @@ Health responses should include enough metadata to diagnose startup and indexing
 - `generatedAt` or equivalent index timestamp
 - `semanticBackend`
 - `autoReindex`
+
+The health endpoint must be lightweight and read-only. It must not trigger index refresh, rebuild, embedding calls, or filesystem mutation.
+
+Readiness is distinct from health. The service should expose a readiness endpoint, currently `/readyz`, that reports whether the index is usable, still loading, or degraded. Packaging and service managers should use readiness, not health alone, as the MCP usability gate.
+
+## Agent Workflows
+
+The MCP API may expose additive prompts for common Obsidian workflows. These prompts must not replace or rename existing tools. They should guide clients toward safe tool use: narrow retrieval, outline-first inspection, graph-aware context, dry-run for broad writes, and hash guards for existing-note updates.
+
+Packaged skill templates are documentation-like agent instructions, not runtime configuration. Installing or omitting them must not change the server's tool behavior.
+
+`doctor` should also report non-secret local diagnostics, including config source attribution, auto-reindex settings, MCP/health/readiness endpoint URLs, index SQLite path and size, index schema metadata when available, and the latest health/readiness payload when service endpoints respond.
 
 The service should fail fast when required config is missing or the vault cannot be read.
 
@@ -125,5 +140,7 @@ Preferred verification commands:
 - `cargo run -p deep-obsidian-cli --bin deep-obsidian-mcp -- doctor --vault tests/fixtures/vault`
 - `cargo run -p deep-obsidian-cli --bin deep-obsidian-mcp -- print-config --vault tests/fixtures/vault`
 - `cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp`
+- `codesign --force --sign - --timestamp=none target/release/deep-obsidian-mcp`
+- `codesign --verify --verbose=2 target/release/deep-obsidian-mcp`
 
 The maintained runtime path is Rust only.

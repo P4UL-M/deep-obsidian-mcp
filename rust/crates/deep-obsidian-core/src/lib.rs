@@ -9,6 +9,6 @@ pub use text::{
 pub use vault::{
     chunk_lines, ensure_inside_vault, ensure_vault_path, list_children, list_folders,
     list_markdown_files, list_top_level_folders, read_text_file, slice_lines, write_binary_file,
-    write_text_file, ChunkSection, ReadTextFileResult, VaultChildEntry, VaultEntryKind,
-    VaultError, WriteBinaryFileResult, WriteTextFileResult, DEFAULT_IGNORED_DIRS,
+    write_text_file, ChunkSection, ReadTextFileResult, VaultChildEntry, VaultEntryKind, VaultError,
+    WriteBinaryFileResult, WriteTextFileResult, DEFAULT_IGNORED_DIRS,
 };

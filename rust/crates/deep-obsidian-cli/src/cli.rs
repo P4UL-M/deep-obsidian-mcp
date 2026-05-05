@@ -54,6 +54,9 @@ pub struct ServiceOptions {
     #[arg(long = "index-dir", global = true)]
     pub index_dir: Option<PathBuf>,
 
+    #[arg(long = "packaged", global = true, action = clap::ArgAction::SetTrue)]
+    pub packaged: bool,
+
     #[arg(long, global = true, value_enum)]
     pub transport: Option<TransportMode>,
 

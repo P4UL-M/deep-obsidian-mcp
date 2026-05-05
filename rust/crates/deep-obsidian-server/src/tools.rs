@@ -1,30 +1,33 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use deep_obsidian_core::text::{extract_heading_sections, note_title, normalize_heading_slug, tokenize};
+use deep_obsidian_core::text::{
+    extract_block_sections, extract_heading_sections, extract_wiki_links, normalize_heading_slug,
+    note_title, tokenize,
+};
 use deep_obsidian_core::vault::{
-    chunk_lines, list_children as vault_list_children, list_folders as vault_list_folders,
-    list_markdown_files, list_top_level_folders, read_text_file, write_binary_file,
-    write_text_file, VaultChildEntry, VaultEntryKind,
+    chunk_lines, ensure_inside_vault, list_children as vault_list_children,
+    list_folders as vault_list_folders, list_markdown_files, list_top_level_folders,
+    read_text_file, write_binary_file, write_text_file, VaultChildEntry, VaultEntryKind,
 };
-use deep_obsidian_index::index::SearchIndex;
 use deep_obsidian_index::graph as index_graph;
-use deep_obsidian_index::search::{
-    self as index_search, RankingOptions, RelatedNoteOptions,
-};
+use deep_obsidian_index::index::SearchIndex;
+use deep_obsidian_index::search::{self as index_search, RankingOptions, RelatedNoteOptions};
 use regex::RegexBuilder;
 use serde_json::{json, Map, Value};
 
 use crate::health::build_vault_overview_payload;
 use crate::mcp::AppState;
 use crate::protocol::{ToolCallResult, ToolContent, ToolDefinition};
-use crate::resources::note_name;
+use crate::resources::{block_uri, heading_uri, note_name, note_uri};
 const JSON_SCHEMA_URI: &str = "http://json-schema.org/draft-07/schema#";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const DEFAULT_MAX_TEXT_CHARS: usize = 20_000;
 
 #[derive(Debug, Clone)]
 struct KnowledgeNote {
@@ -52,13 +55,24 @@ struct NoteStyleProfile {
 }
 
 fn json_text_result(value: Value) -> ToolCallResult {
+    json_text_result_with_format(value, None)
+}
+
+fn json_text_result_with_format(value: Value, format: Option<&str>) -> ToolCallResult {
+    let text = if format == Some("compact") {
+        serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
+    } else {
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+    };
     ToolCallResult {
-        content: vec![ToolContent {
-            kind: "text",
-            text: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
-        }],
+        content: vec![ToolContent { kind: "text", text }],
         structured_content: value,
     }
+}
+
+fn json_text_result_from_arguments(arguments: &Value, value: Value) -> ToolCallResult {
+    let format = optional_string_arg(arguments, "format");
+    json_text_result_with_format(value, format.as_deref())
 }
 
 fn string_arg(arguments: &Value, key: &str) -> Result<String, String> {
@@ -70,7 +84,34 @@ fn string_arg(arguments: &Value, key: &str) -> Result<String, String> {
 }
 
 fn optional_string_arg(arguments: &Value, key: &str) -> Option<String> {
-    arguments.get(key).and_then(Value::as_str).map(ToOwned::to_owned)
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn optional_enum_string_arg(
+    arguments: &Value,
+    key: &str,
+    allowed: &[&str],
+) -> Result<Option<String>, String> {
+    let Some(value) = optional_string_arg(arguments, key) else {
+        return Ok(None);
+    };
+    if allowed.iter().any(|allowed| *allowed == value) {
+        Ok(Some(value))
+    } else {
+        Err(format!(
+            "unsupported {}: {}. Expected one of: {}",
+            key,
+            value,
+            allowed.join(", ")
+        ))
+    }
+}
+
+fn validate_format_arg(arguments: &Value) -> Result<(), String> {
+    optional_enum_string_arg(arguments, "format", &["pretty", "compact"]).map(|_| ())
 }
 
 fn usize_arg(arguments: &Value, key: &str, default_value: usize) -> usize {
@@ -81,6 +122,16 @@ fn usize_arg(arguments: &Value, key: &str, default_value: usize) -> usize {
         .unwrap_or(default_value)
 }
 
+fn clamped_usize_arg(
+    arguments: &Value,
+    key: &str,
+    default_value: usize,
+    min_value: usize,
+    max_value: usize,
+) -> usize {
+    usize_arg(arguments, key, default_value).clamp(min_value, max_value)
+}
+
 fn f64_arg(arguments: &Value, key: &str, default_value: f64) -> f64 {
     arguments
         .get(key)
@@ -88,11 +139,109 @@ fn f64_arg(arguments: &Value, key: &str, default_value: f64) -> f64 {
         .unwrap_or(default_value)
 }
 
+fn clamped_f64_arg(
+    arguments: &Value,
+    key: &str,
+    default_value: f64,
+    min_value: f64,
+    max_value: f64,
+) -> f64 {
+    f64_arg(arguments, key, default_value).clamp(min_value, max_value)
+}
+
 fn bool_arg(arguments: &Value, key: &str, default_value: bool) -> bool {
     arguments
         .get(key)
         .and_then(Value::as_bool)
         .unwrap_or(default_value)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextPayloadOptions {
+    include_text: bool,
+    max_text_chars: usize,
+}
+
+impl TextPayloadOptions {
+    fn from_arguments(arguments: &Value, default_include_text: bool) -> Self {
+        Self {
+            include_text: bool_arg(arguments, "includeText", default_include_text),
+            max_text_chars: clamped_usize_arg(
+                arguments,
+                "maxTextChars",
+                DEFAULT_MAX_TEXT_CHARS,
+                0,
+                DEFAULT_MAX_TEXT_CHARS,
+            ),
+        }
+    }
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> (String, bool) {
+    if max_chars == 0 {
+        return (String::new(), !text.is_empty());
+    }
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    let was_truncated = chars.next().is_some();
+    (truncated, was_truncated)
+}
+
+fn insert_optional_text(
+    object: &mut Map<String, Value>,
+    key: &str,
+    text: &str,
+    options: TextPayloadOptions,
+) {
+    object.insert("includeText".to_string(), json!(options.include_text));
+    object.insert("maxTextChars".to_string(), json!(options.max_text_chars));
+    if !options.include_text {
+        object.insert(format!("{key}Omitted"), json!(true));
+        return;
+    }
+    let (text, truncated) = truncate_text(text, options.max_text_chars);
+    object.insert(key.to_string(), json!(text));
+    object.insert(format!("{key}Truncated"), json!(truncated));
+}
+
+fn content_hash(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn existing_file_bytes(vault_path: &Path, path: &str) -> Result<Option<Vec<u8>>, String> {
+    let absolute_path = ensure_inside_vault(vault_path, path).map_err(|error| error.to_string())?;
+    match fs::read(&absolute_path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn expected_hash_arg(arguments: &Value) -> Option<String> {
+    optional_string_arg(arguments, "expectedHash").filter(|value| !value.trim().is_empty())
+}
+
+fn validate_expected_hash(
+    expected_hash: Option<&str>,
+    previous_hash: Option<&str>,
+    path: &str,
+) -> Result<(), String> {
+    if let Some(expected_hash) = expected_hash {
+        if previous_hash != Some(expected_hash) {
+            return Err(format!(
+                "hash conflict for {}: expected {}, found {}",
+                path,
+                expected_hash,
+                previous_hash.unwrap_or("null")
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_score_order(left: f64, right: f64, left_path: &str, right_path: &str) -> Ordering {
@@ -148,6 +297,7 @@ fn knowledge_note_value(note: KnowledgeNote) -> Value {
     json!({
         "path": note.path,
         "title": note.title,
+        "resourceUri": note_uri(&note.path),
         "wikiLink": note.wiki_link,
         "score": note.score,
         "reasons": note.reasons,
@@ -184,10 +334,16 @@ fn session_note_path(topic: &str, folder: &str) -> String {
 
 fn extract_manual_notes(content: &str) -> Option<String> {
     let marker = "\n## Manual Notes\n";
-    content.find(marker).map(|index| content[index + 1..].trim_end().to_string())
+    content
+        .find(marker)
+        .map(|index| content[index + 1..].trim_end().to_string())
 }
 
-fn merge_with_manual_notes(new_content: &str, existing_content: &str, preserve_manual_notes: bool) -> String {
+fn merge_with_manual_notes(
+    new_content: &str,
+    existing_content: &str,
+    preserve_manual_notes: bool,
+) -> String {
     let normalized = format!("{}\n", new_content.trim_end());
     if !preserve_manual_notes {
         return normalized;
@@ -434,7 +590,8 @@ fn update_or_create_note_section(
             replacement_lines.push(String::new());
             replacement_lines.extend(body_lines);
         }
-        let updated = replace_range_with_block(&lines, section_start, section_end, replacement_lines);
+        let updated =
+            replace_range_with_block(&lines, section_start, section_end, replacement_lines);
         return Ok((updated, "updated", section.level));
     }
 
@@ -534,19 +691,29 @@ fn all_word_tokens(text: &str) -> Vec<String> {
 }
 
 fn count_prefix_lines(lines: &[String], predicate: impl Fn(&str) -> bool) -> usize {
-    lines.iter().filter(|line| predicate(line.trim_start())).count()
+    lines
+        .iter()
+        .filter(|line| predicate(line.trim_start()))
+        .count()
 }
 
 fn note_style_profile(content: &str) -> NoteStyleProfile {
     let lines = split_note_lines(content);
     let line_count = lines.len().max(1) as f64;
-    let non_empty_lines = lines.iter().filter(|line| !line.trim().is_empty()).count().max(1) as f64;
+    let non_empty_lines = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        .max(1) as f64;
     let heading_sections = extract_heading_sections(content);
     let heading_count = heading_sections.len() as f64;
     let avg_heading_level = if heading_sections.is_empty() {
         0.0
     } else {
-        heading_sections.iter().map(|section| section.level as f64).sum::<f64>()
+        heading_sections
+            .iter()
+            .map(|section| section.level as f64)
+            .sum::<f64>()
             / heading_sections.len() as f64
     };
     let bullet_lines = count_prefix_lines(&lines, |line| {
@@ -567,8 +734,16 @@ fn note_style_profile(content: &str) -> NoteStyleProfile {
     let long_lines = lines.iter().filter(|line| line.len() >= 100).count() as f64;
     let wiki_link_count = content.matches("[[").count() as f64;
     let markdown_link_count = content.matches("](").count() as f64;
-    let frontmatter = if content.starts_with("---\n") { 1.0 } else { 0.0 };
-    let has_h1 = if lines.iter().any(|line| line.starts_with("# ")) { 1.0 } else { 0.0 };
+    let frontmatter = if content.starts_with("---\n") {
+        1.0
+    } else {
+        0.0
+    };
+    let has_h1 = if lines.iter().any(|line| line.starts_with("# ")) {
+        1.0
+    } else {
+        0.0
+    };
 
     let mut paragraph_count = 0usize;
     let mut paragraph_lengths = Vec::new();
@@ -604,11 +779,15 @@ fn note_style_profile(content: &str) -> NoteStyleProfile {
 
     let word_tokens = all_word_tokens(content);
     let word_count = word_tokens.len().max(1) as f64;
-    let avg_word_length = word_tokens.iter().map(|token| token.len() as f64).sum::<f64>() / word_count;
+    let avg_word_length = word_tokens
+        .iter()
+        .map(|token| token.len() as f64)
+        .sum::<f64>()
+        / word_count;
     let stopwords = [
-        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "i", "in",
-        "into", "is", "it", "me", "my", "of", "on", "or", "our", "that", "the", "this", "to",
-        "us", "we", "with", "you", "your",
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "i", "in", "into",
+        "is", "it", "me", "my", "of", "on", "or", "our", "that", "the", "this", "to", "us", "we",
+        "with", "you", "your",
     ];
     let stopword_count = word_tokens
         .iter()
@@ -616,13 +795,21 @@ fn note_style_profile(content: &str) -> NoteStyleProfile {
         .count() as f64;
     let first_person_count = word_tokens
         .iter()
-        .filter(|token| matches!(token.as_str(), "i" | "me" | "my" | "mine" | "we" | "us" | "our" | "ours"))
+        .filter(|token| {
+            matches!(
+                token.as_str(),
+                "i" | "me" | "my" | "mine" | "we" | "us" | "our" | "ours"
+            )
+        })
         .count() as f64;
     let second_person_count = word_tokens
         .iter()
         .filter(|token| matches!(token.as_str(), "you" | "your" | "yours"))
         .count() as f64;
-    let contraction_count = word_tokens.iter().filter(|token| token.contains('\'')).count() as f64;
+    let contraction_count = word_tokens
+        .iter()
+        .filter(|token| token.contains('\''))
+        .count() as f64;
     let punctuation_chars = content
         .chars()
         .filter(|ch| matches!(ch, ',' | ';' | ':' | '!' | '?'))
@@ -739,7 +926,10 @@ fn find_similar_notes_payload(
         )
         .map_err(|error| error.to_string())?;
         for item in matches {
-            if !reference_paths.iter().any(|existing| existing == &item.path) {
+            if !reference_paths
+                .iter()
+                .any(|existing| existing == &item.path)
+            {
                 reference_paths.push(item.path);
             }
             if reference_paths.len() >= reference_limit.max(1) {
@@ -747,7 +937,9 @@ fn find_similar_notes_payload(
             }
         }
         if reference_paths.is_empty() {
-            return Err("find_similar_notes could not derive reference notes from the subject.".to_string());
+            return Err(
+                "find_similar_notes could not derive reference notes from the subject.".to_string(),
+            );
         }
     }
 
@@ -772,11 +964,14 @@ fn find_similar_notes_payload(
                 SimilarityMode::Structure => structure_score,
                 SimilarityMode::Tone => tone_score,
                 SimilarityMode::Format => format_score,
-                SimilarityMode::Style => (0.4 * structure_score) + (0.3 * tone_score) + (0.3 * format_score),
+                SimilarityMode::Style => {
+                    (0.4 * structure_score) + (0.3 * tone_score) + (0.3 * format_score)
+                }
             };
             json!({
                 "path": note.path,
                 "title": note.title,
+                "resourceUri": note_uri(&note.path),
                 "wikiLink": note_alias_wiki_link(&note.path, &note.title),
                 "score": score,
                 "structureScore": structure_score,
@@ -854,6 +1049,9 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     ("limitChunks", json!({"type":"integer","exclusiveMinimum":0,"maximum":16,"default":8})),
                     ("includeGraph", json!({"type":"boolean","default":true})),
                     ("graphDepth", json!({"type":"integer","exclusiveMinimum":0,"maximum":3,"default":1})),
+                    ("includeText", json!({"type":"boolean","default":true})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["subject"],
             ),
@@ -890,6 +1088,8 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     ("folder", json!({"type":"string","description":"Target folder inside the vault when no explicit path is provided."})),
                     ("content", json!({"type":"string","description":"Full markdown body to store in the session note."})),
                     ("preserveManualNotes", json!({"type":"boolean","default":true})),
+                    ("dryRun", json!({"type":"boolean","default":false,"description":"Preview the write without changing the vault."})),
+                    ("expectedHash", json!({"type":"string","description":"Optional hash of the current file content. If it does not match, no write occurs."})),
                 ],
                 vec!["content"],
             ),
@@ -907,6 +1107,8 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     ("title", json!({"type":"string","description":"Optional explicit H1 title to prepend when using body mode."})),
                     ("frontmatter", json!({"type":"object","description":"Optional explicit frontmatter object to serialize when using body mode."})),
                     ("preserveManualNotes", json!({"type":"boolean","default":false})),
+                    ("dryRun", json!({"type":"boolean","default":false,"description":"Preview the write without changing the vault."})),
+                    ("expectedHash", json!({"type":"string","description":"Optional hash of the current note content. If it does not match, no write occurs."})),
                 ],
                 vec!["path"],
             ),
@@ -924,6 +1126,8 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     ("content", json!({"type":"string","description":"Replacement body content for the targeted section."})),
                     ("level", json!({"type":"integer","minimum":1,"maximum":6,"default":2})),
                     ("createIfMissing", json!({"type":"boolean","default":true})),
+                    ("dryRun", json!({"type":"boolean","default":false,"description":"Preview the write without changing the vault."})),
+                    ("expectedHash", json!({"type":"string","description":"Optional hash of the current note content. If it does not match, no write occurs."})),
                 ],
                 vec!["path","content"],
             ),
@@ -938,6 +1142,8 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     ("path", json!({"type":"string","description":"Vault-relative file path to create or update."})),
                     ("content", json!({"type":"string","description":"File content as UTF-8 text or base64."})),
                     ("encoding", json!({"type":"string","enum":["utf-8","base64"],"default":"utf-8"})),
+                    ("dryRun", json!({"type":"boolean","default":false,"description":"Preview the write without changing the vault."})),
+                    ("expectedHash", json!({"type":"string","description":"Optional hash of the current file content. If it does not match, no write occurs."})),
                 ],
                 vec!["path","content"],
             ),
@@ -998,6 +1204,9 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     ("path", json!({"type":"string","description":"Vault-relative markdown path."})),
                     ("startLine", json!({"type":"integer","exclusiveMinimum":0,"maximum":MAX_SAFE_INTEGER})),
                     ("endLine", json!({"type":"integer","exclusiveMinimum":0,"maximum":MAX_SAFE_INTEGER})),
+                    ("includeText", json!({"type":"boolean","default":true})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["path"],
             ),
@@ -1013,6 +1222,9 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     ("chunkIndex", json!({"type":"integer","minimum":0,"maximum":MAX_SAFE_INTEGER,"default":0})),
                     ("chunkSizeLines", json!({"type":"integer","exclusiveMinimum":0,"maximum":MAX_SAFE_INTEGER,"default":120})),
                     ("overlapLines", json!({"type":"integer","minimum":0,"maximum":MAX_SAFE_INTEGER,"default":20})),
+                    ("includeText", json!({"type":"boolean","default":true})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["path"],
             ),
@@ -1044,8 +1256,26 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     ("glob", json!({"type":"string","description":"Optional rg glob, for example 'Agent Studio/*.md'."})),
                     ("contextLines", json!({"type":"integer","minimum":0,"maximum":20,"default":0})),
                     ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":500,"default":50})),
+                    ("includeText", json!({"type":"boolean","default":true})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["query"],
+            ),
+        },
+        ToolDefinition {
+            name: "note_outline".to_string(),
+            description: "Return headings, block ids, line ranges, resource URIs, and outgoing wiki links for a markdown note.".to_string(),
+            annotations: Some(tool_annotations(true, None, None)),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema(
+                vec![
+                    ("path", json!({"type":"string","description":"Vault-relative markdown path."})),
+                    ("includeText", json!({"type":"boolean","default":false,"description":"Include heading and block text excerpts."})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":4000})),
+                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
+                ],
+                vec!["path"],
             ),
         },
         ToolDefinition {
@@ -1064,6 +1294,9 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                 vec![
                     ("query", json!({"type":"string","description":"Lexical query."})),
                     ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
+                    ("includeText", json!({"type":"boolean","default":true})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["query"],
             ),
@@ -1077,6 +1310,9 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                 vec![
                     ("query", json!({"type":"string","description":"Natural-language search query."})),
                     ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
+                    ("includeText", json!({"type":"boolean","default":true})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["query"],
             ),
@@ -1092,6 +1328,9 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                     ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
                     ("semanticWeight", json!({"type":"number","minimum":0,"maximum":1,"default":0.6})),
                     ("bm25Weight", json!({"type":"number","minimum":0,"maximum":1,"default":0.4})),
+                    ("includeText", json!({"type":"boolean","default":true})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["query"],
             ),
@@ -1144,49 +1383,178 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     tool_definitions()
 }
 
-fn search_match_json(match_item: &index_search::SearchMatch) -> Value {
-    json!({
-        "path": match_item.path.clone(),
-        "title": match_item.title.clone(),
-        "chunkIndex": match_item.chunk_index,
-        "startLine": match_item.start_line,
-        "endLine": match_item.end_line,
-        "score": match_item.score,
-        "text": match_item.text.clone()
-    })
+fn search_match_json(match_item: &index_search::SearchMatch, options: TextPayloadOptions) -> Value {
+    let mut object = Map::from_iter([
+        ("path".to_string(), json!(match_item.path.clone())),
+        ("title".to_string(), json!(match_item.title.clone())),
+        ("resourceUri".to_string(), json!(note_uri(&match_item.path))),
+        ("chunkIndex".to_string(), json!(match_item.chunk_index)),
+        ("startLine".to_string(), json!(match_item.start_line)),
+        ("endLine".to_string(), json!(match_item.end_line)),
+        ("score".to_string(), json!(match_item.score)),
+    ]);
+    insert_optional_text(&mut object, "text", &match_item.text, options);
+    Value::Object(object)
 }
 
-fn hybrid_search_match_json(match_item: &index_search::SearchMatch) -> Value {
-    json!({
-        "path": match_item.path.clone(),
-        "title": match_item.title.clone(),
-        "chunkIndex": match_item.chunk_index,
-        "startLine": match_item.start_line,
-        "endLine": match_item.end_line,
-        "semanticScore": match_item.semantic_score,
-        "bm25Score": match_item.bm25_score,
-        "score": match_item.score,
-        "text": match_item.text.clone()
-    })
+fn hybrid_search_match_json(
+    match_item: &index_search::SearchMatch,
+    options: TextPayloadOptions,
+) -> Value {
+    let mut object = Map::from_iter([
+        ("path".to_string(), json!(match_item.path.clone())),
+        ("title".to_string(), json!(match_item.title.clone())),
+        ("resourceUri".to_string(), json!(note_uri(&match_item.path))),
+        ("chunkIndex".to_string(), json!(match_item.chunk_index)),
+        ("startLine".to_string(), json!(match_item.start_line)),
+        ("endLine".to_string(), json!(match_item.end_line)),
+        (
+            "semanticScore".to_string(),
+            json!(match_item.semantic_score),
+        ),
+        ("bm25Score".to_string(), json!(match_item.bm25_score)),
+        ("score".to_string(), json!(match_item.score)),
+    ]);
+    insert_optional_text(&mut object, "text", &match_item.text, options);
+    Value::Object(object)
 }
 
 fn file_path_match_json(match_item: &index_search::FilePathMatch) -> Value {
+    let mut object = Map::from_iter([
+        ("path".to_string(), json!(match_item.path.clone())),
+        (
+            "matchedOn".to_string(),
+            json!(match_item.matched_on.clone()),
+        ),
+    ]);
+    if match_item.path.to_lowercase().ends_with(".md") {
+        object.insert("resourceUri".to_string(), json!(note_uri(&match_item.path)));
+    }
+    Value::Object(object)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrepContextLine {
+    line_number: usize,
+    line_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct LiveGrepMatch {
+    path: String,
+    line_number: usize,
+    submatches: Vec<index_search::GrepSubmatch>,
+    line_text: String,
+    context_before: Vec<GrepContextLine>,
+    context_after: Vec<GrepContextLine>,
+}
+
+fn grep_context_line_json(line: &GrepContextLine) -> Value {
     json!({
-        "path": match_item.path.clone(),
-        "matchedOn": match_item.matched_on.clone()
+        "lineNumber": line.line_number,
+        "lineText": line.line_text
     })
 }
 
-fn grep_match_json(match_item: &index_search::GrepMatch) -> Value {
+fn grep_match_json(match_item: &LiveGrepMatch, options: TextPayloadOptions) -> Value {
+    let mut object = Map::from_iter([
+        ("path".to_string(), json!(match_item.path.clone())),
+        ("resourceUri".to_string(), json!(note_uri(&match_item.path))),
+        ("lineNumber".to_string(), json!(match_item.line_number)),
+        (
+            "submatches".to_string(),
+            json!(match_item
+                .submatches
+                .iter()
+                .map(|submatch| json!({
+                    "start": submatch.start,
+                    "end": submatch.end,
+                    "text": submatch.text.clone()
+                }))
+                .collect::<Vec<_>>()),
+        ),
+        (
+            "contextBefore".to_string(),
+            json!(match_item
+                .context_before
+                .iter()
+                .map(grep_context_line_json)
+                .collect::<Vec<_>>()),
+        ),
+        (
+            "contextAfter".to_string(),
+            json!(match_item
+                .context_after
+                .iter()
+                .map(grep_context_line_json)
+                .collect::<Vec<_>>()),
+        ),
+    ]);
+    insert_optional_text(&mut object, "lineText", &match_item.line_text, options);
+    Value::Object(object)
+}
+
+fn note_result_json(
+    path: String,
+    title: String,
+    extra: impl FnOnce(&mut Map<String, Value>),
+) -> Value {
+    let mut object = Map::from_iter([
+        ("path".to_string(), json!(path.clone())),
+        ("title".to_string(), json!(title)),
+        ("resourceUri".to_string(), json!(note_uri(&path))),
+    ]);
+    extra(&mut object);
+    Value::Object(object)
+}
+
+fn outline_payload(path: &str, content: &str, options: TextPayloadOptions) -> Value {
+    let headings = extract_heading_sections(content)
+        .into_iter()
+        .map(|heading| {
+            let mut object = Map::from_iter([
+                ("level".to_string(), json!(heading.level)),
+                ("title".to_string(), json!(heading.title)),
+                ("slug".to_string(), json!(heading.slug.clone())),
+                ("startLine".to_string(), json!(heading.start_line)),
+                ("endLine".to_string(), json!(heading.end_line)),
+                (
+                    "resourceUri".to_string(),
+                    json!(heading_uri(path, &heading.slug)),
+                ),
+            ]);
+            insert_optional_text(&mut object, "text", &heading.text, options);
+            Value::Object(object)
+        })
+        .collect::<Vec<_>>();
+    let blocks = extract_block_sections(content)
+        .into_iter()
+        .map(|block| {
+            let mut object = Map::from_iter([
+                ("id".to_string(), json!(block.id.clone())),
+                ("startLine".to_string(), json!(block.start_line)),
+                ("endLine".to_string(), json!(block.end_line)),
+                ("resourceUri".to_string(), json!(block_uri(path, &block.id))),
+            ]);
+            insert_optional_text(&mut object, "text", &block.text, options);
+            Value::Object(object)
+        })
+        .collect::<Vec<_>>();
+    let links = extract_wiki_links(content)
+        .into_iter()
+        .map(|target| json!({"target": target}))
+        .collect::<Vec<_>>();
     json!({
-        "path": match_item.path.clone(),
-        "lineNumber": match_item.line_number,
-        "submatches": match_item.submatches.iter().map(|submatch| json!({
-            "start": submatch.start,
-            "end": submatch.end,
-            "text": submatch.text.clone()
-        })).collect::<Vec<_>>(),
-        "lineText": match_item.line_text.clone()
+        "path": path,
+        "title": note_title_from_content(path, content),
+        "resourceUri": note_uri(path),
+        "lineCount": split_note_lines(content).len(),
+        "headingCount": headings.len(),
+        "blockCount": blocks.len(),
+        "linkCount": links.len(),
+        "headings": headings,
+        "blocks": blocks,
+        "outgoingLinks": links
     })
 }
 
@@ -1246,7 +1614,7 @@ async fn live_grep_matches(
     glob: Option<String>,
     context_lines: usize,
     limit: usize,
-) -> Result<Vec<index_search::GrepMatch>, String> {
+) -> Result<Vec<LiveGrepMatch>, String> {
     tokio::task::spawn_blocking(move || {
         let mut args = vec![
             "--json".to_string(),
@@ -1272,10 +1640,6 @@ async fn live_grep_matches(
         } else {
             args.push("--glob".to_string());
             args.push("*.md".to_string());
-        }
-        if context_lines > 0 {
-            args.push("--context".to_string());
-            args.push(context_lines.to_string());
         }
         args.push(query);
         args.push(vault_path.to_string_lossy().into_owned());
@@ -1315,7 +1679,8 @@ async fn live_grep_matches(
             let line_number = data
                 .get("line_number")
                 .and_then(Value::as_u64)
-                .ok_or_else(|| "rg match payload missing line number".to_string())? as usize;
+                .ok_or_else(|| "rg match payload missing line number".to_string())?
+                as usize;
             let line_text = data
                 .get("lines")
                 .and_then(|value| value.get("text"))
@@ -1350,21 +1715,67 @@ async fn live_grep_matches(
                 })
                 .collect::<Result<Vec<_>, String>>()?;
 
-            matches.push(index_search::GrepMatch {
+            matches.push(LiveGrepMatch {
                 path: relative_vault_path(&vault_path, absolute_path),
                 line_number,
                 submatches,
                 line_text,
+                context_before: Vec::new(),
+                context_after: Vec::new(),
             });
             if matches.len() >= limit.max(1) {
                 break;
             }
         }
 
+        if context_lines > 0 {
+            populate_grep_context(&vault_path, &mut matches, context_lines)?;
+        }
+
         Ok(matches)
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn populate_grep_context(
+    vault_path: &Path,
+    matches: &mut [LiveGrepMatch],
+    context_lines: usize,
+) -> Result<(), String> {
+    let mut cache = HashMap::<String, Vec<String>>::new();
+    for match_item in matches {
+        let lines = if let Some(lines) = cache.get(&match_item.path) {
+            lines
+        } else {
+            let absolute_path = ensure_inside_vault(vault_path, &match_item.path)
+                .map_err(|error| error.to_string())?;
+            let text = fs::read_to_string(&absolute_path).map_err(|error| error.to_string())?;
+            cache.insert(match_item.path.clone(), split_note_lines(&text));
+            cache.get(&match_item.path).expect("cached grep context")
+        };
+        let line_index = match_item.line_number.saturating_sub(1);
+        let before_start = line_index.saturating_sub(context_lines);
+        match_item.context_before = lines[before_start..line_index.min(lines.len())]
+            .iter()
+            .enumerate()
+            .map(|(offset, line)| GrepContextLine {
+                line_number: before_start + offset + 1,
+                line_text: line.clone(),
+            })
+            .collect();
+        let after_start = (line_index + 1).min(lines.len());
+        let after_end = (after_start + context_lines).min(lines.len());
+        match_item.context_after = lines[after_start..after_end]
+            .iter()
+            .enumerate()
+            .map(|(offset, line)| GrepContextLine {
+                line_number: after_start + offset + 1,
+                line_text: line.clone(),
+            })
+            .collect();
+    }
+    Ok(())
 }
 
 async fn semantic_search_matches(
@@ -1393,12 +1804,18 @@ async fn hybrid_search_matches(
     .map_err(|error| error.to_string())?
 }
 
-pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Result<ToolCallResult, String> {
+pub async fn call_tool(
+    state: &AppState,
+    name: &str,
+    arguments: &Value,
+) -> Result<ToolCallResult, String> {
     let config = state.config.as_ref();
     match name {
         "vault_info" => {
-            let snapshot = state.runtime.refresh("vault_info").await?;
-            Ok(json_text_result(build_vault_overview_payload(config, &snapshot)))
+            let snapshot = state.runtime.fresh_snapshot("vault_info").await?;
+            Ok(json_text_result(build_vault_overview_payload(
+                config, &snapshot,
+            )))
         }
         "list_children" => {
             let path = optional_string_arg(arguments, "path");
@@ -1420,7 +1837,7 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
         "list_folders" => {
             let path = optional_string_arg(arguments, "path");
             let recursive = bool_arg(arguments, "recursive", false);
-            let depth = usize_arg(arguments, "depth", 3);
+            let depth = clamped_usize_arg(arguments, "depth", 3, 1, 12);
             let include_hidden = bool_arg(arguments, "includeHidden", false);
             let include_ignored = bool_arg(arguments, "includeIgnored", false);
             let folders = vault_list_folders(
@@ -1442,52 +1859,91 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
         }
         "read_file" => {
             let path = string_arg(arguments, "path")?;
-            let file = read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
-            let start_line = arguments.get("startLine").and_then(Value::as_u64).map(|value| value as usize);
-            let end_line = arguments.get("endLine").and_then(Value::as_u64).map(|value| value as usize);
+            validate_format_arg(arguments)?;
+            let text_options = TextPayloadOptions::from_arguments(arguments, true);
+            let file =
+                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            let start_line = arguments
+                .get("startLine")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            let end_line = arguments
+                .get("endLine")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
             let text = if start_line.is_some() || end_line.is_some() {
-                deep_obsidian_core::vault::slice_lines(&file.text, start_line.unwrap_or(1), end_line.or(start_line).unwrap_or(1))
+                deep_obsidian_core::vault::slice_lines(
+                    &file.text,
+                    start_line.unwrap_or(1),
+                    end_line.or(start_line).unwrap_or(1),
+                )
             } else {
                 file.text
             };
             let line_count = text.split('\n').count();
-            Ok(json_text_result(json!({
-                "path": path,
-                "startLine": start_line.unwrap_or(1),
-                "endLine": end_line.unwrap_or(line_count),
-                "lineCount": line_count,
-                "text": text
-            })))
+            let mut result = Map::from_iter([
+                ("path".to_string(), json!(path.clone())),
+                ("resourceUri".to_string(), json!(note_uri(&path))),
+                ("startLine".to_string(), json!(start_line.unwrap_or(1))),
+                ("endLine".to_string(), json!(end_line.unwrap_or(line_count))),
+                ("lineCount".to_string(), json!(line_count)),
+            ]);
+            insert_optional_text(&mut result, "text", &text, text_options);
+            Ok(json_text_result_from_arguments(
+                arguments,
+                Value::Object(result),
+            ))
         }
         "read_chunk" => {
             let path = string_arg(arguments, "path")?;
-            let chunk_index = usize_arg(arguments, "chunkIndex", 0);
-            let chunk_size_lines = usize_arg(arguments, "chunkSizeLines", 120);
-            let overlap_lines = usize_arg(arguments, "overlapLines", 20);
-            let file = read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            validate_format_arg(arguments)?;
+            let text_options = TextPayloadOptions::from_arguments(arguments, true);
+            let chunk_index =
+                clamped_usize_arg(arguments, "chunkIndex", 0, 0, MAX_SAFE_INTEGER as usize);
+            let chunk_size_lines = clamped_usize_arg(arguments, "chunkSizeLines", 120, 1, 10_000);
+            let overlap_lines = clamped_usize_arg(
+                arguments,
+                "overlapLines",
+                20,
+                0,
+                chunk_size_lines.saturating_sub(1),
+            );
+            let file =
+                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
             let chunks = chunk_lines(&file.text, chunk_size_lines, overlap_lines);
-            let chunk = chunks
-                .get(chunk_index)
-                .ok_or_else(|| format!("Chunk {} does not exist for {}. Available chunks: {}", chunk_index, path, chunks.len()))?;
-            Ok(json_text_result(json!({
-                "path": path,
-                "chunkIndex": chunk_index,
-                "chunkCount": chunks.len(),
-                "chunkSizeLines": chunk_size_lines,
-                "overlapLines": overlap_lines,
-                "startLine": chunk.start_line,
-                "endLine": chunk.end_line,
-                "text": chunk.text
-            })))
+            let chunk = chunks.get(chunk_index).ok_or_else(|| {
+                format!(
+                    "Chunk {} does not exist for {}. Available chunks: {}",
+                    chunk_index,
+                    path,
+                    chunks.len()
+                )
+            })?;
+            let mut result = Map::from_iter([
+                ("path".to_string(), json!(path.clone())),
+                ("resourceUri".to_string(), json!(note_uri(&path))),
+                ("chunkIndex".to_string(), json!(chunk_index)),
+                ("chunkCount".to_string(), json!(chunks.len())),
+                ("chunkSizeLines".to_string(), json!(chunk_size_lines)),
+                ("overlapLines".to_string(), json!(overlap_lines)),
+                ("startLine".to_string(), json!(chunk.start_line)),
+                ("endLine".to_string(), json!(chunk.end_line)),
+            ]);
+            insert_optional_text(&mut result, "text", &chunk.text, text_options);
+            Ok(json_text_result_from_arguments(
+                arguments,
+                Value::Object(result),
+            ))
         }
         "find_files" => {
             let query = string_arg(arguments, "query")?;
-            let mode = optional_string_arg(arguments, "mode").unwrap_or_else(|| "substring".to_string());
-            let limit = usize_arg(arguments, "limit", 20);
+            let mode = optional_enum_string_arg(arguments, "mode", &["substring", "regex"])?
+                .unwrap_or_else(|| "substring".to_string());
+            let limit = clamped_usize_arg(arguments, "limit", 20, 1, 200);
             let matches = live_find_file_matches(&config.vault_path, &query, &mode, limit)?
-            .into_iter()
-            .map(|item| file_path_match_json(&item))
-            .collect::<Vec<_>>();
+                .into_iter()
+                .map(|item| file_path_match_json(&item))
+                .collect::<Vec<_>>();
             Ok(json_text_result(json!({
                 "query": query,
                 "mode": mode,
@@ -1497,11 +1953,13 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
         }
         "grep_search" => {
             let query = string_arg(arguments, "query")?;
+            validate_format_arg(arguments)?;
             let regex_mode = bool_arg(arguments, "regex", false);
             let case_sensitive = bool_arg(arguments, "caseSensitive", false);
             let glob = optional_string_arg(arguments, "glob");
-            let context_lines = usize_arg(arguments, "contextLines", 0);
-            let limit = usize_arg(arguments, "limit", 50);
+            let context_lines = clamped_usize_arg(arguments, "contextLines", 0, 0, 20);
+            let limit = clamped_usize_arg(arguments, "limit", 50, 1, 500);
+            let text_options = TextPayloadOptions::from_arguments(arguments, true);
             let matches = live_grep_matches(
                 config.vault_path.clone(),
                 query.clone(),
@@ -1513,22 +1971,43 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
             )
             .await?
             .into_iter()
-            .map(|item| grep_match_json(&item))
+            .map(|item| grep_match_json(&item, text_options))
             .collect::<Vec<_>>();
-            Ok(json_text_result(json!({
-                "query": query,
-                "regex": regex_mode,
-                "caseSensitive": case_sensitive,
-                "glob": glob,
-                "count": matches.len(),
-                "matches": matches
-            })))
+            Ok(json_text_result_from_arguments(
+                arguments,
+                json!({
+                    "query": query,
+                    "regex": regex_mode,
+                    "caseSensitive": case_sensitive,
+                    "glob": glob,
+                    "contextLines": context_lines,
+                    "count": matches.len(),
+                    "matches": matches
+                }),
+            ))
+        }
+        "note_outline" => {
+            let path = string_arg(arguments, "path")?;
+            validate_format_arg(arguments)?;
+            let mut text_options = TextPayloadOptions::from_arguments(arguments, false);
+            if arguments.get("maxTextChars").is_none() {
+                text_options.max_text_chars = 4_000;
+            }
+            let file =
+                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            Ok(json_text_result_from_arguments(
+                arguments,
+                outline_payload(&path, &file.text, text_options),
+            ))
         }
         "build_index" => {
             let snapshot = state.runtime.rebuild("manual build_index").await?;
             let mut result = Map::new();
             result.insert("rebuilt".to_string(), json!(true));
-            result.insert("generatedAt".to_string(), json!(snapshot.index.generated_at));
+            result.insert(
+                "generatedAt".to_string(),
+                json!(snapshot.index.generated_at),
+            );
             result.insert("noteCount".to_string(), json!(snapshot.index.note_count));
             result.insert("chunkCount".to_string(), json!(snapshot.index.chunk_count));
             result.insert(
@@ -1548,8 +2027,10 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
         }
         "bm25_search" => {
             let query = string_arg(arguments, "query")?;
-            let limit = usize_arg(arguments, "limit", 8);
-            let snapshot = state.runtime.refresh("bm25_search").await?;
+            validate_format_arg(arguments)?;
+            let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
+            let text_options = TextPayloadOptions::from_arguments(arguments, true);
+            let snapshot = state.runtime.fresh_snapshot("bm25_search").await?;
             let index = snapshot.index;
             let matches = index_search::bm25_search_with_options(
                 &index,
@@ -1561,17 +2042,22 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                 },
             )
             .map_err(|error| error.to_string())?;
-            Ok(json_text_result(json!({
-                "query": query,
-                "rebuilt": snapshot.rebuilt,
-                "count": matches.len(),
-                "matches": matches.into_iter().map(|item| search_match_json(&item)).collect::<Vec<_>>()
-            })))
+            Ok(json_text_result_from_arguments(
+                arguments,
+                json!({
+                    "query": query,
+                    "rebuilt": snapshot.rebuilt,
+                    "count": matches.len(),
+                    "matches": matches.into_iter().map(|item| search_match_json(&item, text_options)).collect::<Vec<_>>()
+                }),
+            ))
         }
         "semantic_search" => {
             let query = string_arg(arguments, "query")?;
-            let limit = usize_arg(arguments, "limit", 8);
-            let snapshot = state.runtime.refresh("semantic_search").await?;
+            validate_format_arg(arguments)?;
+            let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
+            let text_options = TextPayloadOptions::from_arguments(arguments, true);
+            let snapshot = state.runtime.fresh_snapshot("semantic_search").await?;
             let index = snapshot.index;
             let matches = semantic_search_matches(
                 index.clone(),
@@ -1583,20 +2069,25 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                 },
             )
             .await?;
-            Ok(json_text_result(json!({
-                "query": query,
-                "rebuilt": snapshot.rebuilt,
-                "semanticBackend": index.semantic_backend.as_str(),
-                "count": matches.len(),
-                "matches": matches.into_iter().map(|item| search_match_json(&item)).collect::<Vec<_>>()
-            })))
+            Ok(json_text_result_from_arguments(
+                arguments,
+                json!({
+                    "query": query,
+                    "rebuilt": snapshot.rebuilt,
+                    "semanticBackend": index.semantic_backend.as_str(),
+                    "count": matches.len(),
+                    "matches": matches.into_iter().map(|item| search_match_json(&item, text_options)).collect::<Vec<_>>()
+                }),
+            ))
         }
         "hybrid_search" => {
             let query = string_arg(arguments, "query")?;
-            let limit = usize_arg(arguments, "limit", 8);
-            let semantic_weight = f64_arg(arguments, "semanticWeight", 0.6);
-            let bm25_weight = f64_arg(arguments, "bm25Weight", 0.4);
-            let snapshot = state.runtime.refresh("hybrid_search").await?;
+            validate_format_arg(arguments)?;
+            let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
+            let semantic_weight = clamped_f64_arg(arguments, "semanticWeight", 0.6, 0.0, 1.0);
+            let bm25_weight = clamped_f64_arg(arguments, "bm25Weight", 0.4, 0.0, 1.0);
+            let text_options = TextPayloadOptions::from_arguments(arguments, true);
+            let snapshot = state.runtime.fresh_snapshot("hybrid_search").await?;
             let index = snapshot.index;
             let matches = hybrid_search_matches(
                 index.clone(),
@@ -1608,20 +2099,23 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                 },
             )
             .await?;
-            Ok(json_text_result(json!({
-                "query": query,
-                "rebuilt": snapshot.rebuilt,
-                "semanticBackend": index.semantic_backend.as_str(),
-                "semanticWeight": semantic_weight,
-                "bm25Weight": bm25_weight,
-                "count": matches.len(),
-                "matches": matches.into_iter().map(|item| hybrid_search_match_json(&item)).collect::<Vec<_>>()
-            })))
+            Ok(json_text_result_from_arguments(
+                arguments,
+                json!({
+                    "query": query,
+                    "rebuilt": snapshot.rebuilt,
+                    "semanticBackend": index.semantic_backend.as_str(),
+                    "semanticWeight": semantic_weight,
+                    "bm25Weight": bm25_weight,
+                    "count": matches.len(),
+                    "matches": matches.into_iter().map(|item| hybrid_search_match_json(&item, text_options)).collect::<Vec<_>>()
+                }),
+            ))
         }
         "related_notes" => {
             let path = string_arg(arguments, "path")?;
-            let limit = usize_arg(arguments, "limit", 8);
-            let snapshot = state.runtime.refresh("related_notes").await?;
+            let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
+            let snapshot = state.runtime.fresh_snapshot("related_notes").await?;
             let index = snapshot.index;
             let matches = index_search::related_notes_with_options(
                 &index,
@@ -1634,37 +2128,39 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                 "rebuilt": snapshot.rebuilt,
                 "semanticBackend": index.semantic_backend.as_str(),
                 "count": matches.len(),
-                "matches": matches.into_iter().map(|item| json!({
-                    "path": item.path,
-                    "title": item.title,
-                    "score": item.score,
-                    "sharedLinks": item.shared_links
+                "matches": matches.into_iter().map(|item| note_result_json(item.path, item.title, |object| {
+                    object.insert("score".to_string(), json!(item.score));
+                    object.insert("sharedLinks".to_string(), json!(item.shared_links));
                 })).collect::<Vec<_>>()
             })))
         }
         "backlinks" => {
             let path = string_arg(arguments, "path")?;
-            let limit = usize_arg(arguments, "limit", 50);
-            let snapshot = state.runtime.refresh("backlinks").await?;
+            let limit = clamped_usize_arg(arguments, "limit", 50, 1, 200);
+            let snapshot = state.runtime.fresh_snapshot("backlinks").await?;
             let index = snapshot.index;
-            let backlinks = index_graph::backlinks(&index, &path, limit).map_err(|error| error.to_string())?;
+            let backlinks =
+                index_graph::backlinks(&index, &path, limit).map_err(|error| error.to_string())?;
             Ok(json_text_result(json!({
                 "path": path,
                 "rebuilt": snapshot.rebuilt,
                 "count": backlinks.len(),
-                "backlinks": backlinks.into_iter().map(|item| json!({
-                    "path": item.path,
-                    "title": item.title,
-                    "matchedLinks": item.matched_links
+                "backlinks": backlinks.into_iter().map(|item| note_result_json(item.path, item.title, |object| {
+                    object.insert("matchedLinks".to_string(), json!(item.matched_links));
                 })).collect::<Vec<_>>()
             })))
         }
         "graph_traverse" => {
             let path = string_arg(arguments, "path")?;
-            let direction = optional_string_arg(arguments, "direction").unwrap_or_else(|| "both".to_string());
-            let depth = usize_arg(arguments, "depth", 1).max(1);
-            let limit = usize_arg(arguments, "limit", 100).max(1);
-            let snapshot = state.runtime.refresh("graph_traverse").await?;
+            let direction = optional_enum_string_arg(
+                arguments,
+                "direction",
+                &["incoming", "outgoing", "both"],
+            )?
+            .unwrap_or_else(|| "both".to_string());
+            let depth = clamped_usize_arg(arguments, "depth", 1, 1, 6);
+            let limit = clamped_usize_arg(arguments, "limit", 100, 1, 500);
+            let snapshot = state.runtime.fresh_snapshot("graph_traverse").await?;
             let index = snapshot.index;
             let graph_direction = match direction.as_str() {
                 "incoming" => index_graph::GraphDirection::Incoming,
@@ -1680,10 +2176,8 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                 "depth": depth,
                 "nodeCount": graph.nodes.len(),
                 "edgeCount": graph.edges.len(),
-                "nodes": graph.nodes.into_iter().map(|node| json!({
-                    "path": node.path,
-                    "title": node.title,
-                    "depth": node.depth
+                "nodes": graph.nodes.into_iter().map(|node| note_result_json(node.path, node.title, |object| {
+                    object.insert("depth".to_string(), json!(node.depth));
                 })).collect::<Vec<_>>(),
                 "edges": graph.edges.into_iter().map(|edge| json!({
                     "source": edge.source,
@@ -1694,12 +2188,14 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
         }
         "load_knowledge" => {
             let subject = string_arg(arguments, "subject")?;
+            validate_format_arg(arguments)?;
             let project = optional_string_arg(arguments, "project");
-            let limit_notes = usize_arg(arguments, "limitNotes", 6);
-            let limit_chunks = usize_arg(arguments, "limitChunks", 8);
+            let limit_notes = clamped_usize_arg(arguments, "limitNotes", 6, 1, 12);
+            let limit_chunks = clamped_usize_arg(arguments, "limitChunks", 8, 1, 16);
             let include_graph = bool_arg(arguments, "includeGraph", true);
-            let graph_depth = usize_arg(arguments, "graphDepth", 1);
-            let snapshot = state.runtime.refresh("load_knowledge").await?;
+            let graph_depth = clamped_usize_arg(arguments, "graphDepth", 1, 1, 3);
+            let text_options = TextPayloadOptions::from_arguments(arguments, true);
+            let snapshot = state.runtime.fresh_snapshot("load_knowledge").await?;
             let index = snapshot.index;
             let query = [Some(subject.clone()), project.clone()]
                 .into_iter()
@@ -1723,7 +2219,7 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                 if !chunk_paths.iter().any(|existing| existing == &chunk.path) {
                     chunk_paths.push(chunk.path.clone());
                 }
-                let mut chunk_value = hybrid_search_match_json(&chunk);
+                let mut chunk_value = hybrid_search_match_json(&chunk, text_options);
                 if let Some(chunk_object) = chunk_value.as_object_mut() {
                     chunk_object.insert("wikiLink".to_string(), json!(note_wiki_link(&chunk.path)));
                 }
@@ -1803,10 +2299,8 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                 )
                 .map_err(|error| error.to_string())?;
                 json!({
-                    "nodes": graph_payload.nodes.into_iter().map(|node| json!({
-                        "path": node.path,
-                        "title": node.title,
-                        "depth": node.depth
+                    "nodes": graph_payload.nodes.into_iter().map(|node| note_result_json(node.path, node.title, |object| {
+                        object.insert("depth".to_string(), json!(node.depth));
                     })).collect::<Vec<_>>(),
                     "edges": graph_payload.edges.into_iter().map(|edge| json!({
                         "source": edge.source,
@@ -1831,12 +2325,16 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
             result.insert("notes".to_string(), json!(notes));
             result.insert("chunks".to_string(), json!(chunks));
             result.insert("graph".to_string(), graph);
-            Ok(json_text_result(Value::Object(result)))
+            Ok(json_text_result_from_arguments(
+                arguments,
+                Value::Object(result),
+            ))
         }
         "recommend_folder" => {
             let topic = string_arg(arguments, "topic")?;
             let project = optional_string_arg(arguments, "project");
-            let folders = list_top_level_folders(&config.vault_path).map_err(|error| error.to_string())?;
+            let folders =
+                list_top_level_folders(&config.vault_path).map_err(|error| error.to_string())?;
             if folders.is_empty() {
                 return Ok(json_text_result(json!({
                     "folder": "Knowledge Capture",
@@ -1844,7 +2342,7 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                     "scores": []
                 })));
             }
-            let snapshot = state.runtime.refresh("recommend_folder").await?;
+            let snapshot = state.runtime.fresh_snapshot("recommend_folder").await?;
             let index = snapshot.index;
             let query = [Some(topic.clone()), project.clone()]
                 .into_iter()
@@ -1874,7 +2372,10 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                     let matching_paths = matches
                         .iter()
                         .map(|item| item.path.as_str())
-                        .filter(|path| *path == format!("{}.md", folder) || path.starts_with(&format!("{}/", folder)))
+                        .filter(|path| {
+                            *path == format!("{}.md", folder)
+                                || path.starts_with(&format!("{}/", folder))
+                        })
                         .take(6)
                         .map(ToOwned::to_owned)
                         .collect::<Vec<_>>();
@@ -1918,29 +2419,51 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
             if !path.to_lowercase().ends_with(".md") {
                 return Err("upsert_note requires a vault-relative .md path.".to_string());
             }
+            let dry_run = bool_arg(arguments, "dryRun", false);
+            let expected_hash = expected_hash_arg(arguments);
             let content = compose_explicit_note_content(arguments)?;
             let preserve_manual_notes = bool_arg(arguments, "preserveManualNotes", false);
             let existing = read_text_file(&config.vault_path, &path).ok();
+            let previous_hash = existing
+                .as_ref()
+                .map(|existing| content_hash(existing.text.as_bytes()));
+            validate_expected_hash(expected_hash.as_deref(), previous_hash.as_deref(), &path)?;
             let final_content = existing
                 .as_ref()
-                .map(|existing| merge_with_manual_notes(&content, &existing.text, preserve_manual_notes))
+                .map(|existing| {
+                    merge_with_manual_notes(&content, &existing.text, preserve_manual_notes)
+                })
                 .unwrap_or_else(|| finalize_written_content(&content));
-            let write_result = write_text_file(&config.vault_path, &path, &final_content)
-                .map_err(|error| error.to_string())?;
+            let new_hash = content_hash(final_content.as_bytes());
+            let created = existing.is_none();
+            if !dry_run {
+                write_text_file(&config.vault_path, &path, &final_content)
+                    .map_err(|error| error.to_string())?;
+            }
             let title = note_title_from_content(&path, &final_content);
             Ok(json_text_result(json!({
                 "action": if existing.is_some() { "updated" } else { "created" },
                 "path": path,
                 "title": title,
+                "resourceUri": note_uri(&path),
                 "wikiLink": note_alias_wiki_link(&path, &title),
-                "created": write_result.created
+                "created": created,
+                "dryRun": dry_run,
+                "previousHash": previous_hash,
+                "newHash": new_hash
             })))
         }
         "update_note_section" => {
             let path = string_arg(arguments, "path")?;
-            let target = optional_string_arg(arguments, "target").unwrap_or_else(|| "heading".to_string());
+            let target =
+                optional_string_arg(arguments, "target").unwrap_or_else(|| "heading".to_string());
             let replacement = string_arg(arguments, "content")?;
-            let existing = read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            let dry_run = bool_arg(arguments, "dryRun", false);
+            let expected_hash = expected_hash_arg(arguments);
+            let existing =
+                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            let previous_hash = content_hash(existing.text.as_bytes());
+            validate_expected_hash(expected_hash.as_deref(), Some(&previous_hash), &path)?;
             let (final_content, action, level, heading) = match target.as_str() {
                 "preamble" => (
                     replace_note_preamble(&existing.text, &replacement),
@@ -1950,40 +2473,71 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                 ),
                 "heading" => {
                     let heading = string_arg(arguments, "heading")?;
-                    let level = usize_arg(arguments, "level", 2);
+                    let level = clamped_usize_arg(arguments, "level", 2, 1, 6);
                     let create_if_missing = bool_arg(arguments, "createIfMissing", true);
-                    let (updated, action, actual_level) =
-                        update_or_create_note_section(&existing.text, &heading, &replacement, level, create_if_missing)?;
-                    (updated, action.to_string(), Some(actual_level), Some(heading))
+                    let (updated, action, actual_level) = update_or_create_note_section(
+                        &existing.text,
+                        &heading,
+                        &replacement,
+                        level,
+                        create_if_missing,
+                    )?;
+                    (
+                        updated,
+                        action.to_string(),
+                        Some(actual_level),
+                        Some(heading),
+                    )
                 }
                 other => {
                     return Err(format!("unsupported update_note_section target: {}", other));
                 }
             };
-            let write_result = write_text_file(&config.vault_path, &path, &final_content)
-                .map_err(|error| error.to_string())?;
+            let new_hash = content_hash(final_content.as_bytes());
+            if !dry_run {
+                write_text_file(&config.vault_path, &path, &final_content)
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(json_text_result(json!({
                 "action": action,
                 "path": path,
+                "resourceUri": note_uri(&path),
                 "target": target,
                 "heading": heading,
                 "level": level,
-                "created": write_result.created
+                "created": false,
+                "dryRun": dry_run,
+                "previousHash": previous_hash,
+                "newHash": new_hash
             })))
         }
         "write_file_to_vault" => {
             let path = string_arg(arguments, "path")?;
             let content = string_arg(arguments, "content")?;
-            let encoding = optional_string_arg(arguments, "encoding").unwrap_or_else(|| "utf-8".to_string());
+            let encoding =
+                optional_string_arg(arguments, "encoding").unwrap_or_else(|| "utf-8".to_string());
+            let dry_run = bool_arg(arguments, "dryRun", false);
+            let expected_hash = expected_hash_arg(arguments);
             let bytes = decode_file_content(&content, &encoding)?;
-            let write_result =
-                write_binary_file(&config.vault_path, &path, &bytes).map_err(|error| error.to_string())?;
+            let existing_bytes = existing_file_bytes(&config.vault_path, &path)?;
+            let previous_hash = existing_bytes.as_ref().map(|bytes| content_hash(bytes));
+            validate_expected_hash(expected_hash.as_deref(), previous_hash.as_deref(), &path)?;
+            let new_hash = content_hash(&bytes);
+            let created = existing_bytes.is_none();
+            if !dry_run {
+                write_binary_file(&config.vault_path, &path, &bytes)
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(json_text_result(json!({
-                "action": if write_result.created { "created" } else { "updated" },
+                "action": if created { "created" } else { "updated" },
                 "path": path,
+                "resourceUri": if path.to_lowercase().ends_with(".md") { json!(note_uri(&path)) } else { Value::Null },
                 "encoding": encoding,
-                "created": write_result.created,
-                "bytesWritten": write_result.bytes_written
+                "created": created,
+                "dryRun": dry_run,
+                "previousHash": previous_hash,
+                "newHash": new_hash,
+                "bytesWritten": bytes.len()
             })))
         }
         "upsert_session_note" => {
@@ -1992,12 +2546,16 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
             let folder = optional_string_arg(arguments, "folder");
             let content = string_arg(arguments, "content")?;
             let preserve_manual_notes = bool_arg(arguments, "preserveManualNotes", true);
+            let dry_run = bool_arg(arguments, "dryRun", false);
+            let expected_hash = expected_hash_arg(arguments);
             if explicit_path.is_none() && (topic.is_none() || folder.is_none()) {
                 return Err("upsert_session_note requires either an explicit path or both topic and folder.".to_string());
             }
             if let Some(path) = &explicit_path {
                 if !path.to_lowercase().ends_with(".md") {
-                    return Err("Explicit session note path must be a vault-relative .md file.".to_string());
+                    return Err(
+                        "Explicit session note path must be a vault-relative .md file.".to_string(),
+                    );
                 }
             }
             let target_path = explicit_path.clone().unwrap_or_else(|| {
@@ -2007,29 +2565,50 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
                 )
             });
             let existing = read_text_file(&config.vault_path, &target_path).ok();
+            let previous_hash = existing
+                .as_ref()
+                .map(|existing| content_hash(existing.text.as_bytes()));
+            validate_expected_hash(
+                expected_hash.as_deref(),
+                previous_hash.as_deref(),
+                &target_path,
+            )?;
             let final_content = finalize_session_note_content(
                 &content,
                 existing.as_ref().map(|existing| existing.text.as_str()),
                 preserve_manual_notes,
             );
-            let write_result = write_text_file(&config.vault_path, &target_path, &final_content)
-                .map_err(|error| error.to_string())?;
+            let new_hash = content_hash(final_content.as_bytes());
+            let created = existing.is_none();
+            if !dry_run {
+                write_text_file(&config.vault_path, &target_path, &final_content)
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(json_text_result(json!({
                 "action": if existing.is_some() { "updated" } else { "created" },
                 "path": target_path,
+                "resourceUri": note_uri(&target_path),
                 "wikiLink": format!("[[{}]]", strip_md_extension(explicit_path.as_deref().unwrap_or(&session_note_path(topic.as_deref().unwrap_or("session"), folder.as_deref().unwrap_or("Knowledge Capture"))))),
-                "created": write_result.created
+                "created": created,
+                "dryRun": dry_run,
+                "previousHash": previous_hash,
+                "newHash": new_hash
             })))
         }
         "find_similar_notes" => {
             let note_path = optional_string_arg(arguments, "path");
             let subject = optional_string_arg(arguments, "subject");
             let mode = similarity_mode(
-                &optional_string_arg(arguments, "by").unwrap_or_else(|| "style".to_string()),
+                &optional_enum_string_arg(
+                    arguments,
+                    "by",
+                    &["style", "structure", "tone", "format"],
+                )?
+                .unwrap_or_else(|| "style".to_string()),
             );
-            let limit = usize_arg(arguments, "limit", 8);
-            let reference_limit = usize_arg(arguments, "referenceLimit", 3);
-            let snapshot = state.runtime.refresh("find_similar_notes").await?;
+            let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
+            let reference_limit = clamped_usize_arg(arguments, "referenceLimit", 3, 1, 8);
+            let snapshot = state.runtime.fresh_snapshot("find_similar_notes").await?;
             let semantic_backend = snapshot.index.semantic_backend.as_str().to_string();
             let index = snapshot.index;
             let payload = tokio::task::spawn_blocking(move || {
@@ -2059,10 +2638,63 @@ pub async fn call_tool(state: &AppState, name: &str, arguments: &Value) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_explicit_note_content, finalize_session_note_content, merge_with_manual_notes,
-        replace_note_preamble, update_or_create_note_section,
+        call_tool, clamped_usize_arg, compose_explicit_note_content, content_hash,
+        finalize_session_note_content, json_text_result_from_arguments, live_grep_matches,
+        merge_with_manual_notes, optional_enum_string_arg, outline_payload, replace_note_preamble,
+        update_or_create_note_section, TextPayloadOptions,
+    };
+    use crate::mcp::AppState;
+    use crate::runtime::RuntimeState;
+    use deep_obsidian_types::{
+        AutoReindexConfig, EmbeddingConfig, HttpConfig, ResolvedServiceConfig, StdioMode,
+        TransportMode,
     };
     use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "deep-obsidian-server-{name}-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn test_config(vault_path: PathBuf) -> ResolvedServiceConfig {
+        ResolvedServiceConfig {
+            index_dir: vault_path.join(".deep-obsidian-mcp-test"),
+            vault_path,
+            transport: TransportMode::Http,
+            stdio_mode: StdioMode::Auto,
+            http: HttpConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                mcp_path: "/mcp".to_string(),
+                health_path: "/healthz".to_string(),
+            },
+            auto_reindex: AutoReindexConfig {
+                enabled: false,
+                debounce_ms: 0,
+                interval_ms: 0,
+            },
+            embedding: EmbeddingConfig::default(),
+            config_file_path: None,
+        }
+    }
+
+    async fn test_state(vault_path: PathBuf) -> AppState {
+        let config = test_config(vault_path);
+        let (runtime, _auto_reindex) = RuntimeState::bootstrap(config.clone())
+            .await
+            .expect("bootstrap runtime");
+        AppState::new(config, runtime)
+    }
 
     #[test]
     fn finalize_session_note_content_keeps_body_exact_without_inventing_title() {
@@ -2147,5 +2779,146 @@ mod tests {
         assert_eq!(action, "created");
         assert_eq!(level, 3);
         assert_eq!(updated, "# Title\n\nIntro\n\n### Appendix\n\nNew body\n");
+    }
+
+    #[test]
+    fn outline_payload_returns_resource_uris_without_text_by_default() {
+        let content =
+            "# Title\n\nIntro\n\n## Section One\n\nBody ^block-a\n\n[[Target Note|Target]]";
+        let payload = outline_payload(
+            "Folder/Test.md",
+            content,
+            TextPayloadOptions {
+                include_text: false,
+                max_text_chars: 4000,
+            },
+        );
+
+        assert_eq!(
+            payload["resourceUri"],
+            "obsidian://note?path=Folder%2FTest.md"
+        );
+        assert_eq!(payload["headingCount"], 2);
+        assert_eq!(
+            payload["headings"][1]["resourceUri"],
+            "obsidian://heading?path=Folder%2FTest.md&slug=section-one"
+        );
+        assert_eq!(
+            payload["blocks"][0]["resourceUri"],
+            "obsidian://block?path=Folder%2FTest.md&id=block-a"
+        );
+        assert_eq!(payload["headings"][0]["textOmitted"], true);
+        assert_eq!(payload["outgoingLinks"][0]["target"], "Target Note");
+    }
+
+    #[test]
+    fn text_payload_options_truncate_and_compact_format() {
+        let mut object = serde_json::Map::new();
+        super::insert_optional_text(
+            &mut object,
+            "text",
+            "abcdef",
+            TextPayloadOptions {
+                include_text: true,
+                max_text_chars: 3,
+            },
+        );
+        assert_eq!(object["text"], "abc");
+        assert_eq!(object["textTruncated"], true);
+
+        let result = json_text_result_from_arguments(&json!({"format":"compact"}), json!({"a": 1}));
+        assert_eq!(result.content[0].text, "{\"a\":1}");
+    }
+
+    #[test]
+    fn clamped_usize_arg_enforces_schema_limit_at_runtime() {
+        assert_eq!(
+            clamped_usize_arg(&json!({"limit": 999}), "limit", 20, 1, 50),
+            50
+        );
+        assert_eq!(
+            clamped_usize_arg(&json!({"limit": 0}), "limit", 20, 1, 50),
+            1
+        );
+        assert_eq!(clamped_usize_arg(&json!({}), "limit", 20, 1, 50), 20);
+    }
+
+    #[test]
+    fn optional_enum_string_arg_rejects_schema_violations() {
+        let error =
+            optional_enum_string_arg(&json!({"mode":"glob"}), "mode", &["substring", "regex"])
+                .expect_err("invalid mode should fail");
+        assert!(error.contains("unsupported mode"));
+    }
+
+    #[tokio::test]
+    async fn upsert_note_dry_run_and_expected_hash_do_not_write_on_conflict() {
+        let vault_path = temp_dir("upsert-hash");
+        let state = test_state(vault_path.clone()).await;
+
+        let dry_run = call_tool(
+            &state,
+            "upsert_note",
+            &json!({
+                "path": "Notes/Dry.md",
+                "content": "# Dry\n\nPreview only",
+                "dryRun": true
+            }),
+        )
+        .await
+        .expect("dry run should succeed");
+        assert_eq!(dry_run.structured_content["dryRun"], true);
+        assert!(dry_run.structured_content["newHash"].as_str().is_some());
+        assert!(!vault_path.join("Notes/Dry.md").exists());
+
+        let created = call_tool(
+            &state,
+            "upsert_note",
+            &json!({
+                "path": "Notes/Dry.md",
+                "content": "# Dry\n\nOriginal"
+            }),
+        )
+        .await
+        .expect("create should succeed");
+        let previous_hash = created.structured_content["newHash"]
+            .as_str()
+            .expect("new hash")
+            .to_string();
+
+        let conflict = call_tool(
+            &state,
+            "upsert_note",
+            &json!({
+                "path": "Notes/Dry.md",
+                "content": "# Dry\n\nChanged",
+                "expectedHash": "fnv1a64:0000000000000000"
+            }),
+        )
+        .await
+        .expect_err("hash conflict should fail");
+        assert!(conflict.contains("hash conflict"));
+        let file_text = fs::read_to_string(vault_path.join("Notes/Dry.md")).expect("read note");
+        assert_eq!(file_text, "# Dry\n\nOriginal\n");
+        assert_eq!(content_hash(file_text.as_bytes()), previous_hash);
+    }
+
+    #[tokio::test]
+    async fn grep_search_populates_context_lines() {
+        let vault_path = temp_dir("grep-context");
+        fs::write(
+            vault_path.join("Context.md"),
+            "alpha\nbefore\nneedle here\nafter\nomega\n",
+        )
+        .expect("write note");
+
+        let matches = live_grep_matches(vault_path, "needle".to_string(), false, true, None, 1, 10)
+            .await
+            .expect("grep matches");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line_number, 3);
+        assert_eq!(matches[0].context_before[0].line_text, "before");
+        assert_eq!(matches[0].context_after[0].line_text, "after");
     }
 }

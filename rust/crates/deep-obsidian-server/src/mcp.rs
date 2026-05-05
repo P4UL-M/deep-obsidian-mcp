@@ -5,11 +5,11 @@ use serde_json::{json, Value};
 
 use crate::protocol::{
     InitializeResult, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
-    ResourceListResult, ResourceReadResult, ResourceTemplateListResult, ServerInfo, ToolCallResult,
-    ToolListResult,
+    PromptGetResult, PromptListResult, ResourceListResult, ResourceReadResult,
+    ResourceTemplateListResult, ServerInfo, ToolCallResult, ToolListResult,
 };
-use crate::{resources, tools};
 use crate::runtime::RuntimeState;
+use crate::{prompts, resources, tools};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -50,7 +50,8 @@ fn initialize_result() -> InitializeResult {
         protocol_version: "2025-03-26",
         capabilities: json!({
             "tools": {},
-            "resources": {}
+            "resources": {},
+            "prompts": {}
         }),
         server_info: ServerInfo {
             name: "deep-obsidian-mcp",
@@ -63,7 +64,10 @@ pub fn initialize_response() -> JsonRpcResponse<InitializeResult> {
     json_response(json!(1), initialize_result())
 }
 
-pub async fn handle_request(state: AppState, request: JsonRpcRequest) -> Result<Option<Value>, JsonRpcErrorResponse> {
+pub async fn handle_request(
+    state: AppState,
+    request: JsonRpcRequest,
+) -> Result<Option<Value>, JsonRpcErrorResponse> {
     let id = request.id.unwrap_or(Value::Null);
 
     match request.method.as_str() {
@@ -87,12 +91,17 @@ pub async fn handle_request(state: AppState, request: JsonRpcRequest) -> Result<
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| json_error_response(id.clone(), -32602, "missing tool name"))?;
-            let arguments = request.params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let arguments = request
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let result: ToolCallResult = tools::call_tool(&state, tool_name, &arguments)
                 .await
                 .map_err(|error| json_error_response(id.clone(), -32000, error))?;
             Ok(Some(
-                serde_json::to_value(json_response(id, result)).expect("tool response to serialize"),
+                serde_json::to_value(json_response(id, result))
+                    .expect("tool response to serialize"),
             ))
         }
         "resources/list" => {
@@ -100,7 +109,8 @@ pub async fn handle_request(state: AppState, request: JsonRpcRequest) -> Result<
                 .await
                 .map_err(|error| json_error_response(id.clone(), -32000, error))?;
             Ok(Some(
-                serde_json::to_value(json_response(id, result)).expect("resource list response to serialize"),
+                serde_json::to_value(json_response(id, result))
+                    .expect("resource list response to serialize"),
             ))
         }
         "resources/templates/list" => {
@@ -120,7 +130,33 @@ pub async fn handle_request(state: AppState, request: JsonRpcRequest) -> Result<
                 .await
                 .map_err(|error| json_error_response(id.clone(), -32000, error))?;
             Ok(Some(
-                serde_json::to_value(json_response(id, result)).expect("resource read response to serialize"),
+                serde_json::to_value(json_response(id, result))
+                    .expect("resource read response to serialize"),
+            ))
+        }
+        "prompts/list" => {
+            let result: PromptListResult = prompts::list_prompts();
+            Ok(Some(
+                serde_json::to_value(json_response(id, result))
+                    .expect("prompt list response to serialize"),
+            ))
+        }
+        "prompts/get" => {
+            let prompt_name = request
+                .params
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| json_error_response(id.clone(), -32602, "missing prompt name"))?;
+            let arguments = request
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let result: PromptGetResult = prompts::get_prompt(prompt_name, &arguments)
+                .map_err(|error| json_error_response(id.clone(), -32602, error))?;
+            Ok(Some(
+                serde_json::to_value(json_response(id, result))
+                    .expect("prompt get response to serialize"),
             ))
         }
         _ => Err(json_error_response(

@@ -75,6 +75,24 @@ pub fn default_index_dir(vault_path: &Path) -> PathBuf {
     vault_path.join(".deep-obsidian-mcp")
 }
 
+pub fn default_packaged_index_dir(vault_path: &Path) -> PathBuf {
+    home_dir()
+        .join("Library")
+        .join("Application Support")
+        .join(DEFAULT_CONFIG_APP_DIR)
+        .join("indexes")
+        .join(stable_vault_hash(vault_path))
+}
+
+fn stable_vault_hash(vault_path: &Path) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in expand_home_path(vault_path).to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 pub fn expand_home_path(path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
     let Some(raw) = path.to_str() else {
@@ -324,7 +342,7 @@ fn serialize_toml<T: Serialize>(path: &Path, value: &T) -> Result<String, Config
 
 #[cfg(test)]
 mod tests {
-    use super::expand_home_path;
+    use super::{default_packaged_index_dir, expand_home_path, DEFAULT_CONFIG_APP_DIR};
 
     #[test]
     fn expand_home_path_expands_tilde_prefix() {
@@ -332,5 +350,19 @@ mod tests {
         let home_path = std::path::PathBuf::from(home);
         assert_eq!(expand_home_path("~/vault"), home_path.join("vault"));
         assert_eq!(expand_home_path("~"), home_path);
+    }
+
+    #[test]
+    fn default_packaged_index_dir_uses_application_support() {
+        let home = std::env::var("HOME").expect("HOME");
+        let path = default_packaged_index_dir(std::path::Path::new("~/Vault"));
+        assert!(path.starts_with(
+            std::path::Path::new(&home)
+                .join("Library")
+                .join("Application Support")
+                .join(DEFAULT_CONFIG_APP_DIR)
+                .join("indexes")
+        ));
+        assert_eq!(path.file_name().unwrap().to_string_lossy().len(), 16);
     }
 }

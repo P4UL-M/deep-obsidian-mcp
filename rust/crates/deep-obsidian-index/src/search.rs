@@ -1,13 +1,17 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::graph::resolve_wiki_link_target;
 use crate::index::{
-    average, bm25_score, count_terms, cosine_similarity, embedding_runtime_config,
+    average, bm25_score, cosine_similarity, count_terms, embedding_runtime_config,
     find_pattern_spans, matches_pattern, normalize_dense_vector, open_index_connection_for_index,
     path_matches_glob, query_vector_blob, vector_norm, IndexError, Result, SearchIndex,
     SemanticBackend,
 };
-use crate::graph::resolve_wiki_link_target;
-use rusqlite::params;
+use rusqlite::{params, params_from_iter, OptionalExtension};
+
+const HYBRID_SEARCH_OVERSAMPLE_FACTOR: usize = 8;
+const HYBRID_SEARCH_MIN_CANDIDATES: usize = 50;
+const HYBRID_SEARCH_CANDIDATE_CAP: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilePathMatch {
@@ -126,12 +130,27 @@ fn normalize_scores(scores: &[f64]) -> Vec<f64> {
     scores
         .iter()
         .copied()
-        .map(|score| if max_score > 0.0 { score / max_score } else { 0.0 })
+        .map(|score| {
+            if max_score > 0.0 {
+                score / max_score
+            } else {
+                0.0
+            }
+        })
         .collect()
 }
 
 fn sql_distance_score(distance: f64) -> f64 {
     1.0 / (1.0 + distance)
+}
+
+fn hybrid_candidate_limit(chunk_count: usize, requested_limit: usize) -> usize {
+    let requested_limit = requested_limit.max(1);
+    let candidate_limit = requested_limit
+        .saturating_mul(HYBRID_SEARCH_OVERSAMPLE_FACTOR)
+        .max(HYBRID_SEARCH_MIN_CANDIDATES)
+        .min(HYBRID_SEARCH_CANDIDATE_CAP.max(requested_limit));
+    candidate_limit.min(chunk_count.max(1))
 }
 
 fn semantic_search_with_query_vector_sql(
@@ -162,21 +181,24 @@ fn semantic_search_with_query_vector_sql(
         )
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     let rows = statement
-        .query_map(params![query_vector_blob(query_embedding), limit.max(1) as i64], |row| {
-            let distance = row.get::<_, f64>(6)?;
-            let score = sql_distance_score(distance);
-            Ok(SearchMatch {
-                path: row.get::<_, String>(0)?,
-                title: row.get::<_, String>(1)?,
-                chunk_index: row.get::<_, i64>(2)? as usize,
-                start_line: row.get::<_, i64>(3)? as usize,
-                end_line: row.get::<_, i64>(4)? as usize,
-                score,
-                semantic_score: score,
-                bm25_score: 0.0,
-                text: row.get::<_, String>(5)?,
-            })
-        })
+        .query_map(
+            params![query_vector_blob(query_embedding), limit.max(1) as i64],
+            |row| {
+                let distance = row.get::<_, f64>(6)?;
+                let score = sql_distance_score(distance);
+                Ok(SearchMatch {
+                    path: row.get::<_, String>(0)?,
+                    title: row.get::<_, String>(1)?,
+                    chunk_index: row.get::<_, i64>(2)? as usize,
+                    start_line: row.get::<_, i64>(3)? as usize,
+                    end_line: row.get::<_, i64>(4)? as usize,
+                    score,
+                    semantic_score: score,
+                    bm25_score: 0.0,
+                    text: row.get::<_, String>(5)?,
+                })
+            },
+        )
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -235,13 +257,14 @@ fn related_notes_with_embeddings_sql(
                 limit.max(1) as i64
             ],
             |row| {
-                let links: Vec<String> = serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
+                let links: Vec<String> =
+                    serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
                 Ok(RelatedNoteMatch {
                     path: row.get::<_, String>(0)?,
                     title: row.get::<_, String>(1)?,
@@ -411,6 +434,20 @@ pub fn bm25_search_with_options(
 ) -> Result<Vec<SearchMatch>> {
     let query_terms = count_terms(query);
     let query_terms = query_terms.keys().cloned().collect::<Vec<_>>();
+    if query_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Ok(Some(matches)) = bm25_search_with_sql_candidates(index, &query_terms, &options) {
+        return Ok(matches);
+    }
+    bm25_search_in_memory(index, &query_terms, options)
+}
+
+fn bm25_search_in_memory(
+    index: &SearchIndex,
+    query_terms: &[String],
+    options: RankingOptions,
+) -> Result<Vec<SearchMatch>> {
     let chunk_lengths = index
         .chunks
         .iter()
@@ -444,9 +481,122 @@ pub fn bm25_search_with_options(
         .filter(|match_item| match_item.score > 0.0)
         .collect::<Vec<_>>();
 
-    matches.sort_by(|left, right| right.score.total_cmp(&left.score));
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.chunk_index.cmp(&right.chunk_index))
+    });
     matches.truncate(options.limit.max(1));
     Ok(matches)
+}
+
+fn bm25_search_with_sql_candidates(
+    index: &SearchIndex,
+    query_terms: &[String],
+    options: &RankingOptions,
+) -> Result<Option<Vec<SearchMatch>>> {
+    let connection = match open_index_connection_for_index(index, true) {
+        Ok(connection) => connection,
+        Err(_) => return Ok(None),
+    };
+    let has_chunk_terms = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunk_terms'",
+            [],
+            |_row| Ok(()),
+        )
+        .optional()
+        .map_err(|error| IndexError::Embedding(error.to_string()))?
+        .is_some();
+    if !has_chunk_terms {
+        return Ok(None);
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(query_terms.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT DISTINCT
+          c.path,
+          c.title,
+          c.chunk_index,
+          c.start_line,
+          c.end_line,
+          c.text,
+          c.term_counts_json,
+          c.token_count
+        FROM chunk_terms AS ct
+        JOIN chunks AS c ON c.id = ct.chunk_id
+        WHERE ct.term IN ({placeholders})
+        "#
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    let rows = statement
+        .query_map(params_from_iter(query_terms.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)? as usize,
+                row.get::<_, i64>(4)? as usize,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)? as usize,
+            ))
+        })
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+
+    let chunk_lengths = index
+        .chunks
+        .iter()
+        .map(|chunk| chunk.token_count as f64)
+        .collect::<Vec<_>>();
+    let average_chunk_length = average(&chunk_lengths);
+    let mut matches = Vec::new();
+    for row in rows {
+        let (path, title, chunk_index, start_line, end_line, text, term_counts_json, token_count) =
+            row.map_err(|error| IndexError::Embedding(error.to_string()))?;
+        let term_counts: BTreeMap<String, usize> = serde_json::from_str(&term_counts_json)
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        let score = bm25_score(
+            query_terms,
+            &term_counts,
+            &index.document_frequencies,
+            index.chunk_count,
+            token_count,
+            average_chunk_length,
+        );
+        if score <= 0.0 {
+            continue;
+        }
+        matches.push(SearchMatch {
+            path,
+            title,
+            chunk_index,
+            start_line,
+            end_line,
+            score,
+            semantic_score: 0.0,
+            bm25_score: score,
+            text,
+        });
+    }
+
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.chunk_index.cmp(&right.chunk_index))
+    });
+    matches.truncate(options.limit.max(1));
+    Ok(Some(matches))
 }
 
 pub fn semantic_search(index: &SearchIndex, query: &str) -> Result<Vec<SearchMatch>> {
@@ -468,7 +618,12 @@ pub fn semantic_search_with_options(
             .chunks
             .iter()
             .map(|chunk| {
-                let score = cosine_similarity(&query_term_counts, query_norm, &chunk.term_counts, chunk.norm);
+                let score = cosine_similarity(
+                    &query_term_counts,
+                    query_norm,
+                    &chunk.term_counts,
+                    chunk.norm,
+                );
                 SearchMatch {
                     path: chunk.path.clone(),
                     title: chunk.title.clone(),
@@ -485,7 +640,13 @@ pub fn semantic_search_with_options(
             .collect::<Vec<_>>()
     };
 
-    matches.sort_by(|left, right| right.score.total_cmp(&left.score));
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.chunk_index.cmp(&right.chunk_index))
+    });
     matches.truncate(options.limit.max(1));
     Ok(matches)
 }
@@ -499,11 +660,24 @@ pub fn hybrid_search_with_options(
     query: &str,
     options: RankingOptions,
 ) -> Result<Vec<SearchMatch>> {
+    let requested_limit = options.limit.max(1);
+    let candidate_limit = hybrid_candidate_limit(index.chunk_count, requested_limit);
+    hybrid_search_with_candidate_limit(index, query, options, candidate_limit)
+}
+
+fn hybrid_search_with_candidate_limit(
+    index: &SearchIndex,
+    query: &str,
+    options: RankingOptions,
+    candidate_limit: usize,
+) -> Result<Vec<SearchMatch>> {
+    let requested_limit = options.limit.max(1);
+    let candidate_limit = candidate_limit.max(1);
     let semantic_matches = semantic_search_with_options(
         index,
         query,
         RankingOptions {
-            limit: index.chunk_count.max(1),
+            limit: candidate_limit,
             semantic_weight: options.semantic_weight,
             bm25_weight: options.bm25_weight,
         },
@@ -512,14 +686,24 @@ pub fn hybrid_search_with_options(
         index,
         query,
         RankingOptions {
-            limit: index.chunk_count.max(1),
+            limit: candidate_limit,
             semantic_weight: options.semantic_weight,
             bm25_weight: options.bm25_weight,
         },
     )?;
 
-    let semantic_scores = normalize_scores(&semantic_matches.iter().map(|item| item.score).collect::<Vec<_>>());
-    let bm25_scores = normalize_scores(&bm25_matches.iter().map(|item| item.score).collect::<Vec<_>>());
+    let semantic_scores = normalize_scores(
+        &semantic_matches
+            .iter()
+            .map(|item| item.score)
+            .collect::<Vec<_>>(),
+    );
+    let bm25_scores = normalize_scores(
+        &bm25_matches
+            .iter()
+            .map(|item| item.score)
+            .collect::<Vec<_>>(),
+    );
 
     let mut combined: HashMap<(String, usize), SearchMatch> = HashMap::new();
     for (index_position, match_item) in semantic_matches.into_iter().enumerate() {
@@ -555,15 +739,31 @@ pub fn hybrid_search_with_options(
     let mut matches = combined
         .into_values()
         .map(|mut match_item| {
-            match_item.score = options.semantic_weight * match_item.semantic_score + options.bm25_weight * match_item.bm25_score;
+            match_item.score = options.semantic_weight * match_item.semantic_score
+                + options.bm25_weight * match_item.bm25_score;
             match_item
         })
         .filter(|match_item| match_item.score > 0.0)
         .collect::<Vec<_>>();
 
-    matches.sort_by(|left, right| right.score.total_cmp(&left.score));
-    matches.truncate(options.limit.max(1));
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.chunk_index.cmp(&right.chunk_index))
+    });
+    matches.truncate(requested_limit);
     Ok(matches)
+}
+
+#[cfg(test)]
+fn hybrid_search_exhaustive_with_options(
+    index: &SearchIndex,
+    query: &str,
+    options: RankingOptions,
+) -> Result<Vec<SearchMatch>> {
+    hybrid_search_with_candidate_limit(index, query, options, index.chunk_count.max(1))
 }
 
 pub fn related_notes(index: &SearchIndex, note_path: &str) -> Result<Vec<RelatedNoteMatch>> {
@@ -575,7 +775,9 @@ pub fn related_notes_with_options(
     note_path: &str,
     options: RelatedNoteOptions,
 ) -> Result<Vec<RelatedNoteMatch>> {
-    let note = index.note(note_path).ok_or_else(|| IndexError::NoteNotFound(note_path.to_string()))?;
+    let note = index
+        .note(note_path)
+        .ok_or_else(|| IndexError::NoteNotFound(note_path.to_string()))?;
     let note_links: BTreeSet<_> = note.links.iter().cloned().collect();
     let mut matches = if index.semantic_backend == SemanticBackend::Embedding {
         related_notes_with_embeddings_sql(index, note_path, options.limit.max(1))?
@@ -587,7 +789,12 @@ pub fn related_notes_with_options(
             .map(|candidate| RelatedNoteMatch {
                 path: candidate.path.clone(),
                 title: candidate.title.clone(),
-                score: cosine_similarity(&note.term_counts, note.norm, &candidate.term_counts, candidate.norm),
+                score: cosine_similarity(
+                    &note.term_counts,
+                    note.norm,
+                    &candidate.term_counts,
+                    candidate.norm,
+                ),
                 shared_links: candidate
                     .links
                     .iter()
@@ -600,12 +807,21 @@ pub fn related_notes_with_options(
             .collect::<Vec<_>>()
     };
 
-    matches.sort_by(|left, right| right.score.total_cmp(&left.score).then_with(|| left.path.cmp(&right.path)));
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.path.cmp(&right.path))
+    });
     matches.truncate(options.limit.max(1));
     Ok(matches)
 }
 
-pub fn backlinks(index: &SearchIndex, note_path: &str, limit: usize) -> Result<Vec<crate::graph::BacklinkMatch>> {
+pub fn backlinks(
+    index: &SearchIndex,
+    note_path: &str,
+    limit: usize,
+) -> Result<Vec<crate::graph::BacklinkMatch>> {
     crate::graph::backlinks(index, note_path, limit)
 }
 
@@ -679,7 +895,9 @@ mod tests {
     fn file_search_matches_substring_and_regex() {
         let index = sample_index();
         let substring = find_files(&index, "Brew").expect("substring");
-        assert!(substring.iter().any(|entry| entry.path == "Projects/Brew Service.md"));
+        assert!(substring
+            .iter()
+            .any(|entry| entry.path == "Projects/Brew Service.md"));
         let regex = find_files_with_options(
             &index,
             "Service Contract\\.md$",
@@ -689,7 +907,9 @@ mod tests {
             },
         )
         .expect("regex");
-        assert!(regex.iter().any(|entry| entry.path == "Research/Service Contract.md"));
+        assert!(regex
+            .iter()
+            .any(|entry| entry.path == "Research/Service Contract.md"));
     }
 
     #[test]
@@ -705,11 +925,17 @@ mod tests {
         let index = sample_index();
         let bm25 = bm25_search(&index, "install service runtime").expect("bm25");
         assert!(!bm25.is_empty());
-        assert!(bm25.iter().take(2).any(|entry| entry.path == "Projects/Brew Service.md"));
+        assert!(bm25
+            .iter()
+            .take(2)
+            .any(|entry| entry.path == "Projects/Brew Service.md"));
 
         let semantic = semantic_search(&index, "brew runtime").expect("semantic");
         assert!(!semantic.is_empty());
-        assert!(semantic.iter().take(2).any(|entry| entry.path == "Projects/Brew Service.md"));
+        assert!(semantic
+            .iter()
+            .take(2)
+            .any(|entry| entry.path == "Projects/Brew Service.md"));
     }
 
     #[test]
@@ -721,10 +947,31 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_search_candidate_pool_is_bounded() {
+        assert_eq!(hybrid_candidate_limit(10_000, 8), 64);
+        assert_eq!(hybrid_candidate_limit(10_000, 3), 50);
+        assert_eq!(hybrid_candidate_limit(10_000, 1_000), 1_000);
+        assert_eq!(hybrid_candidate_limit(20, 8), 20);
+    }
+
+    #[test]
+    fn exhaustive_hybrid_path_matches_default_on_small_indexes() {
+        let index = sample_index();
+        let options = RankingOptions::default();
+        let bounded = hybrid_search_with_options(&index, "install runtime", options.clone())
+            .expect("bounded");
+        let exhaustive = hybrid_search_exhaustive_with_options(&index, "install runtime", options)
+            .expect("exhaustive");
+        assert_eq!(bounded, exhaustive);
+    }
+
+    #[test]
     fn related_notes_uses_shared_terms_and_links() {
         let index = sample_index();
         let related = related_notes(&index, "Home.md").expect("related");
         assert!(!related.is_empty());
-        assert!(related.iter().any(|entry| entry.path == "Projects/Brew Service.md"));
+        assert!(related
+            .iter()
+            .any(|entry| entry.path == "Projects/Brew Service.md"));
     }
 }

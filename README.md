@@ -25,6 +25,7 @@ Current capabilities:
 - traverse outgoing links and backlinks as a graph
 - answer both newline-delimited and framed stdio MCP clients from the same binary
 - expose vault, note, heading, and block resources for MCP clients
+- expose MCP prompts for common Obsidian agent workflows
 - provide a long-lived HTTP service mode for background operation and MCP clients that prefer a stable endpoint
 
 This server supports two semantic modes:
@@ -99,6 +100,7 @@ Useful endpoints:
 
 - MCP: `http://127.0.0.1:4100/mcp`
 - health: `http://127.0.0.1:4100/healthz`
+- readiness: `http://127.0.0.1:4100/readyz`
 
 Quick HTTP probe:
 
@@ -134,7 +136,23 @@ cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp
 ./bin/deep-obsidian-mcp serve
 ```
 
-See [docs/homebrew-service.md](./docs/homebrew-service.md) for the intended Homebrew workflow, [docs/homebrew-gap-todo.md](./docs/homebrew-gap-todo.md) for the current packaging gaps, and [Formula/deep-obsidian-mcp.rb](./Formula/deep-obsidian-mcp.rb) for the current formula scaffold.
+See [docs/homebrew-service.md](./docs/homebrew-service.md) for the Homebrew workflow, [docs/homebrew-gap-todo.md](./docs/homebrew-gap-todo.md) for the remaining release-artifact validation gaps, and [Formula/deep-obsidian-mcp.rb](./Formula/deep-obsidian-mcp.rb) for the formula.
+
+## Agent Workflows
+
+The server exposes MCP prompts for read/synthesis workflows:
+
+- `obsidian-load-context`
+- `obsidian-project-briefing`
+- `obsidian-daily-review`
+
+Packaged agent skill templates live in [skills](./skills) for operational workflows:
+
+- `obsidian-wiki-init`
+- `obsidian-capture-session`
+- `obsidian-knowledge-maintenance`
+
+Homebrew installs packaged skills under the formula `pkgshare/skills` directory, while source users can copy or symlink the relevant `SKILL.md` files into their agent skill directory.
 
 ## macOS launchd
 
@@ -160,7 +178,7 @@ Remove it:
 
 The installer writes a user LaunchAgent plist under `~/Library/LaunchAgents/`, starts it with `launchctl`, and keeps it running across terminal sessions.
 
-This is still a local operational path. The Homebrew service flow in [docs/homebrew-service.md](./docs/homebrew-service.md) is the target packaged UX.
+This is still a local operational path. The Homebrew service flow in [docs/homebrew-service.md](./docs/homebrew-service.md) is the packaged UX and runs the CLI with `--packaged` so default indexes live outside the vault.
 
 Automatic reindexing is enabled by default. The server performs:
 

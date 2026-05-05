@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use deep_obsidian_config::{
-    default_config_path, expand_home_path, normalize_http_path, normalize_service_config,
-    read_config_file,
+    default_config_path, default_packaged_index_dir, expand_home_path, normalize_http_path,
+    normalize_service_config, read_config_file,
 };
 use deep_obsidian_types::{
     AutoReindexConfigInput, EmbeddingConfigInput, EmbeddingProvider, HttpConfigInput,
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::{ServiceOptions, StdioMode, TransportMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub enum ResolvedSource {
     Cli,
     Config,
@@ -25,6 +26,7 @@ pub enum ResolvedSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ResolvedSources {
     pub vault_path: ResolvedSource,
     pub index_dir: ResolvedSource,
@@ -67,6 +69,7 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
             .and_then(|config| config.vault_path.clone()),
         env_path(&["DEEP_OBSIDIAN_VAULT_PATH", "OBSIDIAN_VAULT_PATH"]),
     );
+    let packaged_mode = options.packaged || env_bool(&["DEEP_OBSIDIAN_PACKAGED"]).unwrap_or(false);
     let (index_dir, index_dir_source) = first_path(
         options.index_dir.clone(),
         config_file
@@ -275,7 +278,10 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
         }),
         config_file_path: Some(config_path.clone()),
     };
-    let service = normalize_service_config(input)?;
+    let mut service = normalize_service_config(input)?;
+    if packaged_mode && matches!(index_dir_source, ResolvedSource::Default) {
+        service.index_dir = default_packaged_index_dir(&service.vault_path);
+    }
 
     Ok(ResolvedRuntimeConfig {
         config_path,
@@ -533,4 +539,193 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_runtime_config, ResolvedSource};
+    use crate::cli::{ServiceOptions, StdioMode, TransportMode};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore {
+        values: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                values: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var(key).ok()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.values {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "deep-obsidian-cli-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn service_options(config: PathBuf, vault: PathBuf) -> ServiceOptions {
+        ServiceOptions {
+            config: Some(config),
+            dry_run: false,
+            no_dry_run: false,
+            json: false,
+            no_json: false,
+            vault_path: Some(vault),
+            index_dir: None,
+            packaged: false,
+            transport: None,
+            stdio_mode: None,
+            host: None,
+            port: None,
+            mcp_path: None,
+            health_path: None,
+            auto_reindex: false,
+            no_auto_reindex: false,
+            reindex_debounce_ms: None,
+            reindex_interval_ms: None,
+            embedding_provider: None,
+            embedding_model: None,
+            embedding_base_url: None,
+            embedding_api_key: None,
+            embedding_api_key_env: None,
+        }
+    }
+
+    #[test]
+    fn resolve_runtime_config_prefers_config_file_over_environment() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _restore = EnvRestore::capture(&["DEEP_OBSIDIAN_INDEX_DIR", "INDEX_DIR"]);
+        let root = unique_temp_dir("config-precedence");
+        let vault = root.join("vault");
+        let config_index = root.join("config-index");
+        let env_index = root.join("env-index");
+        fs::create_dir_all(&vault).expect("create vault");
+        let config_path = root.join("config.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "indexDir": config_index,
+                "transport": "http"
+            })
+            .to_string(),
+        )
+        .expect("write config");
+        std::env::set_var("DEEP_OBSIDIAN_INDEX_DIR", &env_index);
+
+        let resolved =
+            resolve_runtime_config(&service_options(config_path, vault)).expect("resolve config");
+
+        assert_eq!(resolved.service.index_dir, config_index);
+        assert_eq!(resolved.sources.index_dir, ResolvedSource::Config);
+    }
+
+    #[test]
+    fn resolve_runtime_config_prefers_cli_over_config_file() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _restore = EnvRestore::capture(&["DEEP_OBSIDIAN_INDEX_DIR", "INDEX_DIR"]);
+        let root = unique_temp_dir("cli-precedence");
+        let vault = root.join("vault");
+        let cli_index = root.join("cli-index");
+        let config_index = root.join("config-index");
+        let env_index = root.join("env-index");
+        fs::create_dir_all(&vault).expect("create vault");
+        let config_path = root.join("config.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "indexDir": config_index,
+                "transport": "http"
+            })
+            .to_string(),
+        )
+        .expect("write config");
+        std::env::set_var("DEEP_OBSIDIAN_INDEX_DIR", &env_index);
+        let mut options = service_options(config_path, vault);
+        options.index_dir = Some(cli_index.clone());
+        options.transport = Some(TransportMode::Http);
+        options.stdio_mode = Some(StdioMode::Auto);
+
+        let resolved = resolve_runtime_config(&options).expect("resolve config");
+
+        assert_eq!(resolved.service.index_dir, cli_index);
+        assert_eq!(resolved.sources.index_dir, ResolvedSource::Cli);
+    }
+
+    #[test]
+    fn resolve_runtime_config_uses_packaged_index_dir_only_for_default_index() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _restore = EnvRestore::capture(&[
+            "DEEP_OBSIDIAN_INDEX_DIR",
+            "INDEX_DIR",
+            "DEEP_OBSIDIAN_PACKAGED",
+        ]);
+        let root = unique_temp_dir("packaged-index");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).expect("create vault");
+        let config_path = root.join("missing-config.json");
+        let mut options = service_options(config_path, vault.clone());
+        options.packaged = true;
+
+        let resolved = resolve_runtime_config(&options).expect("resolve config");
+
+        assert_eq!(resolved.sources.index_dir, ResolvedSource::Default);
+        assert!(resolved
+            .service
+            .index_dir
+            .to_string_lossy()
+            .contains("Application Support"));
+        assert_ne!(resolved.service.index_dir, vault.join(".deep-obsidian-mcp"));
+    }
+
+    #[test]
+    fn resolve_runtime_config_preserves_explicit_index_dir_in_packaged_mode() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _restore = EnvRestore::capture(&[
+            "DEEP_OBSIDIAN_INDEX_DIR",
+            "INDEX_DIR",
+            "DEEP_OBSIDIAN_PACKAGED",
+        ]);
+        let root = unique_temp_dir("packaged-explicit-index");
+        let vault = root.join("vault");
+        let cli_index = root.join("cli-index");
+        fs::create_dir_all(&vault).expect("create vault");
+        let config_path = root.join("missing-config.json");
+        let mut options = service_options(config_path, vault);
+        options.packaged = true;
+        options.index_dir = Some(cli_index.clone());
+
+        let resolved = resolve_runtime_config(&options).expect("resolve config");
+
+        assert_eq!(resolved.service.index_dir, cli_index);
+        assert_eq!(resolved.sources.index_dir, ResolvedSource::Cli);
+    }
 }

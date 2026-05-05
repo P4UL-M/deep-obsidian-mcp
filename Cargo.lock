@@ -292,6 +292,7 @@ dependencies = [
  "deep-obsidian-server",
  "deep-obsidian-types",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

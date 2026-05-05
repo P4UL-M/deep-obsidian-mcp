@@ -1,5 +1,5 @@
-use std::fmt::Write as _;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::iter;
 use std::net::TcpListener;
@@ -9,22 +9,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use deep_obsidian_config::{build_service_endpoints, to_persisted_config, write_config_file};
+use deep_obsidian_config::{
+    build_service_endpoints, default_packaged_index_dir, to_persisted_config, write_config_file,
+};
 use deep_obsidian_server::{run_http_service, run_stdio_service};
 use deep_obsidian_types::{
     PersistedServiceConfig, ResolvedServiceConfig, ServiceEndpoints, TransportMode,
 };
 use reqwest::Client;
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::cli::{Cli, Command};
-use crate::config::ResolvedRuntimeConfig;
+use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const INDEX_SQLITE_FILENAME: &str = "index.sqlite";
+const CONFIG_PRECEDENCE: [&str; 4] = ["cli", "config", "env", "default"];
 const HELP_TEXT: &str = "\
 Usage:
-  deep-obsidian-mcp [serve] [--config <path>] [--vault <path>] [--transport stdio|http]
+  deep-obsidian-mcp [serve] [--config <path>] [--vault <path>] [--transport stdio|http] [--packaged]
   deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--dry-run]
   deep-obsidian-mcp doctor [--config <path>] [--json]
   deep-obsidian-mcp print-config [--config <path>]
@@ -44,6 +49,63 @@ Commands:
 pub struct EndpointReport {
     pub mcp: String,
     pub health: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigDiagnostics {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub precedence: Vec<&'static str>,
+    pub sources: ResolvedSources,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoReindexDiagnostics {
+    pub enabled: bool,
+    pub debounce_ms: u64,
+    pub interval_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexDiagnostics {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub status: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_snapshot_rows: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceDiagnostics {
+    pub auto_reindex: AutoReindexDiagnostics,
+    pub endpoint: EndpointReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_refresh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,8 +132,11 @@ pub struct CheckReport {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorReport {
-    pub config: ResolvedServiceConfig,
+    pub config: PersistedServiceConfig,
+    pub config_diagnostics: ConfigDiagnostics,
     pub endpoints: EndpointReport,
+    pub index: IndexDiagnostics,
+    pub service: ServiceDiagnostics,
     pub checks: Vec<CheckReport>,
     pub ok: bool,
 }
@@ -472,12 +537,7 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
                     "--embedding-api-key",
                 )
             } else if token.starts_with("--probe-timeout-ms") {
-                normalize_value_flag(
-                    raw_args,
-                    index,
-                    "--probe-timeout-ms",
-                    "--probe-timeout-ms",
-                )
+                normalize_value_flag(raw_args, index, "--probe-timeout-ms", "--probe-timeout-ms")
             } else {
                 normalize_value_flag(raw_args, index, "--timeout-ms", "--timeout-ms")
             };
@@ -515,6 +575,9 @@ pub fn setup_service(
 ) -> Result<SetupServiceReport> {
     let mut service = ensure_service_transport_http(resolved.service.clone())?;
     service.vault_path = absolute_path(&service.vault_path)?;
+    if matches!(resolved.sources.index_dir, ResolvedSource::Default) {
+        service.index_dir = default_packaged_index_dir(&service.vault_path);
+    }
     let config_path = absolute_path(&resolved.config_path)?;
     validate_vault(&service)?;
     let config_dir = config_path
@@ -525,6 +588,7 @@ pub fn setup_service(
     let config = to_persisted_config(&service);
     let messages = vec![
         format!("vault: {}", service.vault_path.display()),
+        format!("index: {}", service.index_dir.display()),
         format!("config: {}", config_path.display()),
     ];
     if dry_run {
@@ -539,6 +603,7 @@ pub fn setup_service(
             messages: vec![
                 messages[0].clone(),
                 messages[1].clone(),
+                messages[2].clone(),
                 "dry-run: config validated but not written".to_string(),
             ],
         });
@@ -565,6 +630,7 @@ pub fn setup_service(
         messages: vec![
             messages[0].clone(),
             messages[1].clone(),
+            messages[2].clone(),
             format!("wrote config: {}", config_path.display()),
         ],
     })
@@ -576,14 +642,41 @@ pub async fn doctor(
 ) -> Result<DoctorReport> {
     let service = resolved.service.clone();
     let endpoints = build_service_endpoints(&service);
-    let mut checks = vec![check_vault(&service), check_index_dir(&service), check_rg()];
+    let index = inspect_index(&service);
+    let mut checks = vec![
+        check_config(resolved),
+        check_vault(&service),
+        check_index_dir(&service),
+        check_index_file(&index),
+        check_rg(),
+    ];
+    let mut health_payload = None;
+    let mut readiness_payload = None;
 
     if matches!(service.transport, TransportMode::Http) {
         let port_check = check_port(&service);
         let should_probe = port_check.status != "ok";
         checks.push(port_check);
         if should_probe {
-            checks.push(check_health(&endpoints, probe_timeout_ms).await);
+            let client = http_client(probe_timeout_ms).ok();
+            let health_check = match &client {
+                Some(client) => check_health(client, &endpoints).await,
+                None => CheckReport {
+                    name: "health".into(),
+                    status: "fail".into(),
+                    message: "failed to build HTTP client".into(),
+                    details: None,
+                },
+            };
+            health_payload = health_payload_from_check(&health_check);
+            checks.push(health_check);
+            if let (Some(client), Some(readiness_url)) =
+                (&client, readiness_endpoint_from_health(&endpoints.health))
+            {
+                let readiness_check = check_readiness(client, &readiness_url).await;
+                readiness_payload = health_payload_from_check(&readiness_check);
+                checks.push(readiness_check);
+            }
         } else {
             checks.push(CheckReport {
                 name: "health".into(),
@@ -608,9 +701,25 @@ pub async fn doctor(
     }
 
     let ok = checks.iter().all(|check| check.status != "fail");
+    let config = redact_config(&to_persisted_config(&service));
+    let service_diagnostics = service_diagnostics(
+        &service,
+        &endpoints,
+        health_payload,
+        readiness_payload,
+        &index,
+    );
     Ok(DoctorReport {
-        config: service,
+        config,
+        config_diagnostics: ConfigDiagnostics {
+            path: resolved.config_path.clone(),
+            exists: resolved.config_file.is_some(),
+            precedence: CONFIG_PRECEDENCE.to_vec(),
+            sources: resolved.sources.clone(),
+        },
         endpoints: endpoint_report(&endpoints),
+        index,
+        service: service_diagnostics,
         checks,
         ok,
     })
@@ -651,12 +760,23 @@ pub async fn serve(resolved: &ResolvedRuntimeConfig) -> Result<ServeReport> {
             let service = ensure_service_transport_http(resolved.service.clone())?;
             let endpoints = build_service_endpoints(&service);
             let report = endpoint_report(&endpoints);
-            let _bootstrap = run_http_service(service).await?;
+            let mut bootstrap = run_http_service(service).await?;
             eprintln!(
                 "deep-obsidian-mcp native server running at {} (health={})",
                 report.mcp, report.health
             );
-            wait_for_shutdown_signal().await?;
+            tokio::select! {
+                shutdown = wait_for_shutdown_signal() => {
+                    shutdown?;
+                }
+                server_result = &mut bootstrap.server_handle => {
+                    match server_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Err(error.into()),
+                        Err(error) => return Err(anyhow!("HTTP server task failed: {error}")),
+                    }
+                }
+            }
             Ok(ServeReport {
                 message: format!(
                     "Rust native server stopped for {} (health={})",
@@ -690,6 +810,7 @@ async fn serve_stdio_native(config: &ResolvedServiceConfig) -> Result<ServeRepor
         endpoints: EndpointReport {
             mcp: "stdio".to_string(),
             health: "n/a".to_string(),
+            readiness: None,
         },
     })
 }
@@ -790,7 +911,20 @@ fn endpoint_report(endpoints: &ServiceEndpoints) -> EndpointReport {
     EndpointReport {
         mcp: endpoints.mcp.clone(),
         health: endpoints.health.clone(),
+        readiness: readiness_endpoint_from_health(&endpoints.health),
     }
+}
+
+fn index_sqlite_path(config: &ResolvedServiceConfig) -> PathBuf {
+    config.index_dir.join(INDEX_SQLITE_FILENAME)
+}
+
+fn readiness_endpoint_from_health(health_url: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(health_url).ok()?;
+    url.set_path("/readyz");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
 }
 
 async fn probe_health(client: &Client, url: &str) -> HealthProbeReport {
@@ -815,7 +949,8 @@ async fn probe_health(client: &Client, url: &str) -> HealthProbeReport {
                 }
             };
             let body = if content_type.contains("application/json") {
-                serde_json::from_str::<Value>(&body_text).unwrap_or_else(|_| Value::String(body_text))
+                serde_json::from_str::<Value>(&body_text)
+                    .unwrap_or_else(|_| Value::String(body_text))
             } else {
                 Value::String(body_text)
             };
@@ -1027,6 +1162,223 @@ async fn probe_mcp(client: &Client, url: &str) -> McpProbeReport {
     }
 }
 
+fn check_config(resolved: &ResolvedRuntimeConfig) -> CheckReport {
+    let source_details = serde_json::to_value(&resolved.sources).unwrap_or(Value::Null);
+    CheckReport {
+        name: "config".into(),
+        status: "ok".into(),
+        message: if resolved.config_file.is_some() {
+            "config file loaded; resolution precedence is cli > config > env > default".into()
+        } else {
+            "config file not found; using cli, environment, and defaults".into()
+        },
+        details: Some(serde_json::json!({
+            "path": &resolved.config_path,
+            "exists": resolved.config_file.is_some(),
+            "precedence": CONFIG_PRECEDENCE,
+            "sources": source_details,
+        })),
+    }
+}
+
+fn inspect_index(config: &ResolvedServiceConfig) -> IndexDiagnostics {
+    let path = index_sqlite_path(config);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return IndexDiagnostics {
+                path,
+                exists: false,
+                status: "warn".to_string(),
+                message: "index sqlite file does not exist yet".to_string(),
+                size_bytes: None,
+                schema_version: None,
+                user_version: None,
+                metadata: None,
+                note_rows: None,
+                chunk_rows: None,
+                file_snapshot_rows: None,
+            };
+        }
+        Err(error) => {
+            return IndexDiagnostics {
+                path,
+                exists: false,
+                status: "fail".to_string(),
+                message: format!("failed to read index sqlite metadata: {error}"),
+                size_bytes: None,
+                schema_version: None,
+                user_version: None,
+                metadata: None,
+                note_rows: None,
+                chunk_rows: None,
+                file_snapshot_rows: None,
+            };
+        }
+    };
+
+    let size_bytes = Some(metadata.len());
+    let connection = match Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return IndexDiagnostics {
+                path,
+                exists: true,
+                status: "fail".to_string(),
+                message: format!("failed to open index sqlite read-only: {error}"),
+                size_bytes,
+                schema_version: None,
+                user_version: None,
+                metadata: None,
+                note_rows: None,
+                chunk_rows: None,
+                file_snapshot_rows: None,
+            };
+        }
+    };
+
+    let schema_version = pragma_i64(&connection, "schema_version");
+    let user_version = pragma_i64(&connection, "user_version");
+    let index_metadata = read_index_metadata(&connection);
+    let note_rows = count_table_rows(&connection, "notes");
+    let chunk_rows = count_table_rows(&connection, "chunks");
+    let file_snapshot_rows = count_table_rows(&connection, "file_snapshots");
+
+    IndexDiagnostics {
+        path,
+        exists: true,
+        status: "ok".to_string(),
+        message: "index sqlite file is readable".to_string(),
+        size_bytes,
+        schema_version,
+        user_version,
+        metadata: index_metadata,
+        note_rows,
+        chunk_rows,
+        file_snapshot_rows,
+    }
+}
+
+fn check_index_file(index: &IndexDiagnostics) -> CheckReport {
+    CheckReport {
+        name: "index-sqlite".into(),
+        status: index.status.clone(),
+        message: index.message.clone(),
+        details: Some(serde_json::json!({
+            "path": &index.path,
+            "exists": index.exists,
+            "sizeBytes": index.size_bytes,
+            "schemaVersion": index.schema_version,
+            "userVersion": index.user_version,
+            "metadata": &index.metadata,
+            "noteRows": index.note_rows,
+            "chunkRows": index.chunk_rows,
+            "fileSnapshotRows": index.file_snapshot_rows,
+        })),
+    }
+}
+
+fn pragma_i64(connection: &Connection, name: &str) -> Option<i64> {
+    connection
+        .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+        .ok()
+}
+
+fn table_exists(connection: &Connection, table: &str) -> bool {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .is_ok()
+}
+
+fn count_table_rows(connection: &Connection, table: &str) -> Option<u64> {
+    if !table_exists(connection, table) {
+        return None;
+    }
+    connection
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .ok()
+        .and_then(|count| u64::try_from(count).ok())
+}
+
+fn read_index_metadata(connection: &Connection) -> Option<Value> {
+    if !table_exists(connection, "metadata") {
+        return None;
+    }
+
+    let mut statement = connection
+        .prepare("SELECT key, value FROM metadata ORDER BY key")
+        .ok()?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .ok()?;
+    let mut metadata = serde_json::Map::new();
+    for row in rows.flatten() {
+        let (key, value) = row;
+        if key.to_ascii_lowercase().contains("apikey") {
+            metadata.insert(key, Value::String("[redacted]".to_string()));
+        } else {
+            metadata.insert(key, Value::String(value));
+        }
+    }
+    Some(Value::Object(metadata))
+}
+
+fn health_payload_from_check(check: &CheckReport) -> Option<Value> {
+    check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("body"))
+        .cloned()
+}
+
+fn service_diagnostics(
+    config: &ResolvedServiceConfig,
+    endpoints: &ServiceEndpoints,
+    health_payload: Option<Value>,
+    readiness_payload: Option<Value>,
+    index: &IndexDiagnostics,
+) -> ServiceDiagnostics {
+    let last_refresh = health_payload
+        .as_ref()
+        .and_then(|payload| payload.get("generatedAt"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            index
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("generatedAt"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+    let last_error = health_payload
+        .as_ref()
+        .and_then(|payload| payload.get("error"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    ServiceDiagnostics {
+        auto_reindex: AutoReindexDiagnostics {
+            enabled: config.auto_reindex.enabled,
+            debounce_ms: config.auto_reindex.debounce_ms,
+            interval_ms: config.auto_reindex.interval_ms,
+        },
+        endpoint: endpoint_report(endpoints),
+        last_refresh,
+        last_error,
+        health: health_payload,
+        readiness: readiness_payload,
+    }
+}
+
 fn check_vault(config: &ResolvedServiceConfig) -> CheckReport {
     let resolved = match absolute_path(&config.vault_path) {
         Ok(path) => path,
@@ -1128,19 +1480,7 @@ fn check_port(config: &ResolvedServiceConfig) -> CheckReport {
     }
 }
 
-async fn check_health(endpoints: &ServiceEndpoints, timeout_ms: u64) -> CheckReport {
-    let client = match http_client(timeout_ms) {
-        Ok(client) => client,
-        Err(error) => {
-            return CheckReport {
-                name: "health".into(),
-                status: "fail".into(),
-                message: error.to_string(),
-                details: None,
-            };
-        }
-    };
-
+async fn check_health(client: &Client, endpoints: &ServiceEndpoints) -> CheckReport {
     match client.get(&endpoints.health).send().await {
         Ok(response) => {
             let status = response.status();
@@ -1152,7 +1492,8 @@ async fn check_health(endpoints: &ServiceEndpoints, timeout_ms: u64) -> CheckRep
                 .to_string();
             let body_text = response.text().await.unwrap_or_default();
             let body = if content_type.contains("application/json") {
-                serde_json::from_str::<Value>(&body_text).unwrap_or_else(|_| Value::String(body_text))
+                serde_json::from_str::<Value>(&body_text)
+                    .unwrap_or_else(|_| Value::String(body_text))
             } else {
                 Value::String(body_text)
             };
@@ -1187,6 +1528,50 @@ async fn check_health(endpoints: &ServiceEndpoints, timeout_ms: u64) -> CheckRep
     }
 }
 
+async fn check_readiness(client: &Client, url: &str) -> CheckReport {
+    match client.get(url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let body_text = response.text().await.unwrap_or_default();
+            let body = if content_type.contains("application/json") {
+                serde_json::from_str::<Value>(&body_text)
+                    .unwrap_or_else(|_| Value::String(body_text))
+            } else {
+                Value::String(body_text)
+            };
+            CheckReport {
+                name: "readiness".into(),
+                status: if status.is_success() { "ok" } else { "warn" }.into(),
+                message: if status.is_success() {
+                    "readiness endpoint responded successfully".into()
+                } else {
+                    format!("readiness endpoint returned status {}", status.as_u16())
+                },
+                details: Some(serde_json::json!({
+                    "url": url,
+                    "status": status.as_u16(),
+                    "body": body,
+                })),
+            }
+        }
+        Err(error) => CheckReport {
+            name: "readiness".into(),
+            status: "warn".into(),
+            message: error.to_string(),
+            details: Some(serde_json::json!({
+                "url": url,
+                "error": error.to_string(),
+            })),
+        },
+    }
+}
+
 fn http_client(timeout_ms: u64) -> Result<Client> {
     Client::builder()
         .timeout(std::time::Duration::from_millis(timeout_ms))
@@ -1206,17 +1591,63 @@ fn redact_config(config: &PersistedServiceConfig) -> PersistedServiceConfig {
 
 fn render_doctor_report(report: &DoctorReport) -> String {
     let mut output = String::new();
-    let config_file_path = report
+    let vault = report
         .config
-        .config_file_path
+        .vault_path
         .as_ref()
         .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "(none)".to_string());
-    let _ = writeln!(&mut output, "config: {}", config_file_path);
-    let _ = writeln!(&mut output, "vault: {}", report.config.vault_path.display());
-    let _ = writeln!(&mut output, "transport: {}", serde_json::to_string(&report.config.transport).unwrap_or_else(|_| "\"stdio\"".to_string()).trim_matches('"'));
+        .unwrap_or_else(|| "(missing)".to_string());
+    let transport = report
+        .config
+        .transport
+        .map(|transport| {
+            serde_json::to_string(&transport)
+                .unwrap_or_else(|_| "\"stdio\"".to_string())
+                .trim_matches('"')
+                .to_string()
+        })
+        .unwrap_or_else(|| "(missing)".to_string());
+    let index_size = report
+        .index
+        .size_bytes
+        .map(|bytes| bytes.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let _ = writeln!(
+        &mut output,
+        "config: {} ({})",
+        report.config_diagnostics.path.display(),
+        if report.config_diagnostics.exists {
+            "found"
+        } else {
+            "not found"
+        }
+    );
+    let _ = writeln!(
+        &mut output,
+        "config precedence: cli > config > env > default"
+    );
+    let _ = writeln!(&mut output, "vault: {}", vault);
+    let _ = writeln!(&mut output, "index sqlite: {}", report.index.path.display());
+    let _ = writeln!(&mut output, "index size bytes: {}", index_size);
+    let _ = writeln!(&mut output, "transport: {}", transport);
     let _ = writeln!(&mut output, "mcp endpoint: {}", report.endpoints.mcp);
     let _ = writeln!(&mut output, "health endpoint: {}", report.endpoints.health);
+    if let Some(readiness) = &report.endpoints.readiness {
+        let _ = writeln!(&mut output, "readiness endpoint: {}", readiness);
+    }
+    let _ = writeln!(
+        &mut output,
+        "auto reindex: {} (debounce={}ms interval={}ms)",
+        report.service.auto_reindex.enabled,
+        report.service.auto_reindex.debounce_ms,
+        report.service.auto_reindex.interval_ms
+    );
+    if let Some(last_refresh) = &report.service.last_refresh {
+        let _ = writeln!(&mut output, "last refresh: {}", last_refresh);
+    }
+    if let Some(last_error) = &report.service.last_error {
+        let _ = writeln!(&mut output, "last error: {}", last_error);
+    }
     let _ = writeln!(&mut output);
     for check in &report.checks {
         let _ = writeln!(
@@ -1235,6 +1666,9 @@ fn render_setup_service_report(report: &SetupServiceReport) -> String {
     }
     let _ = writeln!(&mut output, "mcp endpoint: {}", report.endpoints.mcp);
     let _ = writeln!(&mut output, "health endpoint: {}", report.endpoints.health);
+    if let Some(readiness) = &report.endpoints.readiness {
+        let _ = writeln!(&mut output, "readiness endpoint: {}", readiness);
+    }
     output.trim_end().to_string()
 }
 
@@ -1259,7 +1693,50 @@ fn render_probe_report(report: &ProbeReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_cli_args;
+    use super::{inspect_index, normalize_cli_args, redact_config, INDEX_SQLITE_FILENAME};
+    use deep_obsidian_types::{
+        AutoReindexConfig, EmbeddingConfig, EmbeddingConfigInput, HttpConfig,
+        PersistedServiceConfig, ResolvedServiceConfig, StdioMode, TransportMode,
+    };
+    use rusqlite::Connection;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "deep-obsidian-commands-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn resolved_config(vault_path: &Path, index_dir: &Path) -> ResolvedServiceConfig {
+        ResolvedServiceConfig {
+            vault_path: vault_path.to_path_buf(),
+            index_dir: index_dir.to_path_buf(),
+            transport: TransportMode::Http,
+            stdio_mode: StdioMode::Auto,
+            http: HttpConfig {
+                host: "127.0.0.1".to_string(),
+                port: 4100,
+                mcp_path: "/mcp".to_string(),
+                health_path: "/healthz".to_string(),
+            },
+            auto_reindex: AutoReindexConfig {
+                enabled: true,
+                debounce_ms: 1500,
+                interval_ms: 30000,
+            },
+            embedding: EmbeddingConfig::default(),
+            config_file_path: None,
+        }
+    }
 
     #[test]
     fn normalize_cli_args_maps_boolean_assignment_flags() {
@@ -1326,10 +1803,68 @@ mod tests {
         let normalized = normalize_cli_args(&args).expect("normalize args");
         assert_eq!(
             normalized,
-            vec![
-                "--vault".to_string(),
-                "tests/fixtures/vault".to_string(),
-            ]
+            vec!["--vault".to_string(), "tests/fixtures/vault".to_string(),]
+        );
+    }
+
+    #[test]
+    fn redact_config_removes_inline_embedding_secret() {
+        let config = PersistedServiceConfig {
+            embedding: Some(EmbeddingConfigInput {
+                api_key: Some("super-secret".to_string()),
+                api_key_env: Some("OPENAI_API_KEY".to_string()),
+                ..EmbeddingConfigInput::default()
+            }),
+            ..PersistedServiceConfig::default()
+        };
+
+        let redacted = redact_config(&config);
+        let serialized = serde_json::to_string(&redacted).expect("serialize redacted config");
+
+        assert!(!serialized.contains("super-secret"));
+        assert!(serialized.contains("[redacted]"));
+        assert!(serialized.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn inspect_index_reports_sqlite_metadata_without_loading_vault() {
+        let root = unique_temp_dir("index-diagnostics");
+        let vault = root.join("vault");
+        let index_dir = root.join("index");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::create_dir_all(&index_dir).expect("create index dir");
+        let index_path = index_dir.join(INDEX_SQLITE_FILENAME);
+        let connection = Connection::open(&index_path).expect("open sqlite");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE notes (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+                CREATE TABLE chunks (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+                CREATE TABLE file_snapshots (path TEXT PRIMARY KEY, mtime_ms INTEGER NOT NULL, size INTEGER NOT NULL);
+                INSERT INTO metadata (key, value) VALUES ('version', '2');
+                INSERT INTO metadata (key, value) VALUES ('generatedAt', '2026-05-05T00:00:00Z');
+                INSERT INTO notes (id, path) VALUES (1, 'A.md');
+                INSERT INTO chunks (id, path) VALUES (1, 'A.md');
+                INSERT INTO file_snapshots (path, mtime_ms, size) VALUES ('A.md', 1, 10);
+                "#,
+            )
+            .expect("seed sqlite");
+
+        let diagnostics = inspect_index(&resolved_config(&vault, &index_dir));
+
+        assert!(diagnostics.exists);
+        assert_eq!(diagnostics.status, "ok");
+        assert_eq!(diagnostics.note_rows, Some(1));
+        assert_eq!(diagnostics.chunk_rows, Some(1));
+        assert_eq!(diagnostics.file_snapshot_rows, Some(1));
+        assert_eq!(
+            diagnostics
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("version"))
+                .and_then(serde_json::Value::as_str),
+            Some("2")
         );
     }
 }

@@ -112,10 +112,13 @@ fn is_protected_template_segment(segment: &str) -> bool {
 
 fn ensure_writable_vault_relative_path(relative_path: &str) -> Result<(), VaultError> {
     let normalized = normalize_vault_relative_path(relative_path)?;
-    if Path::new(&normalized).components().any(|component| match component {
-        Component::Normal(part) => is_protected_template_segment(&part.to_string_lossy()),
-        _ => false,
-    }) {
+    if Path::new(&normalized)
+        .components()
+        .any(|component| match component {
+            Component::Normal(part) => is_protected_template_segment(&part.to_string_lossy()),
+            _ => false,
+        })
+    {
         return Err(VaultError::ProtectedWritePath(relative_path.to_string()));
     }
     Ok(())
@@ -336,12 +339,10 @@ pub fn list_children(
         });
     }
 
-    entries.sort_by(|left, right| {
-        match (&left.kind, &right.kind) {
-            (VaultEntryKind::Directory, VaultEntryKind::File) => std::cmp::Ordering::Less,
-            (VaultEntryKind::File, VaultEntryKind::Directory) => std::cmp::Ordering::Greater,
-            _ => left.path.cmp(&right.path),
-        }
+    entries.sort_by(|left, right| match (&left.kind, &right.kind) {
+        (VaultEntryKind::Directory, VaultEntryKind::File) => std::cmp::Ordering::Less,
+        (VaultEntryKind::File, VaultEntryKind::Directory) => std::cmp::Ordering::Greater,
+        _ => left.path.cmp(&right.path),
     });
     Ok(entries)
 }
@@ -572,16 +573,21 @@ mod tests {
         let result = write_binary_file(&vault, "Assets/data.bin", &[0, 1, 2, 3]).unwrap();
         assert!(result.created);
         assert_eq!(result.bytes_written, 4);
-        assert_eq!(fs::read(vault.join("Assets/data.bin")).unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            fs::read(vault.join("Assets/data.bin")).unwrap(),
+            vec![0, 1, 2, 3]
+        );
     }
 
     #[test]
     fn write_text_file_rejects_template_folder_writes() {
         let vault = temp_dir("vault-template-write-blocked");
         fs::create_dir_all(vault.join("Templates")).unwrap();
-        let error =
-            write_text_file(&vault, "Templates/Note.md", "content").expect_err("template write should fail");
-        assert!(matches!(error, VaultError::ProtectedWritePath(path) if path == "Templates/Note.md"));
+        let error = write_text_file(&vault, "Templates/Note.md", "content")
+            .expect_err("template write should fail");
+        assert!(
+            matches!(error, VaultError::ProtectedWritePath(path) if path == "Templates/Note.md")
+        );
     }
 
     #[test]
@@ -590,7 +596,9 @@ mod tests {
         fs::create_dir_all(vault.join("Notes/Templates")).unwrap();
         let error = write_binary_file(&vault, "Notes/Templates/data.bin", &[1, 2, 3])
             .expect_err("nested template write should fail");
-        assert!(matches!(error, VaultError::ProtectedWritePath(path) if path == "Notes/Templates/data.bin"));
+        assert!(
+            matches!(error, VaultError::ProtectedWritePath(path) if path == "Notes/Templates/data.bin")
+        );
     }
 
     #[test]

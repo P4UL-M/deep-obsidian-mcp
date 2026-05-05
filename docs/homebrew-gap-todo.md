@@ -12,24 +12,26 @@ This document tracks what is still missing before `deep-obsidian-mcp` can be tre
 - [ ] Decide whether the formula installs from source with Cargo or from a prebuilt release artifact.
 - [ ] Document the supported macOS architectures and the bottle strategy.
 
-## Missing Service Validation
+## Service Validation
 
-- [ ] Validate `brew services start deep-obsidian-mcp` against the packaged binary, not the checkout script flow.
-- [ ] Confirm the service starts with a config file only and does not rely on shell-only environment setup.
+- [x] Formula service runs the packaged binary with `serve --packaged --transport http`.
+- [x] Formula service sets `DEEP_OBSIDIAN_PACKAGED=1` so default indexes stay outside the vault.
+- [x] Predictable Homebrew log paths are declared under `var/log/deep-obsidian-mcp/`.
+- [ ] Validate `brew services start deep-obsidian-mcp` from an installed tap on a clean machine.
 - [ ] Validate stop, restart, and upgrade behavior with a persisted config and an existing SQLite index.
-- [ ] Confirm predictable log paths and retention behavior under Homebrew service management.
 
-## Missing User Experience Decisions
+## User Experience Decisions
 
-- [ ] Finalize the default config location for a Homebrew install and document it as stable.
-- [ ] Finalize the default index location for packaged installs and document ownership and writability expectations.
+- [x] Default config location remains `~/.config/deep-obsidian-mcp/config.json`.
+- [x] Packaged default index location is `~/Library/Application Support/deep-obsidian-mcp/indexes/<vault-hash>`.
+- [x] Packaged mode is explicit through `--packaged` or `DEEP_OBSIDIAN_PACKAGED=1`.
 - [ ] Decide how embedding credentials should be supplied for `brew services` users.
 - [ ] Document the upgrade path when the config schema changes.
 - [ ] Document uninstall behavior, especially whether config, logs, and index data are preserved or removed.
 
-## Missing Formula Hardening
+## Formula Hardening
 
-- [ ] Replace the placeholder formula test with a real smoke test against the packaged binary.
+- [x] Formula smoke test exercises the installed binary with `help` and `version`.
 - [ ] Decide whether `ripgrep` remains a runtime dependency or becomes an optional degraded-mode dependency.
 - [ ] Confirm the formula versioning and release/tagging policy.
 - [ ] Decide where any packaged examples or config templates should live, if any.

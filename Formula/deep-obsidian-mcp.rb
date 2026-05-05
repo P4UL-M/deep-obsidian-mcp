@@ -15,27 +15,38 @@ class DeepObsidianMcp < Formula
   def install
     # TODO: switch to the released source or bottle artifact once packaging is finalized.
     system "cargo", "install", *std_cargo_args(path: "rust/crates/deep-obsidian-cli")
+    pkgshare.install "skills"
+    (var/"log/deep-obsidian-mcp").mkpath
   end
 
   def caveats
     <<~EOS
-      This formula is still scaffolding.
-      The service commands exist, but Homebrew packaging is not complete until the project ships:
-      - a real release artifact and checksum
-      - validated brew service install/start/upgrade coverage
-      - finalized config and log path expectations
+      Configure the service before starting it:
+        deep-obsidian-mcp setup-service --vault ~/Vault
+
+      Then start and validate:
+        brew services start deep-obsidian-mcp
+        deep-obsidian-mcp doctor
+        curl -fsS http://127.0.0.1:4100/readyz
+
+      Homebrew services run in packaged mode, so default indexes live outside the vault under:
+        ~/Library/Application Support/deep-obsidian-mcp/indexes/<vault-hash>
+
+      Agent skill templates are installed under:
+        #{opt_pkgshare}/skills
     EOS
   end
 
   service do
-    run [opt_bin/"deep-obsidian-mcp", "serve"]
+    run [opt_bin/"deep-obsidian-mcp", "serve", "--packaged", "--transport", "http"]
     keep_alive true
+    environment_variables DEEP_OBSIDIAN_PACKAGED: "1"
     log_path var/"log/deep-obsidian-mcp/output.log"
     error_log_path var/"log/deep-obsidian-mcp/error.log"
   end
 
   test do
-    # TODO: replace with a real packaged-binary smoke test once release artifacts exist.
     assert_match "Usage:", shell_output("#{bin}/deep-obsidian-mcp help")
+    assert_match "deep-obsidian-mcp", shell_output("#{bin}/deep-obsidian-mcp version")
   end
 end

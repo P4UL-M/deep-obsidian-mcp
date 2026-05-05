@@ -8,8 +8,7 @@ use crate::protocol::JsonRpcRequest;
 use crate::runtime::RuntimeState;
 
 fn parse_json_message(payload: &str) -> io::Result<JsonRpcRequest> {
-    serde_json::from_str(payload)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    serde_json::from_str(payload).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn detect_input_mode(buffer: &[u8]) -> Option<StdioMode> {
@@ -31,7 +30,9 @@ fn read_newline_message(buffer: &mut Vec<u8>) -> io::Result<Option<JsonRpcReques
     let Some(newline_index) = buffer.iter().position(|byte| *byte == b'\n') else {
         return Ok(None);
     };
-    let line = String::from_utf8_lossy(&buffer[..newline_index]).trim_end_matches('\r').to_string();
+    let line = String::from_utf8_lossy(&buffer[..newline_index])
+        .trim_end_matches('\r')
+        .to_string();
     buffer.drain(..=newline_index);
     if line.trim().is_empty() {
         return Ok(None);
@@ -57,8 +58,9 @@ fn read_framed_message(buffer: &mut Vec<u8>) -> io::Result<Option<JsonRpcRequest
             }
         }
     }
-    let content_length = content_length
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header"))?;
+    let content_length = content_length.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
+    })?;
     let body_start = header_end + separator_length;
     let body_end = body_start + content_length;
     if buffer.len() < body_end {
@@ -74,7 +76,12 @@ fn send_message(stdout: &mut impl Write, message: &Value, mode: StdioMode) -> io
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     match mode {
         StdioMode::Framed => {
-            write!(stdout, "Content-Length: {}\r\n\r\n{}", serialized.len(), serialized)?;
+            write!(
+                stdout,
+                "Content-Length: {}\r\n\r\n{}",
+                serialized.len(),
+                serialized
+            )?;
         }
         _ => {
             writeln!(stdout, "{serialized}")?;
@@ -128,7 +135,12 @@ pub async fn run_stdio_service(config: ResolvedServiceConfig) -> io::Result<()> 
 
             let response = handle_request(state.clone(), message)
                 .await
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, serde_json::to_string(&error).unwrap_or_else(|_| error.error.message)))?;
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        serde_json::to_string(&error).unwrap_or_else(|_| error.error.message),
+                    )
+                })?;
             if let Some(response) = response {
                 send_message(&mut stdout, &response, output_mode)?;
             }

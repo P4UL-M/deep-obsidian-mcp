@@ -48,7 +48,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     let resolved = normalize_service_config(input)?;
-    let _bootstrap = run_http_service(resolved).await?;
-    tokio::signal::ctrl_c().await?;
+    let mut bootstrap = run_http_service(resolved).await?;
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+        }
+        server_result = &mut bootstrap.server_handle => {
+            match server_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error.into()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     Ok(())
 }

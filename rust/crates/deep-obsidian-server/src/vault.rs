@@ -4,7 +4,13 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
-const DEFAULT_IGNORED_DIRS: &[&str] = &[".git", ".obsidian", ".trash", ".deep-obsidian-mcp", "node_modules"];
+const DEFAULT_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    ".obsidian",
+    ".trash",
+    ".deep-obsidian-mcp",
+    "node_modules",
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VaultInfo {
@@ -48,7 +54,8 @@ pub enum VaultError {
 }
 
 pub fn ensure_vault_path(vault_path: &Path) -> Result<(), VaultError> {
-    let metadata = fs::metadata(vault_path).map_err(|_| VaultError::InvalidVaultPath(vault_path.to_path_buf()))?;
+    let metadata = fs::metadata(vault_path)
+        .map_err(|_| VaultError::InvalidVaultPath(vault_path.to_path_buf()))?;
     if !metadata.is_dir() {
         return Err(VaultError::InvalidVaultPath(vault_path.to_path_buf()));
     }
@@ -58,7 +65,9 @@ pub fn ensure_vault_path(vault_path: &Path) -> Result<(), VaultError> {
 pub fn ensure_inside_vault(vault_path: &Path, relative_path: &str) -> Result<PathBuf, VaultError> {
     let normalized = relative_path.trim_start_matches('/');
     if normalized.is_empty() {
-        return Err(VaultError::InvalidVaultRelativePath(relative_path.to_string()));
+        return Err(VaultError::InvalidVaultRelativePath(
+            relative_path.to_string(),
+        ));
     }
 
     let relative = Path::new(normalized);
@@ -112,7 +121,11 @@ fn is_markdown_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn walk_markdown_files(root: &Path, current: &Path, files: &mut Vec<String>) -> Result<(), VaultError> {
+fn walk_markdown_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<String>,
+) -> Result<(), VaultError> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
