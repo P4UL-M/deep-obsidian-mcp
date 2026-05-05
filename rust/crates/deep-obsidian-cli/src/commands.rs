@@ -30,14 +30,14 @@ const CONFIG_PRECEDENCE: [&str; 4] = ["cli", "config", "env", "default"];
 const HELP_TEXT: &str = "\
 Usage:
   deep-obsidian-mcp [serve] [--config <path>] [--vault <path>] [--transport stdio|http] [--packaged]
-  deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--dry-run]
+  deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--dry-run]
   deep-obsidian-mcp doctor [--config <path>] [--json]
   deep-obsidian-mcp print-config [--config <path>]
   deep-obsidian-mcp probe [--config <path>] [--json]
 
 Commands:
   serve          Start the MCP server using resolved config.
-  setup-service  Validate service config and optionally install MCP client entries or skills.
+  setup-service  Validate service config and optionally install MCP client entries, skills, or vault snippets.
   doctor         Diagnose config, vault access, dependencies, and health.
   print-config   Print the normalized persisted config.
   probe          Probe the configured HTTP health and MCP endpoints.
@@ -119,6 +119,7 @@ pub struct SetupServiceReport {
     pub messages: Vec<String>,
     pub mcp: Vec<SetupActionReport>,
     pub skills: Vec<SetupActionReport>,
+    pub vault_snippets: Vec<SetupActionReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -235,9 +236,10 @@ pub async fn run() -> Result<()> {
             overwrite,
             mcp,
             skills,
+            vault_snippets,
         } => {
             let resolved = crate::config::resolve_runtime_config(&cli.options)?;
-            let report = setup_service(&resolved, dry_run, overwrite, mcp, skills)?;
+            let report = setup_service(&resolved, dry_run, overwrite, mcp, skills, vault_snippets)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -590,6 +592,7 @@ pub fn setup_service(
     overwrite: bool,
     install_mcp: bool,
     install_skills: bool,
+    install_vault_snippets: bool,
 ) -> Result<SetupServiceReport> {
     let mut service = ensure_service_transport_http(resolved.service.clone())?;
     service.vault_path = absolute_path(&service.vault_path)?;
@@ -623,6 +626,11 @@ pub fn setup_service(
         } else {
             Vec::new()
         };
+        let vault_snippets = if install_vault_snippets {
+            setup_vault_snippets(&service.vault_path, true, overwrite)?
+        } else {
+            Vec::new()
+        };
         return Ok(SetupServiceReport {
             config_file_path: config_path,
             written: false,
@@ -637,6 +645,7 @@ pub fn setup_service(
             ],
             mcp,
             skills,
+            vault_snippets,
         });
     }
 
@@ -645,7 +654,7 @@ pub fn setup_service(
     let mut wrote_config = false;
     let mut final_messages = messages.clone();
     if config_path.exists() && !overwrite {
-        if !(install_mcp || install_skills) {
+        if !(install_mcp || install_skills || install_vault_snippets) {
             return Err(anyhow!(
                 "config file already exists: {}",
                 config_path.display()
@@ -672,6 +681,11 @@ pub fn setup_service(
     } else {
         Vec::new()
     };
+    let vault_snippets = if install_vault_snippets {
+        setup_vault_snippets(&service.vault_path, false, overwrite)?
+    } else {
+        Vec::new()
+    };
 
     Ok(SetupServiceReport {
         config_file_path: config_path.clone(),
@@ -682,6 +696,7 @@ pub fn setup_service(
         messages: final_messages,
         mcp,
         skills,
+        vault_snippets,
     })
 }
 
@@ -864,6 +879,132 @@ fn setup_agent_skills(dry_run: bool, overwrite: bool) -> Result<Vec<SetupActionR
     ])
 }
 
+fn setup_vault_snippets(
+    vault_path: &Path,
+    dry_run: bool,
+    overwrite: bool,
+) -> Result<Vec<SetupActionReport>> {
+    let source_dir = packaged_obsidian_snippets_dir()?;
+    Ok(vec![install_vault_snippets_for_target(
+        vault_path,
+        &source_dir,
+        dry_run,
+        overwrite,
+    )?])
+}
+
+fn install_vault_snippets_for_target(
+    vault_path: &Path,
+    source_dir: &Path,
+    dry_run: bool,
+    overwrite: bool,
+) -> Result<SetupActionReport> {
+    let snippets = packaged_snippet_files(source_dir)?;
+    let snippets_dir = vault_path.join(".obsidian").join("snippets");
+    let appearance_path = vault_path.join(".obsidian").join("appearance.json");
+    let snippet_names = snippets
+        .iter()
+        .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if dry_run {
+        assert_creatable_directory(&snippets_dir)?;
+        return Ok(SetupActionReport {
+            target: "vault snippets".into(),
+            path: Some(snippets_dir),
+            changed: false,
+            status: "dry-run".into(),
+            message: format!(
+                "would install and enable {} Obsidian CSS snippets: {}",
+                snippet_names.len(),
+                snippet_names.join(", ")
+            ),
+        });
+    }
+
+    ensure_writable_directory(&snippets_dir)?;
+    let mut installed = 0usize;
+    let mut skipped = 0usize;
+    for source in snippets {
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| anyhow!("invalid snippet path: {}", source.display()))?;
+        let destination = snippets_dir.join(file_name);
+        if destination.exists() && !overwrite {
+            skipped += 1;
+            continue;
+        }
+        fs::copy(&source, &destination).with_context(|| {
+            format!(
+                "failed to copy snippet {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        installed += 1;
+    }
+    let enabled = enable_obsidian_snippets(&appearance_path, &snippet_names)?;
+
+    Ok(SetupActionReport {
+        target: "vault snippets".into(),
+        path: Some(snippets_dir),
+        changed: installed > 0 || enabled > 0,
+        status: "ok".into(),
+        message: format!(
+            "installed {installed} snippets, skipped {skipped} existing snippets, enabled {enabled} snippets"
+        ),
+    })
+}
+
+fn enable_obsidian_snippets(appearance_path: &Path, snippet_names: &[String]) -> Result<usize> {
+    let existing = fs::read_to_string(appearance_path).unwrap_or_default();
+    let mut appearance = if existing.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(&existing)
+            .with_context(|| format!("failed to parse {}", appearance_path.display()))?
+    };
+    let object = appearance.as_object_mut().ok_or_else(|| {
+        anyhow!(
+            "Obsidian appearance config must be a JSON object: {}",
+            appearance_path.display()
+        )
+    })?;
+
+    let snippets = object
+        .entry("enabledCssSnippets".to_string())
+        .or_insert_with(|| json!([]));
+    let snippets = snippets.as_array_mut().ok_or_else(|| {
+        anyhow!(
+            "Obsidian appearance key `enabledCssSnippets` must be an array: {}",
+            appearance_path.display()
+        )
+    })?;
+
+    let mut enabled = 0usize;
+    for name in snippet_names {
+        if !snippets
+            .iter()
+            .any(|value| value.as_str().is_some_and(|existing| existing == name))
+        {
+            snippets.push(Value::String(name.clone()));
+            enabled += 1;
+        }
+    }
+
+    if enabled == 0 {
+        return Ok(0);
+    }
+
+    if let Some(parent) = appearance_path.parent() {
+        ensure_writable_directory(parent)?;
+    }
+    fs::write(appearance_path, serde_json::to_string_pretty(&appearance)?)
+        .with_context(|| format!("failed to write {}", appearance_path.display()))?;
+    Ok(enabled)
+}
+
 fn install_skills_for_target(
     target: &str,
     source_dir: &Path,
@@ -941,6 +1082,32 @@ fn packaged_skill_names(source_dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
+fn packaged_snippet_files(source_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(source_dir).with_context(|| {
+        format!(
+            "failed to read snippets directory: {}",
+            source_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("css")
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        return Err(anyhow!(
+            "no packaged Obsidian snippets found under {}",
+            source_dir.display()
+        ));
+    }
+    Ok(files)
+}
+
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)
         .with_context(|| format!("failed to create directory: {}", destination.display()))?;
@@ -998,6 +1165,42 @@ fn packaged_skills_dir() -> Result<PathBuf> {
 
     Err(anyhow!(
         "packaged skills directory not found; set DEEP_OBSIDIAN_SKILLS_DIR"
+    ))
+}
+
+fn packaged_obsidian_snippets_dir() -> Result<PathBuf> {
+    if let Ok(path) = env::var("DEEP_OBSIDIAN_SNIPPETS_DIR") {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return Ok(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push(env::current_dir()?.join("obsidian-snippets"));
+    if let Ok(exe) = env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            candidates.push(bin_dir.join("../share/deep-obsidian-mcp/obsidian-snippets"));
+            candidates.push(bin_dir.join("../share/obsidian-snippets"));
+        }
+        if let Some(prefix) = exe.parent().and_then(Path::parent) {
+            candidates.push(prefix.join("share/deep-obsidian-mcp/obsidian-snippets"));
+        }
+    }
+
+    for candidate in candidates {
+        let candidate = absolute_path(&candidate)?;
+        if candidate.is_dir()
+            && !packaged_snippet_files(&candidate)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "packaged Obsidian snippets directory not found; set DEEP_OBSIDIAN_SNIPPETS_DIR"
     ))
 }
 
@@ -2059,7 +2262,12 @@ fn render_setup_service_report(report: &SetupServiceReport) -> String {
     if let Some(readiness) = &report.endpoints.readiness {
         let _ = writeln!(&mut output, "readiness endpoint: {}", readiness);
     }
-    for action in report.mcp.iter().chain(report.skills.iter()) {
+    for action in report
+        .mcp
+        .iter()
+        .chain(report.skills.iter())
+        .chain(report.vault_snippets.iter())
+    {
         let path = action
             .path
             .as_ref()
@@ -2095,7 +2303,10 @@ fn render_probe_report(report: &ProbeReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{inspect_index, normalize_cli_args, redact_config, INDEX_SQLITE_FILENAME};
+    use super::{
+        enable_obsidian_snippets, inspect_index, normalize_cli_args, redact_config,
+        INDEX_SQLITE_FILENAME,
+    };
     use deep_obsidian_types::{
         AutoReindexConfig, EmbeddingConfig, EmbeddingConfigInput, HttpConfig,
         PersistedServiceConfig, ResolvedServiceConfig, StdioMode, TransportMode,
@@ -2268,5 +2479,37 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("2")
         );
+    }
+
+    #[test]
+    fn enable_obsidian_snippets_preserves_existing_and_adds_missing_names() {
+        let root = unique_temp_dir("appearance-snippets");
+        let appearance_path = root.join(".obsidian").join("appearance.json");
+        fs::create_dir_all(appearance_path.parent().expect("appearance parent"))
+            .expect("create appearance dir");
+        fs::write(
+            &appearance_path,
+            r#"{"theme":"obsidian","enabledCssSnippets":["templates"]}"#,
+        )
+        .expect("write appearance");
+
+        let enabled = enable_obsidian_snippets(
+            &appearance_path,
+            &[
+                "templates".to_string(),
+                "hide-agent-wiki-folders".to_string(),
+            ],
+        )
+        .expect("enable snippets");
+
+        assert_eq!(enabled, 1);
+        let appearance: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&appearance_path).expect("read appearance"))
+                .expect("parse appearance");
+        assert_eq!(
+            appearance["enabledCssSnippets"],
+            serde_json::json!(["templates", "hide-agent-wiki-folders"])
+        );
+        assert_eq!(appearance["theme"], "obsidian");
     }
 }

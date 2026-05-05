@@ -9,7 +9,7 @@ The Rust implementation exposes the service-oriented commands needed for this wo
 ```bash
 brew tap <tap-name>
 brew install deep-obsidian-mcp
-deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills
+deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
 brew services start deep-obsidian-mcp
 deep-obsidian-mcp doctor
 ```
@@ -28,6 +28,7 @@ curl -fsS http://127.0.0.1:4100/readyz
 - `setup-service` persists the resolved vault and service settings to a stable config file.
 - `setup-service --mcp` also configures local coding-agent MCP clients: Codex through `~/.codex/config.toml`, and Claude Code through `claude mcp add` when the `claude` CLI is available.
 - `setup-service --skills` installs packaged skills into `~/.codex/skills` and `~/.claude/skills`.
+- `setup-service --vault-snippets` installs packaged Obsidian CSS snippets into `<vault>/.obsidian/snippets` and enables them in `<vault>/.obsidian/appearance.json`.
 - `doctor` checks the vault path, config file, writable index directory, local SQLite index diagnostics, `rg` availability, port availability, and a running health endpoint when one is available.
 - `print-config` shows the normalized resolved config so the user can see what the service will actually read.
 - `probe` performs a minimal health or MCP connectivity check.
@@ -119,6 +120,6 @@ Readiness is the packaging gate: `/healthz` can be healthy while the index is st
 
 The existing `scripts/install-launchd-service.sh` and `scripts/run-http-service.sh` now delegate to the same `serve` command and are still useful for local development, but they are not the target product workflow.
 
-The formula in `Formula/deep-obsidian-mcp.rb` installs the CLI, installs packaged agent skills under `pkgshare/skills`, creates the Homebrew log directory, runs `serve --packaged --transport http`, sets `DEEP_OBSIDIAN_PACKAGED=1`, and validates the packaged binary with `help` and `version` smoke tests. Users can then run `setup-service --mcp --skills` to install the MCP client entries and agent skills from the packaged assets.
+The formula in `Formula/deep-obsidian-mcp.rb` installs the CLI, installs packaged agent skills under `pkgshare/skills`, installs packaged Obsidian CSS snippets under `pkgshare/obsidian-snippets`, creates the Homebrew log directory, runs `serve --packaged --transport http`, sets `DEEP_OBSIDIAN_PACKAGED=1`, and validates the packaged binary with `help` and `version` smoke tests. Users can then run `setup-service --mcp --skills --vault-snippets` to install the MCP client entries, agent skills, and vault snippets from the packaged assets.
 
 Current packaging gaps are tracked in [docs/homebrew-gap-todo.md](./homebrew-gap-todo.md).

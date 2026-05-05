@@ -1,0 +1,6 @@
+div[data-path="_Agent"],
+div[data-path="_Agent"] + div.nav-folder-children,
+div[data-path="_Wiki"],
+div[data-path="_Wiki"] + div.nav-folder-children {
+  display: none;
+}

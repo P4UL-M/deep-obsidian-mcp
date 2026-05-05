@@ -127,22 +127,23 @@ Available commands:
 3. environment variables
 4. defaults
 
-Use `--mcp` and `--skills` during setup to connect local coding agents at the same time:
+Use `--mcp`, `--skills`, and `--vault-snippets` during setup to connect local coding agents and install the packaged Obsidian UI helpers at the same time:
 
 ```bash
-deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills
+deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
 ```
 
 - `--mcp` configures Codex in `~/.codex/config.toml` and, when the `claude` CLI is available, runs `claude mcp add --transport http --scope user deep-obsidian <mcp-url>`.
 - `--skills` installs packaged skills into `~/.codex/skills` and `~/.claude/skills`.
+- `--vault-snippets` installs packaged Obsidian CSS snippets into `<vault>/.obsidian/snippets` and enables them in `<vault>/.obsidian/appearance.json`.
 - `--dry-run` validates and reports these changes without writing them.
-- `--overwrite` replaces an existing service config, Codex MCP entry, Claude MCP entry, or installed skill directories.
+- `--overwrite` replaces an existing service config, Codex MCP entry, Claude MCP entry, installed skill directories, or installed vault snippets.
 
 Example flow from the source tree:
 
 ```bash
 cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp
-./bin/deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills
+./bin/deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
 ./bin/deep-obsidian-mcp doctor
 ./bin/deep-obsidian-mcp serve
 ```
@@ -163,7 +164,9 @@ Packaged agent skill templates live in [skills](./skills) for operational workfl
 - `obsidian-capture-session`
 - `obsidian-knowledge-maintenance`
 
-Homebrew installs packaged skills under the formula `pkgshare/skills` directory, while source users can copy or symlink the relevant `SKILL.md` files into their agent skill directory.
+Packaged Obsidian CSS snippets live in [obsidian-snippets](./obsidian-snippets). The default snippet hides `_Agent` and `_Wiki` from the Obsidian file explorer while keeping those folders available to Deep Obsidian through MCP.
+
+Homebrew installs packaged skills under the formula `pkgshare/skills` directory and snippets under `pkgshare/obsidian-snippets`. Source users can install both through `setup-service` from the repository root.
 
 ## macOS launchd
 

@@ -113,6 +113,8 @@ pub enum Command {
         mcp: bool,
         #[arg(long, action = clap::ArgAction::SetTrue)]
         skills: bool,
+        #[arg(long = "vault-snippets", action = clap::ArgAction::SetTrue)]
+        vault_snippets: bool,
     },
     Doctor {
         #[arg(long = "probe-timeout-ms", default_value_t = 5_000)]
