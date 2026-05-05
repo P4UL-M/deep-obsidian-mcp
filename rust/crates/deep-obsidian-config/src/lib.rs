@@ -133,6 +133,7 @@ pub fn normalize_service_config(
     let http = normalize_http_input(input.http);
     let auto_reindex = normalize_auto_reindex_input(input.auto_reindex);
     let embedding = normalize_embedding_input(input.embedding);
+    let artifact_embedding = normalize_embedding_input(input.artifact_embedding);
 
     Ok(ResolvedServiceConfig {
         vault_path,
@@ -142,6 +143,7 @@ pub fn normalize_service_config(
         http,
         auto_reindex,
         embedding,
+        artifact_embedding,
         config_file_path: input.config_file_path.map(expand_home_path),
     })
 }
@@ -157,6 +159,7 @@ pub fn normalize_persisted_config(
         http: input.http,
         auto_reindex: input.auto_reindex,
         embedding: input.embedding,
+        artifact_embedding: input.artifact_embedding,
         config_file_path: None,
     })?;
 
@@ -187,6 +190,22 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
             api_key: config.embedding.api_key.clone(),
             api_key_env: config.embedding.api_key_env.clone(),
         }),
+        artifact_embedding: if config.artifact_embedding.provider.is_some()
+            || config.artifact_embedding.model.is_some()
+            || config.artifact_embedding.base_url.is_some()
+            || config.artifact_embedding.api_key.is_some()
+            || config.artifact_embedding.api_key_env.is_some()
+        {
+            Some(EmbeddingConfigInput {
+                provider: config.artifact_embedding.provider.clone(),
+                model: config.artifact_embedding.model.clone(),
+                base_url: config.artifact_embedding.base_url.clone(),
+                api_key: config.artifact_embedding.api_key.clone(),
+                api_key_env: config.artifact_embedding.api_key_env.clone(),
+            })
+        } else {
+            None
+        },
     }
 }
 

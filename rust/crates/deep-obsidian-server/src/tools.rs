@@ -16,7 +16,7 @@ use deep_obsidian_core::vault::{
     read_text_file, write_binary_file, write_text_file, VaultChildEntry, VaultEntryKind,
 };
 use deep_obsidian_index::graph as index_graph;
-use deep_obsidian_index::index::SearchIndex;
+use deep_obsidian_index::index::{artifact_kind, artifact_mime_type, SearchIndex};
 use deep_obsidian_index::search::{self as index_search, RankingOptions, RelatedNoteOptions};
 use regex::RegexBuilder;
 use serde_json::{json, Map, Value};
@@ -24,7 +24,7 @@ use serde_json::{json, Map, Value};
 use crate::health::build_vault_overview_payload;
 use crate::mcp::AppState;
 use crate::protocol::{ToolCallResult, ToolContent, ToolDefinition};
-use crate::resources::{block_uri, heading_uri, note_name, note_uri};
+use crate::resources::{artifact_uri, block_uri, heading_uri, note_name, note_uri};
 const JSON_SCHEMA_URI: &str = "http://json-schema.org/draft-07/schema#";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const DEFAULT_MAX_TEXT_CHARS: usize = 20_000;
@@ -1212,6 +1212,21 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
+            name: "read_artifact".to_string(),
+            description: "Inspect metadata for a supported non-markdown vault artifact, with optional bounded base64 payload.".to_string(),
+            annotations: Some(tool_annotations(true, None, None)),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema(
+                vec![
+                    ("path", json!({"type":"string","description":"Vault-relative artifact path."})),
+                    ("includeBase64", json!({"type":"boolean","default":false})),
+                    ("maxBytes", json!({"type":"integer","minimum":0,"maximum":1048576,"default":0})),
+                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
+                ],
+                vec!["path"],
+            ),
+        },
+        ToolDefinition {
             name: "read_chunk".to_string(),
             description: "Read a deterministic line-based chunk from a file.".to_string(),
             annotations: Some(tool_annotations(true, None, None)),
@@ -1309,6 +1324,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
             input_schema: object_schema(
                 vec![
                     ("query", json!({"type":"string","description":"Natural-language search query."})),
+                    ("scope", json!({"type":"string","enum":["chunks","artifacts","all"],"default":"chunks"})),
                     ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
                     ("includeText", json!({"type":"boolean","default":true})),
                     ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
@@ -1417,6 +1433,24 @@ fn hybrid_search_match_json(
     ]);
     insert_optional_text(&mut object, "text", &match_item.text, options);
     Value::Object(object)
+}
+
+fn artifact_search_match_json(match_item: &index_search::ArtifactSearchMatch) -> Value {
+    let metadata =
+        serde_json::from_str::<Value>(&match_item.metadata_json).unwrap_or_else(|_| json!({}));
+    Value::Object(Map::from_iter([
+        ("path".to_string(), json!(match_item.path.clone())),
+        ("title".to_string(), json!(match_item.title.clone())),
+        (
+            "resourceUri".to_string(),
+            json!(artifact_uri(&match_item.path)),
+        ),
+        ("kind".to_string(), json!(match_item.kind.clone())),
+        ("mimeType".to_string(), json!(match_item.mime_type.clone())),
+        ("size".to_string(), json!(match_item.size)),
+        ("score".to_string(), json!(match_item.score)),
+        ("metadata".to_string(), metadata),
+    ]))
 }
 
 fn file_path_match_json(match_item: &index_search::FilePathMatch) -> Value {
@@ -1791,6 +1825,19 @@ async fn semantic_search_matches(
     .map_err(|error| error.to_string())?
 }
 
+async fn artifact_semantic_search_matches(
+    index: std::sync::Arc<deep_obsidian_index::index::SearchIndex>,
+    query: String,
+    options: RankingOptions,
+) -> Result<Vec<index_search::ArtifactSearchMatch>, String> {
+    tokio::task::spawn_blocking(move || {
+        index_search::artifact_semantic_search_with_options(index.as_ref(), &query, options)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 async fn hybrid_search_matches(
     index: std::sync::Arc<deep_obsidian_index::index::SearchIndex>,
     query: String,
@@ -1889,6 +1936,50 @@ pub async fn call_tool(
                 ("lineCount".to_string(), json!(line_count)),
             ]);
             insert_optional_text(&mut result, "text", &text, text_options);
+            Ok(json_text_result_from_arguments(
+                arguments,
+                Value::Object(result),
+            ))
+        }
+        "read_artifact" => {
+            let path = string_arg(arguments, "path")?;
+            validate_format_arg(arguments)?;
+            let mime_type = artifact_mime_type(&path)
+                .ok_or_else(|| format!("unsupported artifact type for {}", path))?;
+            let kind = artifact_kind(&path).unwrap_or("artifact");
+            let absolute_path = ensure_inside_vault(&config.vault_path, &path)
+                .map_err(|error| error.to_string())?;
+            let metadata = fs::metadata(&absolute_path).map_err(|error| error.to_string())?;
+            let include_base64 = bool_arg(arguments, "includeBase64", false);
+            let max_bytes = clamped_usize_arg(arguments, "maxBytes", 0, 0, 1_048_576);
+            let bytes = if include_base64 || max_bytes > 0 {
+                fs::read(&absolute_path).map_err(|error| error.to_string())?
+            } else {
+                Vec::new()
+            };
+            let mut result = Map::from_iter([
+                ("path".to_string(), json!(path.clone())),
+                ("resourceUri".to_string(), json!(artifact_uri(&path))),
+                ("kind".to_string(), json!(kind)),
+                ("mimeType".to_string(), json!(mime_type)),
+                ("size".to_string(), json!(metadata.len())),
+                ("includeBase64".to_string(), json!(include_base64)),
+                ("maxBytes".to_string(), json!(max_bytes)),
+            ]);
+            if !bytes.is_empty() {
+                result.insert("hash".to_string(), json!(content_hash(&bytes)));
+            }
+            if include_base64 {
+                if bytes.len() > max_bytes {
+                    return Err(format!(
+                        "artifact payload for {} is {} bytes, above maxBytes {}",
+                        path,
+                        bytes.len(),
+                        max_bytes
+                    ));
+                }
+                result.insert("base64".to_string(), json!(BASE64_STANDARD.encode(&bytes)));
+            }
             Ok(json_text_result_from_arguments(
                 arguments,
                 Value::Object(result),
@@ -2055,30 +2146,84 @@ pub async fn call_tool(
         "semantic_search" => {
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
+            let scope =
+                optional_enum_string_arg(arguments, "scope", &["chunks", "artifacts", "all"])?
+                    .unwrap_or_else(|| "chunks".to_string());
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
             let text_options = TextPayloadOptions::from_arguments(arguments, true);
             let snapshot = state.runtime.fresh_snapshot("semantic_search").await?;
             let index = snapshot.index;
-            let matches = semantic_search_matches(
-                index.clone(),
-                query.clone(),
-                RankingOptions {
-                    limit,
-                    semantic_weight: 1.0,
-                    bm25_weight: 0.0,
-                },
-            )
-            .await?;
-            Ok(json_text_result_from_arguments(
-                arguments,
-                json!({
-                    "query": query,
-                    "rebuilt": snapshot.rebuilt,
-                    "semanticBackend": index.semantic_backend.as_str(),
-                    "count": matches.len(),
-                    "matches": matches.into_iter().map(|item| search_match_json(&item, text_options)).collect::<Vec<_>>()
-                }),
-            ))
+            let options = RankingOptions {
+                limit,
+                semantic_weight: 1.0,
+                bm25_weight: 0.0,
+            };
+            match scope.as_str() {
+                "chunks" => {
+                    let matches =
+                        semantic_search_matches(index.clone(), query.clone(), options).await?;
+                    Ok(json_text_result_from_arguments(
+                        arguments,
+                        json!({
+                            "query": query,
+                            "scope": scope,
+                            "rebuilt": snapshot.rebuilt,
+                            "semanticBackend": index.semantic_backend.as_str(),
+                            "count": matches.len(),
+                            "matches": matches.into_iter().map(|item| search_match_json(&item, text_options)).collect::<Vec<_>>()
+                        }),
+                    ))
+                }
+                "artifacts" => {
+                    let matches =
+                        artifact_semantic_search_matches(index.clone(), query.clone(), options)
+                            .await?;
+                    Ok(json_text_result_from_arguments(
+                        arguments,
+                        json!({
+                            "query": query,
+                            "scope": scope,
+                            "rebuilt": snapshot.rebuilt,
+                            "semanticBackend": index.semantic_backend.as_str(),
+                            "artifactEmbeddingProvider": index.artifact_embedding_provider.clone(),
+                            "artifactEmbeddingModel": index.artifact_embedding_model.clone(),
+                            "count": matches.len(),
+                            "matches": matches.into_iter().map(|item| artifact_search_match_json(&item)).collect::<Vec<_>>()
+                        }),
+                    ))
+                }
+                "all" => {
+                    let chunk_matches =
+                        semantic_search_matches(index.clone(), query.clone(), options.clone())
+                            .await?;
+                    let artifact_result =
+                        artifact_semantic_search_matches(index.clone(), query.clone(), options)
+                            .await;
+                    let (artifact_matches, artifact_error) = match artifact_result {
+                        Ok(matches) => (matches, None),
+                        Err(error) => (Vec::new(), Some(error)),
+                    };
+                    Ok(json_text_result_from_arguments(
+                        arguments,
+                        json!({
+                            "query": query,
+                            "scope": scope,
+                            "rebuilt": snapshot.rebuilt,
+                            "semanticBackend": index.semantic_backend.as_str(),
+                            "chunks": {
+                                "count": chunk_matches.len(),
+                                "matches": chunk_matches.into_iter().map(|item| search_match_json(&item, text_options)).collect::<Vec<_>>()
+                            },
+                            "artifacts": {
+                                "count": artifact_matches.len(),
+                                "error": artifact_error,
+                                "matches": artifact_matches.into_iter().map(|item| artifact_search_match_json(&item)).collect::<Vec<_>>()
+                            }
+                        }),
+                    ))
+                }
+                _ => unreachable!(),
+            }
         }
         "hybrid_search" => {
             let query = string_arg(arguments, "query")?;
@@ -2684,6 +2829,7 @@ mod tests {
                 interval_ms: 0,
             },
             embedding: EmbeddingConfig::default(),
+            artifact_embedding: EmbeddingConfig::default(),
             config_file_path: None,
         }
     }
@@ -2901,6 +3047,35 @@ mod tests {
         let file_text = fs::read_to_string(vault_path.join("Notes/Dry.md")).expect("read note");
         assert_eq!(file_text, "# Dry\n\nOriginal\n");
         assert_eq!(content_hash(file_text.as_bytes()), previous_hash);
+    }
+
+    #[tokio::test]
+    async fn read_artifact_returns_metadata_and_bounded_base64() {
+        let vault_path = temp_dir("read-artifact");
+        fs::create_dir_all(vault_path.join("Assets")).expect("mkdir");
+        fs::write(vault_path.join("Assets/Logo.png"), b"png-bytes").expect("write artifact");
+        let state = test_state(vault_path.clone()).await;
+
+        let result = call_tool(
+            &state,
+            "read_artifact",
+            &json!({
+                "path": "Assets/Logo.png",
+                "includeBase64": true,
+                "maxBytes": 64
+            }),
+        )
+        .await
+        .expect("read artifact should succeed");
+
+        assert_eq!(result.structured_content["path"], "Assets/Logo.png");
+        assert_eq!(result.structured_content["kind"], "image");
+        assert_eq!(result.structured_content["mimeType"], "image/png");
+        assert_eq!(result.structured_content["base64"], "cG5nLWJ5dGVz");
+        assert_eq!(
+            result.structured_content["resourceUri"],
+            "obsidian://artifact?path=Assets%2FLogo.png"
+        );
     }
 
     #[tokio::test]

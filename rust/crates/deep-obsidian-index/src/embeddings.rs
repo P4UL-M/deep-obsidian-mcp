@@ -1,5 +1,7 @@
 use std::{env, thread, time::Duration};
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -106,6 +108,14 @@ impl EmbeddingConfig {
 pub struct EmbeddingResult {
     pub vectors: Vec<Vec<f64>>,
     pub dimensions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactEmbeddingInput {
+    pub path: String,
+    pub kind: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,6 +420,145 @@ pub fn embed_texts_with_client(
     }
 
     if vectors.len() != texts.len() {
+        return Err(EmbeddingError::VectorCountMismatch);
+    }
+
+    let dimensions = vectors.first().map(|vector| vector.len()).unwrap_or(0);
+    Ok(EmbeddingResult {
+        vectors,
+        dimensions,
+    })
+}
+
+pub fn embed_artifacts(
+    artifacts: &[ArtifactEmbeddingInput],
+    config: &EmbeddingConfig,
+) -> Result<EmbeddingResult, EmbeddingError> {
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|error| EmbeddingError::RequestFailed {
+            status: 0,
+            body: error.to_string(),
+        })?;
+    embed_artifacts_with_client(artifacts, config, &client)
+}
+
+pub fn embed_artifacts_with_client(
+    artifacts: &[ArtifactEmbeddingInput],
+    config: &EmbeddingConfig,
+    client: &reqwest::blocking::Client,
+) -> Result<EmbeddingResult, EmbeddingError> {
+    if artifacts.is_empty() {
+        return Ok(EmbeddingResult {
+            vectors: Vec::new(),
+            dimensions: 0,
+        });
+    }
+
+    if config.is_sparse() {
+        return Err(EmbeddingError::NotConfigured);
+    }
+
+    if !matches!(
+        config.provider.as_ref(),
+        Some(EmbeddingProvider::OpenAiCompatible)
+    ) {
+        return Err(match config.provider.as_ref() {
+            Some(other) => EmbeddingError::UnsupportedProvider(other.as_str().to_string()),
+            None => EmbeddingError::NotConfigured,
+        });
+    }
+
+    let base_url = config.base_url().ok_or(EmbeddingError::MissingBaseUrl)?;
+    let model = config
+        .model
+        .as_deref()
+        .ok_or(EmbeddingError::NotConfigured)?;
+    let api_key = config.resolve_api_key();
+
+    let request_body = serde_json::json!({
+        "model": model,
+        "input": artifacts
+            .iter()
+            .map(|artifact| serde_json::json!({
+                "type": "file",
+                "path": artifact.path,
+                "kind": artifact.kind,
+                "mime_type": artifact.mime_type,
+                "data": BASE64_STANDARD.encode(&artifact.bytes),
+            }))
+            .collect::<Vec<_>>(),
+    });
+
+    let mut request = client
+        .post(format!("{}/embeddings", base_url.trim_end_matches('/')))
+        .header("content-type", "application/json");
+    if let Some(api_key) = api_key.as_deref() {
+        request = request.header("authorization", format!("Bearer {api_key}"));
+    }
+
+    let response =
+        request
+            .json(&request_body)
+            .send()
+            .map_err(|error| EmbeddingError::RequestFailed {
+                status: 0,
+                body: error.to_string(),
+            })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        return Err(EmbeddingError::RequestFailed {
+            status: status.as_u16(),
+            body,
+        });
+    }
+
+    let payload: serde_json::Value =
+        response
+            .json()
+            .map_err(|error| EmbeddingError::RequestFailed {
+                status: status.as_u16(),
+                body: error.to_string(),
+            })?;
+    parse_embedding_payload(payload, artifacts.len())
+}
+
+fn parse_embedding_payload(
+    payload: serde_json::Value,
+    expected_count: usize,
+) -> Result<EmbeddingResult, EmbeddingError> {
+    let mut items = payload
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    items.sort_by(|left, right| {
+        let left_index = left
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let right_index = right
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        left_index.cmp(&right_index)
+    });
+
+    let mut vectors = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(vector) = item.get("embedding").and_then(serde_json::Value::as_array) else {
+            return Err(EmbeddingError::VectorCountMismatch);
+        };
+        let parsed = vector
+            .iter()
+            .map(|value| value.as_f64().ok_or(EmbeddingError::VectorCountMismatch))
+            .collect::<Result<Vec<_>, _>>()?;
+        vectors.push(parsed);
+    }
+
+    if vectors.len() != expected_count {
         return Err(EmbeddingError::VectorCountMismatch);
     }
 

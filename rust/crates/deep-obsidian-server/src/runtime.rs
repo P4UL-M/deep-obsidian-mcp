@@ -7,8 +7,9 @@ use deep_obsidian_index::embeddings::{
     DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_MAX_CHARS,
 };
 use deep_obsidian_index::index::{
-    build_index, collect_snapshots, get_search_index, same_semantic_config, SearchIndex,
-    SemanticBackend,
+    build_index_with_artifacts, collect_artifact_snapshots, collect_snapshots,
+    get_search_index_with_artifacts, same_artifact_embedding_config, same_artifact_snapshots,
+    same_semantic_config, SearchIndex, SemanticBackend,
 };
 use deep_obsidian_types::ResolvedServiceConfig;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -95,6 +96,26 @@ fn index_embedding_config(config: &ResolvedServiceConfig) -> IndexEmbeddingConfi
         base_url: config.embedding.base_url.clone(),
         api_key: config.embedding.api_key.clone(),
         api_key_env: config.embedding.api_key_env.clone(),
+        max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
+        batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+    }
+    .normalize()
+}
+
+fn index_artifact_embedding_config(config: &ResolvedServiceConfig) -> IndexEmbeddingConfig {
+    let provider = match config.artifact_embedding.provider {
+        Some(deep_obsidian_types::EmbeddingProvider::OpenAiCompatible) => {
+            Some(IndexEmbeddingProvider::OpenAiCompatible)
+        }
+        None => None,
+    };
+
+    IndexEmbeddingConfig {
+        provider,
+        model: config.artifact_embedding.model.clone(),
+        base_url: config.artifact_embedding.base_url.clone(),
+        api_key: config.artifact_embedding.api_key.clone(),
+        api_key_env: config.artifact_embedding.api_key_env.clone(),
         max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
         batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
     }
@@ -423,10 +444,12 @@ impl RuntimeState {
         let operation_result = if force_rebuild {
             tokio::task::spawn_blocking(move || {
                 let embedding_config = index_embedding_config(&config);
-                build_index(
+                let artifact_embedding_config = index_artifact_embedding_config(&config);
+                build_index_with_artifacts(
                     &config.vault_path,
                     Some(config.index_dir.as_path()),
                     Some(&embedding_config),
+                    Some(&artifact_embedding_config),
                 )
                 .map(|index| (index, true))
                 .map_err(|error| error.to_string())
@@ -437,10 +460,12 @@ impl RuntimeState {
         } else {
             tokio::task::spawn_blocking(move || {
                 let embedding_config = index_embedding_config(&config);
-                get_search_index(
+                let artifact_embedding_config = index_artifact_embedding_config(&config);
+                get_search_index_with_artifacts(
                     &config.vault_path,
                     Some(config.index_dir.as_path()),
                     Some(&embedding_config),
+                    Some(&artifact_embedding_config),
                 )
                 .map_err(|error| error.to_string())
             })
@@ -513,10 +538,21 @@ impl RuntimeState {
         let unchanged = tokio::task::spawn_blocking(move || {
             let snapshots =
                 collect_snapshots(&config.vault_path).map_err(|error| error.to_string())?;
+            let artifact_snapshots = collect_artifact_snapshots(&config.vault_path)
+                .map_err(|error| error.to_string())?;
             let embedding_config = index_embedding_config(&config);
+            let artifact_embedding_config = index_artifact_embedding_config(&config);
             Ok::<_, String>(
                 snapshots == current_index.file_snapshots
-                    && same_semantic_config(current_index.as_ref(), Some(&embedding_config)),
+                    && same_artifact_snapshots(
+                        &current_index.artifact_snapshots,
+                        &artifact_snapshots,
+                    )
+                    && same_semantic_config(current_index.as_ref(), Some(&embedding_config))
+                    && same_artifact_embedding_config(
+                        current_index.as_ref(),
+                        Some(&artifact_embedding_config),
+                    ),
             )
         })
         .await
@@ -685,6 +721,7 @@ mod tests {
                 interval_ms: 30_000,
             },
             embedding: EmbeddingConfig::default(),
+            artifact_embedding: EmbeddingConfig::default(),
             config_file_path: None,
         }
     }

@@ -97,6 +97,19 @@ fn insert_index_snapshot(payload: &mut Map<String, Value>, snapshot: &RuntimeInd
         "markdownFileCount".to_string(),
         json!(index.file_snapshots.len()),
     );
+    payload.insert(
+        "artifactFileCount".to_string(),
+        json!(index.artifact_snapshots.len()),
+    );
+    payload.insert("artifactCount".to_string(), json!(index.artifact_count));
+    payload.insert(
+        "vectorizedArtifactCount".to_string(),
+        json!(index.vectorized_artifact_count),
+    );
+    payload.insert(
+        "skippedArtifactCount".to_string(),
+        json!(index.skipped_artifact_count),
+    );
     payload.insert("rebuilt".to_string(), Value::Bool(snapshot.rebuilt));
     payload.insert(
         "generatedAt".to_string(),
@@ -105,6 +118,26 @@ fn insert_index_snapshot(payload: &mut Map<String, Value>, snapshot: &RuntimeInd
     payload.insert(
         "semanticBackend".to_string(),
         Value::String(index.semantic_backend.as_str().to_string()),
+    );
+    insert_optional_value(
+        payload,
+        "artifactEmbeddingProvider",
+        &index.artifact_embedding_provider,
+    );
+    insert_optional_value(
+        payload,
+        "artifactEmbeddingModel",
+        &index.artifact_embedding_model,
+    );
+    insert_optional_value(
+        payload,
+        "artifactEmbeddingDimensions",
+        &index.artifact_embedding_dimensions,
+    );
+    insert_optional_value(
+        payload,
+        "artifactEmbeddingError",
+        &index.artifact_embedding_error,
     );
 }
 
@@ -166,6 +199,26 @@ pub fn build_vault_overview_payload(
     );
     insert_optional_value(&mut payload, "embeddingProvider", &index.embedding_provider);
     insert_optional_value(&mut payload, "embeddingModel", &index.embedding_model);
+    insert_optional_value(
+        &mut payload,
+        "artifactEmbeddingProvider",
+        &index.artifact_embedding_provider,
+    );
+    insert_optional_value(
+        &mut payload,
+        "artifactEmbeddingModel",
+        &index.artifact_embedding_model,
+    );
+    insert_optional_value(
+        &mut payload,
+        "artifactEmbeddingDimensions",
+        &index.artifact_embedding_dimensions,
+    );
+    insert_optional_value(
+        &mut payload,
+        "artifactEmbeddingError",
+        &index.artifact_embedding_error,
+    );
     payload.insert("rebuilt".to_string(), Value::Bool(snapshot.rebuilt));
     payload.insert(
         "autoReindex".to_string(),
@@ -210,6 +263,7 @@ mod tests {
                 interval_ms: 30_000,
             },
             embedding: EmbeddingConfig::default(),
+            artifact_embedding: EmbeddingConfig::default(),
             config_file_path: None,
         }
     }

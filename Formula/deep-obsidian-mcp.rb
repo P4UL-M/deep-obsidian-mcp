@@ -24,6 +24,11 @@ class DeepObsidianMcp < Formula
       Configure the service before starting it:
         deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
 
+      On macOS, setup-service performs an interactive vault access preflight.
+      If your vault is under Documents, Desktop, Downloads, or iCloud Drive, approve the
+      permission prompt if macOS shows one. If no prompt appears, add the Homebrew
+      service binary to Privacy & Security > Full Disk Access, then restart the service.
+
       Then start and validate:
         brew services start P4UL-M/tap/deep-obsidian-mcp
         deep-obsidian-mcp doctor

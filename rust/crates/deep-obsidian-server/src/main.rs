@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
         auto_reindex: None,
         embedding: None,
+        artifact_embedding: None,
         config_file_path: None,
     };
 

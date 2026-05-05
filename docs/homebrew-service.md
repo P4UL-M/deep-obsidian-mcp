@@ -14,6 +14,8 @@ brew services start deep-obsidian-mcp
 deep-obsidian-mcp doctor
 ```
 
+On macOS, `setup-service` performs an interactive vault access preflight before writing the service config. It intentionally tries to read the configured vault from the Homebrew-installed binary so macOS can show its Documents/Desktop/iCloud permission prompt while the user is present. If macOS denies access without showing a prompt, the command opens Privacy & Security > Full Disk Access and prints the Homebrew service binary paths to add manually.
+
 Optional inspection commands:
 
 ```bash

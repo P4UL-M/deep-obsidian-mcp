@@ -21,6 +21,10 @@ pub(crate) fn note_uri(note_path: &str) -> String {
     format!("obsidian://note?path={}", urlencoding::encode(note_path))
 }
 
+pub(crate) fn artifact_uri(path: &str) -> String {
+    format!("obsidian://artifact?path={}", urlencoding::encode(path))
+}
+
 pub(crate) fn heading_uri(note_path: &str, slug: &str) -> String {
     format!(
         "obsidian://heading?path={}&slug={}",

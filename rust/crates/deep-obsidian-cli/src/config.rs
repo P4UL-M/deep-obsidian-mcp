@@ -276,6 +276,9 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
             api_key: embedding_api_key,
             api_key_env: embedding_api_key_env,
         }),
+        artifact_embedding: config_file
+            .as_ref()
+            .and_then(|config| config.artifact_embedding.clone()),
         config_file_path: Some(config_path.clone()),
     };
     let mut service = normalize_service_config(input)?;

@@ -601,17 +601,19 @@ pub fn setup_service(
     }
     let config_path = absolute_path(&resolved.config_path)?;
     validate_vault(&service)?;
+    let vault_access_messages = macos_vault_access_preflight(&service.vault_path, dry_run)?;
     let config_dir = config_path
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| config_path.clone());
 
     let config = to_persisted_config(&service);
-    let messages = vec![
+    let mut messages = vec![
         format!("vault: {}", service.vault_path.display()),
         format!("index: {}", service.index_dir.display()),
         format!("config: {}", config_path.display()),
     ];
+    messages.extend(vault_access_messages);
     if dry_run {
         assert_creatable_directory(&service.index_dir)?;
         assert_creatable_directory(&config_dir)?;
@@ -637,12 +639,11 @@ pub fn setup_service(
             dry_run: true,
             endpoints,
             persisted_config: config,
-            messages: vec![
-                messages[0].clone(),
-                messages[1].clone(),
-                messages[2].clone(),
-                "dry-run: config validated but not written".to_string(),
-            ],
+            messages: {
+                let mut messages = messages.clone();
+                messages.push("dry-run: config validated but not written".to_string());
+                messages
+            },
             mcp,
             skills,
             vault_snippets,
@@ -1433,13 +1434,140 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 }
 
 fn validate_vault(config: &ResolvedServiceConfig) -> Result<()> {
-    if !config.vault_path.exists() || !config.vault_path.is_dir() {
-        return Err(anyhow!(
+    match fs::metadata(&config.vault_path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(anyhow!(
+            "vault path is not a directory: {}",
+            config.vault_path.display()
+        )),
+        Err(error) if is_permission_denied(&error) => {
+            let privacy_opened = open_macos_full_disk_access_panel();
+            Err(anyhow!(macos_vault_access_guidance(
+                &config.vault_path,
+                privacy_opened
+            )))
+        }
+        Err(_) => Err(anyhow!(
             "vault path does not exist or is not a directory: {}",
             config.vault_path.display()
-        ));
+        )),
     }
-    Ok(())
+}
+
+fn macos_vault_access_preflight(vault_path: &Path, dry_run: bool) -> Result<Vec<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        if dry_run {
+            return Ok(vec![format!(
+                "macOS vault access preflight: would verify current binary can read {}",
+                vault_path.display()
+            )]);
+        }
+
+        match fs::read_dir(vault_path) {
+            Ok(mut entries) => {
+                let _ = entries.next().transpose().with_context(|| {
+                    format!("failed to inspect vault contents: {}", vault_path.display())
+                })?;
+                Ok(vec![format!(
+                    "macOS vault access preflight: current binary can read {}",
+                    vault_path.display()
+                )])
+            }
+            Err(error) if is_permission_denied(&error) => {
+                let privacy_opened = open_macos_full_disk_access_panel();
+                let guidance = macos_vault_access_guidance(vault_path, privacy_opened);
+                Err(anyhow!(guidance))
+            }
+            Err(error) => Err(anyhow!(
+                "failed to read vault directory {}: {}",
+                vault_path.display(),
+                error
+            )),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = vault_path;
+        let _ = dry_run;
+        Ok(Vec::new())
+    }
+}
+
+fn is_permission_denied(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::PermissionDenied)
+        || error
+            .raw_os_error()
+            .is_some_and(|code| code == 1 || code == 13)
+}
+
+fn macos_vault_access_guidance(vault_path: &Path, privacy_opened: bool) -> String {
+    let mut message = String::new();
+    let _ = writeln!(
+        &mut message,
+        "macOS denied access to the vault: {}",
+        vault_path.display()
+    );
+    let _ = writeln!(
+        &mut message,
+        "If a permission pop-up appeared, approve it and rerun setup-service."
+    );
+    if privacy_opened {
+        let _ = writeln!(
+            &mut message,
+            "Privacy & Security > Full Disk Access was opened."
+        );
+    } else {
+        let _ = writeln!(
+            &mut message,
+            "Open Privacy & Security > Full Disk Access manually."
+        );
+    }
+    let _ = writeln!(
+        &mut message,
+        "Add the Homebrew service binary, then restart the service:"
+    );
+    for candidate in service_binary_candidates() {
+        let _ = writeln!(&mut message, "  {}", candidate.display());
+    }
+    let _ = writeln!(&mut message, "  brew services restart deep-obsidian-mcp");
+    let _ = write!(&mut message, "  deep-obsidian-mcp doctor");
+    message
+}
+
+fn service_binary_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = env::current_exe() {
+        candidates.push(exe);
+    }
+    if let Ok(prefix) = env::var("HOMEBREW_PREFIX") {
+        candidates.push(PathBuf::from(prefix).join("bin/deep-obsidian-mcp"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/deep-obsidian-mcp"));
+    candidates.push(PathBuf::from("/usr/local/bin/deep-obsidian-mcp"));
+
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique.iter().any(|existing| existing == &candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn open_macos_full_disk_access_panel() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        ProcessCommand::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -1995,7 +2123,11 @@ fn check_vault(config: &ResolvedServiceConfig) -> CheckReport {
             Err(error) => CheckReport {
                 name: "vault".into(),
                 status: "fail".into(),
-                message: error.to_string(),
+                message: if is_permission_denied(&error) {
+                    macos_vault_access_guidance(&resolved, false)
+                } else {
+                    error.to_string()
+                },
                 details: None,
             },
         },
@@ -2179,6 +2311,11 @@ fn redact_config(config: &PersistedServiceConfig) -> PersistedServiceConfig {
             embedding.api_key = Some("[redacted]".to_string());
         }
     }
+    if let Some(embedding) = &mut cloned.artifact_embedding {
+        if embedding.api_key.is_some() {
+            embedding.api_key = Some("[redacted]".to_string());
+        }
+    }
     cloned
 }
 
@@ -2347,6 +2484,7 @@ mod tests {
                 interval_ms: 30000,
             },
             embedding: EmbeddingConfig::default(),
+            artifact_embedding: EmbeddingConfig::default(),
             config_file_path: None,
         }
     }

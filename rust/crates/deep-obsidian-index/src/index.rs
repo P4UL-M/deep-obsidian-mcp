@@ -76,6 +76,15 @@ pub struct FileSnapshot {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactSnapshot {
+    pub path: String,
+    pub mtime_ms: u64,
+    pub size: u64,
+    pub mime_type: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchNote {
     pub path: String,
@@ -103,6 +112,17 @@ pub struct SearchChunk {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchArtifact {
+    pub path: String,
+    pub kind: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub title: String,
+    pub metadata_json: String,
+    pub embedding: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchIndex {
     pub version: u32,
     pub generated_at: String,
@@ -114,12 +134,25 @@ pub struct SearchIndex {
     pub embedding_api_key_env: Option<String>,
     #[serde(skip_serializing, default)]
     pub embedding_api_key: Option<String>,
+    pub artifact_embedding_provider: Option<String>,
+    pub artifact_embedding_model: Option<String>,
+    pub artifact_embedding_dimensions: Option<usize>,
+    pub artifact_embedding_base_url: Option<String>,
+    pub artifact_embedding_api_key_env: Option<String>,
+    #[serde(skip_serializing, default)]
+    pub artifact_embedding_api_key: Option<String>,
+    pub artifact_embedding_error: Option<String>,
     pub file_snapshots: Vec<FileSnapshot>,
+    pub artifact_snapshots: Vec<ArtifactSnapshot>,
     pub document_frequencies: BTreeMap<String, usize>,
     pub chunk_count: usize,
     pub note_count: usize,
+    pub artifact_count: usize,
+    pub vectorized_artifact_count: usize,
+    pub skipped_artifact_count: usize,
     pub notes: Vec<SearchNote>,
     pub chunks: Vec<SearchChunk>,
+    pub artifacts: Vec<SearchArtifact>,
     #[serde(skip_serializing, skip_deserializing, default)]
     pub context: Option<IndexContext>,
 }
@@ -144,6 +177,14 @@ struct IndexDiff {
     unchanged: Vec<FileSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ArtifactDiff {
+    added: Vec<ArtifactSnapshot>,
+    modified: Vec<ArtifactSnapshot>,
+    deleted: Vec<String>,
+    unchanged: Vec<ArtifactSnapshot>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct PreparedNote {
     snapshot: FileSnapshot,
@@ -153,6 +194,13 @@ struct PreparedNote {
     chunk_texts: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct PreparedArtifact {
+    snapshot: ArtifactSnapshot,
+    artifact: SearchArtifact,
+    bytes: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedIndexHeader {
     pub version: u32,
@@ -160,7 +208,11 @@ pub struct PersistedIndexHeader {
     pub embedding_provider: Option<String>,
     pub embedding_model: Option<String>,
     pub embedding_dimensions: Option<usize>,
+    pub artifact_embedding_provider: Option<String>,
+    pub artifact_embedding_model: Option<String>,
+    pub artifact_embedding_dimensions: Option<usize>,
     pub file_snapshots: Vec<FileSnapshot>,
+    pub artifact_snapshots: Vec<ArtifactSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -181,9 +233,10 @@ pub struct BlockSection {
     pub text: String,
 }
 
-const INDEX_VERSION: u32 = 2;
+const INDEX_VERSION: u32 = sqlite::CURRENT_SCHEMA_VERSION;
 const DEFAULT_CHUNK_SIZE_LINES: usize = 80;
 const DEFAULT_CHUNK_OVERLAP_LINES: usize = 12;
+const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 25 * 1024 * 1024;
 const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "into", "is",
     "it", "of", "on", "or", "that", "the", "this", "to", "with",
@@ -299,6 +352,90 @@ pub fn list_markdown_files(vault_path: &Path) -> Result<Vec<String>> {
             }
 
             if file_type.is_file() && name.to_lowercase().ends_with(".md") {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .iter()
+                    .map(|segment| segment.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                files.push(relative);
+            }
+        }
+        Ok(())
+    }
+
+    walk(&resolved, &resolved, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn artifact_mime_and_kind(path: &Path) -> Option<(&'static str, &'static str)> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => Some(("application/pdf", "pdf")),
+        "png" => Some(("image/png", "image")),
+        "jpg" | "jpeg" => Some(("image/jpeg", "image")),
+        "webp" => Some(("image/webp", "image")),
+        "gif" => Some(("image/gif", "image")),
+        "mp3" => Some(("audio/mpeg", "audio")),
+        "wav" => Some(("audio/wav", "audio")),
+        "m4a" => Some(("audio/mp4", "audio")),
+        "flac" => Some(("audio/flac", "audio")),
+        "ogg" => Some(("audio/ogg", "audio")),
+        "mp4" => Some(("video/mp4", "video")),
+        "mov" => Some(("video/quicktime", "video")),
+        "webm" => Some(("video/webm", "video")),
+        "mkv" => Some(("video/x-matroska", "video")),
+        _ => None,
+    }
+}
+
+pub fn artifact_mime_type(path: &str) -> Option<&'static str> {
+    artifact_mime_and_kind(Path::new(path)).map(|(mime_type, _)| mime_type)
+}
+
+pub fn artifact_kind(path: &str) -> Option<&'static str> {
+    artifact_mime_and_kind(Path::new(path)).map(|(_, kind)| kind)
+}
+
+pub fn is_supported_artifact_path(path: &str) -> bool {
+    artifact_mime_and_kind(Path::new(path)).is_some()
+}
+
+pub fn list_artifact_files(vault_path: &Path) -> Result<Vec<String>> {
+    let resolved = ensure_vault_path(vault_path)?;
+    let mut files = Vec::new();
+
+    fn walk(root: &Path, current: &Path, files: &mut Vec<String>) -> Result<()> {
+        for entry in fs::read_dir(current).map_err(|source| IndexError::Io {
+            path: current.to_path_buf(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| IndexError::Io {
+                path: current.to_path_buf(),
+                source,
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|source| IndexError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if file_type.is_dir() {
+                if IGNORED_DIRS.iter().any(|ignored| *ignored == name) {
+                    continue;
+                }
+                walk(root, &path, files)?;
+                continue;
+            }
+
+            if file_type.is_file() && artifact_mime_and_kind(&path).is_some() {
                 let relative = path
                     .strip_prefix(root)
                     .unwrap_or(&path)
@@ -618,6 +755,37 @@ pub fn collect_snapshots(vault_path: &Path) -> Result<Vec<FileSnapshot>> {
     Ok(snapshots)
 }
 
+pub fn collect_artifact_snapshots(vault_path: &Path) -> Result<Vec<ArtifactSnapshot>> {
+    let files = list_artifact_files(vault_path)?;
+    let mut snapshots = Vec::with_capacity(files.len());
+
+    for relative_path in files {
+        let absolute = ensure_inside_vault(vault_path, &relative_path)?;
+        let metadata = fs::metadata(&absolute).map_err(|source| IndexError::Io {
+            path: absolute.clone(),
+            source,
+        })?;
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let mtime_ms = modified
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let (mime_type, kind) =
+            artifact_mime_and_kind(Path::new(&relative_path)).ok_or_else(|| {
+                IndexError::Embedding(format!("unsupported artifact path: {relative_path}"))
+            })?;
+        snapshots.push(ArtifactSnapshot {
+            path: relative_path,
+            mtime_ms,
+            size: metadata.len(),
+            mime_type: mime_type.to_string(),
+            kind: kind.to_string(),
+        });
+    }
+
+    Ok(snapshots)
+}
+
 pub fn same_snapshots(left: &[FileSnapshot], right: &[FileSnapshot]) -> bool {
     left == right
 }
@@ -652,6 +820,43 @@ fn diff_snapshots(existing: &[FileSnapshot], current: &[FileSnapshot]) -> IndexD
     diff
 }
 
+fn diff_artifact_snapshots(
+    existing: &[ArtifactSnapshot],
+    current: &[ArtifactSnapshot],
+) -> ArtifactDiff {
+    let existing_by_path: BTreeMap<&str, &ArtifactSnapshot> = existing
+        .iter()
+        .map(|snapshot| (snapshot.path.as_str(), snapshot))
+        .collect();
+    let current_by_path: BTreeMap<&str, &ArtifactSnapshot> = current
+        .iter()
+        .map(|snapshot| (snapshot.path.as_str(), snapshot))
+        .collect();
+    let mut diff = ArtifactDiff::default();
+
+    for snapshot in current {
+        match existing_by_path.get(snapshot.path.as_str()) {
+            None => diff.added.push(snapshot.clone()),
+            Some(existing_snapshot) if *existing_snapshot != snapshot => {
+                diff.modified.push(snapshot.clone());
+            }
+            Some(_) => diff.unchanged.push(snapshot.clone()),
+        }
+    }
+
+    for snapshot in existing {
+        if !current_by_path.contains_key(snapshot.path.as_str()) {
+            diff.deleted.push(snapshot.path.clone());
+        }
+    }
+
+    diff
+}
+
+pub fn same_artifact_snapshots(left: &[ArtifactSnapshot], right: &[ArtifactSnapshot]) -> bool {
+    left == right
+}
+
 pub fn same_semantic_config(
     index: &SearchIndex,
     embedding_config: Option<&EmbeddingConfig>,
@@ -684,6 +889,40 @@ pub fn same_persisted_semantic_config(
             header.semantic_backend == SemanticBackend::Embedding
                 && header.embedding_provider.as_deref() == Some(provider)
                 && header.embedding_model.as_deref() == config.model.as_deref()
+        }
+    }
+}
+
+pub fn same_artifact_embedding_config(
+    index: &SearchIndex,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> bool {
+    match artifact_embedding_config {
+        None => index.artifact_embedding_provider.is_none(),
+        Some(config) if config.is_sparse() => index.artifact_embedding_provider.is_none(),
+        Some(config) => {
+            let Some(provider) = config.provider.as_ref().map(EmbeddingProvider::as_str) else {
+                return false;
+            };
+            index.artifact_embedding_provider.as_deref() == Some(provider)
+                && index.artifact_embedding_model.as_deref() == config.model.as_deref()
+        }
+    }
+}
+
+pub fn same_persisted_artifact_embedding_config(
+    header: &PersistedIndexHeader,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> bool {
+    match artifact_embedding_config {
+        None => header.artifact_embedding_provider.is_none(),
+        Some(config) if config.is_sparse() => header.artifact_embedding_provider.is_none(),
+        Some(config) => {
+            let Some(provider) = config.provider.as_ref().map(EmbeddingProvider::as_str) else {
+                return false;
+            };
+            header.artifact_embedding_provider.as_deref() == Some(provider)
+                && header.artifact_embedding_model.as_deref() == config.model.as_deref()
         }
     }
 }
@@ -724,6 +963,29 @@ fn apply_runtime_embedding_config(
         .filter(|value| !value.trim().is_empty());
 }
 
+fn apply_runtime_artifact_embedding_config(
+    index: &mut SearchIndex,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) {
+    let config = normalized_embedding_config(artifact_embedding_config);
+    if index.artifact_embedding_provider.is_none() || !config.supports_embeddings() {
+        return;
+    }
+
+    index.artifact_embedding_base_url = config
+        .base_url
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    index.artifact_embedding_api_key_env = config
+        .api_key_env
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    index.artifact_embedding_api_key = config
+        .api_key
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+}
+
 pub fn embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> {
     if index.semantic_backend != SemanticBackend::Embedding {
         return None;
@@ -742,6 +1004,30 @@ pub fn embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> 
             base_url: index.embedding_base_url.clone(),
             api_key: index.embedding_api_key.clone(),
             api_key_env: index.embedding_api_key_env.clone(),
+            max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+        }
+        .normalize(),
+    )
+}
+
+pub fn artifact_embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> {
+    let provider =
+        index
+            .artifact_embedding_provider
+            .as_deref()
+            .and_then(|provider| match provider {
+                "openai-compatible" => Some(EmbeddingProvider::OpenAiCompatible),
+                _ => None,
+            })?;
+
+    Some(
+        EmbeddingConfig {
+            provider: Some(provider),
+            model: index.artifact_embedding_model.clone(),
+            base_url: index.artifact_embedding_base_url.clone(),
+            api_key: index.artifact_embedding_api_key.clone(),
+            api_key_env: index.artifact_embedding_api_key_env.clone(),
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
         }
@@ -824,9 +1110,31 @@ fn snapshots_from_connection(conn: &Connection) -> Result<Vec<FileSnapshot>> {
         .map_err(|error| IndexError::Embedding(error.to_string()))
 }
 
+fn artifact_snapshots_from_connection(conn: &Connection) -> Result<Vec<ArtifactSnapshot>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT path, mtime_ms, size, mime_type, kind FROM artifact_snapshots ORDER BY path",
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ArtifactSnapshot {
+                path: row.get::<_, String>(0)?,
+                mtime_ms: row.get::<_, i64>(1)? as u64,
+                size: row.get::<_, i64>(2)? as u64,
+                mime_type: row.get::<_, String>(3)?,
+                kind: row.get::<_, String>(4)?,
+            })
+        })
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| IndexError::Embedding(error.to_string()))
+}
+
 fn header_from_metadata_and_snapshots(
     metadata: &BTreeMap<String, String>,
     file_snapshots: Vec<FileSnapshot>,
+    artifact_snapshots: Vec<ArtifactSnapshot>,
 ) -> Result<PersistedIndexHeader> {
     let version = metadata
         .get("version")
@@ -849,7 +1157,13 @@ fn header_from_metadata_and_snapshots(
         embedding_dimensions: metadata
             .get("embeddingDimensions")
             .and_then(|value| value.parse::<usize>().ok()),
+        artifact_embedding_provider: metadata.get("artifactEmbeddingProvider").cloned(),
+        artifact_embedding_model: metadata.get("artifactEmbeddingModel").cloned(),
+        artifact_embedding_dimensions: metadata
+            .get("artifactEmbeddingDimensions")
+            .and_then(|value| value.parse::<usize>().ok()),
         file_snapshots,
+        artifact_snapshots,
     })
 }
 
@@ -937,6 +1251,113 @@ fn prepare_note_from_snapshot(
         note_text,
         chunk_texts,
     })
+}
+
+fn path_title(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn prepare_artifact_from_snapshot(
+    resolved_vault_path: &Path,
+    snapshot: &ArtifactSnapshot,
+    load_bytes: bool,
+) -> Result<PreparedArtifact> {
+    let absolute = ensure_inside_vault(resolved_vault_path, &snapshot.path)?;
+    let bytes = if load_bytes && snapshot.size <= DEFAULT_MAX_ARTIFACT_BYTES {
+        Some(fs::read(&absolute).map_err(|source| IndexError::Io {
+            path: absolute.clone(),
+            source,
+        })?)
+    } else {
+        None
+    };
+    let metadata_json = text_to_json(&serde_json::json!({
+        "mtimeMs": snapshot.mtime_ms,
+        "size": snapshot.size,
+        "vectorization": if snapshot.size <= DEFAULT_MAX_ARTIFACT_BYTES { "eligible" } else { "skipped-size" },
+    }))
+    .map_err(|error| IndexError::Embedding(error.to_string()))?;
+
+    Ok(PreparedArtifact {
+        snapshot: snapshot.clone(),
+        artifact: SearchArtifact {
+            path: snapshot.path.clone(),
+            kind: snapshot.kind.clone(),
+            mime_type: snapshot.mime_type.clone(),
+            size: snapshot.size,
+            title: path_title(&snapshot.path),
+            metadata_json,
+            embedding: None,
+        },
+        bytes,
+    })
+}
+
+fn embed_prepared_artifacts(
+    prepared_artifacts: &mut [PreparedArtifact],
+    artifact_config: &EmbeddingConfig,
+    expected_dimensions: Option<usize>,
+) -> (Option<usize>, Option<String>) {
+    if !artifact_config.supports_embeddings() {
+        return (None, None);
+    }
+
+    let eligible = prepared_artifacts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, prepared)| {
+            prepared.bytes.as_ref().map(|bytes| {
+                (
+                    index,
+                    embeddings::ArtifactEmbeddingInput {
+                        path: prepared.artifact.path.clone(),
+                        kind: prepared.artifact.kind.clone(),
+                        mime_type: prepared.artifact.mime_type.clone(),
+                        bytes: bytes.clone(),
+                    },
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return (expected_dimensions, None);
+    }
+
+    let inputs = eligible
+        .iter()
+        .map(|(_, input)| input.clone())
+        .collect::<Vec<_>>();
+    let result = match embeddings::embed_artifacts(&inputs, artifact_config) {
+        Ok(result) => result,
+        Err(error) => return (expected_dimensions, Some(error.to_string())),
+    };
+    let mut observed_dimensions = None;
+    if let Err(error) = ensure_embedding_dimensions(
+        result.dimensions,
+        expected_dimensions,
+        &mut observed_dimensions,
+    ) {
+        return (expected_dimensions, Some(error.to_string()));
+    }
+    if result.vectors.len() != eligible.len() {
+        return (
+            expected_dimensions,
+            Some(
+                "embedding provider returned an unexpected number of artifact vectors".to_string(),
+            ),
+        );
+    }
+
+    for ((artifact_index, _), vector) in eligible.into_iter().zip(result.vectors.into_iter()) {
+        prepared_artifacts[artifact_index].artifact.embedding =
+            Some(normalize_dense_vector(&vector));
+    }
+
+    (observed_dimensions.or(expected_dimensions), None)
 }
 
 fn collect_document_frequencies<'a>(
@@ -1047,15 +1468,21 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
         DROP TABLE IF EXISTS document_frequencies;
         DROP TABLE IF EXISTS note_embeddings_vec;
         DROP TABLE IF EXISTS chunk_embeddings_vec;
+        DROP TABLE IF EXISTS artifact_embeddings_vec;
         DROP TABLE IF EXISTS notes;
         DROP TABLE IF EXISTS chunks;
+        DROP TABLE IF EXISTS artifacts;
+        DROP TABLE IF EXISTS artifact_snapshots;
         DROP TABLE IF EXISTS embedding_config;
+        DROP TABLE IF EXISTS artifact_embedding_config;
         "#,
     )
     .map_err(|error| IndexError::Embedding(error.to_string()))?;
     conn.execute_batch(sqlite::CURRENT_SCHEMA_DDL)
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     sqlite::recreate_vector_tables(conn, index.embedding_dimensions)
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    sqlite::recreate_artifact_vector_table(conn, index.artifact_embedding_dimensions)
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
 
     let tx = conn
@@ -1075,6 +1502,15 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
             ),
             ("chunkCount", index.chunk_count.to_string()),
             ("noteCount", index.note_count.to_string()),
+            ("artifactCount", index.artifact_count.to_string()),
+            (
+                "vectorizedArtifactCount",
+                index.vectorized_artifact_count.to_string(),
+            ),
+            (
+                "skippedArtifactCount",
+                index.skipped_artifact_count.to_string(),
+            ),
         ];
         for (key, value) in metadata_entries {
             insert_metadata
@@ -1094,6 +1530,29 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
         if let Some(dimensions) = index.embedding_dimensions {
             insert_metadata
                 .execute(params!["embeddingDimensions", dimensions.to_string()])
+                .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+        if let Some(provider) = &index.artifact_embedding_provider {
+            insert_metadata
+                .execute(params!["artifactEmbeddingProvider", provider])
+                .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+        if let Some(model) = &index.artifact_embedding_model {
+            insert_metadata
+                .execute(params!["artifactEmbeddingModel", model])
+                .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+        if let Some(dimensions) = index.artifact_embedding_dimensions {
+            insert_metadata
+                .execute(params![
+                    "artifactEmbeddingDimensions",
+                    dimensions.to_string()
+                ])
+                .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+        if let Some(error) = &index.artifact_embedding_error {
+            insert_metadata
+                .execute(params!["artifactEmbeddingError", error])
                 .map_err(|error| IndexError::Embedding(error.to_string()))?;
         }
     }
@@ -1120,6 +1579,27 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
     }
 
     {
+        let mut insert_runtime_config = tx
+            .prepare("INSERT INTO artifact_embedding_config (key, value) VALUES (?1, ?2)")
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        if let Some(base_url) = &index.artifact_embedding_base_url {
+            insert_runtime_config
+                .execute(params!["baseUrl", base_url])
+                .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+        if let Some(api_key_env) = &index.artifact_embedding_api_key_env {
+            insert_runtime_config
+                .execute(params!["apiKeyEnv", api_key_env])
+                .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+        if let Some(api_key) = &index.artifact_embedding_api_key {
+            insert_runtime_config
+                .execute(params!["apiKey", api_key])
+                .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+    }
+
+    {
         let mut insert_snapshot = tx
             .prepare("INSERT INTO file_snapshots (path, mtime_ms, size) VALUES (?1, ?2, ?3)")
             .map_err(|error| IndexError::Embedding(error.to_string()))?;
@@ -1129,6 +1609,23 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
                     snapshot.path,
                     snapshot.mtime_ms as i64,
                     snapshot.size as i64
+                ])
+                .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+    }
+
+    {
+        let mut insert_snapshot = tx
+            .prepare("INSERT INTO artifact_snapshots (path, mtime_ms, size, mime_type, kind) VALUES (?1, ?2, ?3, ?4, ?5)")
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        for snapshot in &index.artifact_snapshots {
+            insert_snapshot
+                .execute(params![
+                    snapshot.path,
+                    snapshot.mtime_ms as i64,
+                    snapshot.size as i64,
+                    snapshot.mime_type,
+                    snapshot.kind
                 ])
                 .map_err(|error| IndexError::Embedding(error.to_string()))?;
         }
@@ -1233,6 +1730,47 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
         }
     }
 
+    {
+        let mut insert_artifact = tx
+            .prepare(
+                "INSERT INTO artifacts (id, path, kind, mime_type, size, title, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        let mut insert_artifact_embedding = if index.artifact_embedding_dimensions.is_some() {
+            Some(
+                tx.prepare(
+                    "INSERT INTO artifact_embeddings_vec (rowid, embedding) VALUES (?1, ?2)",
+                )
+                .map_err(|error| IndexError::Embedding(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        for (id, artifact) in index.artifacts.iter().enumerate() {
+            let artifact_id = (id + 1) as i64;
+            insert_artifact
+                .execute(params![
+                    artifact_id,
+                    artifact.path,
+                    artifact.kind,
+                    artifact.mime_type,
+                    artifact.size as i64,
+                    artifact.title,
+                    artifact.metadata_json,
+                ])
+                .map_err(|error| IndexError::Embedding(error.to_string()))?;
+
+            if let (Some(insert_embedding), Some(embedding)) = (
+                insert_artifact_embedding.as_mut(),
+                artifact.embedding.as_ref(),
+            ) {
+                insert_embedding
+                    .execute(params![artifact_id, embedding_blob(embedding)])
+                    .map_err(|error| IndexError::Embedding(error.to_string()))?;
+            }
+        }
+    }
+
     tx.commit()
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     Ok(())
@@ -1269,6 +1807,23 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
     let runtime_config = {
         let mut statement = conn
             .prepare("SELECT key, value FROM embedding_config")
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        let mut config = BTreeMap::new();
+        for row in rows {
+            let (key, value) = row.map_err(|error| IndexError::Embedding(error.to_string()))?;
+            config.insert(key, value);
+        }
+        config
+    };
+
+    let artifact_runtime_config = {
+        let mut statement = conn
+            .prepare("SELECT key, value FROM artifact_embedding_config")
             .map_err(|error| IndexError::Embedding(error.to_string()))?;
         let rows = statement
             .query_map([], |row| {
@@ -1341,6 +1896,28 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
             .map_err(|error| IndexError::Embedding(error.to_string()))?
     };
 
+    let artifact_snapshots = artifact_snapshots_from_connection(conn)?;
+    let artifacts = {
+        let mut statement = conn
+            .prepare("SELECT path, kind, mime_type, size, title, metadata_json FROM artifacts ORDER BY path")
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SearchArtifact {
+                    path: row.get::<_, String>(0)?,
+                    kind: row.get::<_, String>(1)?,
+                    mime_type: row.get::<_, String>(2)?,
+                    size: row.get::<_, i64>(3)? as u64,
+                    title: row.get::<_, String>(4)?,
+                    metadata_json: row.get::<_, String>(5)?,
+                    embedding: None,
+                })
+            })
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| IndexError::Embedding(error.to_string()))?
+    };
+
     if semantic_backend == SemanticBackend::Embedding {
         let note_vec_count: usize = conn
             .query_row("SELECT COUNT(*) FROM note_embeddings_vec", [], |row| {
@@ -1361,6 +1938,26 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
         }
     }
 
+    let artifact_embedding_dimensions = metadata
+        .get("artifactEmbeddingDimensions")
+        .and_then(|value| value.parse::<usize>().ok());
+    let vectorized_artifact_count = if artifact_embedding_dimensions.is_some() {
+        if !sqlite::has_artifact_vector_table(conn)
+            .map_err(|error| IndexError::Embedding(error.to_string()))?
+        {
+            return Err(IndexError::Embedding(
+                "artifact embedding index is missing sqlite-vec table".to_string(),
+            ));
+        }
+        conn.query_row("SELECT COUNT(*) FROM artifact_embeddings_vec", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|count| count as usize)
+        .map_err(|error| IndexError::Embedding(error.to_string()))?
+    } else {
+        0
+    };
+
     Ok(SearchIndex {
         version,
         generated_at: metadata
@@ -1376,7 +1973,15 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
         embedding_base_url: runtime_config.get("baseUrl").cloned(),
         embedding_api_key_env: runtime_config.get("apiKeyEnv").cloned(),
         embedding_api_key: runtime_config.get("apiKey").cloned(),
+        artifact_embedding_provider: metadata.get("artifactEmbeddingProvider").cloned(),
+        artifact_embedding_model: metadata.get("artifactEmbeddingModel").cloned(),
+        artifact_embedding_dimensions,
+        artifact_embedding_base_url: artifact_runtime_config.get("baseUrl").cloned(),
+        artifact_embedding_api_key_env: artifact_runtime_config.get("apiKeyEnv").cloned(),
+        artifact_embedding_api_key: artifact_runtime_config.get("apiKey").cloned(),
+        artifact_embedding_error: metadata.get("artifactEmbeddingError").cloned(),
         file_snapshots,
+        artifact_snapshots,
         document_frequencies,
         chunk_count: metadata
             .get("chunkCount")
@@ -1386,8 +1991,21 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
             .get("noteCount")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(notes.len()),
+        artifact_count: metadata
+            .get("artifactCount")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(artifacts.len()),
+        vectorized_artifact_count: metadata
+            .get("vectorizedArtifactCount")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(vectorized_artifact_count),
+        skipped_artifact_count: metadata
+            .get("skippedArtifactCount")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0),
         notes,
         chunks,
+        artifacts,
         context: None,
     })
 }
@@ -1397,8 +2015,25 @@ pub fn build_index(
     index_dir: Option<&Path>,
     embedding_config: Option<&EmbeddingConfig>,
 ) -> Result<SearchIndex> {
+    build_index_with_artifacts(vault_path, index_dir, embedding_config, None)
+}
+
+pub fn build_index_with_artifacts(
+    vault_path: &Path,
+    index_dir: Option<&Path>,
+    embedding_config: Option<&EmbeddingConfig>,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> Result<SearchIndex> {
     let snapshots = collect_snapshots(vault_path)?;
-    build_index_from_snapshots(vault_path, index_dir, snapshots, embedding_config)
+    let artifact_snapshots = collect_artifact_snapshots(vault_path)?;
+    build_index_from_snapshots_with_artifacts(
+        vault_path,
+        index_dir,
+        snapshots,
+        artifact_snapshots,
+        embedding_config,
+        artifact_embedding_config,
+    )
 }
 
 pub fn load_index(vault_path: &Path, index_dir: Option<&Path>) -> Result<Option<SearchIndex>> {
@@ -1444,7 +2079,11 @@ pub fn load_persisted_index_header(
         Ok(snapshots) => snapshots,
         Err(_) => return Ok(None),
     };
-    match header_from_metadata_and_snapshots(&metadata, snapshots) {
+    let artifact_snapshots = match artifact_snapshots_from_connection(&connection) {
+        Ok(snapshots) => snapshots,
+        Err(_) => return Ok(None),
+    };
+    match header_from_metadata_and_snapshots(&metadata, snapshots, artifact_snapshots) {
         Ok(header) => Ok(Some(header)),
         Err(_) => Ok(None),
     }
@@ -1463,9 +2102,36 @@ pub fn persisted_index_matches(
         && same_persisted_semantic_config(&header, embedding_config))
 }
 
+pub fn persisted_index_matches_with_artifacts(
+    vault_path: &Path,
+    index_dir: Option<&Path>,
+    snapshots: &[FileSnapshot],
+    artifact_snapshots: &[ArtifactSnapshot],
+    embedding_config: Option<&EmbeddingConfig>,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> Result<bool> {
+    let Some(header) = load_persisted_index_header(vault_path, index_dir)? else {
+        return Ok(false);
+    };
+    Ok(same_snapshots(&header.file_snapshots, snapshots)
+        && same_artifact_snapshots(&header.artifact_snapshots, artifact_snapshots)
+        && same_persisted_semantic_config(&header, embedding_config)
+        && same_persisted_artifact_embedding_config(&header, artifact_embedding_config))
+}
+
 fn query_optional_note_id(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Option<i64>> {
     tx.query_row(
         "SELECT id FROM notes WHERE path = ?1",
+        params![path],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(|error| IndexError::Embedding(error.to_string()))
+}
+
+fn query_optional_artifact_id(tx: &rusqlite::Transaction<'_>, path: &str) -> Result<Option<i64>> {
+    tx.query_row(
+        "SELECT id FROM artifacts WHERE path = ?1",
         params![path],
         |row| row.get::<_, i64>(0),
     )
@@ -1531,6 +2197,25 @@ fn delete_existing_path_rows(
     tx.execute("DELETE FROM chunks WHERE path = ?1", params![path])
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     tx.execute("DELETE FROM notes WHERE path = ?1", params![path])
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    Ok(())
+}
+
+fn delete_existing_artifact_rows(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    has_artifact_vectors: bool,
+) -> Result<()> {
+    if has_artifact_vectors {
+        if let Some(artifact_id) = query_optional_artifact_id(tx, path)? {
+            tx.execute(
+                "DELETE FROM artifact_embeddings_vec WHERE rowid = ?1",
+                params![artifact_id],
+            )
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+    }
+    tx.execute("DELETE FROM artifacts WHERE path = ?1", params![path])
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     Ok(())
 }
@@ -1602,6 +2287,39 @@ fn insert_prepared_note(
         }
     }
 
+    Ok(())
+}
+
+fn insert_prepared_artifact(
+    tx: &rusqlite::Transaction<'_>,
+    artifact_id: i64,
+    prepared: &PreparedArtifact,
+    has_artifact_vectors: bool,
+) -> Result<()> {
+    let artifact = &prepared.artifact;
+    tx.execute(
+        "INSERT INTO artifacts (id, path, kind, mime_type, size, title, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            artifact_id,
+            artifact.path,
+            artifact.kind,
+            artifact.mime_type,
+            artifact.size as i64,
+            artifact.title,
+            artifact.metadata_json,
+        ],
+    )
+    .map_err(|error| IndexError::Embedding(error.to_string()))?;
+
+    if has_artifact_vectors {
+        if let Some(embedding) = artifact.embedding.as_ref() {
+            tx.execute(
+                "INSERT INTO artifact_embeddings_vec (rowid, embedding) VALUES (?1, ?2)",
+                params![artifact_id, embedding_blob(embedding)],
+            )
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+    }
     Ok(())
 }
 
@@ -1718,9 +2436,12 @@ fn update_document_frequencies_delta(
 fn replace_index_metadata(
     tx: &rusqlite::Transaction<'_>,
     snapshots: &[FileSnapshot],
+    artifact_snapshots: &[ArtifactSnapshot],
     document_frequencies: &BTreeMap<String, usize>,
     index: &SearchIndex,
     index_config: &EmbeddingConfig,
+    artifact_config: &EmbeddingConfig,
+    artifact_embedding_error: Option<&str>,
     generated_at: &str,
 ) -> Result<()> {
     let note_count = tx
@@ -1731,6 +2452,24 @@ fn replace_index_metadata(
             row.get::<_, i64>(0)
         })
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    let artifact_count = tx
+        .query_row("SELECT COUNT(*) FROM artifacts", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    let vectorized_artifact_count = if index.artifact_embedding_dimensions.is_some() {
+        tx.query_row("SELECT COUNT(*) FROM artifact_embeddings_vec", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|count| count as i64)
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    let skipped_artifact_count = artifact_snapshots
+        .iter()
+        .filter(|snapshot| snapshot.size > DEFAULT_MAX_ARTIFACT_BYTES)
+        .count();
 
     tx.execute("DELETE FROM metadata", [])
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
@@ -1743,6 +2482,12 @@ fn replace_index_metadata(
         ),
         ("chunkCount", chunk_count.to_string()),
         ("noteCount", note_count.to_string()),
+        ("artifactCount", artifact_count.to_string()),
+        (
+            "vectorizedArtifactCount",
+            vectorized_artifact_count.to_string(),
+        ),
+        ("skippedArtifactCount", skipped_artifact_count.to_string()),
     ];
     for (key, value) in metadata_entries {
         tx.execute(
@@ -1769,6 +2514,34 @@ fn replace_index_metadata(
         tx.execute(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
             params!["embeddingDimensions", dimensions.to_string()],
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    }
+    if let Some(provider) = &index.artifact_embedding_provider {
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params!["artifactEmbeddingProvider", provider],
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    }
+    if let Some(model) = &index.artifact_embedding_model {
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params!["artifactEmbeddingModel", model],
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    }
+    if let Some(dimensions) = index.artifact_embedding_dimensions {
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params!["artifactEmbeddingDimensions", dimensions.to_string()],
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    }
+    if let Some(error) = artifact_embedding_error.or(index.artifact_embedding_error.as_deref()) {
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            params!["artifactEmbeddingError", error],
         )
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     }
@@ -1799,6 +2572,32 @@ fn replace_index_metadata(
         }
     }
 
+    tx.execute("DELETE FROM artifact_embedding_config", [])
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    if artifact_config.supports_embeddings() {
+        if let Some(base_url) = artifact_config.base_url() {
+            tx.execute(
+                "INSERT INTO artifact_embedding_config (key, value) VALUES (?1, ?2)",
+                params!["baseUrl", base_url],
+            )
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+        if let Some(api_key_env) = &artifact_config.api_key_env {
+            tx.execute(
+                "INSERT INTO artifact_embedding_config (key, value) VALUES (?1, ?2)",
+                params!["apiKeyEnv", api_key_env],
+            )
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+        if let Some(api_key) = &artifact_config.api_key {
+            tx.execute(
+                "INSERT INTO artifact_embedding_config (key, value) VALUES (?1, ?2)",
+                params!["apiKey", api_key],
+            )
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+    }
+
     tx.execute("DELETE FROM file_snapshots", [])
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     for snapshot in snapshots {
@@ -1808,6 +2607,22 @@ fn replace_index_metadata(
                 snapshot.path,
                 snapshot.mtime_ms as i64,
                 snapshot.size as i64
+            ],
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    }
+
+    tx.execute("DELETE FROM artifact_snapshots", [])
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    for snapshot in artifact_snapshots {
+        tx.execute(
+            "INSERT INTO artifact_snapshots (path, mtime_ms, size, mime_type, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                snapshot.path,
+                snapshot.mtime_ms as i64,
+                snapshot.size as i64,
+                snapshot.mime_type,
+                snapshot.kind
             ],
         )
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
@@ -1831,16 +2646,27 @@ fn refresh_index_incremental(
     index_dir: Option<&Path>,
     mut existing: SearchIndex,
     snapshots: Vec<FileSnapshot>,
+    artifact_snapshots: Vec<ArtifactSnapshot>,
     embedding_config: Option<&EmbeddingConfig>,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
 ) -> Result<SearchIndex> {
     let diff = diff_snapshots(&existing.file_snapshots, &snapshots);
-    if diff.added.is_empty() && diff.modified.is_empty() && diff.deleted.is_empty() {
+    let artifact_diff = diff_artifact_snapshots(&existing.artifact_snapshots, &artifact_snapshots);
+    if diff.added.is_empty()
+        && diff.modified.is_empty()
+        && diff.deleted.is_empty()
+        && artifact_diff.added.is_empty()
+        && artifact_diff.modified.is_empty()
+        && artifact_diff.deleted.is_empty()
+    {
         apply_runtime_embedding_config(&mut existing, embedding_config);
+        apply_runtime_artifact_embedding_config(&mut existing, artifact_embedding_config);
         return Ok(existing);
     }
 
     let resolved = ensure_vault_path(vault_path)?;
     let index_config = normalized_embedding_config(embedding_config);
+    let artifact_config = normalized_embedding_config(artifact_embedding_config);
     let expected_dimensions = if index_config.supports_embeddings() {
         existing.embedding_dimensions
     } else {
@@ -1865,6 +2691,33 @@ fn refresh_index_incremental(
             actual: embedding_dimensions.unwrap_or(0),
         });
     }
+    let artifact_changed_paths = artifact_diff
+        .added
+        .iter()
+        .chain(artifact_diff.modified.iter())
+        .map(|snapshot| snapshot.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut prepared_artifacts = artifact_snapshots
+        .iter()
+        .filter(|snapshot| artifact_changed_paths.contains(snapshot.path.as_str()))
+        .map(|snapshot| {
+            prepare_artifact_from_snapshot(
+                &resolved,
+                snapshot,
+                artifact_config.supports_embeddings(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (artifact_embedding_dimensions, artifact_embedding_error) = embed_prepared_artifacts(
+        &mut prepared_artifacts,
+        &artifact_config,
+        existing.artifact_embedding_dimensions,
+    );
+    if artifact_config.supports_embeddings()
+        && artifact_embedding_dimensions != existing.artifact_embedding_dimensions
+    {
+        existing.artifact_embedding_dimensions = artifact_embedding_dimensions;
+    }
 
     let index_file = index_file_path(vault_path, index_dir);
     let mut connection =
@@ -1875,6 +2728,14 @@ fn refresh_index_incremental(
     connection
         .execute_batch(sqlite::CURRENT_SCHEMA_DDL)
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    if artifact_config.supports_embeddings()
+        && existing.artifact_embedding_dimensions.is_some()
+        && !sqlite::has_artifact_vector_table(&connection)
+            .map_err(|error| IndexError::Embedding(error.to_string()))?
+    {
+        sqlite::recreate_artifact_vector_table(&connection, existing.artifact_embedding_dimensions)
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    }
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
@@ -1933,6 +2794,40 @@ fn refresh_index_incremental(
         )?;
     }
 
+    let has_artifact_vectors = existing.artifact_embedding_dimensions.is_some();
+    let mut existing_artifact_ids = BTreeMap::new();
+    for snapshot in &artifact_diff.modified {
+        if let Some(artifact_id) = query_optional_artifact_id(&tx, &snapshot.path)? {
+            existing_artifact_ids.insert(snapshot.path.clone(), artifact_id);
+        }
+    }
+    for path in artifact_diff
+        .deleted
+        .iter()
+        .chain(artifact_diff.modified.iter().map(|snapshot| &snapshot.path))
+    {
+        delete_existing_artifact_rows(&tx, path, has_artifact_vectors)?;
+    }
+
+    let mut next_artifact_id = tx
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) + 1 FROM artifacts",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    for prepared in &prepared_artifacts {
+        let artifact_id = existing_artifact_ids
+            .get(&prepared.snapshot.path)
+            .copied()
+            .unwrap_or_else(|| {
+                let id = next_artifact_id;
+                next_artifact_id += 1;
+                id
+            });
+        insert_prepared_artifact(&tx, artifact_id, prepared, has_artifact_vectors)?;
+    }
+
     let document_frequencies = update_document_frequencies_delta(
         &existing.document_frequencies,
         &removed_term_counts,
@@ -1941,9 +2836,12 @@ fn refresh_index_incremental(
     replace_index_metadata(
         &tx,
         &snapshots,
+        &artifact_snapshots,
         &document_frequencies,
         &existing,
         &index_config,
+        &artifact_config,
+        artifact_embedding_error.as_deref(),
         &now_utc_string(),
     )?;
     tx.commit()
@@ -1955,6 +2853,7 @@ fn refresh_index_incremental(
         index_dir: index_dir.map(PathBuf::from),
     });
     apply_runtime_embedding_config(&mut loaded, embedding_config);
+    apply_runtime_artifact_embedding_config(&mut loaded, artifact_embedding_config);
     Ok(loaded)
 }
 
@@ -1963,28 +2862,50 @@ pub fn get_search_index(
     index_dir: Option<&Path>,
     embedding_config: Option<&EmbeddingConfig>,
 ) -> Result<(SearchIndex, bool)> {
+    get_search_index_with_artifacts(vault_path, index_dir, embedding_config, None)
+}
+
+pub fn get_search_index_with_artifacts(
+    vault_path: &Path,
+    index_dir: Option<&Path>,
+    embedding_config: Option<&EmbeddingConfig>,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> Result<(SearchIndex, bool)> {
     if let Some(mut existing) = load_index(vault_path, index_dir)? {
         let snapshots = collect_snapshots(vault_path)?;
+        let artifact_snapshots = collect_artifact_snapshots(vault_path)?;
         if same_snapshots(&existing.file_snapshots, &snapshots)
+            && same_artifact_snapshots(&existing.artifact_snapshots, &artifact_snapshots)
             && same_semantic_config(&existing, embedding_config)
+            && same_artifact_embedding_config(&existing, artifact_embedding_config)
         {
             apply_runtime_embedding_config(&mut existing, embedding_config);
+            apply_runtime_artifact_embedding_config(&mut existing, artifact_embedding_config);
             return Ok((existing, false));
         }
-        if same_semantic_config(&existing, embedding_config) {
+        if same_semantic_config(&existing, embedding_config)
+            && same_artifact_embedding_config(&existing, artifact_embedding_config)
+        {
             if let Ok(updated) = refresh_index_incremental(
                 vault_path,
                 index_dir,
                 existing,
                 snapshots,
+                artifact_snapshots,
                 embedding_config,
+                artifact_embedding_config,
             ) {
                 return Ok((updated, true));
             }
         }
     }
 
-    let rebuilt = build_index(vault_path, index_dir, embedding_config)?;
+    let rebuilt = build_index_with_artifacts(
+        vault_path,
+        index_dir,
+        embedding_config,
+        artifact_embedding_config,
+    )?;
     Ok((rebuilt, true))
 }
 
@@ -1994,13 +2915,44 @@ pub fn build_index_from_snapshots(
     snapshots: Vec<FileSnapshot>,
     embedding_config: Option<&EmbeddingConfig>,
 ) -> Result<SearchIndex> {
+    build_index_from_snapshots_with_artifacts(
+        vault_path,
+        index_dir,
+        snapshots,
+        Vec::new(),
+        embedding_config,
+        None,
+    )
+}
+
+pub fn build_index_from_snapshots_with_artifacts(
+    vault_path: &Path,
+    index_dir: Option<&Path>,
+    snapshots: Vec<FileSnapshot>,
+    artifact_snapshots: Vec<ArtifactSnapshot>,
+    embedding_config: Option<&EmbeddingConfig>,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> Result<SearchIndex> {
     let resolved = ensure_vault_path(vault_path)?;
     let index_config = normalized_embedding_config(embedding_config);
+    let artifact_config = normalized_embedding_config(artifact_embedding_config);
     let mut prepared_notes = snapshots
         .iter()
         .map(|snapshot| prepare_note_from_snapshot(&resolved, snapshot))
         .collect::<Result<Vec<_>>>()?;
     let embedding_dimensions = embed_prepared_notes(&mut prepared_notes, &index_config, None)?;
+    let mut prepared_artifacts = artifact_snapshots
+        .iter()
+        .map(|snapshot| {
+            prepare_artifact_from_snapshot(
+                &resolved,
+                snapshot,
+                artifact_config.supports_embeddings(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (artifact_embedding_dimensions, artifact_embedding_error) =
+        embed_prepared_artifacts(&mut prepared_artifacts, &artifact_config, None);
     let notes = prepared_notes
         .iter()
         .map(|prepared| prepared.note.clone())
@@ -2009,7 +2961,19 @@ pub fn build_index_from_snapshots(
         .iter()
         .flat_map(|prepared| prepared.chunks.iter().cloned())
         .collect::<Vec<_>>();
+    let artifacts = prepared_artifacts
+        .iter()
+        .map(|prepared| prepared.artifact.clone())
+        .collect::<Vec<_>>();
     let document_frequencies = collect_document_frequencies(&notes);
+    let vectorized_artifact_count = artifacts
+        .iter()
+        .filter(|artifact| artifact.embedding.is_some())
+        .count();
+    let skipped_artifact_count = artifact_snapshots
+        .iter()
+        .filter(|snapshot| snapshot.size > DEFAULT_MAX_ARTIFACT_BYTES)
+        .count();
 
     let index = SearchIndex {
         version: INDEX_VERSION,
@@ -2047,12 +3011,50 @@ pub fn build_index_from_snapshots(
         } else {
             None
         },
+        artifact_embedding_provider: if artifact_config.supports_embeddings() {
+            Some(
+                artifact_config
+                    .provider
+                    .as_ref()
+                    .map(EmbeddingProvider::as_str)
+                    .unwrap_or("openai-compatible")
+                    .to_string(),
+            )
+        } else {
+            None
+        },
+        artifact_embedding_model: artifact_config
+            .model
+            .clone()
+            .filter(|value| !value.trim().is_empty()),
+        artifact_embedding_dimensions,
+        artifact_embedding_base_url: if artifact_config.supports_embeddings() {
+            artifact_config.base_url().map(|value| value.to_string())
+        } else {
+            None
+        },
+        artifact_embedding_api_key_env: if artifact_config.supports_embeddings() {
+            artifact_config.api_key_env.clone()
+        } else {
+            None
+        },
+        artifact_embedding_api_key: if artifact_config.supports_embeddings() {
+            artifact_config.api_key.clone()
+        } else {
+            None
+        },
+        artifact_embedding_error,
         file_snapshots: snapshots,
+        artifact_snapshots,
         document_frequencies,
         chunk_count: chunks.len(),
         note_count: notes.len(),
+        artifact_count: artifacts.len(),
+        vectorized_artifact_count,
+        skipped_artifact_count,
         notes,
         chunks,
+        artifacts,
         context: Some(IndexContext {
             vault_path: resolved.clone(),
             index_dir: index_dir.map(PathBuf::from),
@@ -2493,6 +3495,19 @@ mod tests {
             .expect("collect chunks")
     }
 
+    fn artifact_id(root: &Path, relative: &str) -> Option<i64> {
+        let connection =
+            open_index_connection(&index_file_path(root, None), true).expect("open index");
+        connection
+            .query_row(
+                "SELECT id FROM artifacts WHERE path = ?1",
+                params![relative],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .expect("query artifact id")
+    }
+
     fn vector_counts(root: &Path) -> (usize, usize) {
         let connection =
             open_index_connection(&index_file_path(root, None), true).expect("open index");
@@ -2636,6 +3651,39 @@ mod tests {
     }
 
     #[test]
+    fn artifact_snapshot_collection_supports_common_media_and_ignores_hidden_dirs() {
+        let root = unique_temp_dir("artifact-snapshots");
+        fs::create_dir_all(&root).expect("temp dir");
+        write_fixture(&root, "Home.md", "# Home\n");
+        write_fixture(&root, "docs/Guide.pdf", "fake pdf");
+        write_fixture(&root, "images/Logo.PNG", "fake png");
+        write_fixture(&root, "audio/Clip.mp3", "fake audio");
+        write_fixture(&root, "video/Demo.webm", "fake video");
+        write_fixture(&root, ".hidden/Secret.pdf", "ignored");
+        write_fixture(&root, ".obsidian/Theme.pdf", "ignored");
+
+        let snapshots = collect_artifact_snapshots(&root).expect("artifact snapshots");
+        let paths = snapshots
+            .iter()
+            .map(|snapshot| snapshot.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                "audio/Clip.mp3",
+                "docs/Guide.pdf",
+                "images/Logo.PNG",
+                "video/Demo.webm"
+            ]
+        );
+        assert_eq!(snapshots[1].mime_type, "application/pdf");
+        assert_eq!(snapshots[2].kind, "image");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn heading_and_block_extraction_follow_expected_rules() {
         let content =
             "# Title\n\n## Section One\nBody\n\ninline ^block-id\n\nParagraph\n^block-two\n";
@@ -2774,6 +3822,86 @@ mod tests {
         assert_eq!(chunk_ids(&root, "Other.md"), other_chunks);
         assert!(!updated.document_frequencies.contains_key("alpha"));
         assert_eq!(updated.document_frequencies.get("beta"), Some(&1));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn get_search_index_incrementally_updates_artifacts_without_rewriting_unchanged_ids() {
+        let root = unique_temp_dir("artifact-incremental");
+        fs::create_dir_all(&root).expect("temp dir");
+        write_fixture(&root, "Home.md", "# Home\n\nAlpha anchor.\n");
+        write_fixture(&root, "docs/Guide.pdf", "pdf one");
+        write_fixture(&root, "images/Logo.png", "png one");
+
+        let (built, rebuilt_first) =
+            get_search_index_with_artifacts(&root, None, None, None).expect("build");
+        assert!(rebuilt_first);
+        assert_eq!(built.note_count, 1);
+        assert_eq!(built.artifact_count, 2);
+        assert_eq!(built.vectorized_artifact_count, 0);
+        let guide_id = artifact_id(&root, "docs/Guide.pdf").expect("guide id");
+        let logo_id = artifact_id(&root, "images/Logo.png").expect("logo id");
+        let home_id = note_id(&root, "Home.md").expect("home id");
+
+        write_fixture(&root, "audio/Clip.mp3", "audio one");
+        let (updated, rebuilt) =
+            get_search_index_with_artifacts(&root, None, None, None).expect("refresh");
+
+        assert!(rebuilt);
+        assert_eq!(updated.artifact_count, 3);
+        assert_eq!(artifact_id(&root, "docs/Guide.pdf"), Some(guide_id));
+        assert_eq!(artifact_id(&root, "images/Logo.png"), Some(logo_id));
+        assert_eq!(note_id(&root, "Home.md"), Some(home_id));
+        assert!(artifact_id(&root, "audio/Clip.mp3").is_some());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn artifact_embeddings_are_whole_file_vectors_and_searchable_separately() {
+        let root = unique_temp_dir("artifact-embedding-search");
+        fs::create_dir_all(&root).expect("temp dir");
+        write_fixture(&root, "Home.md", "# Home\n\nAlpha anchor.\n");
+        write_fixture(&root, "docs/Guide.pdf", "pdf bytes");
+        let (base_url, seen_inputs) = start_embedding_server(2);
+        let artifact_config = EmbeddingConfig {
+            provider: Some(EmbeddingProvider::OpenAiCompatible),
+            model: Some("omni-test".to_string()),
+            base_url: Some(base_url),
+            api_key: None,
+            api_key_env: None,
+            max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+        }
+        .normalize();
+
+        let index =
+            build_index_with_artifacts(&root, None, None, Some(&artifact_config)).expect("build");
+
+        assert_eq!(index.artifact_count, 1);
+        assert_eq!(index.vectorized_artifact_count, 1);
+        assert_eq!(index.chunk_count, 1);
+        assert_eq!(index.artifact_embedding_dimensions, Some(3));
+        assert_eq!(seen_inputs.lock().expect("inputs lock").len(), 1);
+
+        let matches = crate::search::artifact_semantic_search_with_options(
+            &index,
+            "find the pdf",
+            crate::search::RankingOptions {
+                limit: 4,
+                semantic_weight: 1.0,
+                bm25_weight: 0.0,
+            },
+        )
+        .expect("artifact search");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, "docs/Guide.pdf");
+        let seen = seen_inputs.lock().expect("inputs lock");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].len(), 1);
+        assert_eq!(seen[1], vec!["find the pdf".to_string()]);
 
         fs::remove_dir_all(root).ok();
     }

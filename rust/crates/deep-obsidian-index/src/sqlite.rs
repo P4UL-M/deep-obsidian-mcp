@@ -5,7 +5,7 @@ use rusqlite::{ffi::sqlite3_auto_extension, Connection, OpenFlags};
 use sqlite_vec::sqlite3_vec_init;
 
 pub const INDEX_FILENAME: &str = "index.sqlite";
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 static SQLITE_VEC_REGISTER: Once = Once::new();
 
@@ -97,9 +97,33 @@ CREATE TABLE IF NOT EXISTS embedding_config (
   value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS artifact_snapshots (
+  path TEXT PRIMARY KEY,
+  mtime_ms INTEGER NOT NULL,
+  size INTEGER NOT NULL,
+  mime_type TEXT NOT NULL,
+  kind TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+  id INTEGER PRIMARY KEY,
+  path TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  metadata_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artifact_embedding_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
 CREATE INDEX IF NOT EXISTS idx_notes_path ON notes(path);
 CREATE INDEX IF NOT EXISTS idx_chunk_terms_chunk_id ON chunk_terms(chunk_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_path ON artifacts(path);
 "#;
 
 pub fn recreate_vector_tables(
@@ -125,6 +149,23 @@ pub fn recreate_vector_tables(
     Ok(())
 }
 
+pub fn recreate_artifact_vector_table(
+    conn: &Connection,
+    embedding_dimensions: Option<usize>,
+) -> rusqlite::Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS artifact_embeddings_vec;")?;
+
+    if let Some(dimensions) = embedding_dimensions.filter(|dimensions| *dimensions > 0) {
+        conn.execute_batch(&format!(
+            r#"
+            CREATE VIRTUAL TABLE artifact_embeddings_vec USING vec0(embedding float[{dimensions}]);
+            "#
+        ))?;
+    }
+
+    Ok(())
+}
+
 pub fn has_vector_tables(conn: &Connection) -> rusqlite::Result<bool> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('note_embeddings_vec', 'chunk_embeddings_vec')",
@@ -132,4 +173,13 @@ pub fn has_vector_tables(conn: &Connection) -> rusqlite::Result<bool> {
         |row| row.get(0),
     )?;
     Ok(count == 2)
+}
+
+pub fn has_artifact_vector_table(conn: &Connection) -> rusqlite::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'artifact_embeddings_vec'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count == 1)
 }

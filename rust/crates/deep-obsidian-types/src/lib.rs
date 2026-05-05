@@ -98,6 +98,7 @@ pub struct ServiceConfigInput {
     pub http: Option<HttpConfigInput>,
     pub auto_reindex: Option<AutoReindexConfigInput>,
     pub embedding: Option<EmbeddingConfigInput>,
+    pub artifact_embedding: Option<EmbeddingConfigInput>,
     pub config_file_path: Option<PathBuf>,
 }
 
@@ -111,6 +112,7 @@ pub struct PersistedServiceConfig {
     pub http: Option<HttpConfigInput>,
     pub auto_reindex: Option<AutoReindexConfigInput>,
     pub embedding: Option<EmbeddingConfigInput>,
+    pub artifact_embedding: Option<EmbeddingConfigInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +125,7 @@ pub struct ResolvedServiceConfig {
     pub http: HttpConfig,
     pub auto_reindex: AutoReindexConfig,
     pub embedding: EmbeddingConfig,
+    pub artifact_embedding: EmbeddingConfig,
     pub config_file_path: Option<PathBuf>,
 }
 

@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::graph::resolve_wiki_link_target;
 use crate::index::{
-    average, bm25_score, cosine_similarity, count_terms, embedding_runtime_config,
-    find_pattern_spans, matches_pattern, normalize_dense_vector, open_index_connection_for_index,
-    path_matches_glob, query_vector_blob, vector_norm, IndexError, Result, SearchIndex,
-    SemanticBackend,
+    artifact_embedding_runtime_config, average, bm25_score, cosine_similarity, count_terms,
+    embedding_runtime_config, find_pattern_spans, matches_pattern, normalize_dense_vector,
+    open_index_connection_for_index, path_matches_glob, query_vector_blob, vector_norm, IndexError,
+    Result, SearchIndex, SemanticBackend,
 };
 use rusqlite::{params, params_from_iter, OptionalExtension};
 
@@ -45,6 +45,17 @@ pub struct SearchMatch {
     pub semantic_score: f64,
     pub bm25_score: f64,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArtifactSearchMatch {
+    pub path: String,
+    pub title: String,
+    pub kind: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub score: f64,
+    pub metadata_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -297,6 +308,80 @@ fn embed_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
         }
     }
     Ok(normalize_dense_vector(&vector))
+}
+
+fn embed_artifact_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
+    if let Some(error) = &index.artifact_embedding_error {
+        return Err(IndexError::Embedding(format!(
+            "artifact embedding unavailable: {error}"
+        )));
+    }
+    let config =
+        artifact_embedding_runtime_config(index).ok_or(IndexError::MissingEmbeddingConfig)?;
+    let result = crate::embeddings::embed_texts(&[query.to_string()], &config)
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    let vector = result.vectors.into_iter().next().unwrap_or_default();
+    if let Some(expected) = index.artifact_embedding_dimensions {
+        if vector.len() != expected {
+            return Err(IndexError::EmbeddingDimensionsMismatch {
+                expected,
+                actual: vector.len(),
+            });
+        }
+    }
+    Ok(normalize_dense_vector(&vector))
+}
+
+fn artifact_search_with_query_vector_sql(
+    index: &SearchIndex,
+    query_embedding: &[f64],
+    limit: usize,
+) -> Result<Vec<ArtifactSearchMatch>> {
+    if index.artifact_embedding_dimensions.is_none() {
+        return Err(IndexError::MissingEmbeddingConfig);
+    }
+    let connection = open_index_connection_for_index(index, true)?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT
+              a.path,
+              a.title,
+              a.kind,
+              a.mime_type,
+              a.size,
+              a.metadata_json,
+              matches.distance
+            FROM (
+              SELECT rowid, distance
+              FROM artifact_embeddings_vec
+              WHERE embedding MATCH ?1 AND k = ?2
+            ) matches
+            JOIN artifacts a ON a.id = matches.rowid
+            ORDER BY matches.distance
+            "#,
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    let rows = statement
+        .query_map(
+            params![query_vector_blob(query_embedding), limit.max(1) as i64],
+            |row| {
+                let distance = row.get::<_, f64>(6)?;
+                Ok(ArtifactSearchMatch {
+                    path: row.get::<_, String>(0)?,
+                    title: row.get::<_, String>(1)?,
+                    kind: row.get::<_, String>(2)?,
+                    mime_type: row.get::<_, String>(3)?,
+                    size: row.get::<_, i64>(4)? as u64,
+                    metadata_json: row.get::<_, String>(5)?,
+                    score: sql_distance_score(distance),
+                })
+            },
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| IndexError::Embedding(error.to_string()))
 }
 
 pub fn find_files(index: &SearchIndex, query: &str) -> Result<Vec<FilePathMatch>> {
@@ -649,6 +734,15 @@ pub fn semantic_search_with_options(
     });
     matches.truncate(options.limit.max(1));
     Ok(matches)
+}
+
+pub fn artifact_semantic_search_with_options(
+    index: &SearchIndex,
+    query: &str,
+    options: RankingOptions,
+) -> Result<Vec<ArtifactSearchMatch>> {
+    let query_embedding = embed_artifact_query(index, query)?;
+    artifact_search_with_query_vector_sql(index, &query_embedding, options.limit.max(1))
 }
 
 pub fn hybrid_search(index: &SearchIndex, query: &str) -> Result<Vec<SearchMatch>> {
