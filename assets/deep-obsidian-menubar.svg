@@ -1,10 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-labelledby="title desc">
-  <title id="title">Deep Obsidian monochrome icon</title>
-  <desc id="desc">A single-color faceted crystal with a small knowledge graph core.</desc>
-  <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M12 2 19.5 10.4 16 20.1 12 22 8 20.1 4.5 10.4Z" stroke-width="1.8"/>
-    <path d="M12 2 10 9.2 4.5 10.4M10 9.2 12 22M10 9.2 19.5 10.4M12 22 14 13.2 19.5 10.4" stroke-width="1.15"/>
-    <path d="M10 9.2 14 13.2" stroke-width="1"/>
-  </g>
-  <circle cx="12.25" cy="14.15" r="1.15" fill="currentColor"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" aria-labelledby="title desc" role="img" viewBox="0 0 24 24"><title id="title">Deep Obsidian monochrome icon</title><desc id="desc">A single-color faceted crystal with a small knowledge graph core.</desc><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path stroke-width="1.8" d="M12 2 19.5 10.4 16 20.1 12 22 8 20.1 4.5 10.4Z"/><path stroke-width="1.15" d="M12 2 10 9.2 4.5 10.4M10 9.2 12 22M10 9.2 19.5 10.4M12 22 14 13.2 19.5 10.4"/><path stroke-width="1" d="M10 9.2 14 13.2"/></g><circle cx="12.25" cy="14.15" r="1.15" fill="currentColor"/></svg>
