@@ -68,14 +68,33 @@ Workspace/
 
 1. Identify the project name and optional project goal.
 2. Call `deep_obsidian.vault_info`.
-3. Call `deep_obsidian.list_folders` and `deep_obsidian.list_children` to inspect the existing vault.
-4. Check whether `Projets/<Project>/`, `_Agent/Contract.md`, `_Agent/Contracts/<Project>.md`, `_Agent/`, `_Wiki/`, and `_Agent/Tasks/<Project>.md` already exist.
-5. Read existing notes before updating them.
+3. Check the minimal required paths directly before doing broader folder listing:
+   - `Projets/<Project>/`
+   - `_Agent/Contract.md`
+   - `_Agent/Contracts/<Project>.md`
+   - `_Agent/Sessions/<Project>/Index.md`
+   - `_Agent/Raw/<Project>/Index.md`
+   - `_Agent/Tasks/<Project>.md`
+   - `_Agent/Log.md`
+   - `_Wiki/Index.md`
+4. Use `deep_obsidian.list_folders` or `deep_obsidian.list_children` only when direct reads are inconclusive or the project name may already exist with a variant spelling.
+5. Read an existing scaffold note before updating it.
 6. If `Projets/<Project>/` does not exist, create the folder with a minimal `.keep.md`; do not create a project hub note unless the user explicitly asks.
-7. Create only missing agent/wiki scaffold notes, or update only missing sections in existing scaffold notes.
+7. Create only missing scaffold notes. For existing notes, append only missing sections or leave them unchanged.
 8. Create or update workspace `AGENTS.md` and `CLAUDE.md` outside the vault.
-9. Add an optional recurring maintenance automation proposal. Do not create the automation silently.
+9. Propose a recurring maintenance automation after initialization. Do not create the automation silently.
 10. Verify each created or updated note with `deep_obsidian.read_file`.
+
+## Idempotency And Efficiency
+
+- Running this skill twice should not duplicate sections, tasks, index links, or automation text.
+- Prefer direct path checks over broad vault scans.
+- Do not read human project notes unless needed to disambiguate the project.
+- Do not rewrite existing scaffold notes wholesale.
+- Preserve manual additions, frontmatter, aliases, links, and local naming conventions.
+- Keep created scaffold notes small; this skill initializes operating structure, it does not populate project knowledge.
+- If a scaffold note already exists with equivalent intent but different wording, keep it and add only missing operational constraints.
+- If a project already has an active session or task structure, link to it instead of creating a parallel one.
 
 ## Recommended Scaffold Content
 
@@ -301,7 +320,6 @@ For project-scoped work, maintain a session note in `_Agent/Sessions/<Project>/`
 - the agent plans to update `_Wiki/`
 
 Do not create a session note for trivial Q&A, simple lookups, or purely conversational replies.
-```
 
 ## Optional Maintenance Automation
 
@@ -330,11 +348,8 @@ Workflow:
    - _Agent/Contract.md
    - _Agent/Contracts/<Project>.md
    - _Agent/Tasks/<Project>.md
-   - _Agent/Sessions/<Project>/Index.md
-   - _Agent/Raw/<Project>/Index.md
-   - _Wiki/Index.md
-3. Find recent unpromoted sessions in _Agent/Sessions/<Project>/.
-4. Find raw sources in _Agent/Raw/<Project>/ not reflected in _Wiki.
+3. Use search, note_outline, and indexes to find recent unpromoted sessions or raw sources.
+4. Read only the source and target notes needed for one maintenance action.
 5. Perform at most one small maintenance task:
    - distill a session into _Wiki/Syntheses/
    - extract a decision into _Wiki/Decisions/
@@ -343,7 +358,7 @@ Workflow:
    - update _Wiki/Index.md
 6. Use dryRun for broad changes.
 7. Do not modify Projets/<Project>/ or RFCs/ unless explicitly instructed.
-8. Append a short entry to _Agent/Log.md.
+8. Append a short entry to _Agent/Log.md when a write is made.
 9. Report what changed, or say no maintenance was needed.
 ```
 
@@ -367,10 +382,10 @@ Project wiki initialized for <Project>. I can also create a recurring Deep Obsid
 
 ## Preferred MCP Tools
 
-- `vault_info`
-- `list_folders`
-- `list_children`
-- `read_file`
-- `upsert_note`
-- `update_note_section`
-- `write_file_to_vault`
+- `vault_info`: verify connectivity and index state
+- `read_file`: check existing scaffold notes and verify writes
+- `list_folders`: disambiguate project folders when direct path checks are not enough
+- `list_children`: inspect only the specific folder being initialized
+- `upsert_note`: create missing scaffold notes
+- `update_note_section`: add missing sections without rewriting whole notes
+- `write_file_to_vault`: create minimal placeholder files when folder creation requires a file
