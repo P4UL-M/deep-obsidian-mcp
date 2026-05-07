@@ -42,7 +42,15 @@ brew tap P4UL-M/tap
 brew install deep-obsidian-mcp
 ```
 
-Configure the local service for your vault:
+Configure the local service for your vault. For a first install, use the interactive wizard:
+
+```bash
+deep-obsidian-mcp setup-service --wizard
+```
+
+The wizard asks for the vault path, whether to configure MCP clients, whether to install packaged skills and vault snippets, and whether to enable embeddings.
+
+For a scriptable setup, pass the choices explicitly:
 
 ```bash
 deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
