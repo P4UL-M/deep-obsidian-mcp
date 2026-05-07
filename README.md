@@ -33,7 +33,50 @@ This server supports two semantic modes:
 - sparse fallback with local term vectors and no external dependency
 - embedding-backed mode using an OpenAI-compatible `/embeddings` endpoint, with similarity ranking executed through `sqlite-vec`
 
-## Usage
+## Homebrew Quick Start
+
+Install the packaged CLI from the tap:
+
+```bash
+brew tap P4UL-M/tap
+brew install deep-obsidian-mcp
+```
+
+Configure the local service for your vault:
+
+```bash
+deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
+```
+
+This writes the service config, configures supported MCP clients, installs packaged agent skills, and installs the packaged Obsidian CSS snippets. Add `--dry-run` to preview the changes, or `--overwrite` to replace existing MCP entries, skills, snippets, or service config.
+
+Start and validate the Homebrew service:
+
+```bash
+brew services start deep-obsidian-mcp
+deep-obsidian-mcp doctor
+deep-obsidian-mcp probe
+```
+
+Useful endpoints after the service starts:
+
+- MCP: `http://127.0.0.1:4100/mcp`
+- health: `http://127.0.0.1:4100/healthz`
+- readiness: `http://127.0.0.1:4100/readyz`
+
+Update or remove the package:
+
+```bash
+brew upgrade deep-obsidian-mcp
+brew services restart deep-obsidian-mcp
+
+brew services stop deep-obsidian-mcp
+brew uninstall deep-obsidian-mcp
+```
+
+See [docs/homebrew-service.md](./docs/homebrew-service.md) for the full Homebrew service model and troubleshooting notes.
+
+## Source Usage
 
 ```bash
 cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp
