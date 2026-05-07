@@ -51,7 +51,7 @@ Pick exactly one primary mode before writing:
 
 | Mode | Use when |
 |---|---|
-| Distill | Agent sessions, raw sources, or scattered context should become durable wiki knowledge. |
+| Distill | Agent sessions, explicitly staged raw sources, or scattered context should become durable wiki knowledge. |
 | Decision | A technical, product, architecture, or workflow decision should be recorded. |
 | Refactor | Existing notes should be split, merged, retitled, relinked, deduplicated, or cleaned. |
 | Memory Policy | The main question is whether something should be remembered and where it belongs. |
@@ -80,7 +80,7 @@ Default durable destinations:
 | Reusable concept | `_Wiki/Concepts/` |
 | Durable decision | `_Wiki/Decisions/` |
 | Open question | `_Wiki/Questions/` |
-| Raw source or transcript | `_Agent/Raw/<Project>/` |
+| Raw source or transcript explicitly provided for processing | `_Agent/Raw/<Project>/` |
 | Work trace | `_Agent/Sessions/<Project>/` |
 | Project maintenance queue | `_Agent/Tasks/<Project>.md` |
 | Write/distillation log | `_Agent/Log.md` |
@@ -89,7 +89,7 @@ Human-owned folders such as `Projets/`, `RFCs/`, `Blog/`, and `Présentations/` 
 
 ## Distill Mode
 
-Turn captured sessions, raw sources, or scattered context into durable wiki knowledge.
+Turn captured sessions, explicitly staged raw sources, or scattered context into durable wiki knowledge.
 
 Workflow:
 
@@ -101,6 +101,8 @@ Workflow:
 6. Write one durable note update or one new durable note.
 7. Link back to the source sessions or raw notes.
 8. Mark source status only if the vault convention supports it; otherwise leave a log entry.
+
+Raw notes are optional. Do not look for `_Agent/Raw/<Project>/` as a routine duty unless the user mentions raw material, an index shows staged sources, or search finds unprocessed raw notes.
 
 Distillation output should be concise and auditable:
 
@@ -200,7 +202,7 @@ Policy:
 - Session-only work history belongs in `_Agent/Sessions/<Project>/`.
 - Stable reusable knowledge belongs in `_Wiki/`.
 - Decisions with future consequences belong in `_Wiki/Decisions/`.
-- Raw material belongs in `_Agent/Raw/<Project>/`.
+- Raw material belongs in `_Agent/Raw/<Project>/` only when it is explicitly provided or imported for processing.
 - Human-facing deliverables belong in human-owned folders only after approval.
 - Sensitive material, secrets, tokens, credentials, and raw `.env` content should not be stored.
 - Personal preferences or long-term user memory require clear user intent.

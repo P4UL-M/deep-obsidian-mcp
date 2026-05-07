@@ -43,7 +43,7 @@ Projets/<Project>/...human-owned notes...
 _Agent/Contract.md
 _Agent/Contracts/<Project>.md
 _Agent/Sessions/<Project>/Index.md
-_Agent/Raw/<Project>/Index.md
+_Agent/Raw/<Project>/Index.md  # optional, only when raw material is staged
 _Agent/Tasks/<Project>.md
 _Agent/Log.md
 _Wiki/Index.md
@@ -57,7 +57,9 @@ _Wiki/Questions/Index.md
 
 Workspace or repository `AGENTS.md` and `CLAUDE.md` are required as the auto-loaded agent entrypoints. They should tell coding agents to use the `deep_obsidian` MCP and read `_Agent/Contract.md`, `_Agent/Contracts/<Project>.md`, and `_Agent/Tasks/<Project>.md` from the vault. The vault should store durable contract notes, but should not rely on a vault-root `AGENTS.md` as the auto-load mechanism.
 
-The init workflow should also offer, but never silently create, a recurring maintenance automation. The automation's job is to run one small maintenance task at a time: distill an unpromoted session, extract a decision, extract a concept, update open questions, or refresh the wiki index.
+`_Agent/Raw/<Project>/` is an optional staging inbox for transcripts, exports, copied source material, logs, or other unprocessed material. It should not be treated as a required human workflow folder, and recurring maintenance should inspect it only when raw material actually exists.
+
+The init workflow should also offer, but never silently create, a recurring maintenance automation. The automation's job is to run one small maintenance task at a time: distill an unpromoted session, distill a staged raw source when present, extract a decision, extract a concept, update open questions, or refresh the wiki index.
 
 Recommended cadence:
 
@@ -75,4 +77,5 @@ Recommended cadence:
 - Use `dryRun` before broad or multi-note writes.
 - Use `expectedHash` where available when updating existing notes.
 - Keep raw session notes and durable knowledge separate.
+- Treat raw source folders as optional, on-demand staging areas.
 - Do not create recurring maintenance automations without explicit user approval.

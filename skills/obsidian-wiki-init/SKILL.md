@@ -5,7 +5,7 @@ description: Initialize a project-specific Obsidian agent/wiki workspace through
 
 # Obsidian Wiki Init
 
-Use this skill to bootstrap a project for agentic collaboration. The goal is to create a small operating structure that lets agents capture work, ingest raw material, distill durable knowledge, and promote validated notes without polluting the user's human project folders.
+Use this skill to bootstrap a project for agentic collaboration. The goal is to create a small operating structure that lets agents capture work, optionally stage raw material when provided, distill durable knowledge, and promote validated notes without polluting the user's human project folders.
 
 All vault access must go through `deep_obsidian`. Do not use raw filesystem reads or writes.
 
@@ -25,7 +25,7 @@ _Agent/
       Index.md
   Raw/
     <Project>/
-      Index.md
+      Index.md  # optional, created only when raw material is ingested
   Tasks/
     <Project>.md
   Log.md
@@ -54,12 +54,12 @@ Workspace/
 | `_Agent/Contract.md` | Agent plus human review | Durable vault architecture contract referenced by workspace instructions. |
 | `_Agent/Contracts/<Project>.md` | Agent plus human review | Project-specific operating rules that point to, but do not modify, the human project surface. |
 | `_Agent/Sessions/<Project>/` | Agent | Messy session captures, work logs, traces, and temporary summaries. |
-| `_Agent/Raw/<Project>/` | Agent | Imported sources, transcripts, snippets, and unprocessed material. |
+| `_Agent/Raw/<Project>/` | Agent | Optional inbox for imported sources, transcripts, snippets, and unprocessed material. Create only when raw material is actually ingested. |
 | `_Agent/Tasks/<Project>.md` | Agent | Project maintenance duties, distillation queue, and recurring automation instructions. |
 | `_Agent/Log.md` | Agent | Append-only record of agent ingests, distillations, promotions, and major writes. |
 | `_Wiki/Concepts/` | Agent plus human review | Cross-project concepts that should not be duplicated per project. |
 | `_Wiki/Decisions/` | Agent plus human review | Durable decisions before or unless they are promoted to `RFCs/`. |
-| `_Wiki/Syntheses/` | Agent plus human review | Stable syntheses distilled from sessions and raw sources. |
+| `_Wiki/Syntheses/` | Agent plus human review | Stable syntheses distilled from sessions, human notes, and optional raw sources. |
 | `_Wiki/Questions/` | Agent plus human review | Open research questions, uncertainties, and follow-up prompts. |
 | workspace `AGENTS.md` | Coding agent | Auto-loaded entrypoint for Codex-like agents. |
 | workspace `CLAUDE.md` | Coding agent | Auto-loaded entrypoint for Claude Code. |
@@ -73,14 +73,13 @@ Workspace/
    - `_Agent/Contract.md`
    - `_Agent/Contracts/<Project>.md`
    - `_Agent/Sessions/<Project>/Index.md`
-   - `_Agent/Raw/<Project>/Index.md`
    - `_Agent/Tasks/<Project>.md`
    - `_Agent/Log.md`
    - `_Wiki/Index.md`
 4. Use `deep_obsidian.list_folders` or `deep_obsidian.list_children` only when direct reads are inconclusive or the project name may already exist with a variant spelling.
 5. Read an existing scaffold note before updating it.
 6. If `Projets/<Project>/` does not exist, create the folder with a minimal `.keep.md`; do not create a project hub note unless the user explicitly asks.
-7. Create only missing scaffold notes. For existing notes, append only missing sections or leave them unchanged.
+7. Create only missing scaffold notes. For existing notes, append only missing sections or leave them unchanged. Do not create `_Agent/Raw/<Project>/Index.md` unless raw material is explicitly supplied or already present.
 8. Create or update workspace `AGENTS.md` and `CLAUDE.md` outside the vault.
 9. Propose a recurring maintenance automation after initialization. Do not create the automation silently.
 10. Verify each created or updated note with `deep_obsidian.read_file`.
@@ -93,6 +92,7 @@ Workspace/
 - Do not rewrite existing scaffold notes wholesale.
 - Preserve manual additions, frontmatter, aliases, links, and local naming conventions.
 - Keep created scaffold notes small; this skill initializes operating structure, it does not populate project knowledge.
+- Treat `_Agent/Raw/<Project>/` as an optional staging inbox, not a required project area.
 - If a scaffold note already exists with equivalent intent but different wording, keep it and add only missing operational constraints.
 - If a project already has an active session or task structure, link to it instead of creating a parallel one.
 
@@ -122,7 +122,7 @@ layer: agent
 
 - Human project notes live in `Projets/`.
 - Agent session traces live in `_Agent/Sessions/`.
-- Raw source material lives in `_Agent/Raw/`.
+- Optional raw source material lives in `_Agent/Raw/` only when provided or imported.
 - Durable agent-maintained knowledge lives in `_Wiki/`.
 - Formal deliverables live in `RFCs/`, `Blog/`, `Présentations/`, or other human-owned folders.
 
@@ -137,7 +137,7 @@ layer: agent
 ## Knowledge Lifecycle
 
 1. Capture messy work in `_Agent/Sessions/<Project>/`.
-2. Store raw sources in `_Agent/Raw/<Project>/`.
+2. If raw material is explicitly provided or imported, stage it in `_Agent/Raw/<Project>/`.
 3. Distill stable facts, concepts, decisions, and questions into `_Wiki/`.
 4. Promote reviewed deliverables into human folders when explicitly requested.
 5. Append important write operations to `_Agent/Log.md`.
@@ -167,13 +167,13 @@ When linking to human notes, discover them through search, graph traversal, and 
 ## Agent Workspace
 
 - `_Agent/Sessions/<Project>/`
-- `_Agent/Raw/<Project>/`
+- `_Agent/Raw/<Project>/` when raw material is explicitly provided or imported
 - `_Agent/Tasks/<Project>.md`
 
 ## Project-Specific Rules
 
 - Keep messy generated work in `_Agent/Sessions/<Project>/`.
-- Keep raw source material in `_Agent/Raw/<Project>/`.
+- Keep explicitly provided raw source material in `_Agent/Raw/<Project>/`.
 - Distill stable project knowledge into `_Wiki/`.
 - Ask before writing directly into `Projets/<Project>/`.
 
@@ -206,7 +206,7 @@ Use this folder for messy agent-created session notes. Do not treat these notes 
 Important findings should be distilled into `_Wiki/Syntheses/`, `_Wiki/Decisions/`, or human project notes after review.
 ```
 
-### `_Agent/Raw/<Project>/Index.md`
+### Optional `_Agent/Raw/<Project>/Index.md`
 
 ```md
 ---
@@ -218,6 +218,8 @@ layer: agent
 # Raw Sources - <Project>
 
 Use this folder for unprocessed source material. Keep provenance and source links when available.
+
+This folder is optional. Do not create or maintain raw notes just because the project exists. Use it only when the user provides transcripts, exports, copied source material, large snippets, logs, or other material that should be staged before distillation.
 ```
 
 ### `_Agent/Tasks/<Project>.md`
@@ -238,7 +240,7 @@ When actively working:
 
 - Capture useful work traces in `_Agent/Sessions/<Project>/`.
 - Link sessions to relevant human notes in `Projets/<Project>/`.
-- Store raw source material in `_Agent/Raw/<Project>/`.
+- Store raw source material in `_Agent/Raw/<Project>/` only when it is explicitly provided or imported.
 - Append major writes, imports, distillations, and promotions to `_Agent/Log.md`.
 
 When not busy:
@@ -253,7 +255,7 @@ When not busy:
 ## Distillation Queue
 
 - [ ] Distill unpromoted sessions from `_Agent/Sessions/<Project>/`.
-- [ ] Review raw sources from `_Agent/Raw/<Project>/`.
+- [ ] If `_Agent/Raw/<Project>/` contains unprocessed material, review it.
 - [ ] Update project synthesis.
 - [ ] Update open questions.
 - [ ] Check stale decisions.
@@ -348,18 +350,20 @@ Workflow:
    - _Agent/Contract.md
    - _Agent/Contracts/<Project>.md
    - _Agent/Tasks/<Project>.md
-3. Use search, note_outline, and indexes to find recent unpromoted sessions or raw sources.
-4. Read only the source and target notes needed for one maintenance action.
-5. Perform at most one small maintenance task:
+3. Use search, note_outline, and indexes to find recent unpromoted sessions.
+4. Check `_Agent/Raw/<Project>/` only if it exists and contains explicitly staged raw material.
+5. Read only the source and target notes needed for one maintenance action.
+6. Perform at most one small maintenance task:
    - distill a session into _Wiki/Syntheses/
+   - distill a staged raw source into _Wiki/Syntheses/
    - extract a decision into _Wiki/Decisions/
    - extract a reusable concept into _Wiki/Concepts/
    - update _Wiki/Questions/
    - update _Wiki/Index.md
-6. Use dryRun for broad changes.
-7. Do not modify Projets/<Project>/ or RFCs/ unless explicitly instructed.
-8. Append a short entry to _Agent/Log.md when a write is made.
-9. Report what changed, or say no maintenance was needed.
+7. Use dryRun for broad changes.
+8. Do not modify Projets/<Project>/ or RFCs/ unless explicitly instructed.
+9. Append a short entry to _Agent/Log.md when a write is made.
+10. Report what changed, or say no maintenance was needed.
 ```
 
 Suggested user-facing proposal:
