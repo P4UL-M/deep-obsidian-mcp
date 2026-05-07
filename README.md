@@ -75,24 +75,23 @@ Or via the wrapper:
 ./scripts/run-http-service.sh /path/to/obsidian-vault
 ```
 
-Embedding settings for service mode can be injected through either:
+Embedding settings for service mode can be configured with:
 
 - `DEEP_OBSIDIAN_EMBEDDING_PROVIDER`
 - `DEEP_OBSIDIAN_EMBEDDING_MODEL`
 - `DEEP_OBSIDIAN_EMBEDDING_BASE_URL`
-- `DEEP_OBSIDIAN_EMBEDDING_API_KEY`
 
 or the generic variables already used by the server:
 
 - `EMBEDDING_PROVIDER`
 - `EMBEDDING_MODEL`
 - `EMBEDDING_BASE_URL`
-- `EMBEDDING_API_KEY`
 - `OPENAI_EMBEDDING_MODEL`
 - `OPENAI_BASE_URL`
-- `OPENAI_API_KEY`
 
-If a model is provided without an explicit provider, the service wrapper/installer assumes `openai-compatible`.
+API keys are stored through `setup-service --wizard` as an `apiKeyRef` in `config.json`; the secret value is stored in the OS keyring when possible, or in the encrypted local fallback. Blank API keys are allowed for local OpenAI-compatible endpoints such as Ollama.
+
+Encrypted local secret storage prevents accidental plaintext exposure in config files. For stronger local protection, use the OS keyring provider. The encrypted-file fallback is not equivalent to OS keyring storage because the application carries the decryption key.
 
 The service mode is intentionally stateless and returns JSON responses over the Streamable HTTP endpoint. That keeps the process long-lived and the index warm, while letting MCP clients connect over HTTP without spawning the server process.
 
@@ -184,12 +183,10 @@ Install as a user service:
 ./scripts/install-launchd-service.sh /path/to/obsidian-vault
 ```
 
-Example with embeddings enabled:
+Example with local embeddings enabled:
 
 ```bash
-export OPENAI_API_KEY=...
-export OPENAI_EMBEDDING_MODEL=text-embedding-3-small
-./scripts/install-launchd-service.sh /path/to/obsidian-vault
+deep-obsidian-mcp setup-service --wizard
 ```
 
 Remove it:
@@ -235,19 +232,18 @@ Embedding-backed mode:
 
 ```bash
 EMBEDDING_PROVIDER=openai-compatible \
-EMBEDDING_MODEL=text-embedding-3-small \
-OPENAI_API_KEY=... \
+EMBEDDING_MODEL=nomic-embed-text \
+EMBEDDING_BASE_URL=http://localhost:11434/v1 \
 ./bin/deep-obsidian-mcp /path/to/obsidian-vault
 ```
 
-Or with explicit flags:
+Or with explicit flags and a config secret reference created by the wizard:
 
 ```bash
 ./bin/deep-obsidian-mcp /path/to/obsidian-vault \
   --embedding-provider openai-compatible \
-  --embedding-model text-embedding-3-small \
-  --embedding-base-url https://api.openai.com/v1 \
-  --embedding-api-key "$OPENAI_API_KEY"
+  --embedding-model nomic-embed-text \
+  --embedding-base-url http://localhost:11434/v1
 ```
 
 ## MCP Tools

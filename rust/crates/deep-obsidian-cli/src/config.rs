@@ -1,5 +1,4 @@
-use std::env;
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use anyhow::{Context, Result};
 use deep_obsidian_config::{
@@ -8,7 +7,7 @@ use deep_obsidian_config::{
 };
 use deep_obsidian_types::{
     AutoReindexConfigInput, EmbeddingConfigInput, EmbeddingProvider, HttpConfigInput,
-    PersistedServiceConfig, ResolvedServiceConfig, ServiceConfigInput,
+    PersistedServiceConfig, ResolvedServiceConfig, SecretRef, ServiceConfigInput,
     StdioMode as SharedStdioMode, TransportMode as SharedTransportMode,
 };
 use serde::{Deserialize, Serialize};
@@ -42,7 +41,7 @@ pub struct ResolvedSources {
     pub embedding_provider: ResolvedSource,
     pub embedding_model: ResolvedSource,
     pub embedding_base_url: ResolvedSource,
-    pub embedding_api_key: ResolvedSource,
+    pub embedding_api_key_ref: ResolvedSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,42 +212,13 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
         ]),
         None,
     );
-    let (embedding_api_key_env, embedding_api_key_source) = first_string(
-        options.embedding_api_key_env.clone(),
-        config_file.as_ref().and_then(|config| {
+    let (embedding_api_key_ref, embedding_api_key_ref_source) =
+        first_secret_ref(config_file.as_ref().and_then(|config| {
             config
                 .embedding
                 .as_ref()
-                .and_then(|value| value.api_key_env.clone())
-        }),
-        env_string(&[
-            "DEEP_OBSIDIAN_EMBEDDING_API_KEY_ENV",
-            "EMBEDDING_API_KEY_ENV",
-        ]),
-        if env::var("OPENAI_API_KEY").is_ok() {
-            Some("OPENAI_API_KEY".to_string())
-        } else {
-            None
-        },
-    );
-    let embedding_api_key = options
-        .embedding_api_key
-        .clone()
-        .or_else(|| {
-            config_file.as_ref().and_then(|config| {
-                config
-                    .embedding
-                    .as_ref()
-                    .and_then(|value| value.api_key.clone())
-            })
-        })
-        .or_else(|| {
-            env_string(&[
-                "DEEP_OBSIDIAN_EMBEDDING_API_KEY",
-                "EMBEDDING_API_KEY",
-                "OPENAI_API_KEY",
-            ])
-        });
+                .and_then(|value| value.api_key_ref.clone())
+        }));
 
     let input = ServiceConfigInput {
         vault_path,
@@ -273,8 +243,7 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
             provider: embedding_provider,
             model: embedding_model,
             base_url: embedding_base_url,
-            api_key: embedding_api_key,
-            api_key_env: embedding_api_key_env,
+            api_key_ref: embedding_api_key_ref,
         }),
         artifact_embedding: config_file
             .as_ref()
@@ -305,9 +274,16 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
             embedding_provider: embedding_provider_source,
             embedding_model: embedding_model_source,
             embedding_base_url: embedding_base_url_source,
-            embedding_api_key: embedding_api_key_source,
+            embedding_api_key_ref: embedding_api_key_ref_source,
         },
     })
+}
+
+fn first_secret_ref(config: Option<SecretRef>) -> (Option<SecretRef>, ResolvedSource) {
+    if let Some(value) = config {
+        return (Some(value), ResolvedSource::Config);
+    }
+    (None, ResolvedSource::Default)
 }
 
 fn map_transport(value: TransportMode) -> SharedTransportMode {
@@ -618,8 +594,6 @@ mod tests {
             embedding_provider: None,
             embedding_model: None,
             embedding_base_url: None,
-            embedding_api_key: None,
-            embedding_api_key_env: None,
         }
     }
 

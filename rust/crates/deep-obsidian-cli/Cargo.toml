@@ -20,7 +20,9 @@ deep-obsidian-config = { path = "../deep-obsidian-config" }
 deep-obsidian-server = { path = "../deep-obsidian-server" }
 deep-obsidian-types = { path = "../deep-obsidian-types" }
 reqwest.workspace = true
+rpassword.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

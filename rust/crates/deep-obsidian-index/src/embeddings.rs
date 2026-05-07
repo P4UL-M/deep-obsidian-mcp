@@ -1,4 +1,4 @@
-use std::{env, thread, time::Duration};
+use std::{thread, time::Duration};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -7,7 +7,6 @@ use thiserror::Error;
 
 use crate::index::SemanticBackend;
 
-const DEFAULT_EMBEDDING_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
 #[allow(dead_code)]
 pub(crate) const DEFAULT_EMBEDDING_MAX_CONCURRENCY: usize = 4;
@@ -35,7 +34,6 @@ pub struct EmbeddingConfig {
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
-    pub api_key_env: Option<String>,
     pub max_chars: usize,
     pub batch_size: usize,
 }
@@ -53,7 +51,6 @@ impl EmbeddingConfig {
             model: None,
             base_url: None,
             api_key: None,
-            api_key_env: None,
             max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
         }
@@ -62,9 +59,6 @@ impl EmbeddingConfig {
     pub fn normalize(mut self) -> Self {
         self.batch_size = self.batch_size.max(1);
         self.max_chars = self.max_chars.max(1);
-        if self.base_url.is_none() {
-            self.base_url = Some(DEFAULT_EMBEDDING_BASE_URL.to_string());
-        }
         self
     }
 
@@ -96,11 +90,7 @@ impl EmbeddingConfig {
     }
 
     pub fn resolve_api_key(&self) -> Option<String> {
-        self.api_key.clone().or_else(|| {
-            self.api_key_env
-                .as_deref()
-                .and_then(|key| env::var(key).ok())
-        })
+        self.api_key.clone()
     }
 }
 
@@ -586,7 +576,6 @@ mod tests {
             model: Some("test-embedding-model".to_string()),
             base_url: Some(base_url),
             api_key: None,
-            api_key_env: None,
             max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: 2,
         }

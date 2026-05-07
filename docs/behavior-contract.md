@@ -32,7 +32,7 @@ Canonical config shape:
 - `embedding.provider`
 - `embedding.model`
 - `embedding.baseUrl`
-- `embedding.apiKeyEnv`
+- `embedding.apiKeyRef`
 
 Resolution precedence:
 
@@ -46,9 +46,9 @@ Rules:
 - `vaultPath` is required before service startup.
 - `transport` must default to `stdio` for subprocess use and `http` for service wrappers.
 - `http.mcpPath` and `http.healthPath` must normalize to leading-slash paths.
-- `embedding.apiKeyEnv` stores the environment variable name, not the secret itself.
-- `doctor` and other diagnostic commands must redact inline embedding API keys.
-- legacy environment names remain acceptable where they already exist, but the normalized config must be the single runtime input.
+- `embedding.apiKeyRef` stores a reference to a secret, not the secret itself.
+- `doctor`, `print-config`, `probe`, and readiness output must never print resolved secret values.
+- Encrypted local secret storage prevents accidental plaintext exposure in config files. For stronger local protection, use the OS keyring provider. The encrypted-file fallback is not equivalent to OS keyring storage because the application carries the decryption key.
 - `setup-service` and packaged mode choose an index directory outside the vault when no index directory is explicitly resolved; explicit CLI, config file, or environment values must be preserved.
 - Packaged mode is opt-in through `--packaged` or `DEEP_OBSIDIAN_PACKAGED=1`; ad-hoc dev commands without that opt-in keep the vault-local default index directory for compatibility.
 

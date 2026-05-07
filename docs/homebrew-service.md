@@ -53,7 +53,9 @@ Expected fields:
 - `embedding.provider`
 - `embedding.model`
 - `embedding.base_url`
-- `embedding.api_key_env`
+- `embedding.apiKeyRef`
+
+Encrypted local secret storage prevents accidental plaintext exposure in config files. For stronger local protection, use the OS keyring provider. The encrypted-file fallback is not equivalent to OS keyring storage because the application carries the decryption key.
 
 Maintained precedence:
 

@@ -131,16 +131,14 @@ pub struct SearchIndex {
     pub embedding_model: Option<String>,
     pub embedding_dimensions: Option<usize>,
     pub embedding_base_url: Option<String>,
-    pub embedding_api_key_env: Option<String>,
-    #[serde(skip_serializing, default)]
-    pub embedding_api_key: Option<String>,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub runtime_embedding_api_key: Option<String>,
     pub artifact_embedding_provider: Option<String>,
     pub artifact_embedding_model: Option<String>,
     pub artifact_embedding_dimensions: Option<usize>,
     pub artifact_embedding_base_url: Option<String>,
-    pub artifact_embedding_api_key_env: Option<String>,
-    #[serde(skip_serializing, default)]
-    pub artifact_embedding_api_key: Option<String>,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub runtime_artifact_embedding_api_key: Option<String>,
     pub artifact_embedding_error: Option<String>,
     pub file_snapshots: Vec<FileSnapshot>,
     pub artifact_snapshots: Vec<ArtifactSnapshot>,
@@ -953,11 +951,7 @@ fn apply_runtime_embedding_config(
         .base_url
         .clone()
         .filter(|value| !value.trim().is_empty());
-    index.embedding_api_key_env = config
-        .api_key_env
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    index.embedding_api_key = config
+    index.runtime_embedding_api_key = config
         .api_key
         .clone()
         .filter(|value| !value.trim().is_empty());
@@ -976,11 +970,7 @@ fn apply_runtime_artifact_embedding_config(
         .base_url
         .clone()
         .filter(|value| !value.trim().is_empty());
-    index.artifact_embedding_api_key_env = config
-        .api_key_env
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    index.artifact_embedding_api_key = config
+    index.runtime_artifact_embedding_api_key = config
         .api_key
         .clone()
         .filter(|value| !value.trim().is_empty());
@@ -1002,8 +992,7 @@ pub fn embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> 
                 }),
             model: index.embedding_model.clone(),
             base_url: index.embedding_base_url.clone(),
-            api_key: index.embedding_api_key.clone(),
-            api_key_env: index.embedding_api_key_env.clone(),
+            api_key: index.runtime_embedding_api_key.clone(),
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
         }
@@ -1026,8 +1015,7 @@ pub fn artifact_embedding_runtime_config(index: &SearchIndex) -> Option<Embeddin
             provider: Some(provider),
             model: index.artifact_embedding_model.clone(),
             base_url: index.artifact_embedding_base_url.clone(),
-            api_key: index.artifact_embedding_api_key.clone(),
-            api_key_env: index.artifact_embedding_api_key_env.clone(),
+            api_key: index.runtime_artifact_embedding_api_key.clone(),
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
         }
@@ -1566,16 +1554,6 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
                 .execute(params!["baseUrl", base_url])
                 .map_err(|error| IndexError::Embedding(error.to_string()))?;
         }
-        if let Some(api_key_env) = &index.embedding_api_key_env {
-            insert_runtime_config
-                .execute(params!["apiKeyEnv", api_key_env])
-                .map_err(|error| IndexError::Embedding(error.to_string()))?;
-        }
-        if let Some(api_key) = &index.embedding_api_key {
-            insert_runtime_config
-                .execute(params!["apiKey", api_key])
-                .map_err(|error| IndexError::Embedding(error.to_string()))?;
-        }
     }
 
     {
@@ -1585,16 +1563,6 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
         if let Some(base_url) = &index.artifact_embedding_base_url {
             insert_runtime_config
                 .execute(params!["baseUrl", base_url])
-                .map_err(|error| IndexError::Embedding(error.to_string()))?;
-        }
-        if let Some(api_key_env) = &index.artifact_embedding_api_key_env {
-            insert_runtime_config
-                .execute(params!["apiKeyEnv", api_key_env])
-                .map_err(|error| IndexError::Embedding(error.to_string()))?;
-        }
-        if let Some(api_key) = &index.artifact_embedding_api_key {
-            insert_runtime_config
-                .execute(params!["apiKey", api_key])
                 .map_err(|error| IndexError::Embedding(error.to_string()))?;
         }
     }
@@ -1971,14 +1939,12 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
             .get("embeddingDimensions")
             .and_then(|value| value.parse::<usize>().ok()),
         embedding_base_url: runtime_config.get("baseUrl").cloned(),
-        embedding_api_key_env: runtime_config.get("apiKeyEnv").cloned(),
-        embedding_api_key: runtime_config.get("apiKey").cloned(),
+        runtime_embedding_api_key: None,
         artifact_embedding_provider: metadata.get("artifactEmbeddingProvider").cloned(),
         artifact_embedding_model: metadata.get("artifactEmbeddingModel").cloned(),
         artifact_embedding_dimensions,
         artifact_embedding_base_url: artifact_runtime_config.get("baseUrl").cloned(),
-        artifact_embedding_api_key_env: artifact_runtime_config.get("apiKeyEnv").cloned(),
-        artifact_embedding_api_key: artifact_runtime_config.get("apiKey").cloned(),
+        runtime_artifact_embedding_api_key: None,
         artifact_embedding_error: metadata.get("artifactEmbeddingError").cloned(),
         file_snapshots,
         artifact_snapshots,
@@ -2556,20 +2522,6 @@ fn replace_index_metadata(
             )
             .map_err(|error| IndexError::Embedding(error.to_string()))?;
         }
-        if let Some(api_key_env) = &index_config.api_key_env {
-            tx.execute(
-                "INSERT INTO embedding_config (key, value) VALUES (?1, ?2)",
-                params!["apiKeyEnv", api_key_env],
-            )
-            .map_err(|error| IndexError::Embedding(error.to_string()))?;
-        }
-        if let Some(api_key) = &index_config.api_key {
-            tx.execute(
-                "INSERT INTO embedding_config (key, value) VALUES (?1, ?2)",
-                params!["apiKey", api_key],
-            )
-            .map_err(|error| IndexError::Embedding(error.to_string()))?;
-        }
     }
 
     tx.execute("DELETE FROM artifact_embedding_config", [])
@@ -2579,20 +2531,6 @@ fn replace_index_metadata(
             tx.execute(
                 "INSERT INTO artifact_embedding_config (key, value) VALUES (?1, ?2)",
                 params!["baseUrl", base_url],
-            )
-            .map_err(|error| IndexError::Embedding(error.to_string()))?;
-        }
-        if let Some(api_key_env) = &artifact_config.api_key_env {
-            tx.execute(
-                "INSERT INTO artifact_embedding_config (key, value) VALUES (?1, ?2)",
-                params!["apiKeyEnv", api_key_env],
-            )
-            .map_err(|error| IndexError::Embedding(error.to_string()))?;
-        }
-        if let Some(api_key) = &artifact_config.api_key {
-            tx.execute(
-                "INSERT INTO artifact_embedding_config (key, value) VALUES (?1, ?2)",
-                params!["apiKey", api_key],
             )
             .map_err(|error| IndexError::Embedding(error.to_string()))?;
         }
@@ -3001,12 +2939,7 @@ pub fn build_index_from_snapshots_with_artifacts(
         } else {
             None
         },
-        embedding_api_key_env: if index_config.supports_embeddings() {
-            index_config.api_key_env.clone()
-        } else {
-            None
-        },
-        embedding_api_key: if index_config.supports_embeddings() {
+        runtime_embedding_api_key: if index_config.supports_embeddings() {
             index_config.api_key.clone()
         } else {
             None
@@ -3033,12 +2966,7 @@ pub fn build_index_from_snapshots_with_artifacts(
         } else {
             None
         },
-        artifact_embedding_api_key_env: if artifact_config.supports_embeddings() {
-            artifact_config.api_key_env.clone()
-        } else {
-            None
-        },
-        artifact_embedding_api_key: if artifact_config.supports_embeddings() {
+        runtime_artifact_embedding_api_key: if artifact_config.supports_embeddings() {
             artifact_config.api_key.clone()
         } else {
             None
@@ -3870,7 +3798,6 @@ mod tests {
             model: Some("omni-test".to_string()),
             base_url: Some(base_url),
             api_key: None,
-            api_key_env: None,
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
         }
@@ -3919,8 +3846,6 @@ mod tests {
         persisted.embedding_model = Some("text-embedding-3-small".to_string());
         persisted.embedding_dimensions = Some(3);
         persisted.embedding_base_url = Some("http://persisted.example".to_string());
-        persisted.embedding_api_key_env = Some("PERSISTED_KEY".to_string());
-        persisted.embedding_api_key = Some("persisted-secret".to_string());
         for (offset, note) in persisted.notes.iter_mut().enumerate() {
             note.embedding = Some(vec![1.0 + offset as f64, 0.0, 0.0]);
         }
@@ -3930,13 +3855,24 @@ mod tests {
 
         let mut connection = open_index_connection(&index_file, false).expect("open index");
         write_search_index_to_connection(&mut connection, &persisted).expect("persist");
+        connection
+            .execute(
+                "INSERT INTO embedding_config (key, value) VALUES ('apiKeyEnv', 'PERSISTED_KEY')",
+                [],
+            )
+            .expect("insert old api key env metadata");
+        connection
+            .execute(
+                "INSERT INTO embedding_config (key, value) VALUES ('apiKey', 'persisted-secret')",
+                [],
+            )
+            .expect("insert old api key metadata");
 
         let runtime_config = EmbeddingConfig {
             provider: Some(EmbeddingProvider::OpenAiCompatible),
             model: Some("text-embedding-3-small".to_string()),
             base_url: Some("http://runtime.example".to_string()),
             api_key: Some("runtime-secret".to_string()),
-            api_key_env: Some("RUNTIME_KEY".to_string()),
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
         }
@@ -3958,8 +3894,10 @@ mod tests {
             loaded.embedding_base_url.as_deref(),
             Some("http://runtime.example")
         );
-        assert_eq!(loaded.embedding_api_key_env.as_deref(), Some("RUNTIME_KEY"));
-        assert_eq!(loaded.embedding_api_key.as_deref(), Some("runtime-secret"));
+        assert_eq!(
+            loaded.runtime_embedding_api_key.as_deref(),
+            Some("runtime-secret")
+        );
 
         fs::remove_dir_all(root).ok();
     }
@@ -3995,7 +3933,6 @@ mod tests {
             model: Some("text-embedding-test".to_string()),
             base_url: Some(base_url),
             api_key: None,
-            api_key_env: None,
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
         }

@@ -95,12 +95,6 @@ pub struct ServiceOptions {
 
     #[arg(long = "embedding-base-url", global = true)]
     pub embedding_base_url: Option<String>,
-
-    #[arg(long = "embedding-api-key", global = true)]
-    pub embedding_api_key: Option<String>,
-
-    #[arg(long = "embedding-api-key-env", global = true)]
-    pub embedding_api_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -109,6 +103,8 @@ pub enum Command {
     SetupService {
         #[arg(long)]
         overwrite: bool,
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        wizard: bool,
         #[arg(long, action = clap::ArgAction::SetTrue)]
         mcp: bool,
         #[arg(long, action = clap::ArgAction::SetTrue)]

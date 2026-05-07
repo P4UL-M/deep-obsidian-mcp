@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_index::embeddings::{
     EmbeddingConfig as IndexEmbeddingConfig, EmbeddingProvider as IndexEmbeddingProvider,
     DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_MAX_CHARS,
@@ -13,6 +14,7 @@ use deep_obsidian_index::index::{
 };
 use deep_obsidian_types::ResolvedServiceConfig;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use secrecy::ExposeSecret;
 use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -82,44 +84,52 @@ pub struct RuntimeFreshnessDiagnostics {
     pub last_watch_signal_unix_ms: Option<u64>,
 }
 
-fn index_embedding_config(config: &ResolvedServiceConfig) -> IndexEmbeddingConfig {
+fn index_embedding_config(config: &ResolvedServiceConfig) -> Result<IndexEmbeddingConfig, String> {
     let provider = match config.embedding.provider {
         Some(deep_obsidian_types::EmbeddingProvider::OpenAiCompatible) => {
             Some(IndexEmbeddingProvider::OpenAiCompatible)
         }
         None => None,
     };
+    let api_key = SecretResolver::new()
+        .resolve_embedding_api_key(&config.embedding)
+        .map_err(|error| error.to_string())?
+        .map(|secret| secret.expose_secret().to_string());
 
-    IndexEmbeddingConfig {
+    Ok(IndexEmbeddingConfig {
         provider,
         model: config.embedding.model.clone(),
         base_url: config.embedding.base_url.clone(),
-        api_key: config.embedding.api_key.clone(),
-        api_key_env: config.embedding.api_key_env.clone(),
+        api_key,
         max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
         batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
     }
-    .normalize()
+    .normalize())
 }
 
-fn index_artifact_embedding_config(config: &ResolvedServiceConfig) -> IndexEmbeddingConfig {
+fn index_artifact_embedding_config(
+    config: &ResolvedServiceConfig,
+) -> Result<IndexEmbeddingConfig, String> {
     let provider = match config.artifact_embedding.provider {
         Some(deep_obsidian_types::EmbeddingProvider::OpenAiCompatible) => {
             Some(IndexEmbeddingProvider::OpenAiCompatible)
         }
         None => None,
     };
+    let api_key = SecretResolver::new()
+        .resolve_embedding_api_key(&config.artifact_embedding)
+        .map_err(|error| error.to_string())?
+        .map(|secret| secret.expose_secret().to_string());
 
-    IndexEmbeddingConfig {
+    Ok(IndexEmbeddingConfig {
         provider,
         model: config.artifact_embedding.model.clone(),
         base_url: config.artifact_embedding.base_url.clone(),
-        api_key: config.artifact_embedding.api_key.clone(),
-        api_key_env: config.artifact_embedding.api_key_env.clone(),
+        api_key,
         max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
         batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
     }
-    .normalize()
+    .normalize())
 }
 
 #[derive(Debug)]
@@ -443,8 +453,8 @@ impl RuntimeState {
         self.refresh_in_flight.store(true, Ordering::SeqCst);
         let operation_result = if force_rebuild {
             tokio::task::spawn_blocking(move || {
-                let embedding_config = index_embedding_config(&config);
-                let artifact_embedding_config = index_artifact_embedding_config(&config);
+                let embedding_config = index_embedding_config(&config)?;
+                let artifact_embedding_config = index_artifact_embedding_config(&config)?;
                 build_index_with_artifacts(
                     &config.vault_path,
                     Some(config.index_dir.as_path()),
@@ -459,8 +469,8 @@ impl RuntimeState {
             .and_then(|result| result)
         } else {
             tokio::task::spawn_blocking(move || {
-                let embedding_config = index_embedding_config(&config);
-                let artifact_embedding_config = index_artifact_embedding_config(&config);
+                let embedding_config = index_embedding_config(&config)?;
+                let artifact_embedding_config = index_artifact_embedding_config(&config)?;
                 get_search_index_with_artifacts(
                     &config.vault_path,
                     Some(config.index_dir.as_path()),
@@ -505,6 +515,9 @@ impl RuntimeState {
                 if let Ok(mut guard) = self.stale_reason.write() {
                     *guard = None;
                 }
+                if let Ok(mut guard) = self.last_error.write() {
+                    *guard = None;
+                }
                 self.generation.fetch_add(1, Ordering::SeqCst);
                 Ok(snapshot)
             }
@@ -540,8 +553,8 @@ impl RuntimeState {
                 collect_snapshots(&config.vault_path).map_err(|error| error.to_string())?;
             let artifact_snapshots = collect_artifact_snapshots(&config.vault_path)
                 .map_err(|error| error.to_string())?;
-            let embedding_config = index_embedding_config(&config);
-            let artifact_embedding_config = index_artifact_embedding_config(&config);
+            let embedding_config = index_embedding_config(&config)?;
+            let artifact_embedding_config = index_artifact_embedding_config(&config)?;
             Ok::<_, String>(
                 snapshots == current_index.file_snapshots
                     && same_artifact_snapshots(

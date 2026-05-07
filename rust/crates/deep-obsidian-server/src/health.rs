@@ -1,4 +1,4 @@
-use deep_obsidian_types::ResolvedServiceConfig;
+use deep_obsidian_types::{ResolvedServiceConfig, SecretRef};
 use serde_json::{json, Map, Value};
 
 use crate::runtime::{
@@ -44,6 +44,18 @@ pub fn build_health_payload(
         Value::Bool(config.auto_reindex.enabled),
     );
     insert_runtime_diagnostics(&mut payload, diagnostics);
+    insert_secret_status(
+        &mut payload,
+        "embeddingApiKey",
+        config.embedding.api_key_ref.as_ref(),
+        diagnostics,
+    );
+    insert_secret_status(
+        &mut payload,
+        "artifactEmbeddingApiKey",
+        config.artifact_embedding.api_key_ref.as_ref(),
+        diagnostics,
+    );
     if let Some(snapshot) = &diagnostics.snapshot {
         insert_index_snapshot(&mut payload, snapshot);
     }
@@ -76,6 +88,18 @@ pub fn build_readiness_payload(
         Value::Bool(config.auto_reindex.enabled),
     );
     insert_runtime_diagnostics(&mut payload, diagnostics);
+    insert_secret_status(
+        &mut payload,
+        "embeddingApiKey",
+        config.embedding.api_key_ref.as_ref(),
+        diagnostics,
+    );
+    insert_secret_status(
+        &mut payload,
+        "artifactEmbeddingApiKey",
+        config.artifact_embedding.api_key_ref.as_ref(),
+        diagnostics,
+    );
     if let Some(snapshot) = &diagnostics.snapshot {
         insert_index_snapshot(&mut payload, snapshot);
     }
@@ -89,6 +113,29 @@ pub fn readiness_status_code(diagnostics: &RuntimeDiagnostics) -> axum::http::St
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         }
     }
+}
+
+fn insert_secret_status(
+    payload: &mut Map<String, Value>,
+    key: &str,
+    reference: Option<&SecretRef>,
+    diagnostics: &RuntimeDiagnostics,
+) {
+    let Some(reference) = reference else {
+        return;
+    };
+    let kind = match reference {
+        SecretRef::OsKeyring { .. } => "osKeyring",
+        SecretRef::EncryptedFile { .. } => "encryptedFile",
+    };
+    payload.insert(
+        key.to_string(),
+        json!({
+            "kind": kind,
+            "configured": true,
+            "resolved": matches!(diagnostics.status, RuntimeReadiness::Ready),
+        }),
+    );
 }
 
 fn insert_index_snapshot(payload: &mut Map<String, Value>, snapshot: &RuntimeIndexSnapshot) {

@@ -13,6 +13,7 @@ use thiserror::Error;
 pub const DEFAULT_CONFIG_DIR_NAME: &str = ".config";
 pub const DEFAULT_CONFIG_APP_DIR: &str = "deep-obsidian-mcp";
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "config.json";
+pub const DEFAULT_SECRETS_FILE_NAME: &str = "secrets.json";
 pub const DEFAULT_HTTP_HOST: &str = "127.0.0.1";
 pub const DEFAULT_HTTP_PORT: u16 = 4100;
 pub const DEFAULT_HTTP_MCP_PATH: &str = "/mcp";
@@ -69,6 +70,12 @@ pub fn default_config_path() -> PathBuf {
     default_config_dir()
         .join(DEFAULT_CONFIG_APP_DIR)
         .join(DEFAULT_CONFIG_FILE_NAME)
+}
+
+pub fn default_secrets_path() -> PathBuf {
+    default_config_dir()
+        .join(DEFAULT_CONFIG_APP_DIR)
+        .join(DEFAULT_SECRETS_FILE_NAME)
 }
 
 pub fn default_index_dir(vault_path: &Path) -> PathBuf {
@@ -187,21 +194,18 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
             provider: config.embedding.provider.clone(),
             model: config.embedding.model.clone(),
             base_url: config.embedding.base_url.clone(),
-            api_key: config.embedding.api_key.clone(),
-            api_key_env: config.embedding.api_key_env.clone(),
+            api_key_ref: config.embedding.api_key_ref.clone(),
         }),
         artifact_embedding: if config.artifact_embedding.provider.is_some()
             || config.artifact_embedding.model.is_some()
             || config.artifact_embedding.base_url.is_some()
-            || config.artifact_embedding.api_key.is_some()
-            || config.artifact_embedding.api_key_env.is_some()
+            || config.artifact_embedding.api_key_ref.is_some()
         {
             Some(EmbeddingConfigInput {
                 provider: config.artifact_embedding.provider.clone(),
                 model: config.artifact_embedding.model.clone(),
                 base_url: config.artifact_embedding.base_url.clone(),
-                api_key: config.artifact_embedding.api_key.clone(),
-                api_key_env: config.artifact_embedding.api_key_env.clone(),
+                api_key_ref: config.artifact_embedding.api_key_ref.clone(),
             })
         } else {
             None
@@ -294,8 +298,7 @@ fn normalize_embedding_input(input: Option<EmbeddingConfigInput>) -> EmbeddingCo
         Some(EmbeddingProvider::OpenAiCompatible) => Some(EmbeddingProvider::OpenAiCompatible),
         None if input.model.is_some()
             || input.base_url.is_some()
-            || input.api_key.is_some()
-            || input.api_key_env.is_some() =>
+            || input.api_key_ref.is_some() =>
         {
             Some(EmbeddingProvider::OpenAiCompatible)
         }
@@ -306,8 +309,7 @@ fn normalize_embedding_input(input: Option<EmbeddingConfigInput>) -> EmbeddingCo
         provider,
         model: trim_optional(input.model),
         base_url: trim_optional(input.base_url),
-        api_key: input.api_key,
-        api_key_env: trim_optional(input.api_key_env),
+        api_key_ref: input.api_key_ref,
     }
 }
 
@@ -358,6 +360,8 @@ fn serialize_toml<T: Serialize>(path: &Path, value: &T) -> Result<String, Config
         source: Box::new(source),
     })
 }
+
+pub mod secrets;
 
 #[cfg(test)]
 mod tests {

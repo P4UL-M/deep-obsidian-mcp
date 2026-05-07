@@ -1,6 +1,7 @@
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, Write};
 use std::iter;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -10,18 +11,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use deep_obsidian_config::{
-    build_service_endpoints, default_packaged_index_dir, to_persisted_config, write_config_file,
+    build_service_endpoints, default_packaged_index_dir, secrets::SecretResolver,
+    to_persisted_config, write_config_file,
 };
 use deep_obsidian_server::{run_http_service, run_stdio_service};
 use deep_obsidian_types::{
-    PersistedServiceConfig, ResolvedServiceConfig, ServiceEndpoints, TransportMode,
+    PersistedServiceConfig, ResolvedServiceConfig, SecretRef, ServiceEndpoints, TransportMode,
 };
 use reqwest::Client;
 use rusqlite::{Connection, OpenFlags};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, ServiceOptions};
 use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -31,6 +34,7 @@ const HELP_TEXT: &str = "\
 Usage:
   deep-obsidian-mcp [serve] [--config <path>] [--vault <path>] [--transport stdio|http] [--packaged]
   deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--dry-run]
+  deep-obsidian-mcp setup-service --wizard [--config <path>] [--dry-run]
   deep-obsidian-mcp doctor [--config <path>] [--json]
   deep-obsidian-mcp print-config [--config <path>]
   deep-obsidian-mcp probe [--config <path>] [--json]
@@ -234,12 +238,24 @@ pub async fn run() -> Result<()> {
         }
         Command::SetupService {
             overwrite,
+            wizard,
             mcp,
             skills,
             vault_snippets,
         } => {
-            let resolved = crate::config::resolve_runtime_config(&cli.options)?;
-            let report = setup_service(&resolved, dry_run, overwrite, mcp, skills, vault_snippets)?;
+            let report = if wizard {
+                setup_service_wizard(
+                    &cli.options,
+                    dry_run,
+                    overwrite,
+                    mcp,
+                    skills,
+                    vault_snippets,
+                )?
+            } else {
+                let resolved = crate::config::resolve_runtime_config(&cli.options)?;
+                setup_service(&resolved, dry_run, overwrite, mcp, skills, vault_snippets)?
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -472,8 +488,6 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
                 | "--embedding-provider"
                 | "--embedding-model"
                 | "--embedding-base-url"
-                | "--embedding-api-key"
-                | "--embedding-api-key-env"
                 | "--probe-timeout-ms"
                 | "--timeout-ms"
         ) || token.starts_with("--config=")
@@ -489,8 +503,6 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
             || token.starts_with("--embedding-provider=")
             || token.starts_with("--embedding-model=")
             || token.starts_with("--embedding-base-url=")
-            || token.starts_with("--embedding-api-key=")
-            || token.starts_with("--embedding-api-key-env=")
             || token.starts_with("--probe-timeout-ms=")
             || token.starts_with("--timeout-ms=")
         {
@@ -539,20 +551,6 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
                     index,
                     "--embedding-base-url",
                     "--embedding-base-url",
-                )
-            } else if token.starts_with("--embedding-api-key-env") {
-                normalize_value_flag(
-                    raw_args,
-                    index,
-                    "--embedding-api-key-env",
-                    "--embedding-api-key-env",
-                )
-            } else if token.starts_with("--embedding-api-key") {
-                normalize_value_flag(
-                    raw_args,
-                    index,
-                    "--embedding-api-key",
-                    "--embedding-api-key",
                 )
             } else if token.starts_with("--probe-timeout-ms") {
                 normalize_value_flag(raw_args, index, "--probe-timeout-ms", "--probe-timeout-ms")
@@ -699,6 +697,128 @@ pub fn setup_service(
         skills,
         vault_snippets,
     })
+}
+
+fn setup_service_wizard(
+    options: &ServiceOptions,
+    dry_run: bool,
+    overwrite: bool,
+    mcp: bool,
+    skills: bool,
+    vault_snippets: bool,
+) -> Result<SetupServiceReport> {
+    let mut options = options.clone();
+    if options.vault_path.is_none() {
+        options.vault_path = Some(PathBuf::from(prompt_string("Vault path", None)?));
+    }
+
+    let install_mcp = mcp || prompt_bool("Configure MCP clients?", false)?;
+    let install_skills = skills || prompt_bool("Install packaged skills?", false)?;
+    let install_vault_snippets = vault_snippets || prompt_bool("Install vault snippets?", false)?;
+    let enable_embeddings = prompt_bool("Enable embeddings?", false)?;
+
+    if enable_embeddings {
+        options.embedding_provider = Some("openai-compatible".to_string());
+        let model = prompt_string("Embedding model", None)?;
+        if !model.trim().is_empty() {
+            options.embedding_model = Some(model);
+        }
+        let base_url = prompt_string("Embedding base URL", None)?;
+        if !base_url.trim().is_empty() {
+            options.embedding_base_url = Some(base_url);
+        }
+    }
+
+    let mut resolved = crate::config::resolve_runtime_config(&options)?;
+
+    if enable_embeddings {
+        let secret = prompt_optional_secret("Embedding API key (blank for no auth)")?;
+        if let Some(secret) = secret {
+            let reference = SecretRef::OsKeyring {
+                service: "deep-obsidian-mcp".to_string(),
+                account: "openai-embedding".to_string(),
+            };
+            if dry_run {
+                resolved.service.embedding.api_key_ref = Some(reference);
+            } else {
+                let resolver = SecretResolver::new();
+                match resolver.put(
+                    &reference,
+                    SecretString::from(secret.expose_secret().to_string()),
+                ) {
+                    Ok(()) => {
+                        resolved.service.embedding.api_key_ref = Some(reference);
+                    }
+                    Err(error) => {
+                        println!("OS keyring unavailable: {error}");
+                        if prompt_bool("Use encrypted local file fallback?", true)? {
+                            let fallback = SecretRef::EncryptedFile {
+                                id: "openai-embedding".to_string(),
+                            };
+                            resolver.put(&fallback, secret)?;
+                            resolved.service.embedding.api_key_ref = Some(fallback);
+                        } else {
+                            return Err(anyhow!("embedding API key was not stored"));
+                        }
+                    }
+                }
+            }
+        } else {
+            resolved.service.embedding.api_key_ref = None;
+        }
+    }
+
+    setup_service(
+        &resolved,
+        dry_run,
+        overwrite,
+        install_mcp,
+        install_skills,
+        install_vault_snippets,
+    )
+}
+
+fn prompt_string(label: &str, default: Option<&str>) -> Result<String> {
+    match default {
+        Some(default) => print!("{label} [{default}]: "),
+        None => print!("{label}: "),
+    }
+    io::stdout().flush().context("failed to flush stdout")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read prompt input")?;
+    let value = input.trim().to_string();
+    Ok(if value.is_empty() {
+        default.unwrap_or_default().to_string()
+    } else {
+        value
+    })
+}
+
+fn prompt_bool(label: &str, default: bool) -> Result<bool> {
+    let suffix = if default { "[Y/n]" } else { "[y/N]" };
+    loop {
+        let value = prompt_string(&format!("{label} {suffix}"), None)?;
+        if value.trim().is_empty() {
+            return Ok(default);
+        }
+        match value.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("Please answer y or n."),
+        }
+    }
+}
+
+fn prompt_optional_secret(label: &str) -> Result<Option<SecretString>> {
+    let value = rpassword::prompt_password(format!("{label}: "))
+        .context("failed to read secret prompt input")?;
+    if value.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(SecretString::from(value)))
+    }
 }
 
 fn setup_mcp_clients(
@@ -1292,6 +1412,18 @@ pub async fn doctor(
             message: "transport is stdio; health probe is skipped".into(),
             details: None,
         });
+    }
+
+    if let Some(check) =
+        secret_reference_check("embeddingApiKey", service.embedding.api_key_ref.as_ref())
+    {
+        checks.push(check);
+    }
+    if let Some(check) = secret_reference_check(
+        "artifactEmbeddingApiKey",
+        service.artifact_embedding.api_key_ref.as_ref(),
+    ) {
+        checks.push(check);
     }
 
     let ok = checks.iter().all(|check| check.status != "fail");
@@ -2179,6 +2311,47 @@ fn check_rg() -> CheckReport {
     }
 }
 
+fn secret_reference_check(name: &str, reference: Option<&SecretRef>) -> Option<CheckReport> {
+    let reference = reference?;
+    let resolver = SecretResolver::new();
+    let kind = match reference {
+        SecretRef::OsKeyring { .. } => "osKeyring",
+        SecretRef::EncryptedFile { .. } => "encryptedFile",
+    };
+    match resolver.get(reference) {
+        Ok(Some(_)) => Some(CheckReport {
+            name: name.into(),
+            status: "ok".into(),
+            message: "secret reference resolved".into(),
+            details: Some(serde_json::json!({
+                "kind": kind,
+                "configured": true,
+                "resolved": true,
+            })),
+        }),
+        Ok(None) => Some(CheckReport {
+            name: name.into(),
+            status: "fail".into(),
+            message: "secret reference is configured but missing".into(),
+            details: Some(serde_json::json!({
+                "kind": kind,
+                "configured": true,
+                "resolved": false,
+            })),
+        }),
+        Err(error) => Some(CheckReport {
+            name: name.into(),
+            status: "fail".into(),
+            message: error.to_string(),
+            details: Some(serde_json::json!({
+                "kind": kind,
+                "configured": true,
+                "resolved": false,
+            })),
+        }),
+    }
+}
+
 fn check_port(config: &ResolvedServiceConfig) -> CheckReport {
     match TcpListener::bind((config.http.host.as_str(), config.http.port)) {
         Ok(listener) => {
@@ -2305,18 +2478,7 @@ fn http_client(timeout_ms: u64) -> Result<Client> {
 }
 
 fn redact_config(config: &PersistedServiceConfig) -> PersistedServiceConfig {
-    let mut cloned = config.clone();
-    if let Some(embedding) = &mut cloned.embedding {
-        if embedding.api_key.is_some() {
-            embedding.api_key = Some("[redacted]".to_string());
-        }
-    }
-    if let Some(embedding) = &mut cloned.artifact_embedding {
-        if embedding.api_key.is_some() {
-            embedding.api_key = Some("[redacted]".to_string());
-        }
-    }
-    cloned
+    config.clone()
 }
 
 fn render_doctor_report(report: &DoctorReport) -> String {
@@ -2446,7 +2608,7 @@ mod tests {
     };
     use deep_obsidian_types::{
         AutoReindexConfig, EmbeddingConfig, EmbeddingConfigInput, HttpConfig,
-        PersistedServiceConfig, ResolvedServiceConfig, StdioMode, TransportMode,
+        PersistedServiceConfig, ResolvedServiceConfig, SecretRef, StdioMode, TransportMode,
     };
     use rusqlite::Connection;
     use std::fs;
@@ -2559,11 +2721,12 @@ mod tests {
     }
 
     #[test]
-    fn redact_config_removes_inline_embedding_secret() {
+    fn persisted_config_uses_secret_reference_without_plaintext() {
         let config = PersistedServiceConfig {
             embedding: Some(EmbeddingConfigInput {
-                api_key: Some("super-secret".to_string()),
-                api_key_env: Some("OPENAI_API_KEY".to_string()),
+                api_key_ref: Some(SecretRef::EncryptedFile {
+                    id: "openai-embedding".to_string(),
+                }),
                 ..EmbeddingConfigInput::default()
             }),
             ..PersistedServiceConfig::default()
@@ -2573,8 +2736,8 @@ mod tests {
         let serialized = serde_json::to_string(&redacted).expect("serialize redacted config");
 
         assert!(!serialized.contains("super-secret"));
-        assert!(serialized.contains("[redacted]"));
-        assert!(serialized.contains("OPENAI_API_KEY"));
+        assert!(serialized.contains("apiKeyRef"));
+        assert!(serialized.contains("encryptedFile"));
     }
 
     #[test]
