@@ -76,6 +76,21 @@ pub struct AutoReindexDiagnostics {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EmbeddingDiagnostics {
+    pub configured: bool,
+    pub active: bool,
+    pub backend: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IndexDiagnostics {
     pub path: PathBuf,
     pub exists: bool,
@@ -101,6 +116,7 @@ pub struct IndexDiagnostics {
 #[serde(rename_all = "camelCase")]
 pub struct ServiceDiagnostics {
     pub auto_reindex: AutoReindexDiagnostics,
+    pub embedding: EmbeddingDiagnostics,
     pub endpoint: EndpointReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<String>,
@@ -2224,11 +2240,71 @@ fn service_diagnostics(
             debounce_ms: config.auto_reindex.debounce_ms,
             interval_ms: config.auto_reindex.interval_ms,
         },
+        embedding: embedding_diagnostics(config, &health_payload, &readiness_payload, index),
         endpoint: endpoint_report(endpoints),
         last_refresh,
         last_error,
         health: health_payload,
         readiness: readiness_payload,
+    }
+}
+
+fn embedding_diagnostics(
+    config: &ResolvedServiceConfig,
+    health_payload: &Option<Value>,
+    readiness_payload: &Option<Value>,
+    index: &IndexDiagnostics,
+) -> EmbeddingDiagnostics {
+    let configured = config.embedding.provider.is_some()
+        && config
+            .embedding
+            .model
+            .as_ref()
+            .map(|model| !model.trim().is_empty())
+            .unwrap_or(false);
+    let backend = readiness_payload
+        .as_ref()
+        .and_then(|payload| payload.get("semanticBackend"))
+        .or_else(|| {
+            health_payload
+                .as_ref()
+                .and_then(|payload| payload.get("semanticBackend"))
+        })
+        .or_else(|| {
+            index
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("semanticBackend"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let active = backend == "embedding";
+    let provider = config
+        .embedding
+        .provider
+        .as_ref()
+        .and_then(|provider| serde_json::to_string(provider).ok())
+        .map(|provider| provider.trim_matches('"').to_string());
+    let message = match (configured, active, backend.as_str()) {
+        (true, true, _) => "embedding backend is active".to_string(),
+        (true, false, "unknown") => {
+            "embedding is configured, but active backend is not known yet".to_string()
+        }
+        (true, false, backend) => {
+            format!("embedding is configured, but current backend is {backend}")
+        }
+        (false, _, _) => "embedding is not configured".to_string(),
+    };
+
+    EmbeddingDiagnostics {
+        configured,
+        active,
+        backend,
+        message,
+        provider,
+        model: config.embedding.model.clone(),
+        base_url: config.embedding.base_url.clone(),
     }
 }
 
@@ -2534,6 +2610,24 @@ fn render_doctor_report(report: &DoctorReport) -> String {
         report.service.auto_reindex.debounce_ms,
         report.service.auto_reindex.interval_ms
     );
+    let embedding_state = if report.service.embedding.active {
+        "active"
+    } else if report.service.embedding.configured {
+        "inactive"
+    } else {
+        "not configured"
+    };
+    let _ = writeln!(
+        &mut output,
+        "embedding: {} (backend={})",
+        embedding_state, report.service.embedding.backend
+    );
+    if let Some(model) = &report.service.embedding.model {
+        let _ = writeln!(&mut output, "embedding model: {}", model);
+    }
+    if let Some(base_url) = &report.service.embedding.base_url {
+        let _ = writeln!(&mut output, "embedding base URL: {}", base_url);
+    }
     if let Some(last_refresh) = &report.service.last_refresh {
         let _ = writeln!(&mut output, "last refresh: {}", last_refresh);
     }
@@ -2603,11 +2697,11 @@ fn render_probe_report(report: &ProbeReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        enable_obsidian_snippets, inspect_index, normalize_cli_args, redact_config,
-        INDEX_SQLITE_FILENAME,
+        embedding_diagnostics, enable_obsidian_snippets, inspect_index, normalize_cli_args,
+        redact_config, IndexDiagnostics, INDEX_SQLITE_FILENAME,
     };
     use deep_obsidian_types::{
-        AutoReindexConfig, EmbeddingConfig, EmbeddingConfigInput, HttpConfig,
+        AutoReindexConfig, EmbeddingConfig, EmbeddingConfigInput, EmbeddingProvider, HttpConfig,
         PersistedServiceConfig, ResolvedServiceConfig, SecretRef, StdioMode, TransportMode,
     };
     use rusqlite::Connection;
@@ -2648,6 +2742,22 @@ mod tests {
             embedding: EmbeddingConfig::default(),
             artifact_embedding: EmbeddingConfig::default(),
             config_file_path: None,
+        }
+    }
+
+    fn minimal_index_diagnostics(index_dir: &Path, backend: &str) -> IndexDiagnostics {
+        IndexDiagnostics {
+            path: index_dir.join(INDEX_SQLITE_FILENAME),
+            exists: true,
+            status: "ok".to_string(),
+            message: "test index".to_string(),
+            size_bytes: None,
+            schema_version: None,
+            user_version: None,
+            metadata: Some(serde_json::json!({ "semanticBackend": backend })),
+            note_rows: None,
+            chunk_rows: None,
+            file_snapshot_rows: None,
         }
     }
 
@@ -2738,6 +2848,56 @@ mod tests {
         assert!(!serialized.contains("super-secret"));
         assert!(serialized.contains("apiKeyRef"));
         assert!(serialized.contains("encryptedFile"));
+    }
+
+    #[test]
+    fn embedding_diagnostics_reports_active_backend() {
+        let root = unique_temp_dir("embedding-diagnostics");
+        let vault = root.join("vault");
+        let index_dir = root.join("index");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::create_dir_all(&index_dir).expect("create index");
+        let mut config = resolved_config(&vault, &index_dir);
+        config.embedding.provider = Some(EmbeddingProvider::OpenAiCompatible);
+        config.embedding.model = Some("qwen3-embedding:0.6b".to_string());
+        config.embedding.base_url = Some("http://localhost:11434/v1".to_string());
+        let index = minimal_index_diagnostics(&index_dir, "sparse");
+        let readiness = Some(serde_json::json!({ "semanticBackend": "embedding" }));
+
+        let diagnostics = embedding_diagnostics(&config, &None, &readiness, &index);
+
+        assert!(diagnostics.configured);
+        assert!(diagnostics.active);
+        assert_eq!(diagnostics.backend, "embedding");
+        assert_eq!(diagnostics.model.as_deref(), Some("qwen3-embedding:0.6b"));
+        assert_eq!(
+            diagnostics.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn embedding_diagnostics_reports_configured_but_inactive_backend() {
+        let root = unique_temp_dir("embedding-diagnostics-inactive");
+        let vault = root.join("vault");
+        let index_dir = root.join("index");
+        fs::create_dir_all(&vault).expect("create vault");
+        fs::create_dir_all(&index_dir).expect("create index");
+        let mut config = resolved_config(&vault, &index_dir);
+        config.embedding.provider = Some(EmbeddingProvider::OpenAiCompatible);
+        config.embedding.model = Some("qwen3-embedding:0.6b".to_string());
+        let index = minimal_index_diagnostics(&index_dir, "sparse");
+
+        let diagnostics = embedding_diagnostics(&config, &None, &None, &index);
+
+        assert!(diagnostics.configured);
+        assert!(!diagnostics.active);
+        assert_eq!(diagnostics.backend, "sparse");
+        assert!(diagnostics.message.contains("current backend is sparse"));
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
