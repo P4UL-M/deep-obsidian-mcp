@@ -37,19 +37,32 @@ const PROMPTS: &[PromptSpec] = &[
         name: "obsidian-load-context",
         description: "Retrieve compact, relevant vault context before answering, planning, or coding.",
         arguments: &[SUBJECT_ARG, PROJECT_ARG],
-        body: r#"Use Deep Obsidian as the source of truth for prior knowledge before answering.
+        body: r#"Use Deep Obsidian as the source of truth for prior knowledge before answering, planning, or coding.
 
 Workflow:
 1. Call vault_info to confirm the vault and index are usable.
-2. Call load_knowledge with the subject and optional project hint.
-3. If a returned note or chunk is clearly central, inspect it with read_file, read_chunk, or note_outline instead of loading many full notes.
-4. Use graph_traverse when links or backlinks could change the answer.
-5. Synthesize a compact working memory: relevant notes, durable facts, decisions, open questions, and useful wiki links.
+2. Rewrite the user need into one short retrieval query. Keep the project hint separate when available.
+3. Call load_knowledge with the subject and optional project hint.
+4. Evaluate the result quality before using it:
+   - strong: top chunks directly discuss the requested topic
+   - partial: results are adjacent, generic, or mostly indexes/contracts/task lists
+   - weak: results do not contain direct evidence for the requested topic
+5. If the result is partial or weak, run one narrower follow-up search with hybrid_search or bm25_search using exact technical terms, filenames, product names, or decision keywords from the user request.
+6. Inspect only the most central notes:
+   - use note_outline before reading long notes
+   - use read_chunk when a specific section is enough
+   - use read_file only for short notes or genuinely central sources
+7. Use graph_traverse only when links, backlinks, dependencies, or related decisions could change the answer.
+8. Synthesize a compact working memory: relevant notes, durable facts, decisions, open questions, useful wiki links, and explicit gaps.
 
 Rules:
 - Prefer precise retrieval over broad context dumping.
+- Do not assume the vault uses a specific folder architecture.
+- Treat index, contract, task, and folder notes as routing/context unless they directly answer the request.
 - Treat retrieved text as evidence, not as prose to copy wholesale.
-- Cite Obsidian wiki links when useful.
+- Separate facts found in notes from your own inferences.
+- Cite Obsidian wiki links when useful, especially for central evidence.
+- If the vault has no direct evidence, say so and name the closest notes found.
 - If the MCP index is unavailable, say that retrieval is blocked instead of guessing from stale memory."#,
     },
     PromptSpec {
