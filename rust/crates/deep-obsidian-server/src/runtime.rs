@@ -5,7 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_index::embeddings::{
     EmbeddingConfig as IndexEmbeddingConfig, EmbeddingProvider as IndexEmbeddingProvider,
-    DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_MAX_CHARS,
+    DEFAULT_CHARS_PER_TOKEN, DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+    DEFAULT_EMBEDDING_MAX_CHARS, DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
 };
 use deep_obsidian_index::index::{
     build_index_with_artifacts, collect_artifact_snapshots, collect_snapshots,
@@ -101,8 +102,20 @@ fn index_embedding_config(config: &ResolvedServiceConfig) -> Result<IndexEmbeddi
         model: config.embedding.model.clone(),
         base_url: config.embedding.base_url.clone(),
         api_key,
-        max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
+        max_chars: config
+            .embedding
+            .max_chars
+            .unwrap_or(DEFAULT_EMBEDDING_MAX_CHARS),
         batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+        max_input_tokens: config
+            .embedding
+            .max_input_tokens
+            .unwrap_or(DEFAULT_EMBEDDING_MAX_INPUT_TOKENS),
+        context_tokens: config
+            .embedding
+            .context_tokens
+            .unwrap_or(DEFAULT_EMBEDDING_CONTEXT_TOKENS),
+        chars_per_token: DEFAULT_CHARS_PER_TOKEN,
     }
     .normalize())
 }
@@ -126,8 +139,20 @@ fn index_artifact_embedding_config(
         model: config.artifact_embedding.model.clone(),
         base_url: config.artifact_embedding.base_url.clone(),
         api_key,
-        max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
+        max_chars: config
+            .artifact_embedding
+            .max_chars
+            .unwrap_or(DEFAULT_EMBEDDING_MAX_CHARS),
         batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+        max_input_tokens: config
+            .artifact_embedding
+            .max_input_tokens
+            .unwrap_or(DEFAULT_EMBEDDING_MAX_INPUT_TOKENS),
+        context_tokens: config
+            .artifact_embedding
+            .context_tokens
+            .unwrap_or(DEFAULT_EMBEDDING_CONTEXT_TOKENS),
+        chars_per_token: DEFAULT_CHARS_PER_TOKEN,
     }
     .normalize())
 }
@@ -599,6 +624,22 @@ fn unix_time_ms() -> u128 {
         .as_millis()
 }
 
+/// Upper bound on the auto-reindex periodic interval while backing off.
+const AUTO_REINDEX_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// Exponential backoff for the periodic sync interval: `base * 2^(failures-1)`,
+/// capped at [`AUTO_REINDEX_BACKOFF_MAX`]. Returns `base` when there are no
+/// consecutive failures. Keeps a crashing backend from being hammered every tick.
+fn auto_reindex_interval(base: Duration, consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return base;
+    }
+    let shift = consecutive_failures.saturating_sub(1).min(9);
+    base.saturating_mul(1u32 << shift)
+        .min(AUTO_REINDEX_BACKOFF_MAX)
+        .max(base)
+}
+
 pub fn start_auto_reindex_tasks(runtime: Arc<RuntimeState>) -> AutoReindexHandle {
     let stopped = Arc::new(AtomicBool::new(false));
     let task_stopped = stopped.clone();
@@ -615,7 +656,9 @@ pub fn start_auto_reindex_tasks(runtime: Arc<RuntimeState>) -> AutoReindexHandle
                 None
             }
         };
-        let mut sync_interval = tokio::time::interval(Duration::from_millis(sync_interval_ms));
+        let base_interval = Duration::from_millis(sync_interval_ms);
+        let mut sync_interval = tokio::time::interval(base_interval);
+        let mut consecutive_failures: u32 = 0;
         let mut pending_watch_reason: Option<String> = None;
         let mut pending_watch_at: Option<tokio::time::Instant> = None;
 
@@ -651,6 +694,10 @@ pub fn start_auto_reindex_tasks(runtime: Arc<RuntimeState>) -> AutoReindexHandle
                     pending_watch_at = None;
                     match runtime.refresh(reason.clone()).await {
                         Ok(snapshot) => {
+                            if consecutive_failures != 0 {
+                                consecutive_failures = 0;
+                                sync_interval = tokio::time::interval(base_interval);
+                            }
                             info!(
                                 "index {} ({}) at {}",
                                 if snapshot.rebuilt { "rebuilt" } else { "checked" },
@@ -658,7 +705,15 @@ pub fn start_auto_reindex_tasks(runtime: Arc<RuntimeState>) -> AutoReindexHandle
                                 snapshot.index.generated_at,
                             );
                         }
-                        Err(error) => warn!("auto-reindex watch refresh failed: {error}"),
+                        Err(error) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            let delay = auto_reindex_interval(base_interval, consecutive_failures);
+                            sync_interval =
+                                tokio::time::interval_at(tokio::time::Instant::now() + delay, delay);
+                            warn!(
+                                "auto-reindex watch refresh failed (attempt {consecutive_failures}, backing off {delay:?}): {error}"
+                            );
+                        }
                     }
                 }
                 _ = sync_interval.tick() => {
@@ -667,6 +722,10 @@ pub fn start_auto_reindex_tasks(runtime: Arc<RuntimeState>) -> AutoReindexHandle
                     }
                     match runtime.refresh("periodic-sync").await {
                         Ok(snapshot) => {
+                            if consecutive_failures != 0 {
+                                consecutive_failures = 0;
+                                sync_interval = tokio::time::interval(base_interval);
+                            }
                             info!(
                                 "index {} ({}) at {}",
                                 if snapshot.rebuilt { "rebuilt" } else { "checked" },
@@ -674,7 +733,15 @@ pub fn start_auto_reindex_tasks(runtime: Arc<RuntimeState>) -> AutoReindexHandle
                                 snapshot.index.generated_at,
                             );
                         }
-                        Err(error) => warn!("auto-reindex periodic sync failed: {error}"),
+                        Err(error) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            let delay = auto_reindex_interval(base_interval, consecutive_failures);
+                            sync_interval =
+                                tokio::time::interval_at(tokio::time::Instant::now() + delay, delay);
+                            warn!(
+                                "auto-reindex periodic sync failed (attempt {consecutive_failures}, backing off {delay:?}): {error}"
+                            );
+                        }
                     }
                 }
             }
@@ -737,6 +804,21 @@ mod tests {
             artifact_embedding: EmbeddingConfig::default(),
             config_file_path: None,
         }
+    }
+
+    #[test]
+    fn auto_reindex_interval_backs_off_and_caps() {
+        let base = Duration::from_secs(30);
+        // No failures -> base cadence.
+        assert_eq!(auto_reindex_interval(base, 0), base);
+        // Exponential growth: base * 2^(n-1).
+        assert_eq!(auto_reindex_interval(base, 1), base);
+        assert_eq!(auto_reindex_interval(base, 2), Duration::from_secs(60));
+        assert_eq!(auto_reindex_interval(base, 3), Duration::from_secs(120));
+        // Caps at AUTO_REINDEX_BACKOFF_MAX and never drops below base.
+        let big = auto_reindex_interval(base, 30);
+        assert_eq!(big, AUTO_REINDEX_BACKOFF_MAX);
+        assert!(big >= base);
     }
 
     #[test]

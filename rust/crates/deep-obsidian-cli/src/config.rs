@@ -244,6 +244,9 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
             model: embedding_model,
             base_url: embedding_base_url,
             api_key_ref: embedding_api_key_ref,
+            max_chars: None,
+            max_input_tokens: None,
+            context_tokens: None,
         }),
         artifact_embedding: config_file
             .as_ref()

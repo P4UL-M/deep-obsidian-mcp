@@ -10,7 +10,18 @@ use crate::index::SemanticBackend;
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
 #[allow(dead_code)]
 pub(crate) const DEFAULT_EMBEDDING_MAX_CONCURRENCY: usize = 4;
-pub const DEFAULT_EMBEDDING_MAX_CHARS: usize = 12_000;
+/// Hard character ceiling on a single embedding input. Acts as a backstop on top
+/// of the token budget below; the effective per-input cap is the smaller of the two.
+pub const DEFAULT_EMBEDDING_MAX_CHARS: usize = 15_000;
+/// Backend context window (tokens) we size inputs against. Must stay <= the
+/// embedding server's allocated `num_ctx` (e.g. Ollama `OLLAMA_CONTEXT_LENGTH`):
+/// an input exceeding the worker's window crashes llama.cpp rather than erroring.
+pub const DEFAULT_EMBEDDING_CONTEXT_TOKENS: usize = 8_192;
+/// Per-input token budget, kept with margin under the context window.
+pub const DEFAULT_EMBEDDING_MAX_INPUT_TOKENS: usize = 6_000;
+/// Conservative chars-per-token estimate. Dense markdown / code / CJK pack more
+/// tokens per char, so we keep this low to over-estimate token counts and stay safe.
+pub const DEFAULT_CHARS_PER_TOKEN: f64 = 2.5;
 #[allow(dead_code)]
 pub(crate) const DEFAULT_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -28,7 +39,7 @@ impl EmbeddingProvider {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     pub provider: Option<EmbeddingProvider>,
     pub model: Option<String>,
@@ -36,6 +47,13 @@ pub struct EmbeddingConfig {
     pub api_key: Option<String>,
     pub max_chars: usize,
     pub batch_size: usize,
+    /// Per-input token budget. Each embedding input is clamped to at most
+    /// `max_input_tokens * chars_per_token` characters (and `max_chars`).
+    pub max_input_tokens: usize,
+    /// Backend context window in tokens; bounds the per-request token total.
+    pub context_tokens: usize,
+    /// Conservative chars-per-token estimate used to convert token budgets to chars.
+    pub chars_per_token: f64,
 }
 
 impl Default for EmbeddingConfig {
@@ -53,13 +71,43 @@ impl EmbeddingConfig {
             api_key: None,
             max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: DEFAULT_CHARS_PER_TOKEN,
         }
     }
 
     pub fn normalize(mut self) -> Self {
         self.batch_size = self.batch_size.max(1);
         self.max_chars = self.max_chars.max(1);
+        self.max_input_tokens = self.max_input_tokens.max(1);
+        self.context_tokens = self.context_tokens.max(self.max_input_tokens);
+        if !(self.chars_per_token.is_finite() && self.chars_per_token >= 1.0) {
+            self.chars_per_token = DEFAULT_CHARS_PER_TOKEN;
+        }
         self
+    }
+
+    /// Effective per-input character cap: the smaller of the hard char ceiling and
+    /// the char-equivalent of the per-input token budget.
+    pub fn effective_max_chars(&self) -> usize {
+        let token_chars = (self.max_input_tokens as f64 * self.chars_per_token).floor();
+        let token_chars = if token_chars.is_finite() && token_chars >= 1.0 {
+            token_chars as usize
+        } else {
+            self.max_chars
+        };
+        self.max_chars.min(token_chars).max(1)
+    }
+
+    /// Estimated token count of a string under the configured chars/token ratio.
+    pub fn estimate_tokens(&self, text: &str) -> usize {
+        let ratio = if self.chars_per_token >= 1.0 {
+            self.chars_per_token
+        } else {
+            DEFAULT_CHARS_PER_TOKEN
+        };
+        ((text.chars().count() as f64) / ratio).ceil() as usize
     }
 
     pub fn is_sparse(&self) -> bool {
@@ -130,6 +178,9 @@ pub(crate) struct EmbeddingBatchOptions {
     pub batch_size: usize,
     pub max_concurrency: usize,
     pub timeout: Duration,
+    /// Upper bound on the estimated total tokens packed into a single HTTP request.
+    /// A batch is closed when EITHER `batch_size` inputs OR this token budget is hit.
+    pub max_request_tokens: usize,
 }
 
 impl EmbeddingBatchOptions {
@@ -139,6 +190,7 @@ impl EmbeddingBatchOptions {
             batch_size: config.batch_size.max(1),
             max_concurrency: DEFAULT_EMBEDDING_MAX_CONCURRENCY,
             timeout: DEFAULT_EMBEDDING_TIMEOUT,
+            max_request_tokens: config.context_tokens.max(config.max_input_tokens).max(1),
         }
     }
 
@@ -146,6 +198,7 @@ impl EmbeddingBatchOptions {
     pub(crate) fn normalized(mut self) -> Self {
         self.batch_size = self.batch_size.max(1);
         self.max_concurrency = self.max_concurrency.max(1);
+        self.max_request_tokens = self.max_request_tokens.max(1);
         self
     }
 }
@@ -168,12 +221,19 @@ pub enum EmbeddingError {
     DimensionsMismatch { expected: usize, actual: usize },
 }
 
-fn clamp_text(text: &str, max_chars: usize) -> String {
+fn clamp_chars(text: &str, max_chars: usize) -> String {
     let safe_max = max_chars.max(1);
     if text.chars().count() <= safe_max {
         return text.to_string();
     }
     text.chars().take(safe_max).collect()
+}
+
+/// Clamp a single embedding input to the config's effective per-input budget
+/// (the smaller of the hard char ceiling and the token-derived char cap). This is
+/// the guarantee that no input sent to the backend can exceed its context window.
+fn clamp_input(text: &str, config: &EmbeddingConfig) -> String {
+    clamp_chars(text, config.effective_max_chars())
 }
 
 pub fn normalize_dense_vector(vector: &[f64]) -> Vec<f64> {
@@ -236,10 +296,7 @@ pub(crate) fn embed_text_batches_with_client(
     }
 
     let options = options.clone().normalized();
-    let batches = texts
-        .chunks(options.batch_size)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>();
+    let batches = pack_batches(texts, config, &options);
     let batch_count = batches.len();
     let mut batch_results = Vec::with_capacity(batch_count);
 
@@ -255,7 +312,7 @@ pub(crate) fn embed_text_batches_with_client(
                     scope.spawn(move || {
                         (
                             batch_index,
-                            embed_texts_with_client(&batch, config, &client),
+                            embed_batch_with_bisect(&batch, config, &client),
                         )
                     })
                 })
@@ -307,6 +364,81 @@ pub(crate) fn embed_text_batches_with_client(
     })
 }
 
+/// Pack inputs into request batches, closing a batch when EITHER the input count
+/// reaches `batch_size` OR the estimated token total reaches `max_request_tokens`.
+/// A single oversized input still gets its own batch (it is clamped at send time).
+#[allow(dead_code)]
+fn pack_batches(
+    texts: &[String],
+    config: &EmbeddingConfig,
+    options: &EmbeddingBatchOptions,
+) -> Vec<Vec<String>> {
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_tokens = 0usize;
+
+    for text in texts {
+        // Tokens actually sent are bounded by the per-input clamp.
+        let est = config.estimate_tokens(&clamp_input(text, config)).max(1);
+        if !current.is_empty()
+            && (current.len() >= options.batch_size
+                || current_tokens + est > options.max_request_tokens)
+        {
+            batches.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current.push(text.clone());
+        current_tokens += est;
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Embed a batch, bisecting the INPUT LIST on failure so one bad input can't fail
+/// the whole batch. Splits in half and retries each half down to a single input;
+/// a size-1 input that still fails propagates its error. The 1:1 input→vector
+/// contract is preserved (we never split an input's text here).
+#[allow(dead_code)]
+fn embed_batch_with_bisect(
+    texts: &[String],
+    config: &EmbeddingConfig,
+    client: &reqwest::blocking::Client,
+) -> Result<EmbeddingResult, EmbeddingError> {
+    match embed_texts_with_client(texts, config, client) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            if texts.len() <= 1 {
+                return Err(error);
+            }
+            let mid = texts.len() / 2;
+            let left = embed_batch_with_bisect(&texts[..mid], config, client)?;
+            let right = embed_batch_with_bisect(&texts[mid..], config, client)?;
+            if !left.vectors.is_empty()
+                && !right.vectors.is_empty()
+                && left.dimensions != right.dimensions
+            {
+                return Err(EmbeddingError::DimensionsMismatch {
+                    expected: left.dimensions,
+                    actual: right.dimensions,
+                });
+            }
+            let dimensions = if left.vectors.is_empty() {
+                right.dimensions
+            } else {
+                left.dimensions
+            };
+            let mut vectors = left.vectors;
+            vectors.extend(right.vectors);
+            Ok(EmbeddingResult {
+                vectors,
+                dimensions,
+            })
+        }
+    }
+}
+
 pub fn embed_texts_with_client(
     texts: &[String],
     config: &EmbeddingConfig,
@@ -344,7 +476,7 @@ pub fn embed_texts_with_client(
         "model": model,
         "input": texts
             .iter()
-            .map(|text| clamp_text(text, config.max_chars))
+            .map(|text| clamp_input(text, config))
             .collect::<Vec<_>>(),
     });
 
@@ -578,6 +710,9 @@ mod tests {
             api_key: None,
             max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: 2,
+            max_input_tokens: DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: DEFAULT_CHARS_PER_TOKEN,
         }
     }
 
@@ -697,6 +832,7 @@ mod tests {
                 batch_size: 2,
                 max_concurrency: 2,
                 timeout: Duration::from_secs(5),
+                max_request_tokens: usize::MAX,
             }),
         )
         .expect("embed batches");
@@ -746,6 +882,7 @@ mod tests {
                 batch_size: 2,
                 max_concurrency: 1,
                 timeout: Duration::from_secs(5),
+                max_request_tokens: usize::MAX,
             }),
         )
         .expect_err("dimension mismatch");
@@ -758,5 +895,132 @@ mod tests {
                 actual: 3
             }
         ));
+    }
+
+    #[test]
+    fn clamp_input_caps_by_token_estimate() {
+        // Token budget binds even though the hard char ceiling is far larger.
+        let mut config = test_config("http://unused".to_string());
+        config.max_chars = 100_000;
+        config.max_input_tokens = 10;
+        config.chars_per_token = 2.5;
+        // effective cap = min(100_000, floor(10 * 2.5)) = 25 chars.
+        assert_eq!(config.effective_max_chars(), 25);
+        let long = "x".repeat(1_000);
+        assert_eq!(clamp_input(&long, &config).chars().count(), 25);
+
+        // Hard char ceiling binds when it is the smaller of the two.
+        config.max_chars = 5;
+        config.max_input_tokens = 10_000;
+        assert_eq!(config.effective_max_chars(), 5);
+        assert_eq!(clamp_input(&long, &config).chars().count(), 5);
+    }
+
+    #[test]
+    fn pack_batches_splits_by_request_token_budget() {
+        let mut config = test_config("http://unused".to_string());
+        config.max_chars = 100_000; // no per-input clamping in this test
+        config.max_input_tokens = 100_000;
+        config.chars_per_token = 2.5;
+        // Each input: 25 chars -> ceil(25 / 2.5) = 10 estimated tokens.
+        let texts = vec!["x".repeat(25), "y".repeat(25), "z".repeat(25)];
+
+        // Token budget of 15 forces one input per request despite a high count cap.
+        let tight = EmbeddingBatchOptions {
+            batch_size: 100,
+            max_concurrency: 1,
+            timeout: Duration::from_secs(5),
+            max_request_tokens: 15,
+        };
+        let batches = pack_batches(&texts, &config, &tight);
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| batch.len() == 1));
+
+        // Token budget of 25 packs two inputs (20 tokens) before the third spills.
+        let loose = EmbeddingBatchOptions {
+            max_request_tokens: 25,
+            ..tight
+        };
+        let batches = pack_batches(&texts, &config, &loose);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[1].len(), 1);
+    }
+
+    /// Mock server that returns HTTP 500 for any request whose `input` array has
+    /// more than one element, and a valid 1-dim embedding otherwise. Used to drive
+    /// the bisect path: a multi-input batch fails, then each half retries down to 1.
+    fn spawn_bisecting_server(expected_requests: usize) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind bisect server");
+        let address = listener.local_addr().expect("read listener address");
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming().take(expected_requests) {
+                let mut stream = stream.expect("accept bisect request");
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request_body(&request).is_some() {
+                        break;
+                    }
+                }
+                let body = request_body(&request).expect("request body");
+                let payload: serde_json::Value =
+                    serde_json::from_slice(body).expect("parse request body");
+                let inputs = payload
+                    .get("input")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("input array")
+                    .clone();
+
+                let response = if inputs.len() > 1 {
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                } else {
+                    let data = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, text)| {
+                            let len = text.as_str().map(|value| value.len()).unwrap_or(0);
+                            json!({ "index": index, "embedding": [len as f64] })
+                        })
+                        .collect::<Vec<_>>();
+                    let response_body = json!({ "data": data }).to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    )
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn embed_batch_with_bisect_isolates_failing_input() {
+        // texts of len 2: request [alpha, beta] -> 500, then [alpha] -> 200,
+        // [beta] -> 200 = 3 connections, preserving 1:1 input order.
+        let (base_url, handle) = spawn_bisecting_server(3);
+        let config = test_config(base_url);
+        let client = reqwest::blocking::Client::builder()
+            .build()
+            .expect("client");
+        let texts = vec!["alpha".to_string(), "beta".to_string()];
+
+        let result = embed_batch_with_bisect(&texts, &config, &client).expect("bisect");
+        handle.join().expect("join bisect server");
+
+        assert_eq!(result.dimensions, 1);
+        assert_eq!(result.vectors.len(), 2);
+        // Embedding value encodes input length, so order is verifiable: alpha=5, beta=4.
+        assert_eq!(result.vectors[0][0], 5.0);
+        assert_eq!(result.vectors[1][0], 4.0);
     }
 }
