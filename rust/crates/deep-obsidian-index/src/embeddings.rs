@@ -12,15 +12,18 @@ pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
 pub(crate) const DEFAULT_EMBEDDING_MAX_CONCURRENCY: usize = 4;
 /// Hard character ceiling on a single embedding input. Acts as a backstop on top
 /// of the token budget below; the effective per-input cap is the smaller of the two.
-pub const DEFAULT_EMBEDDING_MAX_CHARS: usize = 15_000;
-/// Backend context window (tokens) we size inputs against. Must stay <= the
-/// embedding server's allocated `num_ctx` (e.g. Ollama `OLLAMA_CONTEXT_LENGTH`):
-/// an input exceeding the worker's window crashes llama.cpp rather than erroring.
-pub const DEFAULT_EMBEDDING_CONTEXT_TOKENS: usize = 8_192;
-/// Per-input token budget, kept with margin under the context window.
-pub const DEFAULT_EMBEDDING_MAX_INPUT_TOKENS: usize = 6_000;
-/// Conservative chars-per-token estimate. Dense markdown / code / CJK pack more
-/// tokens per char, so we keep this low to over-estimate token counts and stay safe.
+pub const DEFAULT_EMBEDDING_MAX_CHARS: usize = 8_000;
+/// Backend context window (tokens) we size inputs against. Defaults to Ollama's
+/// out-of-box `num_ctx` (4096) so the fix works without changing the embedding
+/// server. An input exceeding the worker's window crashes llama.cpp rather than
+/// erroring, so this MUST stay <= the server's actual `num_ctx`
+/// (`OLLAMA_CONTEXT_LENGTH`). Raise via config only after raising the server window.
+pub const DEFAULT_EMBEDDING_CONTEXT_TOKENS: usize = 4_096;
+/// Per-input token budget, kept with margin (~30%) under the context window.
+pub const DEFAULT_EMBEDDING_MAX_INPUT_TOKENS: usize = 2_800;
+/// Conservative chars-per-token estimate. Dense markdown / code pack ~2.7-2.9
+/// tokens per char (observed on technical vaults), so we keep this low to
+/// over-estimate token counts and stay safe.
 pub const DEFAULT_CHARS_PER_TOKEN: f64 = 2.5;
 #[allow(dead_code)]
 pub(crate) const DEFAULT_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(60);
@@ -190,7 +193,12 @@ impl EmbeddingBatchOptions {
             batch_size: config.batch_size.max(1),
             max_concurrency: DEFAULT_EMBEDDING_MAX_CONCURRENCY,
             timeout: DEFAULT_EMBEDDING_TIMEOUT,
-            max_request_tokens: config.context_tokens.max(config.max_input_tokens).max(1),
+            // Cap the per-request token sum at the per-input budget so a batch never
+            // decodes far more than a single chunk's worth of tokens against the
+            // worker's `num_ctx`. llama.cpp can crash (heap corruption) when a
+            // request exceeds the window, so we keep request totals modest rather
+            // than packing up to the full context.
+            max_request_tokens: config.max_input_tokens.max(1),
         }
     }
 
