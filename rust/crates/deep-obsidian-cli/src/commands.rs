@@ -2369,19 +2369,21 @@ fn check_index_dir(config: &ResolvedServiceConfig) -> CheckReport {
 }
 
 fn check_rg() -> CheckReport {
-    match ProcessCommand::new("rg").arg("--version").output() {
+    let rg = deep_obsidian_server::tools::resolve_ripgrep();
+    match ProcessCommand::new(&rg).arg("--version").output() {
         Ok(output) if output.status.success() => CheckReport {
             name: "rg".into(),
             status: "ok".into(),
-            message: "ripgrep is available".into(),
+            message: format!("ripgrep is available ({})", rg.display()),
             details: Some(serde_json::json!({
                 "version": String::from_utf8_lossy(&output.stdout).trim(),
+                "path": rg.display().to_string(),
             })),
         },
         _ => CheckReport {
             name: "rg".into(),
             status: "fail".into(),
-            message: "ripgrep is not available on PATH".into(),
+            message: "ripgrep (rg) not found. Install it (e.g. `brew install ripgrep`) or set DEEP_OBSIDIAN_RIPGREP to its absolute path.".into(),
             details: None,
         },
     }

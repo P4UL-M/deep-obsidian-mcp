@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -28,6 +28,64 @@ use crate::resources::{artifact_uri, block_uri, heading_uri, note_name, note_uri
 const JSON_SCHEMA_URI: &str = "http://json-schema.org/draft-07/schema#";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const DEFAULT_MAX_TEXT_CHARS: usize = 20_000;
+
+/// Resolve the absolute path to the `rg` (ripgrep) binary.
+///
+/// The MCP server runs under launchd as a Homebrew service, whose `PATH` is the
+/// minimal `/usr/bin:/bin:/usr/sbin:/sbin` — it does NOT include Homebrew's bin
+/// dir, so spawning bare `rg` fails with `ENOENT`. We resolve an absolute path
+/// instead: an explicit env override, then `PATH`, then known install locations,
+/// finally falling back to bare `rg` (preserving old behavior when it is on PATH).
+pub fn resolve_ripgrep() -> PathBuf {
+    resolve_ripgrep_env(|key| std::env::var(key).ok())
+}
+
+fn resolve_ripgrep_env(get_env: impl Fn(&str) -> Option<String>) -> PathBuf {
+    // 1. Explicit override.
+    for key in ["DEEP_OBSIDIAN_RIPGREP", "RIPGREP_PATH"] {
+        if let Some(value) = get_env(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                let candidate = PathBuf::from(trimmed);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    // 2. Search PATH.
+    if let Some(path) = get_env("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("rg");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    // 3. Known install locations (Homebrew prefix first, then common paths).
+    let mut known: Vec<PathBuf> = Vec::new();
+    if let Some(prefix) = get_env("HOMEBREW_PREFIX") {
+        let trimmed = prefix.trim();
+        if !trimmed.is_empty() {
+            known.push(PathBuf::from(trimmed).join("bin").join("rg"));
+        }
+    }
+    for path in [
+        "/opt/homebrew/bin/rg",
+        "/usr/local/bin/rg",
+        "/usr/bin/rg",
+        "/bin/rg",
+    ] {
+        known.push(PathBuf::from(path));
+    }
+    for candidate in known {
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    // 4. Fallback: bare name (works when rg is on PATH).
+    PathBuf::from("rg")
+}
 
 #[derive(Debug, Clone)]
 struct KnowledgeNote {
@@ -1678,10 +1736,20 @@ async fn live_grep_matches(
         args.push(query);
         args.push(vault_path.to_string_lossy().into_owned());
 
-        let output = ProcessCommand::new("rg")
+        let rg = resolve_ripgrep();
+        let output = ProcessCommand::new(&rg)
             .args(&args)
             .output()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    format!(
+                        "ripgrep (rg) not found at '{}'. Install it (e.g. `brew install ripgrep`) or set DEEP_OBSIDIAN_RIPGREP to its absolute path.",
+                        rg.display()
+                    )
+                } else {
+                    error.to_string()
+                }
+            })?;
 
         if !output.status.success() && output.status.code() != Some(1) {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -3095,5 +3163,32 @@ mod tests {
         assert_eq!(matches[0].line_number, 3);
         assert_eq!(matches[0].context_before[0].line_text, "before");
         assert_eq!(matches[0].context_after[0].line_text, "after");
+    }
+
+    #[test]
+    fn resolve_ripgrep_honors_existing_override() {
+        // `/bin/sh` exists on macOS and Linux — stand-in for an existing rg path.
+        let resolved = super::resolve_ripgrep_env(|key| {
+            if key == "DEEP_OBSIDIAN_RIPGREP" {
+                Some("/bin/sh".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(resolved, std::path::PathBuf::from("/bin/sh"));
+    }
+
+    #[test]
+    fn resolve_ripgrep_ignores_missing_override_and_resolves_rg() {
+        // A non-existent override and a bogus PATH dir must never be returned.
+        // The result is always a path named `rg` — either a real known location
+        // (when ripgrep is installed) or the bare fallback name.
+        let resolved = super::resolve_ripgrep_env(|key| match key {
+            "DEEP_OBSIDIAN_RIPGREP" => Some("/no/such/rg".to_string()),
+            "PATH" => Some("/no/such/dir".to_string()),
+            _ => None,
+        });
+        assert_ne!(resolved, std::path::PathBuf::from("/no/such/rg"));
+        assert_eq!(resolved.file_name().and_then(|n| n.to_str()), Some("rg"));
     }
 }
