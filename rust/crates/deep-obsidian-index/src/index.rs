@@ -188,7 +188,6 @@ struct PreparedNote {
     snapshot: FileSnapshot,
     note: SearchNote,
     chunks: Vec<SearchChunk>,
-    note_text: String,
     chunk_texts: Vec<String>,
 }
 
@@ -234,6 +233,11 @@ pub struct BlockSection {
 const INDEX_VERSION: u32 = sqlite::CURRENT_SCHEMA_VERSION;
 const DEFAULT_CHUNK_SIZE_LINES: usize = 80;
 const DEFAULT_CHUNK_OVERLAP_LINES: usize = 12;
+/// Character ceiling per chunk. Kept below the per-input embedding budget
+/// (`DEFAULT_EMBEDDING_MAX_CHARS`) so a chunk plus its `"{title}\n"` prefix never
+/// exceeds what the embedding backend can process. Only bites on dense long-line
+/// content; typical 80-line prose chunks are well under it.
+const DEFAULT_CHUNK_MAX_CHARS: usize = 12_000;
 const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 25 * 1024 * 1024;
 const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "into", "is",
@@ -493,21 +497,48 @@ pub fn chunk_lines(
     text: &str,
     chunk_size_lines: usize,
     overlap_lines: usize,
+    max_chars: usize,
 ) -> Vec<(usize, usize, usize, String)> {
     let lines: Vec<&str> = text.split('\n').collect();
     let safe_chunk_size = chunk_size_lines.max(1);
     let safe_overlap = overlap_lines.min(safe_chunk_size.saturating_sub(1));
+    let safe_max_chars = max_chars.max(1);
     let mut chunks = Vec::new();
     let mut start = 0;
     let mut chunk_index = 0;
 
     while start < lines.len() {
-        let end = (start + safe_chunk_size).min(lines.len());
+        // Extend the chunk while within BOTH the line budget and the char budget,
+        // always ending on a whole-line boundary so start/end line ranges stay valid
+        // for `slice_lines`/`read_chunk`. A single line over the char budget becomes
+        // its own chunk and is truncated downstream by the embedding input clamp.
+        let mut end = start;
+        let mut char_count = 0usize;
+        while end < lines.len() && (end - start) < safe_chunk_size {
+            let line_chars = lines[end].chars().count();
+            // +1 approximates the '\n' separator added by `join` between lines.
+            let added = if end == start {
+                line_chars
+            } else {
+                line_chars + 1
+            };
+            if end > start && char_count + added > safe_max_chars {
+                break;
+            }
+            char_count += added;
+            end += 1;
+        }
+        if end == start {
+            end = start + 1;
+        }
+
         chunks.push((chunk_index, start + 1, end, lines[start..end].join("\n")));
         if end >= lines.len() {
             break;
         }
-        start = end.saturating_sub(safe_overlap);
+        // `.max(start + 1)` guarantees forward progress when a small (char-bounded)
+        // chunk is shorter than the overlap window.
+        start = end.saturating_sub(safe_overlap).max(start + 1);
         chunk_index += 1;
     }
 
@@ -995,6 +1026,9 @@ pub fn embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> 
             api_key: index.runtime_embedding_api_key.clone(),
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
         }
         .normalize(),
     )
@@ -1018,6 +1052,9 @@ pub fn artifact_embedding_runtime_config(index: &SearchIndex) -> Option<Embeddin
             api_key: index.runtime_artifact_embedding_api_key.clone(),
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
         }
         .normalize(),
     )
@@ -1196,7 +1233,6 @@ fn prepare_note_from_snapshot(
     let title = note_title(stem, &content);
     let term_counts = count_terms(&format!("{title}\n{content}"));
     let links = extract_wiki_links(&content);
-    let note_text = format!("{title}\n{content}");
 
     let note = SearchNote {
         path: snapshot.path.clone(),
@@ -1215,6 +1251,7 @@ fn prepare_note_from_snapshot(
         &content,
         DEFAULT_CHUNK_SIZE_LINES,
         DEFAULT_CHUNK_OVERLAP_LINES,
+        DEFAULT_CHUNK_MAX_CHARS,
     ) {
         let term_counts = count_terms(&format!("{title}\n{text}"));
         chunks.push(SearchChunk {
@@ -1236,7 +1273,6 @@ fn prepare_note_from_snapshot(
         snapshot: snapshot.clone(),
         note,
         chunks,
-        note_text,
         chunk_texts,
     })
 }
@@ -1388,28 +1424,11 @@ fn embed_prepared_notes(
         return Ok(expected_dimensions);
     }
 
-    let note_texts = prepared_notes
-        .iter()
-        .map(|prepared| prepared.note_text.clone())
-        .collect::<Vec<_>>();
     let mut observed_dimensions = None;
-    let note_embedding_batch = embeddings::embed_text_batches(&note_texts, index_config, None)
-        .map_err(|error| IndexError::Embedding(error.to_string()))?;
-    ensure_embedding_dimensions(
-        note_embedding_batch.dimensions,
-        expected_dimensions,
-        &mut observed_dimensions,
-    )?;
-    let note_embeddings = note_embedding_batch
-        .vectors
-        .into_iter()
-        .map(|vector| normalize_dense_vector(&vector))
-        .collect::<Vec<_>>();
 
-    for (prepared, embedding) in prepared_notes.iter_mut().zip(note_embeddings.into_iter()) {
-        prepared.note.embedding = Some(embedding);
-    }
-
+    // Embed chunks only. Each chunk is bounded to a safe size by `chunk_lines`
+    // (char budget) and `clamp_input` (token/char budget), so no input can exceed
+    // the backend's context window.
     let chunk_texts = prepared_notes
         .iter()
         .flat_map(|prepared| prepared.chunk_texts.iter().cloned())
@@ -1427,19 +1446,48 @@ fn embed_prepared_notes(
         .map(|vector| normalize_dense_vector(&vector))
         .collect::<Vec<_>>();
 
-    let mut embeddings = chunk_embeddings.into_iter();
-    for prepared in prepared_notes {
+    // Assign chunk vectors, and derive each note vector as the normalized mean of
+    // its own chunk vectors. The whole-note text is never embedded (it can exceed
+    // the backend context window); mean-pooling reuses the chunk vectors at no
+    // extra HTTP cost. A note with no chunk vectors keeps `embedding = None`.
+    let mut chunk_iter = chunk_embeddings.into_iter();
+    for prepared in prepared_notes.iter_mut() {
+        let mut accumulator: Option<Vec<f64>> = None;
+        let mut count = 0usize;
         for chunk in &mut prepared.chunks {
-            let embedding = embeddings.next().ok_or_else(|| {
+            let embedding = chunk_iter.next().ok_or_else(|| {
                 IndexError::Embedding(
                     "embedding provider returned too few chunk vectors".to_string(),
                 )
             })?;
+            match accumulator.as_mut() {
+                Some(acc) if acc.len() == embedding.len() => {
+                    for (slot, value) in acc.iter_mut().zip(embedding.iter()) {
+                        *slot += *value;
+                    }
+                    count += 1;
+                }
+                Some(_) => {}
+                None => {
+                    accumulator = Some(embedding.clone());
+                    count = 1;
+                }
+            }
             chunk.embedding = Some(embedding);
         }
+        prepared.note.embedding = match accumulator {
+            Some(acc) if count > 0 => {
+                let mean = acc
+                    .iter()
+                    .map(|value| value / count as f64)
+                    .collect::<Vec<_>>();
+                Some(normalize_dense_vector(&mean))
+            }
+            _ => None,
+        };
     }
 
-    if embeddings.next().is_some() {
+    if chunk_iter.next().is_some() {
         return Err(IndexError::Embedding(
             "embedding provider returned too many chunk vectors".to_string(),
         ));
@@ -3800,6 +3848,9 @@ mod tests {
             api_key: None,
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
         }
         .normalize();
 
@@ -3875,6 +3926,9 @@ mod tests {
             api_key: Some("runtime-secret".to_string()),
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
         }
         .normalize();
 
@@ -3925,7 +3979,9 @@ mod tests {
         write_search_index_to_connection(&mut connection, &persisted).expect("persist");
         let home_id = note_id(&root, "Home.md").expect("home id");
         let home_chunks = chunk_ids(&root, "Home.md");
-        let (base_url, seen_inputs) = start_embedding_server(2);
+        // Note vectors are mean-pooled from chunk vectors, so incremental refresh
+        // issues a single embedding request (chunks of the changed note only).
+        let (base_url, seen_inputs) = start_embedding_server(1);
 
         write_fixture(&root, "New.md", "# New\n\nFresh embedding target.\n");
         let runtime_config = EmbeddingConfig {
@@ -3935,6 +3991,9 @@ mod tests {
             api_key: None,
             max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
         }
         .normalize();
         let (updated, rebuilt) =
@@ -3949,11 +4008,127 @@ mod tests {
         let related = crate::search::related_notes(&updated, "Home.md").expect("related notes");
         assert!(related.iter().any(|item| item.path == "New.md"));
         let seen = seen_inputs.lock().expect("inputs lock");
-        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.len(), 1);
         assert!(seen.iter().flatten().all(|input| input.contains("New")));
         assert!(seen.iter().flatten().all(|input| !input.contains("Home")));
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn chunk_lines_respects_max_chars() {
+        // Three 10-char lines, no overlap, 15-char budget -> one line per chunk.
+        let text = "aaaaaaaaaa\nbbbbbbbbbb\ncccccccccc";
+        let chunks = chunk_lines(text, 80, 0, 15);
+        assert_eq!(chunks.len(), 3);
+        for (_, start, end, body) in &chunks {
+            assert!(end >= start);
+            assert!(body.chars().count() <= 15);
+        }
+        // Line ranges stay contiguous and cover the whole note.
+        assert_eq!(chunks.first().unwrap().1, 1);
+        assert_eq!(chunks.last().unwrap().2, 3);
+    }
+
+    #[test]
+    fn chunk_lines_emits_oversized_single_line_as_own_chunk() {
+        let huge = "z".repeat(50);
+        let text = format!("short\n{huge}\nshort2");
+        let chunks = chunk_lines(&text, 80, 0, 20);
+        // The 50-char line exceeds the 20-char budget but is kept whole, on its
+        // own line boundary, to be truncated downstream by the input clamp.
+        assert!(chunks.iter().any(|(_, _, _, body)| body == &huge));
+        // No chunk splits a line mid-way.
+        assert!(chunks
+            .iter()
+            .all(|(_, _, _, body)| text.contains(body.as_str())));
+    }
+
+    #[test]
+    fn note_embedding_is_mean_pool_of_chunk_vectors() {
+        // Two chunks -> one embedding request; the note vector must equal the
+        // normalized mean of its chunk vectors, and the full note is never sent.
+        let (base_url, seen_inputs) = start_embedding_server(1);
+        let config = EmbeddingConfig {
+            provider: Some(EmbeddingProvider::OpenAiCompatible),
+            model: Some("text-embedding-test".to_string()),
+            base_url: Some(base_url),
+            api_key: None,
+            max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+        }
+        .normalize();
+
+        let make_chunk = |idx: usize, text: &str| SearchChunk {
+            path: "Note.md".to_string(),
+            title: "Note".to_string(),
+            chunk_index: idx,
+            start_line: 1,
+            end_line: 1,
+            text: text.to_string(),
+            term_counts: Default::default(),
+            norm: 0.0,
+            token_count: 0,
+            embedding: None,
+        };
+        let mut prepared = vec![PreparedNote {
+            snapshot: FileSnapshot {
+                path: "Note.md".to_string(),
+                mtime_ms: 0,
+                size: 0,
+            },
+            note: SearchNote {
+                path: "Note.md".to_string(),
+                title: "Note".to_string(),
+                content: "body".to_string(),
+                term_counts: Default::default(),
+                norm: 0.0,
+                token_count: 0,
+                links: Vec::new(),
+                embedding: None,
+            },
+            chunks: vec![make_chunk(0, "chunk one"), make_chunk(1, "chunk two")],
+            chunk_texts: vec!["Note\nchunk one".to_string(), "Note\nchunk two".to_string()],
+        }];
+
+        embed_prepared_notes(&mut prepared, &config, None).expect("embed prepared notes");
+
+        let chunk_vecs: Vec<Vec<f64>> = prepared[0]
+            .chunks
+            .iter()
+            .map(|chunk| chunk.embedding.clone().expect("chunk embedding"))
+            .collect();
+        assert_eq!(chunk_vecs.len(), 2);
+        let dims = chunk_vecs[0].len();
+        let mut mean = vec![0.0_f64; dims];
+        for vector in &chunk_vecs {
+            for (slot, value) in mean.iter_mut().zip(vector.iter()) {
+                *slot += value / chunk_vecs.len() as f64;
+            }
+        }
+        let expected = normalize_dense_vector(&mean);
+        let note_embedding = prepared[0]
+            .note
+            .embedding
+            .clone()
+            .expect("note embedding present");
+        assert_eq!(note_embedding.len(), dims);
+        for (actual, want) in note_embedding.iter().zip(expected.iter()) {
+            assert!(
+                (actual - want).abs() < 1e-9,
+                "note vector must be the normalized mean of its chunk vectors"
+            );
+        }
+        // Exactly one request, and the full note body was never embedded.
+        let seen = seen_inputs.lock().expect("inputs lock");
+        assert_eq!(seen.len(), 1);
+        assert!(seen
+            .iter()
+            .flatten()
+            .all(|input| input != "body" && input != "Note\nbody"));
     }
 
     #[test]
