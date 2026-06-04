@@ -233,11 +233,11 @@ pub struct BlockSection {
 const INDEX_VERSION: u32 = sqlite::CURRENT_SCHEMA_VERSION;
 const DEFAULT_CHUNK_SIZE_LINES: usize = 80;
 const DEFAULT_CHUNK_OVERLAP_LINES: usize = 12;
-/// Character ceiling per chunk. Kept below the per-input embedding budget
-/// (`DEFAULT_EMBEDDING_MAX_CHARS`) so a chunk plus its `"{title}\n"` prefix never
-/// exceeds what the embedding backend can process. Only bites on dense long-line
-/// content; typical 80-line prose chunks are well under it.
-const DEFAULT_CHUNK_MAX_CHARS: usize = 12_000;
+/// Character ceiling per chunk. Kept well below the per-input embedding budget so a
+/// chunk plus its `"{title}\n"` prefix stays comfortably under the backend context
+/// window (~2,400 estimated tokens at 2.5 chars/token, safe under a 4096 `num_ctx`).
+/// Only bites on dense long-line content; typical 80-line prose chunks are smaller.
+const DEFAULT_CHUNK_MAX_CHARS: usize = 6_000;
 const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 25 * 1024 * 1024;
 const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "into", "is",
