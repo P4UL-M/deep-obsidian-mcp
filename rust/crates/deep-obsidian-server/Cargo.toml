@@ -12,7 +12,9 @@ deep-obsidian-config = { path = "../deep-obsidian-config" }
 deep-obsidian-core = { path = "../deep-obsidian-core" }
 deep-obsidian-index = { path = "../deep-obsidian-index" }
 deep-obsidian-types = { path = "../deep-obsidian-types" }
+futures-util.workspace = true
 notify.workspace = true
+rand.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true

@@ -7,6 +7,7 @@ pub mod resources;
 pub mod runtime;
 pub mod stdio;
 pub mod tools;
+pub mod uploads;
 pub mod vault;
 
 pub use bootstrap::{run_http_service, ServiceBootstrapContext};

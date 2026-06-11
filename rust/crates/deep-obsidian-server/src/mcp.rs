@@ -10,6 +10,7 @@ use crate::protocol::{
     ResourceTemplateListResult, ServerInfo, ToolCallResult, ToolListResult,
 };
 use crate::runtime::RuntimeState;
+use crate::uploads::UploadStore;
 use crate::{prompts, resources, tools};
 
 #[derive(Clone)]
@@ -23,9 +24,17 @@ pub struct AppState {
     /// Whether ripgrep was resolved to a real executable at startup. Drives both
     /// conditional `grep_search` registration and the defensive call guard.
     pub rg_available: bool,
+    /// Shared store of pending out-of-band uploads. Both the `request_vault_upload`
+    /// tool handler (mint) and the `PUT /upload/{token}` endpoint (consume) share it.
+    pub uploads: UploadStore,
+    /// Base URL the upload endpoint is reachable at, e.g. `http://127.0.0.1:7777`.
+    /// `Some` only under the HTTP transport; `None` under stdio (no HTTP listener),
+    /// in which case `request_vault_upload` returns a clear transport error.
+    pub upload_base: Option<String>,
 }
 
 impl AppState {
+    /// Build state with no upload base (used by the stdio transport).
     pub fn new(config: ResolvedServiceConfig, runtime: Arc<RuntimeState>) -> Self {
         let ripgrep_path = tools::resolve_ripgrep();
         let rg_available = ripgrep_path.is_file();
@@ -34,7 +43,15 @@ impl AppState {
             runtime,
             ripgrep_path: Arc::new(ripgrep_path),
             rg_available,
+            uploads: UploadStore::new(),
+            upload_base: None,
         }
+    }
+
+    /// Attach an upload base URL, enabling `request_vault_upload`.
+    pub fn with_upload_base(mut self, upload_base: String) -> Self {
+        self.upload_base = Some(upload_base);
+        self
     }
 }
 
