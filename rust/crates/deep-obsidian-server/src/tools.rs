@@ -1417,6 +1417,7 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
                     ("path", json!({"type":"string","description":"Vault-relative markdown path."})),
                     ("startLine", json!({"type":"integer","exclusiveMinimum":0,"maximum":MAX_SAFE_INTEGER})),
                     ("endLine", json!({"type":"integer","exclusiveMinimum":0,"maximum":MAX_SAFE_INTEGER})),
+                    ("knownHash", json!({"type":"string","description":"If set and it matches the file's current content hash, the body is omitted and `unchanged: true` is returned."})),
                     ("includeText", json!({"type":"boolean","default":true})),
                     ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
@@ -2136,6 +2137,22 @@ pub async fn call_tool(
             let text_options = TextPayloadOptions::from_arguments(arguments, true);
             let file =
                 read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            // Full-file content hash, computed with the same helper the write tools use so a
+            // write's `newHash` can be fed straight back into a read's `knownHash`. Always the
+            // full-file hash regardless of any startLine/endLine slice.
+            let hash = content_hash(file.text.as_bytes());
+            let known_hash = optional_string_arg(arguments, "knownHash");
+            if known_hash.as_deref() == Some(hash.as_str()) {
+                let result = Map::from_iter([
+                    ("path".to_string(), json!(path.clone())),
+                    ("hash".to_string(), json!(hash)),
+                    ("unchanged".to_string(), json!(true)),
+                ]);
+                return Ok(json_text_result_from_arguments(
+                    arguments,
+                    Value::Object(result),
+                ));
+            }
             let start_line = arguments
                 .get("startLine")
                 .and_then(Value::as_u64)
@@ -2157,6 +2174,8 @@ pub async fn call_tool(
             let mut result = Map::from_iter([
                 ("path".to_string(), json!(path.clone())),
                 ("resourceUri".to_string(), json!(note_uri(&path))),
+                ("hash".to_string(), json!(hash)),
+                ("unchanged".to_string(), json!(false)),
                 ("startLine".to_string(), json!(start_line.unwrap_or(1))),
                 ("endLine".to_string(), json!(end_line.unwrap_or(line_count))),
                 ("lineCount".to_string(), json!(line_count)),
@@ -3487,6 +3506,99 @@ mod tests {
         assert_eq!(
             result.structured_content["resourceUri"],
             "obsidian://artifact?path=Assets%2FLogo.png"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_full_file_hash_matching_write_side() {
+        let vault_path = temp_dir("read-file-hash");
+        let body = "# Title\n\nline one\nline two\n";
+        fs::write(vault_path.join("Note.md"), body).expect("write note");
+        let state = test_state(vault_path.clone()).await;
+
+        let result = call_tool(&state, "read_file", &json!({"path": "Note.md"}))
+            .await
+            .expect("read_file should succeed");
+
+        let hash = result.structured_content["hash"]
+            .as_str()
+            .expect("hash field");
+        // Cross-consistency: same hash the write tools produce over the file bytes.
+        assert_eq!(hash, content_hash(body.as_bytes()));
+        assert_eq!(result.structured_content["unchanged"], false);
+        assert!(result.structured_content["text"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn read_file_known_hash_match_omits_text_and_marks_unchanged() {
+        let vault_path = temp_dir("read-file-known-match");
+        let body = "# Title\n\nbody text\n";
+        fs::write(vault_path.join("Note.md"), body).expect("write note");
+        let state = test_state(vault_path.clone()).await;
+
+        let known = content_hash(body.as_bytes());
+        let result = call_tool(
+            &state,
+            "read_file",
+            &json!({"path": "Note.md", "knownHash": known}),
+        )
+        .await
+        .expect("read_file should succeed");
+
+        assert_eq!(result.structured_content["unchanged"], true);
+        assert_eq!(result.structured_content["hash"], json!(known));
+        assert_eq!(result.structured_content["path"], "Note.md");
+        assert!(result.structured_content.get("text").is_none());
+    }
+
+    #[tokio::test]
+    async fn read_file_known_hash_mismatch_returns_full_text() {
+        let vault_path = temp_dir("read-file-known-mismatch");
+        let body = "# Title\n\nbody text\n";
+        fs::write(vault_path.join("Note.md"), body).expect("write note");
+        let state = test_state(vault_path.clone()).await;
+
+        let result = call_tool(
+            &state,
+            "read_file",
+            &json!({"path": "Note.md", "knownHash": "fnv1a64:0000000000000000"}),
+        )
+        .await
+        .expect("read_file should succeed");
+
+        assert_eq!(result.structured_content["unchanged"], false);
+        assert_eq!(
+            result.structured_content["hash"],
+            json!(content_hash(body.as_bytes()))
+        );
+        assert!(result.structured_content["text"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn read_file_sliced_read_reports_full_file_hash() {
+        let vault_path = temp_dir("read-file-slice-hash");
+        let body = "line1\nline2\nline3\nline4\n";
+        fs::write(vault_path.join("Note.md"), body).expect("write note");
+        let state = test_state(vault_path.clone()).await;
+
+        let full = call_tool(&state, "read_file", &json!({"path": "Note.md"}))
+            .await
+            .expect("full read should succeed");
+        let sliced = call_tool(
+            &state,
+            "read_file",
+            &json!({"path": "Note.md", "startLine": 2, "endLine": 3}),
+        )
+        .await
+        .expect("sliced read should succeed");
+
+        assert_eq!(
+            sliced.structured_content["hash"],
+            full.structured_content["hash"]
+        );
+        assert_eq!(
+            sliced.structured_content["hash"],
+            json!(content_hash(body.as_bytes()))
         );
     }
 
