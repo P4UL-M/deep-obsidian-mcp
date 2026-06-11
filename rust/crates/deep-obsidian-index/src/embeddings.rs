@@ -25,7 +25,6 @@ pub const DEFAULT_EMBEDDING_MAX_INPUT_TOKENS: usize = 2_800;
 /// tokens per char (observed on technical vaults), so we keep this low to
 /// over-estimate token counts and stay safe.
 pub const DEFAULT_CHARS_PER_TOKEN: f64 = 2.5;
-#[allow(dead_code)]
 pub(crate) const DEFAULT_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,7 +186,6 @@ pub(crate) struct EmbeddingBatchOptions {
 }
 
 impl EmbeddingBatchOptions {
-    #[allow(dead_code)]
     pub(crate) fn from_config(config: &EmbeddingConfig) -> Self {
         Self {
             batch_size: config.batch_size.max(1),
@@ -256,7 +254,11 @@ pub fn embed_texts(
     texts: &[String],
     config: &EmbeddingConfig,
 ) -> Result<EmbeddingResult, EmbeddingError> {
+    // Bound every request so a hung backend can't stall the caller indefinitely.
+    // Source the timeout from the same plumbing the batch path uses, defaulting to
+    // `DEFAULT_EMBEDDING_TIMEOUT` (60s) when config exposes no explicit value.
     let client = reqwest::blocking::Client::builder()
+        .timeout(EmbeddingBatchOptions::from_config(config).timeout)
         .build()
         .map_err(|error| EmbeddingError::RequestFailed {
             status: 0,
@@ -564,7 +566,11 @@ pub fn embed_artifacts(
     artifacts: &[ArtifactEmbeddingInput],
     config: &EmbeddingConfig,
 ) -> Result<EmbeddingResult, EmbeddingError> {
+    // Same request timeout rationale as `embed_texts`: this path runs during the
+    // reindex (via `embed_prepared_artifacts`), so a hung backend would otherwise
+    // stall the whole build with no upper bound.
     let client = reqwest::blocking::Client::builder()
+        .timeout(EmbeddingBatchOptions::from_config(config).timeout)
         .build()
         .map_err(|error| EmbeddingError::RequestFailed {
             status: 0,
@@ -1030,5 +1036,67 @@ mod tests {
         // Embedding value encodes input length, so order is verifiable: alpha=5, beta=4.
         assert_eq!(result.vectors[0][0], 5.0);
         assert_eq!(result.vectors[1][0], 4.0);
+    }
+
+    #[test]
+    fn embed_texts_client_uses_configured_timeout() {
+        // `embed_texts` builds its blocking client with the timeout sourced from the
+        // same plumbing it now shares with the batch path. Assert the plumbing
+        // resolves to the 60s default so a hung backend can't stall the caller.
+        let config = test_config("http://unused".to_string());
+        assert_eq!(
+            EmbeddingBatchOptions::from_config(&config).timeout,
+            DEFAULT_EMBEDDING_TIMEOUT
+        );
+        assert_eq!(DEFAULT_EMBEDDING_TIMEOUT, Duration::from_secs(60));
+    }
+
+    /// Accept a connection but never respond, so a request against it can only end
+    /// via the client timeout. Returns the base URL and the listener (kept alive by
+    /// the caller; dropping it closes the port).
+    fn spawn_silent_server() -> (String, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent server");
+        let address = listener.local_addr().expect("read listener address");
+        let accept_listener = listener.try_clone().expect("clone listener");
+        thread::spawn(move || {
+            // Hold accepted connections open without ever writing a response.
+            let mut held = Vec::new();
+            for stream in accept_listener.incoming() {
+                match stream {
+                    Ok(stream) => held.push(stream),
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{address}"), listener)
+    }
+
+    #[test]
+    fn embed_text_batches_times_out_against_unresponsive_server() {
+        // Exercise real timeout behavior through the injectable-timeout batch path
+        // (the shared `embed_texts_with_client` impl), rather than waiting 60s on
+        // `embed_texts`. A short timeout against a silent server must error, not hang.
+        let (base_url, _listener) = spawn_silent_server();
+        let config = test_config(base_url);
+        let texts = vec!["alpha".to_string()];
+
+        let started = std::time::Instant::now();
+        let error = embed_text_batches(
+            &texts,
+            &config,
+            Some(EmbeddingBatchOptions {
+                batch_size: 1,
+                max_concurrency: 1,
+                timeout: Duration::from_millis(250),
+                max_request_tokens: usize::MAX,
+            }),
+        )
+        .expect_err("request should time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timed-out request should return promptly, took {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(error, EmbeddingError::RequestFailed { .. }));
     }
 }

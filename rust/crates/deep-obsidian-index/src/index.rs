@@ -1411,89 +1411,198 @@ fn ensure_embedding_dimensions(
     Ok(())
 }
 
+/// Result of embedding a batch of prepared notes.
+///
+/// `dimensions` is the observed (or carried-forward expected) embedding width.
+/// `failed_paths` lists notes whose dense embedding could NOT be produced; those
+/// notes keep `embedding = None` on themselves and their chunks and fall back to
+/// BM25/sparse retrieval. The build stays usable and the caller can surface the
+/// partial result. When every note embeds successfully, `failed_paths` is empty and
+/// the assigned vectors are identical to the all-or-nothing path.
+struct NoteEmbeddingOutcome {
+    dimensions: Option<usize>,
+    failed_paths: Vec<String>,
+}
+
 fn embed_prepared_notes(
     prepared_notes: &mut [PreparedNote],
     index_config: &EmbeddingConfig,
     expected_dimensions: Option<usize>,
-) -> Result<Option<usize>> {
+) -> Result<NoteEmbeddingOutcome> {
     if !index_config.supports_embeddings() {
-        return Ok(None);
+        return Ok(NoteEmbeddingOutcome {
+            dimensions: None,
+            failed_paths: Vec::new(),
+        });
     }
 
     if prepared_notes.is_empty() {
-        return Ok(expected_dimensions);
+        return Ok(NoteEmbeddingOutcome {
+            dimensions: expected_dimensions,
+            failed_paths: Vec::new(),
+        });
     }
 
-    let mut observed_dimensions = None;
-
-    // Embed chunks only. Each chunk is bounded to a safe size by `chunk_lines`
-    // (char budget) and `clamp_input` (token/char budget), so no input can exceed
-    // the backend's context window.
+    // Fast path: embed every chunk across all notes in one batched call, sharing
+    // the request packing and concurrency. If this succeeds the assigned vectors
+    // are byte-identical to the previous all-or-nothing behavior. Each chunk is
+    // bounded to a safe size by `chunk_lines` (char budget) and `clamp_input`
+    // (token/char budget), so no input can exceed the backend's context window.
     let chunk_texts = prepared_notes
         .iter()
         .flat_map(|prepared| prepared.chunk_texts.iter().cloned())
         .collect::<Vec<_>>();
-    let chunk_embedding_batch = embeddings::embed_text_batches(&chunk_texts, index_config, None)
-        .map_err(|error| IndexError::Embedding(error.to_string()))?;
-    ensure_embedding_dimensions(
-        chunk_embedding_batch.dimensions,
-        expected_dimensions,
-        &mut observed_dimensions,
-    )?;
-    let chunk_embeddings = chunk_embedding_batch
-        .vectors
-        .into_iter()
-        .map(|vector| normalize_dense_vector(&vector))
-        .collect::<Vec<_>>();
+    match embeddings::embed_text_batches(&chunk_texts, index_config, None) {
+        Ok(chunk_embedding_batch) => {
+            let mut observed_dimensions = None;
+            ensure_embedding_dimensions(
+                chunk_embedding_batch.dimensions,
+                expected_dimensions,
+                &mut observed_dimensions,
+            )?;
+            let chunk_embeddings = chunk_embedding_batch
+                .vectors
+                .into_iter()
+                .map(|vector| normalize_dense_vector(&vector))
+                .collect::<Vec<_>>();
 
-    // Assign chunk vectors, and derive each note vector as the normalized mean of
-    // its own chunk vectors. The whole-note text is never embedded (it can exceed
-    // the backend context window); mean-pooling reuses the chunk vectors at no
-    // extra HTTP cost. A note with no chunk vectors keeps `embedding = None`.
-    let mut chunk_iter = chunk_embeddings.into_iter();
-    for prepared in prepared_notes.iter_mut() {
-        let mut accumulator: Option<Vec<f64>> = None;
-        let mut count = 0usize;
-        for chunk in &mut prepared.chunks {
-            let embedding = chunk_iter.next().ok_or_else(|| {
-                IndexError::Embedding(
-                    "embedding provider returned too few chunk vectors".to_string(),
-                )
-            })?;
-            match accumulator.as_mut() {
-                Some(acc) if acc.len() == embedding.len() => {
-                    for (slot, value) in acc.iter_mut().zip(embedding.iter()) {
-                        *slot += *value;
-                    }
-                    count += 1;
-                }
-                Some(_) => {}
-                None => {
-                    accumulator = Some(embedding.clone());
-                    count = 1;
-                }
+            let mut chunk_iter = chunk_embeddings.into_iter();
+            for prepared in prepared_notes.iter_mut() {
+                assign_note_chunk_embeddings(prepared, &mut chunk_iter)?;
             }
-            chunk.embedding = Some(embedding);
+            if chunk_iter.next().is_some() {
+                return Err(IndexError::Embedding(
+                    "embedding provider returned too many chunk vectors".to_string(),
+                ));
+            }
+            Ok(NoteEmbeddingOutcome {
+                dimensions: observed_dimensions.or(expected_dimensions),
+                failed_paths: Vec::new(),
+            })
         }
-        prepared.note.embedding = match accumulator {
-            Some(acc) if count > 0 => {
-                let mean = acc
-                    .iter()
-                    .map(|value| value / count as f64)
+        Err(bulk_error) => {
+            // Resilience path: a single failed batch must not abort the whole
+            // build. Re-embed note-by-note so one bad note only drops its own dense
+            // vector (falling back to BM25/sparse) instead of nuking the index.
+            tracing::warn!(
+                error = %bulk_error,
+                "bulk note embedding failed; retrying note-by-note for partial progress"
+            );
+            embed_prepared_notes_per_note(prepared_notes, index_config, expected_dimensions)
+        }
+    }
+}
+
+/// Per-note fallback used when the bulk embedding call fails. Embeds each note's
+/// chunks in isolation: notes that fail to embed are recorded in `failed_paths` and
+/// left without a dense vector; notes that succeed are assigned and dimension-checked
+/// against the rest (a real dimension mismatch among successful notes stays fatal).
+fn embed_prepared_notes_per_note(
+    prepared_notes: &mut [PreparedNote],
+    index_config: &EmbeddingConfig,
+    expected_dimensions: Option<usize>,
+) -> Result<NoteEmbeddingOutcome> {
+    let mut observed_dimensions = None;
+    let mut failed_paths = Vec::new();
+
+    for prepared in prepared_notes.iter_mut() {
+        if prepared.chunk_texts.is_empty() {
+            // No chunks to embed; matches the bulk path's "no vectors" outcome.
+            prepared.note.embedding = None;
+            continue;
+        }
+
+        match embeddings::embed_text_batches(&prepared.chunk_texts, index_config, None) {
+            Ok(batch) => {
+                if let Err(error) = ensure_embedding_dimensions(
+                    batch.dimensions,
+                    expected_dimensions,
+                    &mut observed_dimensions,
+                ) {
+                    // A dimension mismatch among notes that DID embed is a genuine
+                    // schema inconsistency, not a transient per-note failure.
+                    return Err(error);
+                }
+                let chunk_embeddings = batch
+                    .vectors
+                    .into_iter()
+                    .map(|vector| normalize_dense_vector(&vector))
                     .collect::<Vec<_>>();
-                Some(normalize_dense_vector(&mean))
+                let mut chunk_iter = chunk_embeddings.into_iter();
+                assign_note_chunk_embeddings(prepared, &mut chunk_iter)?;
+                if chunk_iter.next().is_some() {
+                    return Err(IndexError::Embedding(
+                        "embedding provider returned too many chunk vectors".to_string(),
+                    ));
+                }
             }
-            _ => None,
-        };
+            Err(error) => {
+                tracing::warn!(
+                    path = %prepared.note.path,
+                    error = %error,
+                    "embedding failed for note; leaving it without a dense vector (BM25/sparse only)"
+                );
+                clear_note_embeddings(prepared);
+                failed_paths.push(prepared.note.path.clone());
+            }
+        }
     }
 
-    if chunk_iter.next().is_some() {
-        return Err(IndexError::Embedding(
-            "embedding provider returned too many chunk vectors".to_string(),
-        ));
-    }
+    Ok(NoteEmbeddingOutcome {
+        dimensions: observed_dimensions.or(expected_dimensions),
+        failed_paths,
+    })
+}
 
-    Ok(observed_dimensions.or(expected_dimensions))
+/// Assign chunk vectors pulled from `chunk_iter` to a note's chunks, and derive the
+/// note vector as the normalized mean of its own chunk vectors. The whole-note text
+/// is never embedded (it can exceed the backend context window); mean-pooling reuses
+/// the chunk vectors at no extra HTTP cost. A note with no chunk vectors keeps
+/// `embedding = None`.
+fn assign_note_chunk_embeddings(
+    prepared: &mut PreparedNote,
+    chunk_iter: &mut impl Iterator<Item = Vec<f64>>,
+) -> Result<()> {
+    let mut accumulator: Option<Vec<f64>> = None;
+    let mut count = 0usize;
+    for chunk in &mut prepared.chunks {
+        let embedding = chunk_iter.next().ok_or_else(|| {
+            IndexError::Embedding("embedding provider returned too few chunk vectors".to_string())
+        })?;
+        match accumulator.as_mut() {
+            Some(acc) if acc.len() == embedding.len() => {
+                for (slot, value) in acc.iter_mut().zip(embedding.iter()) {
+                    *slot += *value;
+                }
+                count += 1;
+            }
+            Some(_) => {}
+            None => {
+                accumulator = Some(embedding.clone());
+                count = 1;
+            }
+        }
+        chunk.embedding = Some(embedding);
+    }
+    prepared.note.embedding = match accumulator {
+        Some(acc) if count > 0 => {
+            let mean = acc
+                .iter()
+                .map(|value| value / count as f64)
+                .collect::<Vec<_>>();
+            Some(normalize_dense_vector(&mean))
+        }
+        _ => None,
+    };
+    Ok(())
+}
+
+/// Drop any dense vectors from a note and its chunks so it falls back to BM25/sparse.
+fn clear_note_embeddings(prepared: &mut PreparedNote) {
+    prepared.note.embedding = None;
+    for chunk in &mut prepared.chunks {
+        chunk.embedding = None;
+    }
 }
 
 fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) -> Result<()> {
@@ -1947,9 +2056,15 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
             })
             .map(|count| count as usize)
             .map_err(|error| IndexError::Embedding(error.to_string()))?;
-        if note_vec_count != notes.len() || chunk_vec_count != chunks.len() {
+        // A partial reindex (one or more notes failed to embed) persists fewer
+        // vectors than notes/chunks on purpose: those notes fall back to BM25/sparse
+        // and keep `embedding = None`. Embedding is dropped per-note as a whole, so
+        // counts can only be <= the row counts. MORE vectors than rows is genuine
+        // corruption and stays fatal.
+        if note_vec_count > notes.len() || chunk_vec_count > chunks.len() {
             return Err(IndexError::Embedding(
-                "embedding index is missing one or more persisted vectors".to_string(),
+                "embedding index has more persisted vectors than notes/chunks (index corruption)"
+                    .to_string(),
             ));
         }
     }
@@ -2256,15 +2371,17 @@ fn insert_prepared_note(
     )
     .map_err(|error| IndexError::Embedding(error.to_string()))?;
 
+    // A note may legitimately lack a dense vector when its embedding failed during a
+    // partial reindex; it falls back to BM25/sparse, so skip the vec row rather than
+    // erroring (mirrors the full-build writer).
     if semantic_backend == &SemanticBackend::Embedding {
-        let embedding = prepared.note.embedding.as_ref().ok_or_else(|| {
-            IndexError::Embedding(format!("missing note embedding for {}", prepared.note.path))
-        })?;
-        tx.execute(
-            "INSERT INTO note_embeddings_vec (rowid, embedding) VALUES (?1, ?2)",
-            params![note_id, embedding_blob(embedding)],
-        )
-        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        if let Some(embedding) = prepared.note.embedding.as_ref() {
+            tx.execute(
+                "INSERT INTO note_embeddings_vec (rowid, embedding) VALUES (?1, ?2)",
+                params![note_id, embedding_blob(embedding)],
+            )
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
     }
 
     for chunk in &prepared.chunks {
@@ -2290,14 +2407,13 @@ fn insert_prepared_note(
         insert_chunk_terms(tx, chunk_id, &chunk.term_counts)?;
 
         if semantic_backend == &SemanticBackend::Embedding {
-            let embedding = chunk.embedding.as_ref().ok_or_else(|| {
-                IndexError::Embedding(format!("missing chunk embedding for {}", chunk.path))
-            })?;
-            tx.execute(
-                "INSERT INTO chunk_embeddings_vec (rowid, embedding) VALUES (?1, ?2)",
-                params![chunk_id, embedding_blob(embedding)],
-            )
-            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+            if let Some(embedding) = chunk.embedding.as_ref() {
+                tx.execute(
+                    "INSERT INTO chunk_embeddings_vec (rowid, embedding) VALUES (?1, ?2)",
+                    params![chunk_id, embedding_blob(embedding)],
+                )
+                .map_err(|error| IndexError::Embedding(error.to_string()))?;
+            }
         }
     }
 
@@ -2669,8 +2785,16 @@ fn refresh_index_incremental(
         .filter(|snapshot| changed_paths.contains(snapshot.path.as_str()))
         .map(|snapshot| prepare_note_from_snapshot(&resolved, snapshot))
         .collect::<Result<Vec<_>>>()?;
-    let embedding_dimensions =
+    let note_embedding_outcome =
         embed_prepared_notes(&mut prepared_notes, &index_config, expected_dimensions)?;
+    let embedding_dimensions = note_embedding_outcome.dimensions;
+    if !note_embedding_outcome.failed_paths.is_empty() {
+        tracing::warn!(
+            failed_count = note_embedding_outcome.failed_paths.len(),
+            failed_paths = ?note_embedding_outcome.failed_paths,
+            "incremental index built with partial embeddings; listed notes fall back to BM25/sparse"
+        );
+    }
     if index_config.supports_embeddings() && embedding_dimensions != existing.embedding_dimensions {
         return Err(IndexError::EmbeddingDimensionsMismatch {
             expected: existing.embedding_dimensions.unwrap_or(0),
@@ -2926,7 +3050,15 @@ pub fn build_index_from_snapshots_with_artifacts(
         .iter()
         .map(|snapshot| prepare_note_from_snapshot(&resolved, snapshot))
         .collect::<Result<Vec<_>>>()?;
-    let embedding_dimensions = embed_prepared_notes(&mut prepared_notes, &index_config, None)?;
+    let note_embedding_outcome = embed_prepared_notes(&mut prepared_notes, &index_config, None)?;
+    let embedding_dimensions = note_embedding_outcome.dimensions;
+    if !note_embedding_outcome.failed_paths.is_empty() {
+        tracing::warn!(
+            failed_count = note_embedding_outcome.failed_paths.len(),
+            failed_paths = ?note_embedding_outcome.failed_paths,
+            "index built with partial embeddings; listed notes fall back to BM25/sparse"
+        );
+    }
     let mut prepared_artifacts = artifact_snapshots
         .iter()
         .map(|snapshot| {
@@ -2961,10 +3093,21 @@ pub fn build_index_from_snapshots_with_artifacts(
         .filter(|snapshot| snapshot.size > DEFAULT_MAX_ARTIFACT_BYTES)
         .count();
 
+    // If embeddings were requested but NOTHING embedded (e.g. the backend was fully
+    // down for the whole build), no vec tables get created. Persisting
+    // `semantic_backend = Embedding` in that state makes the load gate demand vec
+    // tables that don't exist and silently reject the index (-> perpetual rebuild).
+    // Record `Sparse` so the index reloads as a usable BM25 index; a later reindex
+    // upgrades it once the backend is reachable.
+    let semantic_backend = match semantic_backend_from_config(embedding_config) {
+        SemanticBackend::Embedding if embedding_dimensions.is_none() => SemanticBackend::Sparse,
+        backend => backend,
+    };
+
     let index = SearchIndex {
         version: INDEX_VERSION,
         generated_at: now_utc_string(),
-        semantic_backend: semantic_backend_from_config(embedding_config),
+        semantic_backend,
         embedding_provider: if index_config.supports_embeddings() {
             Some(
                 index_config
@@ -4152,5 +4295,345 @@ mod tests {
     fn glob_matching_supports_wildcards() {
         assert!(path_matches_glob("Projects/Brew Service.md", "Projects/*.md").expect("glob"));
         assert!(!path_matches_glob("Projects/Brew Service.md", "Research/*.md").expect("glob"));
+    }
+
+    /// Embedding server that fails (HTTP 500) for any request whose `input` array
+    /// contains the sentinel substring, and returns a valid 3-dim embedding
+    /// otherwise. Served in an unbounded loop so the bulk-then-per-note retry path
+    /// (whose request count is not 1:1 with notes) never out-runs `take(N)`.
+    fn start_sentinel_failing_server(sentinel: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind sentinel server");
+        let address = listener.local_addr().expect("server address");
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                let mut buffer = Vec::new();
+                let mut header_end = None;
+                while header_end.is_none() {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    header_end = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+                }
+                let Some(header_end) = header_end.map(|end| end + 4) else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .expect("content length header");
+                while buffer.len() < header_end + content_length {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).expect("read body");
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+                let body = &buffer[header_end..header_end + content_length];
+                let payload: serde_json::Value =
+                    serde_json::from_slice(body).expect("json request");
+                let inputs = payload
+                    .get("input")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("input array")
+                    .iter()
+                    .map(|value| value.as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>();
+
+                let response = if inputs.iter().any(|input| input.contains(sentinel)) {
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                } else {
+                    let data = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| {
+                            serde_json::json!({
+                                "index": index,
+                                "embedding": [1.0, index as f64 + 1.0, 0.5]
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let response_body = serde_json::json!({ "data": data }).to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    )
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        format!("http://{}", address)
+    }
+
+    #[test]
+    fn embed_prepared_notes_keeps_good_notes_when_one_note_fails() {
+        // One note's chunk triggers a backend 500; the other embeds fine. The build
+        // must NOT abort: good note gets a dense vector, failing note falls back to
+        // BM25/sparse (no vector) and is reported in `failed_paths`.
+        const SENTINEL: &str = "EMBED_BREAK";
+        let base_url = start_sentinel_failing_server(SENTINEL);
+        let config = EmbeddingConfig {
+            provider: Some(EmbeddingProvider::OpenAiCompatible),
+            model: Some("text-embedding-test".to_string()),
+            base_url: Some(base_url),
+            api_key: None,
+            max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+        }
+        .normalize();
+
+        let make_chunk = |path: &str, idx: usize, text: &str| SearchChunk {
+            path: path.to_string(),
+            title: path.to_string(),
+            chunk_index: idx,
+            start_line: 1,
+            end_line: 1,
+            text: text.to_string(),
+            term_counts: Default::default(),
+            norm: 0.0,
+            token_count: 0,
+            embedding: None,
+        };
+        let make_note = |path: &str, chunk_text: &str| PreparedNote {
+            snapshot: FileSnapshot {
+                path: path.to_string(),
+                mtime_ms: 0,
+                size: 0,
+            },
+            note: SearchNote {
+                path: path.to_string(),
+                title: path.to_string(),
+                content: "body".to_string(),
+                term_counts: Default::default(),
+                norm: 0.0,
+                token_count: 0,
+                links: Vec::new(),
+                embedding: None,
+            },
+            chunks: vec![make_chunk(path, 0, chunk_text)],
+            chunk_texts: vec![chunk_text.to_string()],
+        };
+
+        let mut prepared = vec![
+            make_note("Good.md", "harmless content"),
+            make_note("Bad.md", SENTINEL),
+        ];
+
+        let outcome = embed_prepared_notes(&mut prepared, &config, None)
+            .expect("partial failure must not abort the build");
+
+        // Good note: dense vector on note and chunk.
+        assert!(
+            prepared[0].note.embedding.is_some(),
+            "good note must keep its dense vector"
+        );
+        assert!(prepared[0].chunks[0].embedding.is_some());
+
+        // Failing note: no dense vector anywhere, reported in failed_paths.
+        assert!(
+            prepared[1].note.embedding.is_none(),
+            "failing note must fall back to BM25/sparse (no dense vector)"
+        );
+        assert!(prepared[1].chunks[0].embedding.is_none());
+        assert_eq!(outcome.failed_paths, vec!["Bad.md".to_string()]);
+
+        // Dimensions still observed from the note that did embed.
+        assert_eq!(outcome.dimensions, Some(3));
+    }
+
+    #[test]
+    fn build_index_with_one_failing_note_produces_usable_partial_index() {
+        // End-to-end: a reindex where one note's embedding fails must complete
+        // (return Ok), persist a loadable index, embed the good note, and leave the
+        // failing note BM25-only (no dense vector) rather than aborting the build.
+        const SENTINEL: &str = "EMBED_BREAK";
+        let root = unique_temp_dir("partial-embed-build");
+        fs::create_dir_all(&root).expect("temp dir");
+        write_fixture(&root, "Good.md", "# Good\n\nHarmless searchable anchor.\n");
+        write_fixture(&root, "Bad.md", &format!("# Bad\n\n{SENTINEL} anchor.\n"));
+
+        let base_url = start_sentinel_failing_server(SENTINEL);
+        let config = EmbeddingConfig {
+            provider: Some(EmbeddingProvider::OpenAiCompatible),
+            model: Some("text-embedding-test".to_string()),
+            base_url: Some(base_url),
+            api_key: None,
+            max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+        }
+        .normalize();
+
+        // The whole build must NOT error just because one note failed to embed.
+        let index = build_index(&root, None, Some(&config)).expect("partial build must succeed");
+
+        assert_eq!(index.note_count, 2);
+        assert_eq!(index.semantic_backend, SemanticBackend::Embedding);
+        assert_eq!(index.embedding_dimensions, Some(3));
+
+        // Good note keeps a dense vector; the failing note has none.
+        assert!(
+            index.note("Good.md").and_then(|n| n.embedding.as_ref()).is_some(),
+            "good note must be embedded"
+        );
+        assert!(
+            index.note("Bad.md").and_then(|n| n.embedding.as_ref()).is_none(),
+            "failing note must fall back to BM25/sparse (no dense vector)"
+        );
+
+        // Persisted index is loadable and holds exactly the embedded vectors.
+        let (note_vectors, chunk_vectors) = vector_counts(&root);
+        assert_eq!(note_vectors, 1, "only the good note's vector is persisted");
+        assert_eq!(chunk_vectors, 1, "only the good note's chunk vector is persisted");
+        let loaded = load_index(&root, None)
+            .expect("load partial index")
+            .expect("persisted index present");
+        assert_eq!(loaded.note_count, 2);
+        assert!(loaded.note("Bad.md").is_some(), "failing note still indexed for BM25");
+
+        // Usable: BM25 still surfaces the un-embedded note, and semantic search
+        // (KNN by rowid) returns the embedded note without choking on the missing
+        // vector rows.
+        let bm25 = crate::search::bm25_search(&loaded, "anchor").expect("bm25 search");
+        assert!(
+            bm25.iter().any(|m| m.path == "Bad.md"),
+            "un-embedded note must remain findable via BM25"
+        );
+        let semantic = crate::search::semantic_search(&loaded, "harmless searchable")
+            .expect("semantic search on partial index");
+        assert!(
+            semantic.iter().any(|m| m.path == "Good.md"),
+            "embedded note must be findable via semantic search"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Resolve a localhost address that is closed, so every embedding request fails
+    /// fast with connection-refused (no waiting on a timeout). We bind then drop the
+    /// listener to free the port.
+    fn closed_local_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to reserve port");
+        let address = listener.local_addr().expect("server address");
+        drop(listener);
+        format!("http://{}", address)
+    }
+
+    #[test]
+    fn build_index_with_total_embedding_failure_stays_loadable_as_bm25() {
+        // Server fully down: EVERY note fails to embed. The build must still complete
+        // and the persisted index must load (not be silently rejected and rebuilt
+        // forever), serving every note via BM25.
+        let root = unique_temp_dir("total-embed-failure");
+        fs::create_dir_all(&root).expect("temp dir");
+        write_fixture(&root, "Alpha.md", "# Alpha\n\nAlpha anchor.\n");
+        write_fixture(&root, "Beta.md", "# Beta\n\nBeta anchor.\n");
+
+        let config = EmbeddingConfig {
+            provider: Some(EmbeddingProvider::OpenAiCompatible),
+            model: Some("text-embedding-test".to_string()),
+            base_url: Some(closed_local_url()),
+            api_key: None,
+            max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+        }
+        .normalize();
+
+        let index = build_index(&root, None, Some(&config))
+            .expect("total embedding failure must not abort the build");
+        assert_eq!(index.note_count, 2);
+
+        // No vectors were produced; the persisted index must reload as a usable
+        // (BM25) index rather than being treated as absent.
+        let loaded = load_index(&root, None)
+            .expect("load index after total embedding failure")
+            .expect("persisted index must remain loadable, not silently rejected");
+        assert_eq!(loaded.note_count, 2);
+        let bm25 = crate::search::bm25_search(&loaded, "anchor").expect("bm25 search");
+        assert!(bm25.iter().any(|m| m.path == "Alpha.md"));
+        assert!(bm25.iter().any(|m| m.path == "Beta.md"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn incremental_reindex_tolerates_a_failing_new_note() {
+        // Build a healthy semantic index, then incrementally add a note that fails to
+        // embed. The incremental rebuild must complete (the per-note insert tolerates
+        // a missing vector) with the new note BM25-only and the old one still embedded.
+        const SENTINEL: &str = "EMBED_BREAK";
+        let root = unique_temp_dir("incremental-partial-embed");
+        fs::create_dir_all(&root).expect("temp dir");
+        write_fixture(&root, "Home.md", "# Home\n\nStable anchor.\n");
+
+        let base_url = start_sentinel_failing_server(SENTINEL);
+        let config = EmbeddingConfig {
+            provider: Some(EmbeddingProvider::OpenAiCompatible),
+            model: Some("text-embedding-test".to_string()),
+            base_url: Some(base_url),
+            api_key: None,
+            max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+        }
+        .normalize();
+
+        let (first, rebuilt_first) =
+            get_search_index(&root, None, Some(&config)).expect("initial semantic build");
+        assert!(rebuilt_first);
+        assert_eq!(first.semantic_backend, SemanticBackend::Embedding);
+        // Persisted state is the source of truth: vectors live in the sqlite-vec
+        // tables, not the in-memory note/chunk structs (load leaves those `None`).
+        assert_eq!(vector_counts(&root), (1, 1), "initial index embeds the only note");
+
+        // Add a note whose chunk text triggers the backend 500.
+        write_fixture(&root, "Bad.md", &format!("# Bad\n\n{SENTINEL} anchor.\n"));
+        let (updated, rebuilt_second) = get_search_index(&root, None, Some(&config))
+            .expect("incremental reindex must not abort on a failing note");
+        assert!(rebuilt_second);
+        assert_eq!(updated.note_count, 2);
+        // Only the original note's vector persists; the failing note has none.
+        assert_eq!(
+            vector_counts(&root),
+            (1, 1),
+            "failing new note adds no vector; original note's vector is preserved"
+        );
+
+        // Reloads cleanly with the partial vector set, and the failing note is still
+        // searchable via BM25.
+        let loaded = load_index(&root, None)
+            .expect("load incremental partial index")
+            .expect("persisted index present");
+        assert_eq!(loaded.semantic_backend, SemanticBackend::Embedding);
+        let bm25 = crate::search::bm25_search(&loaded, "anchor").expect("bm25 search");
+        assert!(bm25.iter().any(|m| m.path == "Bad.md"));
+        assert!(bm25.iter().any(|m| m.path == "Home.md"));
+
+        fs::remove_dir_all(root).ok();
     }
 }
