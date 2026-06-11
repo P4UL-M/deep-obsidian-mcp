@@ -13,6 +13,10 @@ const HYBRID_SEARCH_OVERSAMPLE_FACTOR: usize = 8;
 const HYBRID_SEARCH_MIN_CANDIDATES: usize = 50;
 const HYBRID_SEARCH_CANDIDATE_CAP: usize = 512;
 
+/// Reciprocal Rank Fusion smoothing constant. The standard value from Cormack et al.
+/// (2009); larger `k` flattens the contribution of top ranks, smaller `k` sharpens it.
+const RRF_K: f64 = 60.0;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilePathMatch {
     pub path: String,
@@ -82,7 +86,16 @@ impl Default for FindFilesOptions {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankingOptions {
     pub limit: usize,
+    /// Per-retriever weight for the dense/semantic list in Reciprocal Rank Fusion.
+    /// Multiplies that list's `1/(k + rank)` contribution. Defaults to 1.0 (unweighted).
+    ///
+    /// Historically this was the dense weight in a max-normalized weighted sum; the
+    /// hybrid fusion is now rank-based (RRF), so this is the RRF dense weight. The
+    /// field name is retained so existing callers keep compiling. For the non-hybrid
+    /// `semantic_search` / `bm25_search` paths this field is inert.
     pub semantic_weight: f64,
+    /// Per-retriever weight for the BM25 list in Reciprocal Rank Fusion. See
+    /// [`RankingOptions::semantic_weight`]; defaults to 1.0 (unweighted).
     pub bm25_weight: f64,
 }
 
@@ -90,8 +103,9 @@ impl Default for RankingOptions {
     fn default() -> Self {
         Self {
             limit: 8,
-            semantic_weight: 0.6,
-            bm25_weight: 0.4,
+            // RRF is rank-based and scale-free, so default to UNWEIGHTED fusion.
+            semantic_weight: 1.0,
+            bm25_weight: 1.0,
         }
     }
 }
@@ -107,19 +121,11 @@ impl Default for RelatedNoteOptions {
     }
 }
 
-fn normalize_scores(scores: &[f64]) -> Vec<f64> {
-    let max_score = scores.iter().copied().fold(0.0_f64, f64::max);
-    scores
-        .iter()
-        .copied()
-        .map(|score| {
-            if max_score > 0.0 {
-                score / max_score
-            } else {
-                0.0
-            }
-        })
-        .collect()
+/// Reciprocal Rank Fusion contribution of a single ranked list: `weight / (k + rank)`,
+/// with `rank` 1-based. A document absent from a list never calls this, so it
+/// contributes 0 to its fused score (the issue's requirement).
+fn rrf_contribution(rank_one_based: usize, weight: f64, k: f64) -> f64 {
+    weight / (k + rank_one_based as f64)
 }
 
 fn sql_distance_score(distance: f64) -> f64 {
@@ -681,56 +687,46 @@ fn hybrid_search_with_candidate_limit(
         },
     )?;
 
-    let semantic_scores = normalize_scores(
-        &semantic_matches
-            .iter()
-            .map(|item| item.score)
-            .collect::<Vec<_>>(),
-    );
-    let bm25_scores = normalize_scores(
-        &bm25_matches
-            .iter()
-            .map(|item| item.score)
-            .collect::<Vec<_>>(),
+    // Reciprocal Rank Fusion: rank each retriever independently by its own score
+    // (the lists arrive already sorted, so enumeration position is the 0-based rank),
+    // then fuse by `score(doc) = Σ_retrievers weight_i / (k + rank_i(doc))`. Rank-based
+    // fusion drops the dependence on incomparable cosine vs BM25 scales. The per-list
+    // weights default to 1.0 (unweighted); the retained `semantic_weight`/`bm25_weight`
+    // fields supply them when a caller wants to tilt the fusion.
+    let fused = rrf_fuse(
+        &semantic_matches,
+        options.semantic_weight,
+        &bm25_matches,
+        options.bm25_weight,
     );
 
-    let mut combined: HashMap<(String, usize), SearchMatch> = HashMap::new();
-    for (index_position, match_item) in semantic_matches.into_iter().enumerate() {
-        combined.insert(
-            (match_item.path.clone(), match_item.chunk_index),
-            SearchMatch {
-                semantic_score: semantic_scores.get(index_position).copied().unwrap_or(0.0),
-                score: 0.0,
-                bm25_score: 0.0,
-                ..match_item
-            },
-        );
+    // Materialize fused results: carry each retriever's real component score (handy for
+    // the public API / display) and set `score` to the fused RRF value.
+    let mut semantic_by_key: HashMap<(String, usize), SearchMatch> = HashMap::new();
+    for match_item in semantic_matches {
+        semantic_by_key.insert((match_item.path.clone(), match_item.chunk_index), match_item);
+    }
+    let mut bm25_by_key: HashMap<(String, usize), SearchMatch> = HashMap::new();
+    for match_item in bm25_matches {
+        bm25_by_key.insert((match_item.path.clone(), match_item.chunk_index), match_item);
     }
 
-    for (index_position, match_item) in bm25_matches.into_iter().enumerate() {
-        let normalized = bm25_scores.get(index_position).copied().unwrap_or(0.0);
-        let key = (match_item.path.clone(), match_item.chunk_index);
-        if let Some(existing) = combined.get_mut(&key) {
-            existing.bm25_score = normalized;
-            continue;
-        }
-        combined.insert(
-            key,
-            SearchMatch {
-                semantic_score: 0.0,
-                bm25_score: normalized,
-                score: 0.0,
-                ..match_item
-            },
-        );
-    }
-
-    let mut matches = combined
-        .into_values()
-        .map(|mut match_item| {
-            match_item.score = options.semantic_weight * match_item.semantic_score
-                + options.bm25_weight * match_item.bm25_score;
-            match_item
+    let mut matches = fused
+        .into_iter()
+        .filter_map(|(key, fused_score)| {
+            let semantic = semantic_by_key.remove(&key);
+            let bm25 = bm25_by_key.remove(&key);
+            let semantic_score = semantic.as_ref().map(|item| item.score).unwrap_or(0.0);
+            let bm25_score = bm25.as_ref().map(|item| item.score).unwrap_or(0.0);
+            // Prefer the semantic record for the displayed text/metadata, falling back
+            // to the BM25 record; one of the two must exist for the key to appear.
+            let base = semantic.or(bm25)?;
+            Some(SearchMatch {
+                score: fused_score,
+                semantic_score,
+                bm25_score,
+                ..base
+            })
         })
         .filter(|match_item| match_item.score > 0.0)
         .collect::<Vec<_>>();
@@ -744,6 +740,35 @@ fn hybrid_search_with_candidate_limit(
     });
     matches.truncate(requested_limit);
     Ok(matches)
+}
+
+/// Pure Reciprocal Rank Fusion over two ranked lists.
+///
+/// Each list is assumed already sorted best-first (position 0 is rank 1). A document
+/// keyed by `(path, chunk_index)` accumulates `weight_i / (RRF_K + rank_i)` from every
+/// list it appears in; a document absent from a list contributes nothing from that list
+/// (it never gets a term). Returns `(key, fused_score)` pairs (unordered — the caller
+/// sorts), so the math is testable without building an index.
+fn rrf_fuse(
+    semantic_matches: &[SearchMatch],
+    semantic_weight: f64,
+    bm25_matches: &[SearchMatch],
+    bm25_weight: f64,
+) -> HashMap<(String, usize), f64> {
+    let mut fused: HashMap<(String, usize), f64> = HashMap::new();
+    for (position, match_item) in semantic_matches.iter().enumerate() {
+        let contribution = rrf_contribution(position + 1, semantic_weight, RRF_K);
+        *fused
+            .entry((match_item.path.clone(), match_item.chunk_index))
+            .or_insert(0.0) += contribution;
+    }
+    for (position, match_item) in bm25_matches.iter().enumerate() {
+        let contribution = rrf_contribution(position + 1, bm25_weight, RRF_K);
+        *fused
+            .entry((match_item.path.clone(), match_item.chunk_index))
+            .or_insert(0.0) += contribution;
+    }
+    fused
 }
 
 #[cfg(test)]
@@ -946,6 +971,108 @@ mod tests {
         let hybrid = hybrid_search(&index, "install runtime").expect("hybrid");
         assert!(!hybrid.is_empty());
         assert!(hybrid[0].score > 0.0);
+    }
+
+    /// Build a minimal SearchMatch keyed only by path (chunk_index 0); the score field
+    /// is irrelevant to RRF (rank-based), so it is set to 0.0.
+    fn ranked(path: &str) -> SearchMatch {
+        SearchMatch {
+            path: path.to_string(),
+            title: path.to_string(),
+            chunk_index: 0,
+            start_line: 0,
+            end_line: 0,
+            score: 0.0,
+            semantic_score: 0.0,
+            bm25_score: 0.0,
+            text: String::new(),
+        }
+    }
+
+    /// Sort an RRF result map into descending (path, score) order for assertions.
+    fn fused_order(fused: HashMap<(String, usize), f64>) -> Vec<(String, f64)> {
+        let mut entries = fused
+            .into_iter()
+            .map(|((path, _chunk), score)| (path, score))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        entries
+    }
+
+    #[test]
+    fn rrf_fuses_known_lists_with_expected_scores() {
+        // Two retrievers, identical single-doc lists. Doc gets 1/(60+1) from each.
+        let semantic = vec![ranked("A")];
+        let bm25 = vec![ranked("A")];
+        let fused = rrf_fuse(&semantic, 1.0, &bm25, 1.0);
+        let expected = 2.0 / (RRF_K + 1.0);
+        assert!((fused[&("A".to_string(), 0)] - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rrf_surfaces_docs_strong_in_only_one_retriever() {
+        // `top_bm25` is #1 in BM25 but mid-pack (#3) in dense; `top_dense` is the
+        // mirror image (#1 dense, #3 BM25). Both must survive fusion NEAR THE TOP,
+        // ahead of docs that are merely mid-pack in BOTH lists. This is the exact
+        // case the issue calls out for RRF.
+        let semantic = vec![
+            ranked("top_dense"),  // dense rank 1
+            ranked("mid_both_a"), // dense rank 2
+            ranked("top_bm25"),   // dense rank 3
+            ranked("mid_both_b"), // dense rank 4
+        ];
+        let bm25 = vec![
+            ranked("top_bm25"),   // bm25 rank 1
+            ranked("mid_both_b"), // bm25 rank 2
+            ranked("top_dense"),  // bm25 rank 3
+            ranked("mid_both_a"), // bm25 rank 4
+        ];
+
+        let order = fused_order(rrf_fuse(&semantic, 1.0, &bm25, 1.0));
+        let ranks: Vec<&str> = order.iter().map(|(path, _)| path.as_str()).collect();
+
+        // Both single-retriever leaders fuse to 1/61 + 1/63; the docs that are #2/#4 in
+        // both fuse to 1/62 + 1/64 (a). top_bm25/top_dense each = 1/61+1/63 > any mid pair.
+        let leader_score = 1.0 / (RRF_K + 1.0) + 1.0 / (RRF_K + 3.0);
+        assert!((order[0].1 - leader_score).abs() < 1e-12);
+        assert!((order[1].1 - leader_score).abs() < 1e-12);
+        // The top two slots are exactly the two single-retriever leaders.
+        assert_eq!(&ranks[0..2].iter().copied().collect::<BTreeSet<_>>(), &BTreeSet::from(["top_bm25", "top_dense"]));
+        // ...and they outrank both docs that were only ever mid-pack.
+        let pos = |name: &str| ranks.iter().position(|item| *item == name).unwrap();
+        assert!(pos("top_bm25") < pos("mid_both_a"));
+        assert!(pos("top_bm25") < pos("mid_both_b"));
+        assert!(pos("top_dense") < pos("mid_both_a"));
+        assert!(pos("top_dense") < pos("mid_both_b"));
+    }
+
+    #[test]
+    fn rrf_absent_doc_contributes_zero() {
+        // `only_dense` appears solely in the dense list; its fused score is exactly its
+        // single dense contribution (the BM25 side adds nothing).
+        let semantic = vec![ranked("shared"), ranked("only_dense")];
+        let bm25 = vec![ranked("shared")];
+        let fused = rrf_fuse(&semantic, 1.0, &bm25, 1.0);
+        let only_dense = fused[&("only_dense".to_string(), 0)];
+        assert!((only_dense - 1.0 / (RRF_K + 2.0)).abs() < 1e-12);
+        // `shared` is in both at rank 1, so it must outrank the single-list doc.
+        let shared = fused[&("shared".to_string(), 0)];
+        assert!(shared > only_dense);
+    }
+
+    #[test]
+    fn rrf_weights_tilt_fusion() {
+        // With BM25 weight 0, only the dense ranking matters: a BM25-only doc drops out.
+        let semantic = vec![ranked("dense_doc")];
+        let bm25 = vec![ranked("bm25_doc")];
+        let fused = rrf_fuse(&semantic, 1.0, &bm25, 0.0);
+        assert!((fused[&("bm25_doc".to_string(), 0)] - 0.0).abs() < 1e-12);
+        assert!(fused[&("dense_doc".to_string(), 0)] > 0.0);
     }
 
     #[test]

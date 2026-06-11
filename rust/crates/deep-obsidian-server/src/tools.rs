@@ -1086,8 +1086,8 @@ fn find_similar_notes_payload(
             query,
             RankingOptions {
                 limit: (reference_limit.max(1) * 8).max(12),
-                semantic_weight: 0.6,
-                bm25_weight: 0.4,
+                // Unweighted RRF fusion (the scale-free default).
+                ..RankingOptions::default()
             },
         )
         .map_err(|error| error.to_string())?;
@@ -1549,15 +1549,15 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "hybrid_search".to_string(),
-            description: "Combine BM25 lexical ranking with semantic similarity over note chunks.".to_string(),
+            description: "Combine BM25 lexical ranking with semantic similarity over note chunks using Reciprocal Rank Fusion (rank-based, scale-free).".to_string(),
             annotations: Some(tool_annotations(true, None, None)),
             execution: Some(json!({"taskSupport":"forbidden"})),
             input_schema: object_schema(
                 vec![
                     ("query", json!({"type":"string","description":"Natural-language or lexical query."})),
                     ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
-                    ("semanticWeight", json!({"type":"number","minimum":0,"maximum":1,"default":0.6})),
-                    ("bm25Weight", json!({"type":"number","minimum":0,"maximum":1,"default":0.4})),
+                    ("semanticWeight", json!({"type":"number","minimum":0,"maximum":1,"default":1.0,"description":"RRF weight for the semantic list (multiplies its 1/(k+rank) contribution). Default 1.0 (unweighted)."})),
+                    ("bm25Weight", json!({"type":"number","minimum":0,"maximum":1,"default":1.0,"description":"RRF weight for the BM25 list (multiplies its 1/(k+rank) contribution). Default 1.0 (unweighted)."})),
                     ("includeText", json!({"type":"boolean","default":true})),
                     ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
@@ -2520,8 +2520,9 @@ pub async fn call_tool(
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
-            let semantic_weight = clamped_f64_arg(arguments, "semanticWeight", 0.6, 0.0, 1.0);
-            let bm25_weight = clamped_f64_arg(arguments, "bm25Weight", 0.4, 0.0, 1.0);
+            // RRF per-list weights; default to 1.0 (unweighted, scale-free fusion).
+            let semantic_weight = clamped_f64_arg(arguments, "semanticWeight", 1.0, 0.0, 1.0);
+            let bm25_weight = clamped_f64_arg(arguments, "bm25Weight", 1.0, 0.0, 1.0);
             let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
             let snapshot = state.runtime.fresh_snapshot("hybrid_search").await?;
             let index = snapshot.index;
@@ -2654,8 +2655,8 @@ pub async fn call_tool(
                 query.clone(),
                 RankingOptions {
                     limit: limit_chunks,
-                    semantic_weight: 0.6,
-                    bm25_weight: 0.4,
+                    // Unweighted RRF fusion (the scale-free default).
+                    ..RankingOptions::default()
                 },
             )
             .await?;
@@ -2676,21 +2677,28 @@ pub async fn call_tool(
                 apply_response_text_budget(&mut chunks, "text", RESPONSE_TEXT_BUDGET_CHARS);
 
             let mut note_bucket = HashMap::<String, KnowledgeNote>::new();
-            for chunk in &chunks {
+            // `chunks` is in hybrid-sorted (best-first) order. The hybrid score is now a
+            // raw Reciprocal Rank Fusion value (~1/k, tiny and scale-free), which is NOT
+            // comparable to the cosine similarity returned by `related_notes` below. To
+            // keep both signals on one comparable [0,1] scale for the merge/sort, derive
+            // each chunk match's knowledge score from its hybrid RANK (`1/rank`): top
+            // chunk = 1.0, then 0.5, 0.33, ... This preserves the original intent that a
+            // direct chunk match outranks a discounted (`* 0.85`) related-of note.
+            for (position, chunk) in chunks.iter().enumerate() {
                 if let Some(path) = chunk.get("path").and_then(Value::as_str) {
                     let title = chunk
                         .get("title")
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned)
                         .unwrap_or_else(|| note_name(path));
-                    let score = chunk.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+                    let rank_score = 1.0 / (position as f64 + 1.0);
                     merge_knowledge_note(
                         &mut note_bucket,
                         KnowledgeNote {
                             path: path.to_string(),
                             title,
                             wiki_link: note_wiki_link(path),
-                            score,
+                            score: rank_score,
                             reasons: vec!["top chunk match".to_string()],
                             shared_links: Vec::new(),
                         },
@@ -2804,8 +2812,8 @@ pub async fn call_tool(
                 query.clone(),
                 RankingOptions {
                     limit: 24,
-                    semantic_weight: 0.6,
-                    bm25_weight: 0.4,
+                    // Unweighted RRF fusion (the scale-free default).
+                    ..RankingOptions::default()
                 },
             )
             .await?;
