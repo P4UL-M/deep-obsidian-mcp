@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::graph::resolve_wiki_link_target;
 use crate::index::{
     artifact_embedding_runtime_config, average, bm25_score, cosine_similarity, count_terms,
-    embedding_runtime_config, find_pattern_spans, matches_pattern, normalize_dense_vector,
-    open_index_connection_for_index, path_matches_glob, query_vector_blob, vector_norm, IndexError,
+    embedding_runtime_config, matches_pattern, normalize_dense_vector,
+    open_index_connection_for_index, query_vector_blob, vector_norm, IndexError,
     Result, SearchIndex, SemanticBackend,
 };
 use rusqlite::{params, params_from_iter, OptionalExtension};
@@ -24,14 +24,6 @@ pub struct GrepSubmatch {
     pub start: usize,
     pub end: usize,
     pub text: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct GrepMatch {
-    pub path: String,
-    pub line_number: usize,
-    pub submatches: Vec<GrepSubmatch>,
-    pub line_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,27 +75,6 @@ impl Default for FindFilesOptions {
         Self {
             mode: FileSearchMode::Substring,
             limit: 20,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GrepOptions {
-    pub regex: bool,
-    pub case_sensitive: bool,
-    pub glob: Option<String>,
-    pub context_lines: usize,
-    pub limit: usize,
-}
-
-impl Default for GrepOptions {
-    fn default() -> Self {
-        Self {
-            regex: false,
-            case_sensitive: false,
-            glob: None,
-            context_lines: 0,
-            limit: 50,
         }
     }
 }
@@ -430,82 +401,6 @@ pub fn find_files_with_options(
     }
 
     Ok(files)
-}
-
-pub fn grep_search(index: &SearchIndex, query: &str) -> Result<Vec<GrepMatch>> {
-    grep_search_with_options(index, query, GrepOptions::default())
-}
-
-pub fn grep_search_with_options(
-    index: &SearchIndex,
-    query: &str,
-    options: GrepOptions,
-) -> Result<Vec<GrepMatch>> {
-    let limit = options.limit.max(1);
-    if query.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut matches = Vec::new();
-
-    for note in &index.notes {
-        if let Some(glob) = options.glob.as_deref() {
-            if !path_matches_glob(&note.path, glob)? {
-                continue;
-            }
-        }
-
-        for (line_number, line) in note.content.split('\n').enumerate() {
-            let mut submatches = Vec::new();
-            if options.regex {
-                for (start, end) in find_pattern_spans(line, query, options.case_sensitive)? {
-                    submatches.push(GrepSubmatch {
-                        start,
-                        end,
-                        text: line[start..end].to_string(),
-                    });
-                }
-            } else {
-                let query_text = if options.case_sensitive {
-                    query.to_string()
-                } else {
-                    query.to_lowercase()
-                };
-                let line_text = if options.case_sensitive {
-                    line.to_string()
-                } else {
-                    line.to_lowercase()
-                };
-                let mut search_start = 0;
-                while let Some(relative_start) = line_text[search_start..].find(&query_text) {
-                    let start = search_start + relative_start;
-                    let end = start + query_text.len();
-                    submatches.push(GrepSubmatch {
-                        start,
-                        end,
-                        text: line[start..end].to_string(),
-                    });
-                    search_start = end;
-                }
-            }
-
-            if submatches.is_empty() {
-                continue;
-            }
-
-            matches.push(GrepMatch {
-                path: note.path.clone(),
-                line_number: line_number + 1,
-                submatches,
-                line_text: line.to_string(),
-            });
-
-            if matches.len() >= limit {
-                return Ok(matches);
-            }
-        }
-    }
-
-    Ok(matches)
 }
 
 pub fn bm25_search(index: &SearchIndex, query: &str) -> Result<Vec<SearchMatch>> {
@@ -1004,14 +899,6 @@ mod tests {
         assert!(regex
             .iter()
             .any(|entry| entry.path == "Research/Service Contract.md"));
-    }
-
-    #[test]
-    fn grep_search_returns_line_matches() {
-        let index = sample_index();
-        let matches = grep_search(&index, "install").expect("grep");
-        assert!(!matches.is_empty());
-        assert!(matches.iter().any(|entry| entry.path == "Home.md"));
     }
 
     #[test]
