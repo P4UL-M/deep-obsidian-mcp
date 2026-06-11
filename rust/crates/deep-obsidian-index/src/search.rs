@@ -5,7 +5,7 @@ use crate::index::{
     artifact_embedding_runtime_config, average, bm25_score, cosine_similarity, count_terms,
     embedding_runtime_config, matches_pattern, normalize_dense_vector,
     open_index_connection_for_index, query_vector_blob, vector_norm, IndexError,
-    Result, SearchIndex, SemanticBackend,
+    Result, SearchIndex, SearchNote, SemanticBackend,
 };
 use rusqlite::{params, params_from_iter, OptionalExtension};
 
@@ -755,6 +755,37 @@ fn hybrid_search_exhaustive_with_options(
     hybrid_search_with_candidate_limit(index, query, options, index.chunk_count.max(1))
 }
 
+/// Sparse term-overlap related-notes computation: cosine similarity over term counts,
+/// plus shared outbound links. Shared by the sparse backend and by the
+/// graceful-degradation path when an embedding-backend note has no dense vector.
+/// The caller is responsible for sorting and truncating to the requested limit.
+fn related_notes_sparse(index: &SearchIndex, note: &SearchNote) -> Vec<RelatedNoteMatch> {
+    let note_links: BTreeSet<_> = note.links.iter().cloned().collect();
+    index
+        .notes
+        .iter()
+        .filter(|candidate| candidate.path != note.path)
+        .map(|candidate| RelatedNoteMatch {
+            path: candidate.path.clone(),
+            title: candidate.title.clone(),
+            score: cosine_similarity(
+                &note.term_counts,
+                note.norm,
+                &candidate.term_counts,
+                candidate.norm,
+            ),
+            shared_links: candidate
+                .links
+                .iter()
+                .filter(|link| note_links.contains(*link))
+                .cloned()
+                .take(10)
+                .collect(),
+        })
+        .filter(|candidate| candidate.score > 0.0)
+        .collect::<Vec<_>>()
+}
+
 pub fn related_notes(index: &SearchIndex, note_path: &str) -> Result<Vec<RelatedNoteMatch>> {
     related_notes_with_options(index, note_path, RelatedNoteOptions::default())
 }
@@ -767,33 +798,20 @@ pub fn related_notes_with_options(
     let note = index
         .note(note_path)
         .ok_or_else(|| IndexError::NoteNotFound(note_path.to_string()))?;
-    let note_links: BTreeSet<_> = note.links.iter().cloned().collect();
     let mut matches = if index.semantic_backend == SemanticBackend::Embedding {
-        related_notes_with_embeddings_sql(index, note_path, options.limit.max(1))?
+        match related_notes_with_embeddings_sql(index, note_path, options.limit.max(1)) {
+            Ok(matches) => matches,
+            // Partial indexes (a note that failed to embed) can leave an
+            // Embedding-backend index with no dense vector for this note. Rather than
+            // failing the whole call, degrade to the sparse term-overlap path for this
+            // note — the same graceful per-query degradation `search` already relies on.
+            Err(IndexError::MissingNoteEmbedding(_)) => {
+                related_notes_sparse(index, note)
+            }
+            Err(error) => return Err(error),
+        }
     } else {
-        index
-            .notes
-            .iter()
-            .filter(|candidate| candidate.path != note.path)
-            .map(|candidate| RelatedNoteMatch {
-                path: candidate.path.clone(),
-                title: candidate.title.clone(),
-                score: cosine_similarity(
-                    &note.term_counts,
-                    note.norm,
-                    &candidate.term_counts,
-                    candidate.norm,
-                ),
-                shared_links: candidate
-                    .links
-                    .iter()
-                    .filter(|link| note_links.contains(*link))
-                    .cloned()
-                    .take(10)
-                    .collect(),
-            })
-            .filter(|candidate| candidate.score > 0.0)
-            .collect::<Vec<_>>()
+        related_notes_sparse(index, note)
     };
 
     matches.sort_by(|left, right| {
@@ -832,9 +850,12 @@ pub fn resolve_note_link(index: &SearchIndex, source_path: &str, raw_link: &str)
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -954,5 +975,141 @@ mod tests {
         assert!(related
             .iter()
             .any(|entry| entry.path == "Projects/Brew Service.md"));
+    }
+
+    /// Embedding backend returning a valid 3-dim vector for any input that does NOT
+    /// contain `sentinel`, and HTTP 500 for any input that does. Lets a build embed
+    /// every note except the one whose text carries the sentinel.
+    fn start_sentinel_failing_embedding_server(sentinel: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind sentinel server");
+        let address = listener.local_addr().expect("server address");
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                let mut buffer = Vec::new();
+                let mut header_end = None;
+                while header_end.is_none() {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    header_end = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+                }
+                let Some(header_end) = header_end.map(|end| end + 4) else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .expect("content length header");
+                while buffer.len() < header_end + content_length {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).expect("read body");
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+                let body = &buffer[header_end..header_end + content_length];
+                let payload: serde_json::Value =
+                    serde_json::from_slice(body).expect("json request");
+                let inputs = payload
+                    .get("input")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("input array")
+                    .iter()
+                    .map(|value| value.as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>();
+
+                let response = if inputs.iter().any(|input| input.contains(sentinel)) {
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                } else {
+                    let data = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| {
+                            serde_json::json!({
+                                "index": index,
+                                "embedding": [1.0, index as f64 + 1.0, 0.5]
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let response_body = serde_json::json!({ "data": data }).to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    )
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        format!("http://{}", address)
+    }
+
+    #[test]
+    fn related_notes_degrades_to_sparse_when_source_note_has_no_embedding() {
+        // FIX 3: on an Embedding-backend index, a note that failed to embed has no
+        // dense vector. `related_notes` for that note must degrade to the sparse
+        // term-overlap path instead of erroring with MissingNoteEmbedding.
+        const SENTINEL: &str = "EMBED_BREAK";
+        let root = unique_temp_dir("related-no-embedding");
+        fs::create_dir_all(&root).expect("temp dir");
+        // The source note carries the sentinel so its embedding fails; it shares terms
+        // and a link with a sibling that embeds fine, so sparse still finds a relation.
+        write_fixture(
+            &root,
+            "Source.md",
+            &format!("# Source\n\n{SENTINEL} install the service runtime.\n\nSee [[Sibling]].\n"),
+        );
+        write_fixture(
+            &root,
+            "Sibling.md",
+            "# Sibling\n\nInstall the service runtime.\n\nReference [[Source]].\n",
+        );
+
+        let base_url = start_sentinel_failing_embedding_server(SENTINEL);
+        let config = crate::embeddings::EmbeddingConfig {
+            provider: Some(crate::embeddings::EmbeddingProvider::OpenAiCompatible),
+            model: Some("text-embedding-test".to_string()),
+            base_url: Some(base_url),
+            api_key: None,
+            max_chars: crate::embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: crate::embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: crate::embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: crate::embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: crate::embeddings::DEFAULT_CHARS_PER_TOKEN,
+        }
+        .normalize();
+
+        let index =
+            crate::index::build_index(&root, None, Some(&config)).expect("partial embedding build");
+
+        // Precondition: embedding backend, with the source note left un-embedded.
+        assert_eq!(index.semantic_backend, SemanticBackend::Embedding);
+
+        // Must NOT error with MissingNoteEmbedding; degrades to sparse and still finds
+        // the sibling via shared terms/links. (The embedding backend reads the
+        // persisted sqlite at query time, so keep `root` until after the query.)
+        let related = related_notes(&index, "Source.md")
+            .expect("related_notes must degrade to sparse, not error on a missing embedding");
+        assert!(
+            related.iter().any(|entry| entry.path == "Sibling.md"),
+            "sparse degradation should still surface the related sibling"
+        );
+
+        fs::remove_dir_all(root).ok();
     }
 }
