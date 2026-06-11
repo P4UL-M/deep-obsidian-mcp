@@ -133,6 +133,11 @@ pub struct SearchIndex {
     pub embedding_base_url: Option<String>,
     #[serde(skip_serializing, skip_deserializing, default)]
     pub runtime_embedding_api_key: Option<String>,
+    /// Explicit user-configured query instruction injected at load (query-side only,
+    /// not persisted). When `None`, an auto-default is derived from the model name in
+    /// `embedding_runtime_config`. Mirrors `runtime_embedding_api_key`.
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub runtime_query_instruction: Option<String>,
     pub artifact_embedding_provider: Option<String>,
     pub artifact_embedding_model: Option<String>,
     pub artifact_embedding_dimensions: Option<usize>,
@@ -998,6 +1003,10 @@ fn apply_runtime_embedding_config(
         .api_key
         .clone()
         .filter(|value| !value.trim().is_empty());
+    index.runtime_query_instruction = config
+        .query_instruction
+        .clone()
+        .filter(|value| !value.trim().is_empty());
 }
 
 fn apply_runtime_artifact_embedding_config(
@@ -1019,10 +1028,32 @@ fn apply_runtime_artifact_embedding_config(
         .filter(|value| !value.trim().is_empty());
 }
 
+/// Auto-default query instruction for instruction-tuned embedding models.
+///
+/// Returns the qwen3-embedding default search-query instruction when the model name
+/// looks like an instruct embedding model (case-insensitive substring
+/// `qwen3-embedding`); otherwise `None`. Keyed purely on the model-name string so
+/// generic (non-qwen3) configs — including the hermetic eval's test config — stay
+/// `None` and send raw queries unchanged.
+pub fn default_query_instruction_for_model(model: Option<&str>) -> Option<String> {
+    let model = model?;
+    if model.to_ascii_lowercase().contains("qwen3-embedding") {
+        Some(embeddings::DEFAULT_SEARCH_QUERY_INSTRUCTION.to_string())
+    } else {
+        None
+    }
+}
+
 pub fn embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> {
     if index.semantic_backend != SemanticBackend::Embedding {
         return None;
     }
+
+    // Explicit user override wins; otherwise auto-default for recognized instruct models.
+    let query_instruction = index
+        .runtime_query_instruction
+        .clone()
+        .or_else(|| default_query_instruction_for_model(index.embedding_model.as_deref()));
 
     Some(
         EmbeddingConfig {
@@ -1041,6 +1072,7 @@ pub fn embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> 
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction,
         }
         .normalize(),
     )
@@ -1067,6 +1099,8 @@ pub fn artifact_embedding_runtime_config(index: &SearchIndex) -> Option<Embeddin
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            // Artifacts are intentionally out of scope for query-instruction wrapping.
+            query_instruction: None,
         }
         .normalize(),
     )
@@ -2188,6 +2222,7 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
             .and_then(|value| value.parse::<usize>().ok()),
         embedding_base_url: runtime_config.get("baseUrl").cloned(),
         runtime_embedding_api_key: None,
+        runtime_query_instruction: None,
         artifact_embedding_provider: metadata.get("artifactEmbeddingProvider").cloned(),
         artifact_embedding_model: metadata.get("artifactEmbeddingModel").cloned(),
         artifact_embedding_dimensions,
@@ -3220,6 +3255,11 @@ pub fn build_index_from_snapshots_with_artifacts(
         } else {
             None
         },
+        runtime_query_instruction: if index_config.supports_embeddings() {
+            index_config.query_instruction.clone()
+        } else {
+            None
+        },
         artifact_embedding_provider: if artifact_config.supports_embeddings() {
             Some(
                 artifact_config
@@ -4079,6 +4119,7 @@ mod tests {
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
         .normalize();
 
@@ -4157,6 +4198,7 @@ mod tests {
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
         .normalize();
 
@@ -4222,6 +4264,7 @@ mod tests {
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
         .normalize();
         let (updated, rebuilt) =
@@ -4287,6 +4330,7 @@ mod tests {
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
         .normalize();
 
@@ -4482,6 +4526,7 @@ mod tests {
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
         .normalize();
 
@@ -4566,6 +4611,7 @@ mod tests {
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
         .normalize();
 
@@ -4644,6 +4690,7 @@ mod tests {
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
         .normalize();
 
@@ -4685,6 +4732,7 @@ mod tests {
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
         .normalize();
 
@@ -4768,6 +4816,7 @@ mod tests {
             max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
         .normalize()
     }
@@ -4892,5 +4941,140 @@ mod tests {
             requests, NOTES,
             "deterministic error must not spray a per-note retry wave; saw {requests} requests"
         );
+    }
+
+    #[test]
+    fn auto_default_query_instruction_for_qwen3_models() {
+        // qwen3-embedding (case-insensitive, with a tag) auto-enables the default.
+        assert_eq!(
+            default_query_instruction_for_model(Some("qwen3-embedding:0.6b")),
+            Some(embeddings::DEFAULT_SEARCH_QUERY_INSTRUCTION.to_string())
+        );
+        assert_eq!(
+            default_query_instruction_for_model(Some("Qwen3-Embedding-8B")),
+            Some(embeddings::DEFAULT_SEARCH_QUERY_INSTRUCTION.to_string())
+        );
+    }
+
+    #[test]
+    fn no_auto_default_query_instruction_for_other_models() {
+        assert_eq!(
+            default_query_instruction_for_model(Some("text-embedding-3-small")),
+            None
+        );
+        assert_eq!(
+            default_query_instruction_for_model(Some("pseudo-eval-model")),
+            None
+        );
+        assert_eq!(default_query_instruction_for_model(None), None);
+    }
+
+    #[test]
+    fn explicit_query_instruction_overrides_auto_default() {
+        // A user-set instruction wins even on a qwen3 model.
+        let mut index = SearchIndex {
+            version: 1,
+            generated_at: String::new(),
+            semantic_backend: SemanticBackend::Embedding,
+            embedding_provider: Some("openai-compatible".to_string()),
+            embedding_model: Some("qwen3-embedding:0.6b".to_string()),
+            embedding_dimensions: None,
+            embedding_base_url: Some("http://unused".to_string()),
+            runtime_embedding_api_key: None,
+            runtime_query_instruction: Some("Custom task".to_string()),
+            artifact_embedding_provider: None,
+            artifact_embedding_model: None,
+            artifact_embedding_dimensions: None,
+            artifact_embedding_base_url: None,
+            runtime_artifact_embedding_api_key: None,
+            artifact_embedding_error: None,
+            file_snapshots: Vec::new(),
+            artifact_snapshots: Vec::new(),
+            document_frequencies: BTreeMap::new(),
+            chunk_count: 0,
+            note_count: 0,
+            artifact_count: 0,
+            vectorized_artifact_count: 0,
+            skipped_artifact_count: 0,
+            notes: Vec::new(),
+            chunks: Vec::new(),
+            artifacts: Vec::new(),
+            context: None,
+        };
+
+        let config = embedding_runtime_config(&index).expect("embedding runtime config");
+        assert_eq!(config.query_instruction.as_deref(), Some("Custom task"));
+
+        // With no explicit override, the qwen3 model auto-defaults.
+        index.runtime_query_instruction = None;
+        let config = embedding_runtime_config(&index).expect("embedding runtime config");
+        assert_eq!(
+            config.query_instruction.as_deref(),
+            Some(embeddings::DEFAULT_SEARCH_QUERY_INSTRUCTION)
+        );
+
+        // A non-qwen3 model stays plain (None).
+        index.embedding_model = Some("text-embedding-3-small".to_string());
+        let config = embedding_runtime_config(&index).expect("embedding runtime config");
+        assert_eq!(config.query_instruction, None);
+    }
+
+    #[test]
+    fn apply_runtime_embedding_config_injects_query_instruction_at_load() {
+        // Mirrors how `runtime_embedding_api_key` is injected at load: a populated
+        // user config sets the non-persisted `runtime_query_instruction`, so an
+        // explicit override survives a plain index load (not just a rebuild).
+        let mut index = SearchIndex {
+            version: 1,
+            generated_at: String::new(),
+            semantic_backend: SemanticBackend::Embedding,
+            embedding_provider: Some("openai-compatible".to_string()),
+            embedding_model: Some("text-embedding-3-small".to_string()),
+            embedding_dimensions: None,
+            embedding_base_url: Some("http://unused".to_string()),
+            runtime_embedding_api_key: None,
+            runtime_query_instruction: None,
+            artifact_embedding_provider: None,
+            artifact_embedding_model: None,
+            artifact_embedding_dimensions: None,
+            artifact_embedding_base_url: None,
+            runtime_artifact_embedding_api_key: None,
+            artifact_embedding_error: None,
+            file_snapshots: Vec::new(),
+            artifact_snapshots: Vec::new(),
+            document_frequencies: BTreeMap::new(),
+            chunk_count: 0,
+            note_count: 0,
+            artifact_count: 0,
+            vectorized_artifact_count: 0,
+            skipped_artifact_count: 0,
+            notes: Vec::new(),
+            chunks: Vec::new(),
+            artifacts: Vec::new(),
+            context: None,
+        };
+
+        let user_config = EmbeddingConfig {
+            provider: Some(EmbeddingProvider::OpenAiCompatible),
+            model: Some("text-embedding-3-small".to_string()),
+            base_url: Some("http://unused".to_string()),
+            api_key: None,
+            max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: Some("Custom task".to_string()),
+        };
+
+        apply_runtime_embedding_config(&mut index, Some(&user_config));
+        assert_eq!(
+            index.runtime_query_instruction.as_deref(),
+            Some("Custom task")
+        );
+
+        // And it flows through to the runtime config even on a non-qwen3 model.
+        let runtime = embedding_runtime_config(&index).expect("runtime config");
+        assert_eq!(runtime.query_instruction.as_deref(), Some("Custom task"));
     }
 }

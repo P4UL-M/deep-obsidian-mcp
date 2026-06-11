@@ -198,6 +198,7 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
             max_chars: config.embedding.max_chars,
             max_input_tokens: config.embedding.max_input_tokens,
             context_tokens: config.embedding.context_tokens,
+            query_instruction: config.embedding.query_instruction.clone(),
         }),
         artifact_embedding: if config.artifact_embedding.provider.is_some()
             || config.artifact_embedding.model.is_some()
@@ -212,6 +213,7 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
                 max_chars: config.artifact_embedding.max_chars,
                 max_input_tokens: config.artifact_embedding.max_input_tokens,
                 context_tokens: config.artifact_embedding.context_tokens,
+                query_instruction: config.artifact_embedding.query_instruction.clone(),
             })
         } else {
             None
@@ -319,6 +321,7 @@ fn normalize_embedding_input(input: Option<EmbeddingConfigInput>) -> EmbeddingCo
         max_chars: input.max_chars,
         max_input_tokens: input.max_input_tokens,
         context_tokens: input.context_tokens,
+        query_instruction: trim_optional(input.query_instruction),
     }
 }
 

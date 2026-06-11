@@ -86,6 +86,11 @@ pub struct EmbeddingConfig {
     /// allocated `num_ctx` (default applied if unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<usize>,
+    /// Optional query-side task instruction for instruction-tuned embedding models
+    /// (e.g. qwen3-embedding). Explicit user override; when unset an auto-default is
+    /// applied at runtime for recognized instruct models. Query-side only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_instruction: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -105,6 +110,8 @@ pub struct EmbeddingConfigInput {
     pub max_input_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_instruction: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

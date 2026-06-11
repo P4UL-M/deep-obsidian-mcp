@@ -561,6 +561,9 @@ fn eval_config(base_url: String) -> EmbeddingConfig {
         max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
         context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
         chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+        // Generic (non-qwen3) eval model => no auto-default; queries stay plain so the
+        // baseline rankings are unchanged.
+        query_instruction: None,
     }
     .normalize()
 }
