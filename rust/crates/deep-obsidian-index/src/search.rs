@@ -271,9 +271,24 @@ fn related_notes_with_embeddings_sql(
         .map_err(|error| IndexError::Embedding(error.to_string()))
 }
 
+/// Build the exact string sent to the embedding backend for a query.
+///
+/// Query-side only: for instruction-tuned models the config carries a
+/// `query_instruction` and the query is wrapped in the qwen3 instruction format
+/// (`Instruct: {instruction}\nQuery: {query}`). When no instruction is set the raw
+/// query is returned unchanged. Documents were indexed PLAIN and the document/index
+/// embedding path never applies this, so no reindex is required.
+fn query_embedding_input(config: &crate::embeddings::EmbeddingConfig, query: &str) -> String {
+    match config.query_instruction.as_deref() {
+        Some(instruction) => crate::embeddings::format_query_with_instruction(instruction, query),
+        None => query.to_string(),
+    }
+}
+
 fn embed_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
     let config = embedding_runtime_config(index).ok_or(IndexError::MissingEmbeddingConfig)?;
-    let result = crate::embeddings::embed_texts(&[query.to_string()], &config)
+    let input = query_embedding_input(&config, query);
+    let result = crate::embeddings::embed_texts(&[input], &config)
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     let vector = result.vectors.into_iter().next().unwrap_or_default();
     if let Some(expected) = index.embedding_dimensions {
@@ -1218,6 +1233,7 @@ mod tests {
             max_input_tokens: crate::embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: crate::embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: crate::embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
         .normalize();
 
@@ -1238,5 +1254,132 @@ mod tests {
         );
 
         fs::remove_dir_all(root).ok();
+    }
+
+    // --- Query-side instruction wrapping (asymmetric query encoding) ---
+
+    use crate::embeddings::{
+        EmbeddingConfig, EmbeddingProvider, DEFAULT_CHARS_PER_TOKEN,
+        DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+        DEFAULT_EMBEDDING_MAX_CHARS, DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+        DEFAULT_SEARCH_QUERY_INSTRUCTION,
+    };
+
+    fn embedding_config_with_instruction(instruction: Option<&str>) -> EmbeddingConfig {
+        EmbeddingConfig {
+            provider: Some(EmbeddingProvider::OpenAiCompatible),
+            model: Some("test-embedding-model".to_string()),
+            base_url: Some("http://unused".to_string()),
+            api_key: None,
+            max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: instruction.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn query_input_wraps_in_qwen3_instruction_format_when_set() {
+        let config = embedding_config_with_instruction(Some(DEFAULT_SEARCH_QUERY_INSTRUCTION));
+        let input = query_embedding_input(&config, "how do embeddings work");
+        assert_eq!(
+            input,
+            format!(
+                "Instruct: {DEFAULT_SEARCH_QUERY_INSTRUCTION}\nQuery: how do embeddings work"
+            )
+        );
+    }
+
+    #[test]
+    fn query_input_is_raw_when_instruction_is_none() {
+        let config = embedding_config_with_instruction(None);
+        let input = query_embedding_input(&config, "how do embeddings work");
+        assert_eq!(input, "how do embeddings work");
+    }
+
+    /// End-to-end query encoding: the wrapped string is what `embed_texts` actually
+    /// SENDS to the backend. Spins up a mock embedding server and captures the request
+    /// `input` array, asserting the qwen3 wrapper is on the wire.
+    #[test]
+    fn embed_texts_sends_wrapped_query_to_backend() {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Arc, Mutex};
+
+        fn request_body(request: &[u8]) -> Option<&[u8]> {
+            let header_end = request.windows(4).position(|w| w == b"\r\n\r\n")?;
+            let headers = std::str::from_utf8(&request[..header_end]).ok()?;
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let body_start = header_end + 4;
+            (request.len() >= body_start + content_length)
+                .then(|| &request[body_start..body_start + content_length])
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let address = listener.local_addr().expect("addr");
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_thread = Arc::clone(&captured);
+        let handle = thread::spawn(move || {
+            let mut stream: TcpStream =
+                listener.incoming().next().unwrap().expect("accept");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).expect("read");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request_body(&request).is_some() {
+                    break;
+                }
+            }
+            let body = request_body(&request).expect("body");
+            let payload: serde_json::Value =
+                serde_json::from_slice(body).expect("parse body");
+            let inputs = payload
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .expect("input array")
+                .iter()
+                .map(|v| v.as_str().expect("string input").to_string())
+                .collect::<Vec<_>>();
+            *captured_for_thread.lock().unwrap() = inputs;
+            let response_body = serde_json::json!({
+                "data": [{ "index": 0, "embedding": [1.0, 2.0, 3.0] }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+
+        let mut config =
+            embedding_config_with_instruction(Some(DEFAULT_SEARCH_QUERY_INSTRUCTION));
+        config.base_url = Some(format!("http://{address}"));
+        let input = query_embedding_input(&config, "ranking signals");
+        crate::embeddings::embed_texts(&[input], &config).expect("embed");
+        handle.join().expect("join mock server");
+
+        let sent = captured.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            vec![format!(
+                "Instruct: {DEFAULT_SEARCH_QUERY_INSTRUCTION}\nQuery: ranking signals"
+            )]
+        );
     }
 }

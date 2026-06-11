@@ -116,6 +116,7 @@ fn index_embedding_config(config: &ResolvedServiceConfig) -> Result<IndexEmbeddi
             .context_tokens
             .unwrap_or(DEFAULT_EMBEDDING_CONTEXT_TOKENS),
         chars_per_token: DEFAULT_CHARS_PER_TOKEN,
+        query_instruction: config.embedding.query_instruction.clone(),
     }
     .normalize())
 }
@@ -153,6 +154,8 @@ fn index_artifact_embedding_config(
             .context_tokens
             .unwrap_or(DEFAULT_EMBEDDING_CONTEXT_TOKENS),
         chars_per_token: DEFAULT_CHARS_PER_TOKEN,
+        // Artifacts are intentionally out of scope for query-instruction wrapping.
+        query_instruction: None,
     }
     .normalize())
 }

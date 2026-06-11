@@ -247,6 +247,14 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
             max_chars: None,
             max_input_tokens: None,
             context_tokens: None,
+            // Query-side instruction is config-file only (no dedicated CLI flag);
+            // preserve any value from the config file so the user override round-trips.
+            query_instruction: config_file.as_ref().and_then(|config| {
+                config
+                    .embedding
+                    .as_ref()
+                    .and_then(|embedding| embedding.query_instruction.clone())
+            }),
         }),
         artifact_embedding: config_file
             .as_ref()

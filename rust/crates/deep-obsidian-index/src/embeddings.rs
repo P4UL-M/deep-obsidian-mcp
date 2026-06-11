@@ -56,6 +56,20 @@ pub struct EmbeddingConfig {
     pub context_tokens: usize,
     /// Conservative chars-per-token estimate used to convert token budgets to chars.
     pub chars_per_token: f64,
+    /// Optional task instruction applied QUERY-SIDE ONLY by `embed_query` for
+    /// instruction-tuned embedding models (e.g. qwen3-embedding). When `Some`, the
+    /// query is wrapped as `Instruct: {instruction}\nQuery: {query}` before embedding.
+    /// Document/index embedding never acts on this field, so documents stay plain.
+    pub query_instruction: Option<String>,
+}
+
+/// The qwen3-embedding default task description for retrieval search queries.
+pub const DEFAULT_SEARCH_QUERY_INSTRUCTION: &str =
+    "Given a search query, retrieve relevant passages that answer the query";
+
+/// Wrap a query in the qwen3 instruction format. Used only on the query side.
+pub fn format_query_with_instruction(instruction: &str, query: &str) -> String {
+    format!("Instruct: {instruction}\nQuery: {query}")
 }
 
 impl Default for EmbeddingConfig {
@@ -76,6 +90,7 @@ impl EmbeddingConfig {
             max_input_tokens: DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
     }
 
@@ -756,6 +771,7 @@ mod tests {
             max_input_tokens: DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
         }
     }
 
