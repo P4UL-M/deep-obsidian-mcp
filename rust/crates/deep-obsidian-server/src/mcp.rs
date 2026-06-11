@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use deep_obsidian_types::ResolvedServiceConfig;
@@ -15,13 +16,24 @@ use crate::{prompts, resources, tools};
 pub struct AppState {
     pub config: Arc<ResolvedServiceConfig>,
     pub runtime: Arc<RuntimeState>,
+    /// Absolute path to the resolved `rg` (ripgrep) binary, resolved once at
+    /// startup. When ripgrep cannot be found this is the bare `rg` fallback and
+    /// `rg_available` is `false`.
+    pub ripgrep_path: Arc<PathBuf>,
+    /// Whether ripgrep was resolved to a real executable at startup. Drives both
+    /// conditional `grep_search` registration and the defensive call guard.
+    pub rg_available: bool,
 }
 
 impl AppState {
     pub fn new(config: ResolvedServiceConfig, runtime: Arc<RuntimeState>) -> Self {
+        let ripgrep_path = tools::resolve_ripgrep();
+        let rg_available = ripgrep_path.is_file();
         Self {
             config: Arc::new(config),
             runtime,
+            ripgrep_path: Arc::new(ripgrep_path),
+            rg_available,
         }
     }
 }
@@ -80,7 +92,7 @@ pub async fn handle_request(
             serde_json::to_value(json_response(
                 id,
                 ToolListResult {
-                    tools: tools::list_tools(),
+                    tools: tools::list_tools(state.rg_available),
                 },
             ))
             .expect("tool list response to serialize"),

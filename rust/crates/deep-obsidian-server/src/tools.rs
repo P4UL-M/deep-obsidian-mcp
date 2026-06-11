@@ -29,6 +29,11 @@ const JSON_SCHEMA_URI: &str = "http://json-schema.org/draft-07/schema#";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const DEFAULT_MAX_TEXT_CHARS: usize = 20_000;
 
+/// Clear, actionable error surfaced when `grep_search` is invoked but ripgrep
+/// could not be resolved at startup (or a spawn unexpectedly fails with
+/// `NotFound`). Never surface the raw `os error 2` for this case.
+const RIPGREP_UNAVAILABLE_MESSAGE: &str = "grep_search is unavailable: ripgrep (rg) not found on PATH. Install ripgrep or fix the service PATH, then restart.";
+
 /// Resolve the absolute path to the `rg` (ripgrep) binary.
 ///
 /// The MCP server runs under launchd as a Homebrew service, whose `PATH` is the
@@ -1092,8 +1097,8 @@ fn tool_annotations(read_only: bool, destructive: Option<bool>, idempotent: Opti
     Value::Object(annotations)
 }
 
-fn tool_definitions() -> Vec<ToolDefinition> {
-    vec![
+fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
+    let mut definitions = vec![
         ToolDefinition {
             name: "load_knowledge".to_string(),
             description: "Load vault knowledge related to a conversation subject using hybrid retrieval, related-note expansion, and optional graph context.".to_string(),
@@ -1450,11 +1455,17 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                 vec!["path"],
             ),
         },
-    ]
+    ];
+    // "rg works or grep_search doesn't exist." When ripgrep is not available we
+    // omit the tool entirely so it never appears in `tools/list`.
+    if !rg_available {
+        definitions.retain(|definition| definition.name != "grep_search");
+    }
+    definitions
 }
 
-pub fn list_tools() -> Vec<ToolDefinition> {
-    tool_definitions()
+pub fn list_tools(rg_available: bool) -> Vec<ToolDefinition> {
+    tool_definitions(rg_available)
 }
 
 fn search_match_json(match_item: &index_search::SearchMatch, options: TextPayloadOptions) -> Value {
@@ -1699,6 +1710,7 @@ fn live_find_file_matches(
 }
 
 async fn live_grep_matches(
+    ripgrep_path: std::path::PathBuf,
     vault_path: std::path::PathBuf,
     query: String,
     regex_mode: bool,
@@ -1736,16 +1748,12 @@ async fn live_grep_matches(
         args.push(query);
         args.push(vault_path.to_string_lossy().into_owned());
 
-        let rg = resolve_ripgrep();
-        let output = ProcessCommand::new(&rg)
+        let output = ProcessCommand::new(&ripgrep_path)
             .args(&args)
             .output()
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    format!(
-                        "ripgrep (rg) not found at '{}'. Install it (e.g. `brew install ripgrep`) or set DEEP_OBSIDIAN_RIPGREP to its absolute path.",
-                        rg.display()
-                    )
+                    RIPGREP_UNAVAILABLE_MESSAGE.to_string()
                 } else {
                     error.to_string()
                 }
@@ -2111,6 +2119,9 @@ pub async fn call_tool(
             })))
         }
         "grep_search" => {
+            if !state.rg_available {
+                return Err(RIPGREP_UNAVAILABLE_MESSAGE.to_string());
+            }
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
             let regex_mode = bool_arg(arguments, "regex", false);
@@ -2120,6 +2131,7 @@ pub async fn call_tool(
             let limit = clamped_usize_arg(arguments, "limit", 50, 1, 500);
             let text_options = TextPayloadOptions::from_arguments(arguments, true);
             let matches = live_grep_matches(
+                (*state.ripgrep_path).clone(),
                 config.vault_path.clone(),
                 query.clone(),
                 regex_mode,
@@ -3155,14 +3167,97 @@ mod tests {
         )
         .expect("write note");
 
-        let matches = live_grep_matches(vault_path, "needle".to_string(), false, true, None, 1, 10)
-            .await
-            .expect("grep matches");
+        let matches = live_grep_matches(
+            super::resolve_ripgrep(),
+            vault_path,
+            "needle".to_string(),
+            false,
+            true,
+            None,
+            1,
+            10,
+        )
+        .await
+        .expect("grep matches");
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].line_number, 3);
         assert_eq!(matches[0].context_before[0].line_text, "before");
         assert_eq!(matches[0].context_after[0].line_text, "after");
+    }
+
+    #[test]
+    fn tool_list_omits_grep_search_when_ripgrep_unavailable() {
+        let available = super::tool_definitions(true);
+        assert!(
+            available.iter().any(|tool| tool.name == "grep_search"),
+            "grep_search should be present when ripgrep is available"
+        );
+
+        let unavailable = super::tool_definitions(false);
+        assert!(
+            !unavailable.iter().any(|tool| tool.name == "grep_search"),
+            "grep_search must be omitted when ripgrep is unavailable"
+        );
+        // Omission must be surgical: every other tool stays registered.
+        assert_eq!(unavailable.len(), available.len() - 1);
+    }
+
+    #[tokio::test]
+    async fn grep_search_returns_clear_error_when_ripgrep_unavailable() {
+        let vault_path = temp_dir("grep-disabled");
+        let config = test_config(vault_path.clone());
+        let (runtime, _auto_reindex) = RuntimeState::bootstrap(config.clone())
+            .await
+            .expect("bootstrap runtime");
+        // Force the unavailable state regardless of the host environment.
+        let state = AppState {
+            config: std::sync::Arc::new(config),
+            runtime,
+            ripgrep_path: std::sync::Arc::new(PathBuf::from("rg")),
+            rg_available: false,
+        };
+
+        let error = super::call_tool(&state, "grep_search", &json!({"query": "needle"}))
+            .await
+            .expect_err("grep_search must fail when ripgrep is unavailable");
+        assert!(
+            error.contains("ripgrep"),
+            "error should mention ripgrep, got: {error}"
+        );
+        assert!(
+            !error.contains("os error 2"),
+            "error must not surface the raw spawn error, got: {error}"
+        );
+        assert_eq!(error, super::RIPGREP_UNAVAILABLE_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn live_grep_spawn_not_found_yields_clear_message() {
+        let vault_path = temp_dir("grep-spawn-missing");
+        // An absolute path that does not exist makes the spawn fail with
+        // `ErrorKind::NotFound`, exercising the spawn-failure branch directly.
+        let missing_rg = vault_path.join("definitely-missing-rg");
+        let result = live_grep_matches(
+            missing_rg,
+            vault_path,
+            "needle".to_string(),
+            false,
+            true,
+            None,
+            0,
+            10,
+        )
+        .await;
+        let error = result.expect_err("spawn of a missing binary must fail");
+        assert!(
+            error.contains("ripgrep"),
+            "spawn NotFound should yield the clear message, got: {error}"
+        );
+        assert!(
+            !error.contains("os error 2"),
+            "spawn NotFound must not surface the raw os error, got: {error}"
+        );
     }
 
     #[test]
