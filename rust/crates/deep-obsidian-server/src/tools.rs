@@ -154,7 +154,29 @@ fn string_arg(arguments: &Value, key: &str) -> Result<String, String> {
         .get(key)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("missing {}", key))
+        .ok_or_else(|| missing_required_argument(key))
+}
+
+/// Build a self-explanatory error for a missing required argument. Well-known
+/// argument names get a short hint describing what they mean (cross-checked
+/// against the tool input-schema property descriptions); anything else falls
+/// back to a clearer-but-generic message.
+fn missing_required_argument(key: &str) -> String {
+    let hint = match key {
+        "query" => Some("the text or pattern to search for"),
+        "topic" => Some("the subject to recommend a folder for"),
+        "subject" => Some("the conversation subject or user problem to ground against the vault"),
+        "path" => {
+            Some("vault-relative file path, e.g. \"Projets/A2A/Current Sprint.md\"")
+        }
+        "heading" => Some("the exact heading title of the section"),
+        "content" => Some("the replacement body content for the targeted section"),
+        _ => None,
+    };
+    match hint {
+        Some(hint) => format!("missing required argument '{}' ({})", key, hint),
+        None => format!("missing required argument '{}'", key),
+    }
 }
 
 fn optional_string_arg(arguments: &Value, key: &str) -> Option<String> {
@@ -1165,6 +1187,23 @@ fn object_schema(properties: Vec<(&str, Value)>, required: Vec<&str>) -> Value {
     Value::Object(schema)
 }
 
+/// Like `object_schema`, but merges additional top-level schema keys (e.g.
+/// `allOf` for conditional requirements) into the resulting object. Used for
+/// tools whose constraints cannot be expressed by a flat `required` array.
+fn object_schema_with_extra(
+    properties: Vec<(&str, Value)>,
+    required: Vec<&str>,
+    extra: Vec<(&str, Value)>,
+) -> Value {
+    let mut schema = object_schema(properties, required);
+    if let Value::Object(map) = &mut schema {
+        for (key, value) in extra {
+            map.insert(key.to_string(), value);
+        }
+    }
+    schema
+}
+
 fn tool_annotations(read_only: bool, destructive: Option<bool>, idempotent: Option<bool>) -> Value {
     let mut annotations = Map::new();
     annotations.insert("readOnlyHint".to_string(), json!(read_only));
@@ -1262,7 +1301,7 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
             description: "Replace the note preamble or a named heading section without rewriting the whole note.".to_string(),
             annotations: Some(tool_annotations(false, Some(false), Some(true))),
             execution: Some(json!({"taskSupport":"forbidden"})),
-            input_schema: object_schema(
+            input_schema: object_schema_with_extra(
                 vec![
                     ("path", json!({"type":"string","description":"Vault-relative markdown note path."})),
                     ("target", json!({"type":"string","enum":["preamble","heading"],"default":"heading"})),
@@ -1274,6 +1313,22 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
                     ("expectedHash", json!({"type":"string","description":"Optional hash of the current note content. If it does not match, no write occurs."})),
                 ],
                 vec!["path","content"],
+                // `heading` is required unless writing the preamble. The `if`
+                // matches only when `target` is *present and* equal to "preamble"
+                // (the `required: ["target"]` guard stops `properties` matching
+                // vacuously when `target` is absent); the `else` branch then
+                // requires `heading` for both an explicit target:"heading" and an
+                // absent target (which defaults to heading).
+                vec![("allOf", json!([
+                    {
+                        "if": {
+                            "required": ["target"],
+                            "properties": {"target": {"const": "preamble"}}
+                        },
+                        "then": {},
+                        "else": {"required": ["heading"]}
+                    }
+                ]))],
             ),
         },
         ToolDefinition {
@@ -2848,7 +2903,9 @@ pub async fn call_tool(
                     None,
                 ),
                 "heading" => {
-                    let heading = string_arg(arguments, "heading")?;
+                    let heading = optional_string_arg(arguments, "heading").ok_or_else(|| {
+                        "update_note_section requires 'heading' (the exact heading title) when target is 'heading' (the default). To edit the note preamble instead, set target to 'preamble'.".to_string()
+                    })?;
                     let level = clamped_usize_arg(arguments, "level", 2, 1, 6);
                     let create_if_missing = bool_arg(arguments, "createIfMissing", true);
                     let (updated, action, actual_level) = update_or_create_note_section(
@@ -3053,7 +3110,7 @@ mod tests {
         call_tool, clamped_usize_arg, compose_explicit_note_content, content_hash,
         finalize_session_note_content, json_text_result_from_arguments, live_grep_matches,
         merge_with_manual_notes, optional_enum_string_arg, outline_payload, replace_note_preamble,
-        update_or_create_note_section, TextPayloadOptions,
+        string_arg, tool_definitions, update_or_create_note_section, TextPayloadOptions,
     };
     use crate::mcp::AppState;
     use crate::runtime::RuntimeState;
@@ -3262,6 +3319,94 @@ mod tests {
             optional_enum_string_arg(&json!({"mode":"glob"}), "mode", &["substring", "regex"])
                 .expect_err("invalid mode should fail");
         assert!(error.contains("unsupported mode"));
+    }
+
+    #[test]
+    fn string_arg_missing_messages_describe_well_known_arguments() {
+        let empty = json!({});
+        let query = string_arg(&empty, "query").expect_err("query should be required");
+        assert!(query.contains("missing required argument 'query'"));
+        assert!(query.contains("text or pattern to search for"));
+
+        let topic = string_arg(&empty, "topic").expect_err("topic should be required");
+        assert!(topic.contains("missing required argument 'topic'"));
+        assert!(topic.contains("recommend a folder for"));
+
+        let heading = string_arg(&empty, "heading").expect_err("heading should be required");
+        assert!(heading.contains("missing required argument 'heading'"));
+        assert!(heading.contains("exact heading title"));
+
+        let path = string_arg(&empty, "path").expect_err("path should be required");
+        assert!(path.contains("missing required argument 'path'"));
+        assert!(path.contains("vault-relative file path"));
+
+        // Unknown keys still get a clearer-but-generic message.
+        let other = string_arg(&empty, "widget").expect_err("widget should be required");
+        assert_eq!(other, "missing required argument 'widget'");
+    }
+
+    #[test]
+    fn update_note_section_schema_declares_conditional_heading_requirement() {
+        let definitions = tool_definitions(true);
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == "update_note_section")
+            .expect("update_note_section tool definition");
+        let all_of = definition.input_schema["allOf"]
+            .as_array()
+            .expect("allOf array");
+        let conditional = &all_of[0];
+        // The `if` matches only when `target` is present and equals "preamble";
+        // the `required: ["target"]` guard prevents a vacuous match on absent
+        // `target`, so the `else` requires `heading` for the default case too.
+        assert_eq!(conditional["if"]["required"], json!(["target"]));
+        assert_eq!(
+            conditional["if"]["properties"]["target"]["const"],
+            json!("preamble")
+        );
+        assert_eq!(conditional["else"]["required"], json!(["heading"]));
+    }
+
+    #[tokio::test]
+    async fn update_note_section_requires_heading_for_default_target() {
+        let vault_path = temp_dir("update-section-heading");
+        fs::write(
+            vault_path.join("Note.md"),
+            "# Note\n\nPreamble body\n\n## Status\n\nold\n",
+        )
+        .expect("write note");
+        let state = test_state(vault_path.clone()).await;
+
+        // Default target (heading) with no heading -> clear conditional error.
+        let missing = call_tool(
+            &state,
+            "update_note_section",
+            &json!({"path": "Note.md", "content": "new"}),
+        )
+        .await
+        .expect_err("missing heading should fail");
+        assert!(missing.contains("target is 'heading'"));
+        assert!(missing.contains("set target to 'preamble'"));
+
+        // Providing heading works normally.
+        let updated = call_tool(
+            &state,
+            "update_note_section",
+            &json!({"path": "Note.md", "heading": "Status", "content": "fresh"}),
+        )
+        .await
+        .expect("heading update should succeed");
+        assert_eq!(updated.structured_content["heading"], "Status");
+
+        // target:preamble works without a heading.
+        let preamble = call_tool(
+            &state,
+            "update_note_section",
+            &json!({"path": "Note.md", "target": "preamble", "content": "intro"}),
+        )
+        .await
+        .expect("preamble update should succeed");
+        assert_eq!(preamble.structured_content["target"], "preamble");
     }
 
     #[tokio::test]
