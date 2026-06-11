@@ -28,6 +28,17 @@ use crate::resources::{artifact_uri, block_uri, heading_uri, note_name, note_uri
 const JSON_SCHEMA_URI: &str = "http://json-schema.org/draft-07/schema#";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const DEFAULT_MAX_TEXT_CHARS: usize = 20_000;
+/// Per-result snippet default for multi-result search tools when the caller does
+/// not pass `maxTextChars`. A search snippet does not need the 20k full-document
+/// budget; this keeps the typical `limit`-sized response small.
+const DEFAULT_SEARCH_SNIPPET_CHARS: usize = 2_000;
+/// Aggregate cap on total emitted snippet text across ALL matches in a single
+/// response. Once exhausted, later matches keep their metadata but drop their
+/// `text` field (marked `<key>Omitted`). This is the per-response guard that the
+/// per-field `max_text_chars` cap alone cannot provide for multi-result tools.
+const RESPONSE_TEXT_BUDGET_CHARS: usize = 24_000;
+const TRUNCATION_NOTE: &str =
+    "Response text truncated to fit the aggregate budget; later matches' text was omitted. Lower `limit` or call read_file/read_chunk for full text.";
 
 /// Clear, actionable error surfaced when `grep_search` is invoked but ripgrep
 /// could not be resolved at startup (or a spawn unexpectedly fails with
@@ -237,6 +248,67 @@ impl TextPayloadOptions {
                 DEFAULT_MAX_TEXT_CHARS,
             ),
         }
+    }
+
+    /// Like [`from_arguments`], but defaults the per-result snippet cap to
+    /// [`DEFAULT_SEARCH_SNIPPET_CHARS`] when the caller did not pass
+    /// `maxTextChars`. Used by multi-result search tools so the aggregate
+    /// response stays small by default. An explicit `maxTextChars` is still
+    /// honored (clamped to [`DEFAULT_MAX_TEXT_CHARS`]).
+    fn search_snippet_from_arguments(arguments: &Value, default_include_text: bool) -> Self {
+        let mut options = Self::from_arguments(arguments, default_include_text);
+        if arguments.get("maxTextChars").is_none() {
+            options.max_text_chars = DEFAULT_SEARCH_SNIPPET_CHARS;
+        }
+        options
+    }
+}
+
+/// Enforce an aggregate text budget across an ordered list of already-built
+/// match objects. Walks the matches in order, summing the char length of each
+/// present `key` field. The first match that pushes the cumulative total past
+/// `budget` is still included whole; every match after it has its `key` field
+/// removed and `<key>Omitted` set to `true`. Returns `true` if any match's text
+/// was omitted.
+fn apply_response_text_budget(matches: &mut [Value], key: &str, budget: usize) -> bool {
+    let omitted_key = format!("{key}Omitted");
+    let mut used = 0usize;
+    let mut exhausted = false;
+    let mut any_omitted = false;
+    for item in matches.iter_mut() {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        if exhausted {
+            if object.remove(key).is_some() {
+                // Drop the now-stale per-field `<key>Truncated` flag that
+                // `insert_optional_text` wrote, and mark the field omitted.
+                object.remove(&format!("{key}Truncated"));
+                object.insert(omitted_key.clone(), json!(true));
+                any_omitted = true;
+            }
+            continue;
+        }
+        let len = object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|text| text.chars().count())
+            .unwrap_or(0);
+        used = used.saturating_add(len);
+        if used > budget {
+            exhausted = true;
+        }
+    }
+    any_omitted
+}
+
+/// Insert response-level truncation signaling fields when [`apply_response_text_budget`]
+/// reported that snippet text was omitted. Additive and backward-compatible:
+/// nothing is inserted for responses that stayed within budget.
+fn insert_response_truncation_flags(object: &mut Map<String, Value>, response_truncated: bool) {
+    if response_truncated {
+        object.insert("responseTruncated".to_string(), json!(true));
+        object.insert("truncationNote".to_string(), json!(TRUNCATION_NOTE));
     }
 }
 
@@ -1122,7 +1194,7 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
                     ("includeGraph", json!({"type":"boolean","default":true})),
                     ("graphDepth", json!({"type":"integer","exclusiveMinimum":0,"maximum":3,"default":1})),
                     ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["subject"],
@@ -1396,7 +1468,7 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
                     ("query", json!({"type":"string","description":"Lexical query."})),
                     ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
                     ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["query"],
@@ -1413,7 +1485,7 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
                     ("scope", json!({"type":"string","enum":["chunks","artifacts","all"],"default":"chunks"})),
                     ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
                     ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["query"],
@@ -1431,7 +1503,7 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
                     ("semanticWeight", json!({"type":"number","minimum":0,"maximum":1,"default":0.6})),
                     ("bm25Weight", json!({"type":"number","minimum":0,"maximum":1,"default":0.4})),
                     ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["query"],
@@ -2223,7 +2295,7 @@ pub async fn call_tool(
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
-            let text_options = TextPayloadOptions::from_arguments(arguments, true);
+            let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
             let snapshot = state.runtime.fresh_snapshot("bm25_search").await?;
             let index = snapshot.index;
             let matches = index_search::bm25_search_with_options(
@@ -2236,14 +2308,22 @@ pub async fn call_tool(
                 },
             )
             .map_err(|error| error.to_string())?;
+            let count = matches.len();
+            let mut match_values = matches
+                .into_iter()
+                .map(|item| search_match_json(&item, text_options))
+                .collect::<Vec<_>>();
+            let response_truncated =
+                apply_response_text_budget(&mut match_values, "text", RESPONSE_TEXT_BUDGET_CHARS);
+            let mut result = Map::new();
+            result.insert("query".to_string(), json!(query));
+            result.insert("rebuilt".to_string(), json!(snapshot.rebuilt));
+            result.insert("count".to_string(), json!(count));
+            result.insert("matches".to_string(), json!(match_values));
+            insert_response_truncation_flags(&mut result, response_truncated);
             Ok(json_text_result_from_arguments(
                 arguments,
-                json!({
-                    "query": query,
-                    "rebuilt": snapshot.rebuilt,
-                    "count": matches.len(),
-                    "matches": matches.into_iter().map(|item| search_match_json(&item, text_options)).collect::<Vec<_>>()
-                }),
+                Value::Object(result),
             ))
         }
         "semantic_search" => {
@@ -2253,7 +2333,7 @@ pub async fn call_tool(
                 optional_enum_string_arg(arguments, "scope", &["chunks", "artifacts", "all"])?
                     .unwrap_or_else(|| "chunks".to_string());
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
-            let text_options = TextPayloadOptions::from_arguments(arguments, true);
+            let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
             let snapshot = state.runtime.fresh_snapshot("semantic_search").await?;
             let index = snapshot.index;
             let options = RankingOptions {
@@ -2265,16 +2345,30 @@ pub async fn call_tool(
                 "chunks" => {
                     let matches =
                         semantic_search_matches(index.clone(), query.clone(), options).await?;
+                    let count = matches.len();
+                    let mut match_values = matches
+                        .into_iter()
+                        .map(|item| search_match_json(&item, text_options))
+                        .collect::<Vec<_>>();
+                    let response_truncated = apply_response_text_budget(
+                        &mut match_values,
+                        "text",
+                        RESPONSE_TEXT_BUDGET_CHARS,
+                    );
+                    let mut result = Map::new();
+                    result.insert("query".to_string(), json!(query));
+                    result.insert("scope".to_string(), json!(scope));
+                    result.insert("rebuilt".to_string(), json!(snapshot.rebuilt));
+                    result.insert(
+                        "semanticBackend".to_string(),
+                        json!(index.semantic_backend.as_str()),
+                    );
+                    result.insert("count".to_string(), json!(count));
+                    result.insert("matches".to_string(), json!(match_values));
+                    insert_response_truncation_flags(&mut result, response_truncated);
                     Ok(json_text_result_from_arguments(
                         arguments,
-                        json!({
-                            "query": query,
-                            "scope": scope,
-                            "rebuilt": snapshot.rebuilt,
-                            "semanticBackend": index.semantic_backend.as_str(),
-                            "count": matches.len(),
-                            "matches": matches.into_iter().map(|item| search_match_json(&item, text_options)).collect::<Vec<_>>()
-                        }),
+                        Value::Object(result),
                     ))
                 }
                 "artifacts" => {
@@ -2306,23 +2400,43 @@ pub async fn call_tool(
                         Ok(matches) => (matches, None),
                         Err(error) => (Vec::new(), Some(error)),
                     };
+                    let chunk_count = chunk_matches.len();
+                    let mut chunk_values = chunk_matches
+                        .into_iter()
+                        .map(|item| search_match_json(&item, text_options))
+                        .collect::<Vec<_>>();
+                    let response_truncated = apply_response_text_budget(
+                        &mut chunk_values,
+                        "text",
+                        RESPONSE_TEXT_BUDGET_CHARS,
+                    );
+                    let mut result = Map::new();
+                    result.insert("query".to_string(), json!(query));
+                    result.insert("scope".to_string(), json!(scope));
+                    result.insert("rebuilt".to_string(), json!(snapshot.rebuilt));
+                    result.insert(
+                        "semanticBackend".to_string(),
+                        json!(index.semantic_backend.as_str()),
+                    );
+                    result.insert(
+                        "chunks".to_string(),
+                        json!({
+                            "count": chunk_count,
+                            "matches": chunk_values
+                        }),
+                    );
+                    result.insert(
+                        "artifacts".to_string(),
+                        json!({
+                            "count": artifact_matches.len(),
+                            "error": artifact_error,
+                            "matches": artifact_matches.into_iter().map(|item| artifact_search_match_json(&item)).collect::<Vec<_>>()
+                        }),
+                    );
+                    insert_response_truncation_flags(&mut result, response_truncated);
                     Ok(json_text_result_from_arguments(
                         arguments,
-                        json!({
-                            "query": query,
-                            "scope": scope,
-                            "rebuilt": snapshot.rebuilt,
-                            "semanticBackend": index.semantic_backend.as_str(),
-                            "chunks": {
-                                "count": chunk_matches.len(),
-                                "matches": chunk_matches.into_iter().map(|item| search_match_json(&item, text_options)).collect::<Vec<_>>()
-                            },
-                            "artifacts": {
-                                "count": artifact_matches.len(),
-                                "error": artifact_error,
-                                "matches": artifact_matches.into_iter().map(|item| artifact_search_match_json(&item)).collect::<Vec<_>>()
-                            }
-                        }),
+                        Value::Object(result),
                     ))
                 }
                 _ => unreachable!(),
@@ -2334,7 +2448,7 @@ pub async fn call_tool(
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
             let semantic_weight = clamped_f64_arg(arguments, "semanticWeight", 0.6, 0.0, 1.0);
             let bm25_weight = clamped_f64_arg(arguments, "bm25Weight", 0.4, 0.0, 1.0);
-            let text_options = TextPayloadOptions::from_arguments(arguments, true);
+            let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
             let snapshot = state.runtime.fresh_snapshot("hybrid_search").await?;
             let index = snapshot.index;
             let matches = hybrid_search_matches(
@@ -2347,17 +2461,28 @@ pub async fn call_tool(
                 },
             )
             .await?;
+            let count = matches.len();
+            let mut match_values = matches
+                .into_iter()
+                .map(|item| hybrid_search_match_json(&item, text_options))
+                .collect::<Vec<_>>();
+            let response_truncated =
+                apply_response_text_budget(&mut match_values, "text", RESPONSE_TEXT_BUDGET_CHARS);
+            let mut result = Map::new();
+            result.insert("query".to_string(), json!(query));
+            result.insert("rebuilt".to_string(), json!(snapshot.rebuilt));
+            result.insert(
+                "semanticBackend".to_string(),
+                json!(index.semantic_backend.as_str()),
+            );
+            result.insert("semanticWeight".to_string(), json!(semantic_weight));
+            result.insert("bm25Weight".to_string(), json!(bm25_weight));
+            result.insert("count".to_string(), json!(count));
+            result.insert("matches".to_string(), json!(match_values));
+            insert_response_truncation_flags(&mut result, response_truncated);
             Ok(json_text_result_from_arguments(
                 arguments,
-                json!({
-                    "query": query,
-                    "rebuilt": snapshot.rebuilt,
-                    "semanticBackend": index.semantic_backend.as_str(),
-                    "semanticWeight": semantic_weight,
-                    "bm25Weight": bm25_weight,
-                    "count": matches.len(),
-                    "matches": matches.into_iter().map(|item| hybrid_search_match_json(&item, text_options)).collect::<Vec<_>>()
-                }),
+                Value::Object(result),
             ))
         }
         "related_notes" => {
@@ -2442,7 +2567,7 @@ pub async fn call_tool(
             let limit_chunks = clamped_usize_arg(arguments, "limitChunks", 8, 1, 16);
             let include_graph = bool_arg(arguments, "includeGraph", true);
             let graph_depth = clamped_usize_arg(arguments, "graphDepth", 1, 1, 3);
-            let text_options = TextPayloadOptions::from_arguments(arguments, true);
+            let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
             let snapshot = state.runtime.fresh_snapshot("load_knowledge").await?;
             let index = snapshot.index;
             let query = [Some(subject.clone()), project.clone()]
@@ -2473,6 +2598,8 @@ pub async fn call_tool(
                 }
                 chunks.push(chunk_value);
             }
+            let response_truncated =
+                apply_response_text_budget(&mut chunks, "text", RESPONSE_TEXT_BUDGET_CHARS);
 
             let mut note_bucket = HashMap::<String, KnowledgeNote>::new();
             for chunk in &chunks {
@@ -2573,6 +2700,7 @@ pub async fn call_tool(
             result.insert("notes".to_string(), json!(notes));
             result.insert("chunks".to_string(), json!(chunks));
             result.insert("graph".to_string(), graph);
+            insert_response_truncation_flags(&mut result, response_truncated);
             Ok(json_text_result_from_arguments(
                 arguments,
                 Value::Object(result),
@@ -3506,6 +3634,138 @@ mod tests {
             !error.contains("os error 2"),
             "spawn NotFound must not surface the raw os error, got: {error}"
         );
+    }
+
+    #[test]
+    fn apply_response_text_budget_omits_text_after_budget_exhausted() {
+        let mut matches = vec![
+            json!({"path": "a.md", "text": "x".repeat(10), "textTruncated": false}),
+            json!({"path": "b.md", "text": "y".repeat(10), "textTruncated": false}),
+            json!({"path": "c.md", "text": "z".repeat(10), "textTruncated": false}),
+        ];
+        // Budget of 15: first match (10) fits, second (cumulative 20 > 15) is the
+        // crossing match and is kept whole, third is omitted.
+        let truncated = super::apply_response_text_budget(&mut matches, "text", 15);
+        assert!(truncated);
+        assert_eq!(matches[0]["text"], "x".repeat(10));
+        assert!(matches[0].get("textOmitted").is_none());
+        assert_eq!(matches[1]["text"], "y".repeat(10));
+        assert!(matches[1].get("textOmitted").is_none());
+        assert!(matches[2].get("text").is_none());
+        assert_eq!(matches[2]["textOmitted"], true);
+    }
+
+    #[test]
+    fn apply_response_text_budget_leaves_small_responses_untouched() {
+        let mut matches = vec![
+            json!({"path": "a.md", "text": "small"}),
+            json!({"path": "b.md", "text": "also small"}),
+        ];
+        let truncated =
+            super::apply_response_text_budget(&mut matches, "text", super::RESPONSE_TEXT_BUDGET_CHARS);
+        assert!(!truncated);
+        assert_eq!(matches[0]["text"], "small");
+        assert_eq!(matches[1]["text"], "also small");
+        assert!(matches[0].get("textOmitted").is_none());
+        assert!(matches[1].get("textOmitted").is_none());
+    }
+
+    #[test]
+    fn search_snippet_options_default_to_snippet_cap_but_respect_explicit() {
+        let defaulted = TextPayloadOptions::search_snippet_from_arguments(&json!({}), true);
+        assert_eq!(defaulted.max_text_chars, super::DEFAULT_SEARCH_SNIPPET_CHARS);
+        assert!(defaulted.include_text);
+
+        let explicit =
+            TextPayloadOptions::search_snippet_from_arguments(&json!({"maxTextChars": 5000}), true);
+        assert_eq!(explicit.max_text_chars, 5000);
+
+        // Explicit value above the ceiling is clamped to the per-field max.
+        let clamped =
+            TextPayloadOptions::search_snippet_from_arguments(&json!({"maxTextChars": 999999}), true);
+        assert_eq!(clamped.max_text_chars, super::DEFAULT_MAX_TEXT_CHARS);
+    }
+
+    #[tokio::test]
+    async fn bm25_search_caps_aggregate_text_and_signals_truncation() {
+        let vault_path = temp_dir("bm25-budget");
+        // A large body so each chunk snippet is sizable. Many notes sharing the
+        // query term so the response carries multiple text-bearing matches.
+        let body = (0..400)
+            .map(|i| format!("needle paragraph line {i} with some filler content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for n in 0..6 {
+            fs::write(
+                vault_path.join(format!("Note{n}.md")),
+                format!("# Note {n}\n\n{body}\n"),
+            )
+            .expect("write note");
+        }
+        let state = test_state(vault_path).await;
+
+        // Force large per-result snippets so a few matches blow past the budget.
+        let result = call_tool(
+            &state,
+            "bm25_search",
+            &json!({"query": "needle", "limit": 50, "maxTextChars": 20000}),
+        )
+        .await
+        .expect("bm25_search should succeed");
+
+        let matches = result.structured_content["matches"]
+            .as_array()
+            .expect("matches array");
+        assert!(
+            !matches.is_empty(),
+            "index must contain matches for the truncation assertion to be meaningful"
+        );
+        assert_eq!(result.structured_content["responseTruncated"], true);
+        assert!(result.structured_content["truncationNote"]
+            .as_str()
+            .is_some());
+
+        // Cumulative emitted text stays within budget (allowing the single
+        // boundary-crossing match), and at least one later match is omitted.
+        let total: usize = matches
+            .iter()
+            .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+            .map(|text| text.chars().count())
+            .sum();
+        assert!(
+            total <= super::RESPONSE_TEXT_BUDGET_CHARS + 20000,
+            "emitted text {total} exceeds budget plus one crossing match"
+        );
+        let omitted = matches
+            .iter()
+            .filter(|item| item.get("textOmitted").and_then(serde_json::Value::as_bool) == Some(true))
+            .count();
+        assert!(omitted > 0, "expected at least one omitted match text");
+    }
+
+    #[tokio::test]
+    async fn bm25_search_small_response_is_not_truncated() {
+        let vault_path = temp_dir("bm25-small");
+        fs::write(
+            vault_path.join("Only.md"),
+            "# Only\n\nA short needle note body.\n",
+        )
+        .expect("write note");
+        let state = test_state(vault_path).await;
+
+        let result = call_tool(&state, "bm25_search", &json!({"query": "needle"}))
+            .await
+            .expect("bm25_search should succeed");
+
+        let matches = result.structured_content["matches"]
+            .as_array()
+            .expect("matches array");
+        assert!(!matches.is_empty(), "expected at least one match");
+        assert!(result.structured_content.get("responseTruncated").is_none());
+        assert!(result.structured_content.get("truncationNote").is_none());
+        // Full text present and not omitted for a small response.
+        assert!(matches[0].get("text").and_then(serde_json::Value::as_str).is_some());
+        assert!(matches[0].get("textOmitted").is_none());
     }
 
     #[test]
