@@ -267,13 +267,22 @@ fn insert_optional_text(
     object.insert(format!("{key}Truncated"), json!(truncated));
 }
 
-fn content_hash(bytes: &[u8]) -> String {
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("fnv1a64:{hash:016x}")
+}
+
+/// True when `path` targets a protected Template(s) folder. Mirrors the policy
+/// in core's `ensure_writable_vault_relative_path` (which is private), so the
+/// out-of-band upload path enforces the same protection as `write_binary_file`.
+fn is_protected_write_path(path: &str) -> bool {
+    path.trim_start_matches('/').split('/').any(|segment| {
+        segment.eq_ignore_ascii_case("template") || segment.eq_ignore_ascii_case("templates")
+    })
 }
 
 fn existing_file_bytes(vault_path: &Path, path: &str) -> Result<Option<Vec<u8>>, String> {
@@ -1209,6 +1218,20 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
                     ("expectedHash", json!({"type":"string","description":"Optional hash of the current file content. If it does not match, no write occurs."})),
                 ],
                 vec!["path","content"],
+            ),
+        },
+        ToolDefinition {
+            name: "request_vault_upload".to_string(),
+            description: "Mint a short-lived, single-use upload URL for a binary file too large to inline as base64. Bytes are uploaded out-of-band (e.g. via curl) to the returned URL, which writes them to the bound vault path. Requires the HTTP service transport.".to_string(),
+            annotations: Some(tool_annotations(false, Some(false), Some(false))),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema(
+                vec![
+                    ("path", json!({"type":"string","description":"Vault-relative destination path the uploaded bytes will be written to."})),
+                    ("expectedHash", json!({"type":"string","description":"Optional hash of the current destination content for optimistic concurrency, checked at upload commit."})),
+                    ("mimeType", json!({"type":"string","description":"Optional informational MIME type of the file being uploaded."})),
+                ],
+                vec!["path"],
             ),
         },
         ToolDefinition {
@@ -2765,6 +2788,42 @@ pub async fn call_tool(
                 "bytesWritten": bytes.len()
             })))
         }
+        "request_vault_upload" => {
+            let path = string_arg(arguments, "path")?;
+            let expected_hash = expected_hash_arg(arguments);
+            let mime_type = optional_string_arg(arguments, "mimeType");
+            // Reject traversal NOW, at mint, before issuing any capability.
+            ensure_inside_vault(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            // Match write_file_to_vault's protected-path policy: never let an
+            // upload land inside Template(s)/ folders. Checked at mint so the
+            // capability is never even issued for a protected destination.
+            if is_protected_write_path(&path) {
+                return Err(format!("protected write path: {}", path));
+            }
+            let Some(base) = state.upload_base.as_ref() else {
+                return Err("request_vault_upload requires the HTTP service transport".to_string());
+            };
+            // Best-effort cleanup of temp files orphaned by a crashed upload.
+            crate::uploads::sweep_orphan_temp_files(&config.vault_path);
+            let expires_at =
+                std::time::SystemTime::now() + crate::uploads::TOKEN_TTL;
+            let token = state.uploads.mint(crate::uploads::PendingUpload {
+                dest_path: path.clone(),
+                expected_hash: expected_hash.clone(),
+                max_bytes: crate::uploads::DEFAULT_MAX_UPLOAD_BYTES,
+                expires_at,
+                in_flight: false,
+            })?;
+            let upload_url = format!("{}/upload/{}", base.trim_end_matches('/'), token);
+            Ok(json_text_result(json!({
+                "uploadUrl": upload_url,
+                "expiresAt": crate::uploads::expires_at_epoch(expires_at),
+                "maxBytes": crate::uploads::DEFAULT_MAX_UPLOAD_BYTES,
+                "path": path,
+                "mimeType": mime_type,
+                "curlExample": format!("curl -X PUT --data-binary @YOUR_FILE \"{}\"", upload_url),
+            })))
+        }
         "upsert_session_note" => {
             let explicit_path = optional_string_arg(arguments, "path");
             let topic = optional_string_arg(arguments, "topic");
@@ -3186,6 +3245,193 @@ mod tests {
         assert_eq!(matches[0].context_after[0].line_text, "after");
     }
 
+    #[tokio::test]
+    async fn request_vault_upload_requires_http_transport_under_stdio() {
+        let vault_path = temp_dir("upload-stdio");
+        // `test_state` builds an AppState with upload_base = None (stdio default).
+        let state = test_state(vault_path).await;
+        let error = call_tool(
+            &state,
+            "request_vault_upload",
+            &json!({ "path": "Assets/file.bin" }),
+        )
+        .await
+        .expect_err("stdio mode should reject upload minting");
+        assert_eq!(
+            error,
+            "request_vault_upload requires the HTTP service transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_vault_upload_rejects_traversal_at_mint() {
+        let vault_path = temp_dir("upload-traversal");
+        let state = test_state(vault_path)
+            .await
+            .with_upload_base("http://127.0.0.1:7777".to_string());
+        let error = call_tool(
+            &state,
+            "request_vault_upload",
+            &json!({ "path": "../escape.bin" }),
+        )
+        .await
+        .expect_err("traversal must be rejected at mint");
+        assert!(!error.contains("requires the HTTP service transport"));
+    }
+
+    #[tokio::test]
+    async fn request_vault_upload_rejects_protected_template_path() {
+        let vault_path = temp_dir("upload-protected");
+        let state = test_state(vault_path)
+            .await
+            .with_upload_base("http://127.0.0.1:7777".to_string());
+        let error = call_tool(
+            &state,
+            "request_vault_upload",
+            &json!({ "path": "Templates/daily.bin" }),
+        )
+        .await
+        .expect_err("protected template path must be rejected at mint");
+        assert!(error.contains("protected write path"));
+    }
+
+    #[tokio::test]
+    async fn request_vault_upload_mints_and_upload_lands_file() {
+        use axum::routing::put;
+        use axum::Router;
+
+        let vault_path = temp_dir("upload-e2e");
+        // Share one AppState (and thus one UploadStore) between the mint tool call
+        // and the HTTP upload endpoint.
+        let state = test_state(vault_path.clone())
+            .await
+            .with_upload_base("http://placeholder".to_string());
+
+        // Mint a token via the tool. We patch the base URL after binding.
+        let minted = call_tool(
+            &state,
+            "request_vault_upload",
+            &json!({ "path": "Uploads/picture.bin" }),
+        )
+        .await
+        .expect("mint should succeed");
+        let upload_url = minted.structured_content["uploadUrl"]
+            .as_str()
+            .expect("uploadUrl present")
+            .to_string();
+        let token = upload_url.rsplit('/').next().unwrap().to_string();
+
+        // Stand up the upload route on a real listener.
+        let router = Router::new()
+            .route("/upload/{token}", put(crate::bootstrap::upload_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let real_url = format!("http://{}/upload/{}", addr, token);
+        let client = reqwest::Client::new();
+        let response = client
+            .put(&real_url)
+            .body(b"binary-payload-bytes".to_vec())
+            .send()
+            .await
+            .expect("upload request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.expect("json body");
+        assert_eq!(body["action"], "created");
+        assert_eq!(body["bytesWritten"], 20);
+        assert_eq!(body["path"], "Uploads/picture.bin");
+
+        let written = fs::read(vault_path.join("Uploads/picture.bin")).expect("file landed");
+        assert_eq!(written, b"binary-payload-bytes");
+        assert_eq!(
+            body["hash"].as_str().unwrap(),
+            content_hash(b"binary-payload-bytes")
+        );
+
+        // Reusing the consumed token is rejected (403).
+        let reuse = client
+            .put(&real_url)
+            .body(b"again".to_vec())
+            .send()
+            .await
+            .expect("reuse request");
+        assert_eq!(reuse.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // An unknown token is also rejected (403), no info leak.
+        let unknown = client
+            .put(format!("http://{}/upload/deadbeef", addr))
+            .body(b"x".to_vec())
+            .send()
+            .await
+            .expect("unknown request");
+        assert_eq!(unknown.status(), reqwest::StatusCode::FORBIDDEN);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_accepts_body_larger_than_axum_default_limit() {
+        use axum::extract::DefaultBodyLimit;
+        use axum::routing::put;
+        use axum::Router;
+
+        let vault_path = temp_dir("upload-large");
+        let state = test_state(vault_path.clone())
+            .await
+            .with_upload_base("http://placeholder".to_string());
+        let minted = call_tool(
+            &state,
+            "request_vault_upload",
+            &json!({ "path": "Uploads/big.bin" }),
+        )
+        .await
+        .expect("mint should succeed");
+        let token = minted.structured_content["uploadUrl"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let router = Router::new()
+            .route(
+                "/upload/{token}",
+                put(crate::bootstrap::upload_handler).layer(DefaultBodyLimit::disable()),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        // 3 MB exceeds axum's 2 MB DefaultBodyLimit; must still land.
+        let payload = vec![0x5au8; 3 * 1024 * 1024];
+        let client = reqwest::Client::new();
+        let response = client
+            .put(format!("http://{}/upload/{}", addr, token))
+            .body(payload.clone())
+            .send()
+            .await
+            .expect("large upload request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["bytesWritten"], payload.len());
+        let written = fs::read(vault_path.join("Uploads/big.bin")).unwrap();
+        assert_eq!(written.len(), payload.len());
+
+        server.abort();
+    }
+
     #[test]
     fn tool_list_omits_grep_search_when_ripgrep_unavailable() {
         let available = super::tool_definitions(true);
@@ -3216,6 +3462,8 @@ mod tests {
             runtime,
             ripgrep_path: std::sync::Arc::new(PathBuf::from("rg")),
             rg_available: false,
+            uploads: crate::uploads::UploadStore::new(),
+            upload_base: None,
         };
 
         let error = super::call_tool(&state, "grep_search", &json!({"query": "needle"}))
