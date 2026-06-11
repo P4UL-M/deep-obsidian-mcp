@@ -243,6 +243,15 @@ const DEFAULT_CHUNK_OVERLAP_LINES: usize = 12;
 /// window (~2,400 estimated tokens at 2.5 chars/token, safe under a 4096 `num_ctx`).
 /// Only bites on dense long-line content; typical 80-line prose chunks are smaller.
 const DEFAULT_CHUNK_MAX_CHARS: usize = 6_000;
+/// Target upper bound (in `tokenize` tokens) for a section-based chunk. A heading
+/// section whose token count exceeds this is split (sub-heading -> paragraph ->
+/// hard-wrap) until each piece fits. Chosen at the top of the common 256-512 dense
+/// retrieval window so chunks carry enough context without diluting the embedding.
+const SECTION_CHUNK_TARGET_TOKENS: usize = 512;
+/// Floor (in `tokenize` tokens) below which adjacent sibling sections are merged so
+/// the index does not fill with single-line micro-chunks. Merging stops once the
+/// accumulated chunk reaches this size or a heading-hierarchy boundary is crossed.
+const SECTION_CHUNK_MIN_TOKENS: usize = 100;
 const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 25 * 1024 * 1024;
 /// Per-note timeout used by the resilience fallback (`embed_prepared_notes_per_note`).
 /// Deliberately much SHORTER than the 60s bulk timeout: the fallback runs one HTTP
@@ -560,6 +569,502 @@ pub fn chunk_lines(
     }
 
     chunks
+}
+
+/// A planned chunk produced by the section-aware chunker. `heading_path` is the
+/// ordered stack of ancestor headings (root-most first, this section's own heading
+/// last); the indexer renders it as the embedding prefix. `start_line`/`end_line`
+/// are 1-based inclusive source line numbers that round-trip to `slice_lines`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SectionChunk {
+    start_line: usize,
+    end_line: usize,
+    text: String,
+    heading_path: Vec<String>,
+    /// Top-level (H1) group id; tiny siblings only merge within the same group so the
+    /// merge step never fuses two unrelated top-level sections. The preamble is group 0.
+    group_id: usize,
+}
+
+/// Returns the fence delimiter (```` ``` ```` or `~~~`) opened or closed by `line`,
+/// if the line is a fence marker. A fence marker is a line whose first non-whitespace
+/// run is at least three of the same fence char.
+fn fence_marker(line: &str) -> Option<char> {
+    let trimmed = line.trim_start();
+    for marker in ['`', '~'] {
+        let run = trimmed.chars().take_while(|ch| *ch == marker).count();
+        if run >= 3 {
+            return Some(marker);
+        }
+    }
+    None
+}
+
+/// True when `line` (already known to be outside a fenced code block) is an ATX
+/// heading line (`#`..`######` followed by whitespace).
+fn is_atx_heading(line: &str) -> bool {
+    let level = line.chars().take_while(|ch| *ch == '#').count();
+    (1..=6).contains(&level) && line.chars().nth(level).is_some_and(|ch| ch.is_whitespace())
+}
+
+/// True when `line` looks like a markdown table row (`|`-delimited). Used so the
+/// blank-line splitter does not slice a borderless run of table rows; table rows are
+/// not blank, so they already stay together, but a table-detecting guard keeps the
+/// hard-wrap fallback from cutting between rows.
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') || (trimmed.contains('|') && trimmed.contains("---"))
+}
+
+fn token_len(text: &str) -> usize {
+    tokenize(text).len()
+}
+
+/// A heading boundary discovered by the fence-aware scan: 1-based line, nesting level
+/// (`#` count), and the heading title text.
+struct HeadingBoundary {
+    line: usize,
+    level: usize,
+    title: String,
+}
+
+/// Single fence-aware pass over the note: returns every ATX heading that is NOT inside
+/// a fenced code block. `extract_heading_sections` is fence-blind (a `# foo` line inside
+/// ```` ```bash ```` reads as a heading), so the chunker does its own scan to guarantee
+/// fences are never split.
+fn scan_heading_boundaries(lines: &[&str]) -> Vec<HeadingBoundary> {
+    let mut boundaries = Vec::new();
+    let mut fence: Option<char> = None;
+    for (index, line) in lines.iter().enumerate() {
+        match fence {
+            Some(open) => {
+                if fence_marker(line) == Some(open) {
+                    fence = None;
+                }
+            }
+            None => {
+                if let Some(open) = fence_marker(line) {
+                    fence = Some(open);
+                } else if is_atx_heading(line) {
+                    let level = line.chars().take_while(|ch| *ch == '#').count();
+                    boundaries.push(HeadingBoundary {
+                        line: index + 1,
+                        level,
+                        title: line[level..].trim().to_string(),
+                    });
+                }
+            }
+        }
+    }
+    boundaries
+}
+
+/// Build the embedding/index prefix from a heading path: `"A › B › C"`. An empty path
+/// (heading-less preamble) yields an empty string.
+fn render_heading_path(path: &[String]) -> String {
+    path.join(" › ")
+}
+
+/// Section-aware chunker. Tiles the note into NON-overlapping segments at heading
+/// boundaries (each heading owns `[heading_line, next_heading_line)` regardless of the
+/// next heading's level, plus a leading preamble segment), carrying the ancestor
+/// heading stack as `heading_path`. Tiny adjacent siblings are merged up to
+/// `min_tokens`; oversized segments are split sub-heading -> paragraph -> hard-wrap,
+/// never cutting inside a fenced code block or table. Returns `None` when the note has
+/// no usable headings so the caller can fall back to `chunk_lines`.
+fn section_chunks(
+    content: &str,
+    note_title: &str,
+    target_tokens: usize,
+    min_tokens: usize,
+    max_chars: usize,
+) -> Option<Vec<SectionChunk>> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let boundaries = scan_heading_boundaries(&lines);
+    if boundaries.is_empty() {
+        return None;
+    }
+
+    // Tile into non-overlapping [start, end) line spans with an ancestor stack.
+    let mut tiles: Vec<SectionChunk> = Vec::new();
+    let mut stack: Vec<(usize, String)> = Vec::new();
+
+    // Preamble before the first heading (if any non-empty content).
+    let first_line = boundaries[0].line; // 1-based
+    if first_line > 1 {
+        let text = lines[0..first_line - 1].join("\n");
+        if !text.trim().is_empty() {
+            tiles.push(SectionChunk {
+                start_line: 1,
+                end_line: first_line - 1,
+                text,
+                heading_path: Vec::new(),
+                group_id: 0,
+            });
+        }
+    }
+
+    // Top-level group id: incremented on every level-1 heading so the merge step keeps
+    // unrelated H1 sections apart. The preamble and any pre-H1 content stay in group 0.
+    let mut group_id = 0usize;
+
+    for (index, boundary) in boundaries.iter().enumerate() {
+        if boundary.level == 1 {
+            group_id += 1;
+        }
+        // Pop ancestors that do not strictly enclose this heading.
+        while stack.last().is_some_and(|(level, _)| *level >= boundary.level) {
+            stack.pop();
+        }
+        // Heading path: ancestors + this heading. Drop a leading entry that duplicates
+        // the note title (the usual `# Title` H1) so the path is not `"T › T › ..."`.
+        let mut path: Vec<String> = stack.iter().map(|(_, title)| title.clone()).collect();
+        path.push(boundary.title.clone());
+        stack.push((boundary.level, boundary.title.clone()));
+
+        let mut display_path = vec![note_title.to_string()];
+        for (offset, title) in path.iter().enumerate() {
+            if offset == 0 && title == note_title {
+                continue;
+            }
+            display_path.push(title.clone());
+        }
+
+        let end_line = boundaries
+            .get(index + 1)
+            .map(|next| next.line - 1)
+            .unwrap_or(lines.len());
+        let start_line = boundary.line;
+        let text = lines[start_line - 1..end_line].join("\n");
+        tiles.push(SectionChunk {
+            start_line,
+            end_line,
+            text,
+            heading_path: display_path,
+            group_id,
+        });
+    }
+
+    // Merge tiny adjacent tiles up to the floor, only within the same H1 group, so
+    // unrelated top-level sections stay apart.
+    let merged = merge_small_tiles(tiles, min_tokens);
+
+    // Split any tile that still exceeds the target token budget.
+    let mut chunks = Vec::new();
+    for tile in merged {
+        split_oversized_tile(&lines, tile, target_tokens, max_chars, &mut chunks);
+    }
+    Some(chunks)
+}
+
+fn merge_small_tiles(tiles: Vec<SectionChunk>, min_tokens: usize) -> Vec<SectionChunk> {
+    let mut merged: Vec<SectionChunk> = Vec::new();
+    for tile in tiles {
+        if let Some(previous) = merged.last_mut() {
+            let prev_small = token_len(&previous.text) < min_tokens;
+            let same_group = previous.group_id == tile.group_id;
+            let contiguous = tile.start_line == previous.end_line + 1;
+            if prev_small && same_group && contiguous {
+                previous.text.push('\n');
+                previous.text.push_str(&tile.text);
+                previous.end_line = tile.end_line;
+                // Keep the shallower/earlier heading path (already set on `previous`).
+                continue;
+            }
+        }
+        merged.push(tile);
+    }
+    merged
+}
+
+/// Recursively split a tile that exceeds `target_tokens`: first at contained
+/// sub-headings, then at blank-line (paragraph) boundaries, then hard-wrap by lines.
+/// Fence and table runs are never cut. Pushes finished pieces onto `out`.
+fn split_oversized_tile(
+    lines: &[&str],
+    tile: SectionChunk,
+    target_tokens: usize,
+    max_chars: usize,
+    out: &mut Vec<SectionChunk>,
+) {
+    if token_len(&tile.text) <= target_tokens {
+        out.push(tile);
+        return;
+    }
+
+    // 1) Split at sub-headings strictly deeper than the tile's own heading. The tile's
+    //    own heading is on its first line; find deeper headings inside the body.
+    let body_start = tile.start_line; // 1-based
+    let body_end = tile.end_line; // 1-based inclusive
+    let own_level = lines
+        .get(body_start - 1)
+        .and_then(|line| {
+            if is_atx_heading(line) {
+                Some(line.chars().take_while(|ch| *ch == '#').count())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    let inner = &lines[body_start - 1..body_end];
+    let inner_boundaries = scan_heading_boundaries(inner);
+    let subheadings: Vec<&HeadingBoundary> = inner_boundaries
+        .iter()
+        .filter(|boundary| boundary.line > 1 && boundary.level > own_level)
+        .collect();
+
+    if !subheadings.is_empty() {
+        // Cut at each sub-heading; the segment before the first sub-heading keeps the
+        // tile's heading path, later segments append their sub-heading title.
+        let mut cut_points: Vec<usize> = vec![1]; // 1-based offsets within `inner`
+        for boundary in &subheadings {
+            cut_points.push(boundary.line);
+        }
+        cut_points.push(inner.len() + 1);
+        cut_points.dedup();
+
+        for window in cut_points.windows(2) {
+            let seg_start = window[0];
+            let seg_end = window[1] - 1;
+            if seg_start > seg_end {
+                continue;
+            }
+            let text = inner[seg_start - 1..seg_end].join("\n");
+            if text.trim().is_empty() {
+                continue;
+            }
+            let mut path = tile.heading_path.clone();
+            if seg_start > 1 {
+                // This segment starts at a sub-heading; append its title.
+                if let Some(line) = inner.get(seg_start - 1) {
+                    let level = line.chars().take_while(|ch| *ch == '#').count();
+                    if is_atx_heading(line) {
+                        path.push(line[level..].trim().to_string());
+                    }
+                }
+            }
+            let child = SectionChunk {
+                start_line: body_start + seg_start - 1,
+                end_line: body_start + seg_end - 1,
+                text,
+                heading_path: path,
+                group_id: tile.group_id,
+            };
+            split_oversized_tile(lines, child, target_tokens, max_chars, out);
+        }
+        return;
+    }
+
+    // 2) No sub-headings: greedily pack the body into <=target_tokens chunks. Cuts land
+    //    on line boundaries, preferring paragraph (blank-line) boundaries, and NEVER
+    //    inside a fenced code block or a contiguous table run. A single atomic unit that
+    //    alone exceeds the budget is word-split as a last resort.
+    let pieces = pack_body(
+        inner,
+        body_start,
+        &tile.heading_path,
+        tile.group_id,
+        target_tokens,
+    );
+    out.extend(pieces);
+}
+
+/// An atomic run of lines that must never be cut internally: a fenced code block, a
+/// contiguous markdown table, or a single non-fence/non-table line. The packer only
+/// ever cuts between units, so fences and tables stay whole. `blank_before` marks a
+/// paragraph boundary (a blank line precedes this unit), the preferred cut point.
+struct AtomicUnit {
+    start: usize, // 0-based index within `inner`, inclusive
+    end: usize,   // 0-based index within `inner`, exclusive
+    blank_before: bool,
+}
+
+/// Partition `inner` into atomic units (fence blocks, table runs, single lines).
+fn atomic_units(inner: &[&str]) -> Vec<AtomicUnit> {
+    let mut units = Vec::new();
+    let mut index = 0usize;
+    let mut prev_blank = false;
+    while index < inner.len() {
+        let line = inner[index];
+        if let Some(open) = fence_marker(line) {
+            // Consume through the matching closing fence (or EOF).
+            let start = index;
+            index += 1;
+            while index < inner.len() {
+                let closes = fence_marker(inner[index]) == Some(open);
+                index += 1;
+                if closes {
+                    break;
+                }
+            }
+            units.push(AtomicUnit {
+                start,
+                end: index,
+                blank_before: prev_blank,
+            });
+            prev_blank = false;
+            continue;
+        }
+        if is_table_row(line) {
+            let start = index;
+            while index < inner.len() && is_table_row(inner[index]) {
+                index += 1;
+            }
+            units.push(AtomicUnit {
+                start,
+                end: index,
+                blank_before: prev_blank,
+            });
+            prev_blank = false;
+            continue;
+        }
+        // A plain line. Blank lines are boundaries, not content units.
+        if line.trim().is_empty() {
+            prev_blank = true;
+            index += 1;
+            continue;
+        }
+        units.push(AtomicUnit {
+            start: index,
+            end: index + 1,
+            blank_before: prev_blank,
+        });
+        prev_blank = false;
+        index += 1;
+    }
+    units
+}
+
+/// Greedy token-budget packer over atomic units. `offset` is the 1-based source line of
+/// `inner[0]`. Whole lines are preserved (so `start_line`/`end_line` stay valid source
+/// offsets); a single unit larger than the budget is word-split into sub-line pieces
+/// (their line numbers still point at the source lines, but `text` is a substring).
+fn pack_body(
+    inner: &[&str],
+    offset: usize,
+    heading_path: &[String],
+    group_id: usize,
+    target_tokens: usize,
+) -> Vec<SectionChunk> {
+    let units = atomic_units(inner);
+    let mut pieces: Vec<SectionChunk> = Vec::new();
+    // Accumulator over [cur_start, cur_end) line indices (0-based within `inner`).
+    let mut cur_start: Option<usize> = None;
+    let mut cur_end = 0usize;
+
+    let flush = |pieces: &mut Vec<SectionChunk>, start: usize, end: usize| {
+        if start >= end {
+            return;
+        }
+        let text = inner[start..end].join("\n");
+        if text.trim().is_empty() {
+            return;
+        }
+        pieces.push(SectionChunk {
+            start_line: offset + start,
+            end_line: offset + end - 1,
+            text,
+            heading_path: heading_path.to_vec(),
+            group_id,
+        });
+    };
+
+    for unit in &units {
+        let unit_text = inner[unit.start..unit.end].join("\n");
+        let unit_tokens = token_len(&unit_text);
+
+        // A single unit larger than budget: flush what we have, then word-split it.
+        if unit_tokens > target_tokens && unit.start + 1 == unit.end {
+            if let Some(start) = cur_start.take() {
+                flush(&mut pieces, start, cur_end);
+            }
+            word_split_line(
+                inner[unit.start],
+                offset + unit.start,
+                heading_path,
+                group_id,
+                target_tokens,
+                &mut pieces,
+            );
+            continue;
+        }
+
+        match cur_start {
+            None => {
+                cur_start = Some(unit.start);
+                cur_end = unit.end;
+            }
+            Some(start) => {
+                let accumulated = token_len(&inner[start..cur_end].join("\n"));
+                // Cut before this unit when adding it would overflow the budget, or when
+                // this unit begins a new paragraph (blank line before it) and we have
+                // already filled the budget -- preferring paragraph boundaries keeps
+                // related prose together. Either way the cut is on a whole-line boundary
+                // between atomic units, so fences and tables are never split.
+                let overflow = accumulated + unit_tokens > target_tokens;
+                let paragraph_cut = unit.blank_before && accumulated >= target_tokens;
+                if overflow || paragraph_cut {
+                    flush(&mut pieces, start, cur_end);
+                    cur_start = Some(unit.start);
+                    cur_end = unit.end;
+                } else {
+                    cur_end = unit.end;
+                }
+            }
+        }
+    }
+    if let Some(start) = cur_start {
+        flush(&mut pieces, start, cur_end);
+    }
+    pieces
+}
+
+/// Word-split a single over-budget line into <=`target_tokens` pieces. Both pieces map
+/// to the same source `line_number` (1-based); `text` is a whitespace-delimited
+/// substring, so it does not equal the full source line (documented sub-line caveat).
+fn word_split_line(
+    line: &str,
+    line_number: usize,
+    heading_path: &[String],
+    group_id: usize,
+    target_tokens: usize,
+    out: &mut Vec<SectionChunk>,
+) {
+    let budget = target_tokens.max(1);
+    let words: Vec<&str> = line.split_whitespace().collect();
+    if words.is_empty() {
+        return;
+    }
+    let mut current = String::new();
+    let mut count = 0usize;
+    for word in words {
+        let word_tokens = token_len(word).max(1);
+        if count > 0 && count + word_tokens > budget {
+            out.push(SectionChunk {
+                start_line: line_number,
+                end_line: line_number,
+                text: std::mem::take(&mut current),
+                heading_path: heading_path.to_vec(),
+                group_id,
+            });
+            count = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+        count += word_tokens;
+    }
+    if !current.is_empty() {
+        out.push(SectionChunk {
+            start_line: line_number,
+            end_line: line_number,
+            text: current,
+            heading_path: heading_path.to_vec(),
+            group_id,
+        });
+    }
 }
 
 pub fn tokenize(text: &str) -> Vec<String> {
@@ -1291,14 +1796,49 @@ fn prepare_note_from_snapshot(
         embedding: None,
     };
 
-    let mut chunks = Vec::new();
-    let mut chunk_texts = Vec::new();
-    for (chunk_index, start_line, end_line, text) in chunk_lines(
+    // Section-aware chunking: tile the note at heading boundaries (carrying the heading
+    // path as the embedding/index prefix), merging tiny siblings and splitting oversized
+    // sections without cutting fenced code blocks or tables. Heading-less notes (and any
+    // section that resists reduction) fall back to the line-based `chunk_lines` path.
+    let planned: Vec<(usize, usize, String, String)> = match section_chunks(
         &content,
-        DEFAULT_CHUNK_SIZE_LINES,
-        DEFAULT_CHUNK_OVERLAP_LINES,
+        &title,
+        SECTION_CHUNK_TARGET_TOKENS,
+        SECTION_CHUNK_MIN_TOKENS,
         DEFAULT_CHUNK_MAX_CHARS,
     ) {
+        Some(sections) => sections
+            .into_iter()
+            .map(|section| {
+                let prefix = render_heading_path(&section.heading_path);
+                (section.start_line, section.end_line, section.text, prefix)
+            })
+            .collect(),
+        None => chunk_lines(
+            &content,
+            DEFAULT_CHUNK_SIZE_LINES,
+            DEFAULT_CHUNK_OVERLAP_LINES,
+            DEFAULT_CHUNK_MAX_CHARS,
+        )
+        .into_iter()
+        .map(|(_, start_line, end_line, text)| (start_line, end_line, text, title.clone()))
+        .collect(),
+    };
+
+    let mut chunks = Vec::new();
+    let mut chunk_texts = Vec::new();
+    for (chunk_index, (start_line, end_line, text, prefix)) in planned.into_iter().enumerate() {
+        // The EMBEDDING text carries the structural prefix (note title + heading path) so
+        // dense vectors get structural context (issue #6 item 1). BM25 `term_counts`
+        // stays scoped to `{title}\n{text}` (unchanged from before) so the lexical signal
+        // is not diluted by ancestor heading words repeated across every child chunk.
+        // The stored `text` is the raw source slice so start/end offsets round-trip.
+        let prefix = if prefix.trim().is_empty() {
+            title.clone()
+        } else {
+            prefix
+        };
+        let embedding_text = format!("{prefix}\n{text}");
         let term_counts = count_terms(&format!("{title}\n{text}"));
         chunks.push(SearchChunk {
             path: snapshot.path.clone(),
@@ -1312,7 +1852,7 @@ fn prepare_note_from_snapshot(
             token_count: token_count(&term_counts),
             embedding: None,
         });
-        chunk_texts.push(format!("{title}\n{text}"));
+        chunk_texts.push(embedding_text);
     }
 
     Ok(PreparedNote {
@@ -3942,6 +4482,183 @@ mod tests {
         assert_eq!(blocks[1].id, "block-two");
     }
 
+    fn section_chunks_default(content: &str, title: &str) -> Vec<SectionChunk> {
+        section_chunks(
+            content,
+            title,
+            SECTION_CHUNK_TARGET_TOKENS,
+            SECTION_CHUNK_MIN_TOKENS,
+            DEFAULT_CHUNK_MAX_CHARS,
+        )
+        .expect("note has headings")
+    }
+
+    #[test]
+    fn section_chunks_returns_none_for_heading_less_note() {
+        let content = "Just a paragraph of prose.\nNo headings at all here.\n";
+        assert!(section_chunks(
+            content,
+            "Untitled",
+            SECTION_CHUNK_TARGET_TOKENS,
+            SECTION_CHUNK_MIN_TOKENS,
+            DEFAULT_CHUNK_MAX_CHARS,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn section_chunks_keep_fenced_code_block_intact() {
+        // A `#`-prefixed line inside the fence must NOT be read as a heading, and a
+        // small note collapses to a single chunk that contains the whole fence.
+        let content = "# Guide\n\n## A\nalpha text\n\n### B\nbeta text\n\n```bash\n# not a heading\nrun --flag\n```\n";
+        let chunks = section_chunks_default(content, "Guide");
+        // The whole note is well under the merge floor, so it is a single chunk.
+        assert_eq!(chunks.len(), 1, "tiny multi-heading note merges to one chunk");
+        let chunk = &chunks[0];
+        assert!(chunk.text.contains("```bash"));
+        assert!(chunk.text.contains("# not a heading"));
+        assert!(chunk.text.contains("run --flag"));
+        // The closing fence is present => the fence was never split across a boundary.
+        assert_eq!(chunk.text.matches("```").count(), 2);
+    }
+
+    #[test]
+    fn section_chunks_split_large_note_on_subheadings_and_keep_fence() {
+        // Make each section large enough to clear the merge floor and the target budget
+        // so the note splits into per-heading chunks; verify the code fence stays whole.
+        let filler = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore ".repeat(8);
+        let content = format!(
+            "# Big\n\n## A\n{filler}\n\n## B\n{filler}\n\n```python\n# inside fence\nx = 1\ny = 2\n```\n{filler}\n",
+        );
+        let chunks = section_chunks_default(&content, "Big");
+        assert!(chunks.len() >= 2, "oversized note must split: {}", chunks.len());
+        // Exactly one chunk contains the opening fence, and it also contains the close.
+        let fence_chunks: Vec<&SectionChunk> = chunks
+            .iter()
+            .filter(|chunk| chunk.text.contains("```python"))
+            .collect();
+        assert_eq!(fence_chunks.len(), 1, "fence opener in exactly one chunk");
+        assert_eq!(
+            fence_chunks[0].text.matches("```").count(),
+            2,
+            "fence kept intact (open + close in same chunk)"
+        );
+        // The B sub-heading drives a chunk whose path ends in "B".
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk.heading_path.last().map(String::as_str) == Some("B")));
+    }
+
+    #[test]
+    fn section_chunks_do_not_split_a_table_mid_table() {
+        let filler = "padding words to grow the section beyond the merge floor and target budget ".repeat(12);
+        let content = format!(
+            "# Codes\n\n## Intro\n{filler}\n\n## Table\n| Code | Meaning |\n| --- | --- |\n| ERR_1 | one |\n| ERR_2 | two |\n| ERR_3 | three |\n{filler}\n",
+        );
+        let chunks = section_chunks_default(&content, "Codes");
+        // Every table row must live in a single chunk (none split across chunks).
+        for row in ["| ERR_1 | one |", "| ERR_2 | two |", "| ERR_3 | three |"] {
+            let count = chunks.iter().filter(|chunk| chunk.text.contains(row)).count();
+            assert_eq!(count, 1, "table row {row:?} appears in exactly one chunk");
+        }
+        // The header and its rows stay in the same chunk (contiguous table run).
+        let table_chunk = chunks
+            .iter()
+            .find(|chunk| chunk.text.contains("| Code | Meaning |"))
+            .expect("table chunk");
+        assert!(table_chunk.text.contains("| ERR_3 | three |"));
+    }
+
+    #[test]
+    fn section_chunks_round_trip_line_ranges_to_source() {
+        let content = "# Title\n\n## One\nalpha\n\n## Two\nbeta\n";
+        let lines: Vec<&str> = content.split('\n').collect();
+        let chunks = section_chunks_default(content, "Title");
+        for chunk in &chunks {
+            assert!(chunk.start_line >= 1 && chunk.end_line <= lines.len());
+            assert!(chunk.start_line <= chunk.end_line);
+            let expected = lines[chunk.start_line - 1..chunk.end_line].join("\n");
+            assert_eq!(chunk.text, expected, "stored text must equal source slice");
+        }
+    }
+
+    #[test]
+    fn section_chunks_heading_path_drops_duplicate_title_and_nests() {
+        // Each heading gets a body that clears the merge floor so per-heading chunks
+        // survive (no merge into one). `# Service` has its own body so it stays a
+        // distinct chunk rather than absorbing its first child.
+        let filler =
+            "context sentence with enough distinct words to clear the floor and budget ".repeat(16);
+        assert!(
+            token_len(&filler) >= SECTION_CHUNK_MIN_TOKENS,
+            "filler must clear the merge floor: {}",
+            token_len(&filler)
+        );
+        let content = format!(
+            "# Service\n{filler}\n\n## Setup\n{filler}\n\n### Steps\n{filler}\n",
+        );
+        let chunks = section_chunks_default(&content, "Service");
+        // No path should start with the title twice.
+        for chunk in &chunks {
+            assert_ne!(
+                chunk.heading_path.first().map(String::as_str),
+                chunk.heading_path.get(1).map(String::as_str),
+                "title must not be duplicated at the front of the path"
+            );
+            assert_eq!(chunk.heading_path.first().map(String::as_str), Some("Service"));
+        }
+        // A nested chunk carries the full path Service › Setup › Steps.
+        assert!(chunks.iter().any(|chunk| chunk.heading_path
+            == vec![
+                "Service".to_string(),
+                "Setup".to_string(),
+                "Steps".to_string()
+            ]));
+    }
+
+    #[test]
+    fn section_chunks_oversized_multiline_section_packs_under_budget() {
+        // Production path: a heading with many newline-separated short lines, no
+        // sub-headings, no blanks. The greedy packer must produce multiple chunks each
+        // at or under budget, and every chunk must round-trip to whole source lines.
+        let lines: Vec<String> = (0..80)
+            .map(|i| format!("line{i} alpha beta gamma delta epsilon"))
+            .collect();
+        let content = format!("# Solo\n{}\n", lines.join("\n"));
+        let src: Vec<&str> = content.split('\n').collect();
+        let chunks = section_chunks(&content, "Solo", 64, 16, DEFAULT_CHUNK_MAX_CHARS)
+            .expect("has heading");
+        assert!(chunks.len() > 1, "oversized multiline section must split");
+        for chunk in &chunks {
+            assert!(
+                token_len(&chunk.text) <= 64,
+                "chunk over budget: {} tokens",
+                token_len(&chunk.text)
+            );
+            // Whole-line packing => text equals the source line slice.
+            let expected = src[chunk.start_line - 1..chunk.end_line].join("\n");
+            assert_eq!(chunk.text, expected, "whole-line chunk must round-trip");
+        }
+    }
+
+    #[test]
+    fn section_chunks_oversized_single_line_word_splits_under_budget() {
+        // A single physical line that alone exceeds the budget must be word-split. The
+        // pieces share one source line number (sub-line caveat) but stay under budget.
+        let body = "alpha beta gamma delta epsilon zeta eta theta iota kappa ".repeat(120);
+        let content = format!("# Solo\n{body}\n");
+        let chunks = section_chunks(&content, "Solo", 64, 16, DEFAULT_CHUNK_MAX_CHARS)
+            .expect("has heading");
+        assert!(chunks.len() > 1, "oversized single line must word-split");
+        for chunk in &chunks {
+            assert!(
+                token_len(&chunk.text) <= 64,
+                "chunk over budget: {} tokens",
+                token_len(&chunk.text)
+            );
+        }
+    }
+
     #[test]
     fn sqlite_index_round_trip_loads_persisted_sparse_index() {
         let root = unique_temp_dir("sqlite-round-trip");
@@ -3984,6 +4701,40 @@ mod tests {
         assert!(!rebuilt_second);
         assert_eq!(second.generated_at, first.generated_at);
         assert_eq!(second.file_snapshots, first.file_snapshots);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn get_search_index_rebuilds_when_persisted_version_is_stale() {
+        // The version gate must force a rebuild when the on-disk index predates the
+        // current schema version (the migration path for the new chunker): load maps a
+        // version mismatch to Ok(None) -> get_search_index rebuilds with the current
+        // version stamped back into metadata.
+        let root = unique_temp_dir("sqlite-stale-version");
+        fs::create_dir_all(&root).expect("temp dir");
+        write_fixture(&root, "Home.md", "# Home\n\nService anchor.\n");
+
+        let (_first, rebuilt_first) = get_search_index(&root, None, None).expect("first build");
+        assert!(rebuilt_first);
+
+        // Stamp an older version into the persisted metadata, simulating a pre-bump index.
+        {
+            let connection =
+                open_index_connection(&index_file_path(&root, None), false).expect("open index");
+            connection
+                .execute(
+                    "UPDATE metadata SET value = ?1 WHERE key = 'version'",
+                    params![(INDEX_VERSION - 1).to_string()],
+                )
+                .expect("downgrade version");
+        }
+
+        // load_index must reject the stale index (Ok(None)); get_search_index rebuilds.
+        assert!(load_index(&root, None).expect("load").is_none());
+        let (rebuilt, rebuilt_again) = get_search_index(&root, None, None).expect("rebuild");
+        assert!(rebuilt_again, "stale version must trigger a rebuild");
+        assert_eq!(rebuilt.version, INDEX_VERSION);
 
         fs::remove_dir_all(root).ok();
     }

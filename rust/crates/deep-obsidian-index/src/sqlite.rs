@@ -5,7 +5,11 @@ use rusqlite::{ffi::sqlite3_auto_extension, Connection, OpenFlags};
 use sqlite_vec::sqlite3_vec_init;
 
 pub const INDEX_FILENAME: &str = "index.sqlite";
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+// Bumped 4 -> 5 for heading-aware, structure-respecting chunking: chunk boundaries and
+// embedding text changed (heading-path prefix), so existing indexes must rebuild. The
+// load path maps a version mismatch to `Ok(None)` -> `get_search_index` rebuilds. No DDL
+// change accompanies this bump; a full rebuild regenerates the chunk rows.
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 static SQLITE_VEC_REGISTER: Once = Once::new();
 
