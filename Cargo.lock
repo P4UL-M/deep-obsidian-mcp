@@ -405,6 +405,7 @@ dependencies = [
  "serde_json",
  "sqlite-vec",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
