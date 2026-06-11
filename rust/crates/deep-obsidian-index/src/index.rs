@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::embeddings::{self, EmbeddingConfig, EmbeddingProvider};
+use crate::embeddings::{self, EmbeddingBatchOptions, EmbeddingConfig, EmbeddingProvider};
 use crate::sqlite;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +239,18 @@ const DEFAULT_CHUNK_OVERLAP_LINES: usize = 12;
 /// Only bites on dense long-line content; typical 80-line prose chunks are smaller.
 const DEFAULT_CHUNK_MAX_CHARS: usize = 6_000;
 const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 25 * 1024 * 1024;
+/// Per-note timeout used by the resilience fallback (`embed_prepared_notes_per_note`).
+/// Deliberately much SHORTER than the 60s bulk timeout: the fallback runs one HTTP
+/// call per note sequentially, so against a backend that accepts the connection but
+/// hangs, a 60s-per-note budget would turn into hours of apparent freeze on a large
+/// vault. A tight per-note budget bounds each attempt; the short-circuit below bounds
+/// the total number of attempts.
+const PER_NOTE_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(15);
+/// Consecutive per-note embedding failures tolerated in the fallback before giving up.
+/// After this many notes fail back-to-back the backend is treated as unhealthy: the
+/// remaining notes are recorded as failed (no dense vector -> BM25/sparse at query
+/// time) without further attempts, so a dead/hung backend can't grind through all N.
+const MAX_CONSECUTIVE_PER_NOTE_FAILURES: usize = 3;
 const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "into", "is",
     "it", "of", "on", "or", "that", "the", "this", "to", "with",
@@ -1419,6 +1431,7 @@ fn ensure_embedding_dimensions(
 /// BM25/sparse retrieval. The build stays usable and the caller can surface the
 /// partial result. When every note embeds successfully, `failed_paths` is empty and
 /// the assigned vectors are identical to the all-or-nothing path.
+#[derive(Debug)]
 struct NoteEmbeddingOutcome {
     dimensions: Option<usize>,
     failed_paths: Vec<String>,
@@ -1481,38 +1494,83 @@ fn embed_prepared_notes(
             })
         }
         Err(bulk_error) => {
+            // Only fall back to the note-by-note path for TRANSIENT failures
+            // (timeouts, dropped connections, 5xx) that might succeed on smaller,
+            // isolated inputs. A DETERMINISTIC failure — a 4xx (bad model name,
+            // oversized input, auth), misconfiguration, a contract violation, or a
+            // dimension mismatch — would fail identically on every note, so retrying
+            // note-by-note would only spray N wasted requests. Surface it instead.
+            if !bulk_error.is_transient() {
+                tracing::error!(
+                    error = %bulk_error,
+                    "bulk note embedding failed deterministically; not retrying note-by-note"
+                );
+                return Err(IndexError::Embedding(bulk_error.to_string()));
+            }
             // Resilience path: a single failed batch must not abort the whole
             // build. Re-embed note-by-note so one bad note only drops its own dense
             // vector (falling back to BM25/sparse) instead of nuking the index.
             tracing::warn!(
                 error = %bulk_error,
-                "bulk note embedding failed; retrying note-by-note for partial progress"
+                "bulk note embedding failed transiently; retrying note-by-note for partial progress"
             );
-            embed_prepared_notes_per_note(prepared_notes, index_config, expected_dimensions)
+            embed_prepared_notes_per_note(
+                prepared_notes,
+                index_config,
+                expected_dimensions,
+                PER_NOTE_EMBEDDING_TIMEOUT,
+                MAX_CONSECUTIVE_PER_NOTE_FAILURES,
+            )
         }
     }
 }
 
-/// Per-note fallback used when the bulk embedding call fails. Embeds each note's
-/// chunks in isolation: notes that fail to embed are recorded in `failed_paths` and
-/// left without a dense vector; notes that succeed are assigned and dimension-checked
-/// against the rest (a real dimension mismatch among successful notes stays fatal).
+/// Per-note fallback used when the bulk embedding call fails transiently. Embeds each
+/// note's chunks in isolation with a TIGHT per-note `timeout` (much shorter than the
+/// bulk timeout) so one slow note can't stall the build: notes that fail to embed are
+/// recorded in `failed_paths` and left without a dense vector; notes that succeed are
+/// assigned and dimension-checked against the rest.
+///
+/// Two cross-note safeguards keep this bounded against an unhealthy backend:
+/// - A genuine `DimensionsMismatch` (between notes, or reported by the backend for a
+///   single note) is FATAL and propagated — it signals a schema inconsistency, not a
+///   transient per-note hiccup, consistent with the cross-note
+///   `ensure_embedding_dimensions` guard.
+/// - After `max_consecutive_failures` notes fail back-to-back, the backend is treated
+///   as unhealthy: the loop SHORT-CIRCUITS, recording every remaining (unattempted)
+///   note as failed without trying it, so a dead/hung backend can't grind through all
+///   N notes at `timeout` apiece.
 fn embed_prepared_notes_per_note(
     prepared_notes: &mut [PreparedNote],
     index_config: &EmbeddingConfig,
     expected_dimensions: Option<usize>,
+    timeout: Duration,
+    max_consecutive_failures: usize,
 ) -> Result<NoteEmbeddingOutcome> {
     let mut observed_dimensions = None;
     let mut failed_paths = Vec::new();
+    let mut consecutive_failures = 0usize;
+    // Tighten only the timeout; keep the rest of the batch options from config so the
+    // per-note path packs requests identically to the bulk path.
+    let per_note_options = EmbeddingBatchOptions {
+        timeout,
+        ..EmbeddingBatchOptions::from_config(index_config)
+    };
 
-    for prepared in prepared_notes.iter_mut() {
+    let mut notes = prepared_notes.iter_mut();
+    for prepared in notes.by_ref() {
         if prepared.chunk_texts.is_empty() {
             // No chunks to embed; matches the bulk path's "no vectors" outcome.
+            // Neither a success nor a failure: leave the consecutive counter alone.
             prepared.note.embedding = None;
             continue;
         }
 
-        match embeddings::embed_text_batches(&prepared.chunk_texts, index_config, None) {
+        match embeddings::embed_text_batches(
+            &prepared.chunk_texts,
+            index_config,
+            Some(per_note_options.clone()),
+        ) {
             Ok(batch) => {
                 if let Err(error) = ensure_embedding_dimensions(
                     batch.dimensions,
@@ -1535,6 +1593,14 @@ fn embed_prepared_notes_per_note(
                         "embedding provider returned too many chunk vectors".to_string(),
                     ));
                 }
+                // A success breaks any failure streak.
+                consecutive_failures = 0;
+            }
+            // A genuine dimension mismatch reported by the backend stays FATAL even
+            // for a single note, mapped to the same structured variant the cross-note
+            // `ensure_embedding_dimensions` guard above returns.
+            Err(embeddings::EmbeddingError::DimensionsMismatch { expected, actual }) => {
+                return Err(IndexError::EmbeddingDimensionsMismatch { expected, actual });
             }
             Err(error) => {
                 tracing::warn!(
@@ -1544,6 +1610,25 @@ fn embed_prepared_notes_per_note(
                 );
                 clear_note_embeddings(prepared);
                 failed_paths.push(prepared.note.path.clone());
+                consecutive_failures += 1;
+                if consecutive_failures >= max_consecutive_failures {
+                    // Backend looks unhealthy. Stop attempting the rest and record
+                    // every remaining note as failed so we don't grind through N
+                    // sequential per-note timeouts.
+                    let mut short_circuited = 0usize;
+                    for remaining in notes.by_ref() {
+                        clear_note_embeddings(remaining);
+                        failed_paths.push(remaining.note.path.clone());
+                        short_circuited += 1;
+                    }
+                    tracing::error!(
+                        consecutive_failures,
+                        remaining = short_circuited,
+                        "per-note embedding short-circuited after consecutive failures; \
+                         remaining notes recorded as failed (BM25/sparse only)"
+                    );
+                    break;
+                }
             }
         }
     }
@@ -4635,5 +4720,177 @@ mod tests {
         assert!(bm25.iter().any(|m| m.path == "Home.md"));
 
         fs::remove_dir_all(root).ok();
+    }
+
+    /// Single-chunk prepared note whose chunk text is `chunk_text`. Single-chunk so
+    /// the bisect path inside a batch call never adds extra requests.
+    fn single_chunk_note(path: &str, chunk_text: &str) -> PreparedNote {
+        PreparedNote {
+            snapshot: FileSnapshot {
+                path: path.to_string(),
+                mtime_ms: 0,
+                size: 0,
+            },
+            note: SearchNote {
+                path: path.to_string(),
+                title: path.to_string(),
+                content: "body".to_string(),
+                term_counts: Default::default(),
+                norm: 0.0,
+                token_count: 0,
+                links: Vec::new(),
+                embedding: None,
+            },
+            chunks: vec![SearchChunk {
+                path: path.to_string(),
+                title: path.to_string(),
+                chunk_index: 0,
+                start_line: 1,
+                end_line: 1,
+                text: chunk_text.to_string(),
+                term_counts: Default::default(),
+                norm: 0.0,
+                token_count: 0,
+                embedding: None,
+            }],
+            chunk_texts: vec![chunk_text.to_string()],
+        }
+    }
+
+    fn embedding_test_config(base_url: String) -> EmbeddingConfig {
+        EmbeddingConfig {
+            provider: Some(EmbeddingProvider::OpenAiCompatible),
+            model: Some("text-embedding-test".to_string()),
+            base_url: Some(base_url),
+            api_key: None,
+            max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
+        }
+        .normalize()
+    }
+
+    /// Server that accepts connections but NEVER responds, counting how many requests
+    /// it received. A request against it can only end via the client timeout. Returns
+    /// the base URL and a shared request counter; the listener thread holds accepted
+    /// connections open for the lifetime of the process.
+    fn start_silent_counting_server() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent server");
+        let address = listener.local_addr().expect("server address");
+        let count = Arc::new(AtomicUsize::new(0));
+        let thread_count = Arc::clone(&count);
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        thread_count.fetch_add(1, Ordering::Relaxed);
+                        // Hold the connection open without ever writing a response.
+                        held.push(stream);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{}", address), count)
+    }
+
+    #[test]
+    fn per_note_short_circuits_against_a_hung_backend() {
+        // FIX 1: against a backend that accepts the connection but hangs, the per-note
+        // fallback must give up after K consecutive failures using a SHORT per-note
+        // timeout — never grinding through all N notes at the full bulk timeout.
+        let (base_url, request_count) = start_silent_counting_server();
+        let config = embedding_test_config(base_url);
+
+        // Eight notes, but only the first K should be attempted before short-circuit.
+        let mut prepared = (0..8)
+            .map(|i| single_chunk_note(&format!("Note{i}.md"), &format!("content {i}")))
+            .collect::<Vec<_>>();
+
+        let per_note_timeout = Duration::from_millis(200);
+        let max_consecutive_failures = 3;
+        let started = std::time::Instant::now();
+        let outcome = embed_prepared_notes_per_note(
+            &mut prepared,
+            &config,
+            None,
+            per_note_timeout,
+            max_consecutive_failures,
+        )
+        .expect("hung backend must not error; notes fall back to BM25/sparse");
+        let elapsed = started.elapsed();
+
+        // Every note is recorded as failed (the first K attempted, the rest
+        // short-circuited without an attempt) and has no dense vector.
+        assert_eq!(outcome.failed_paths.len(), 8, "all notes recorded as failed");
+        assert!(prepared.iter().all(|p| p.note.embedding.is_none()));
+        assert!(prepared.iter().all(|p| p.chunks[0].embedding.is_none()));
+
+        // Only K HTTP requests were issued — we did NOT attempt all 8 notes.
+        assert_eq!(
+            request_count.load(Ordering::Relaxed),
+            max_consecutive_failures,
+            "must short-circuit after K attempts, not try every note"
+        );
+
+        // Bounded time: ~K * per_note_timeout, nowhere near N * 60s. Generous ceiling
+        // to stay non-flaky on slow CI.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "short-circuit must return promptly, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn bulk_deterministic_error_does_not_spray_per_note_calls() {
+        // FIX 2: a DETERMINISTIC bulk failure (HTTP 4xx — e.g. bad model name) must NOT
+        // trigger the note-by-note retry. The whole embed must error out after the bulk
+        // attempt's requests, issuing no extra per-note calls.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 4xx server");
+        let address = listener.local_addr().expect("server address");
+        let count = Arc::new(AtomicUsize::new(0));
+        let thread_count = Arc::clone(&count);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                thread_count.fetch_add(1, Ordering::Relaxed);
+                // Drain the request, then always answer HTTP 400 (deterministic).
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                );
+            }
+        });
+        // batch_size = 1 so each note is its own bulk batch (one request, size 1) and
+        // the in-batch bisect can never amplify. The bulk pass then issues exactly N
+        // requests; a per-note retry would add a SECOND wave of N more.
+        let mut config = embedding_test_config(format!("http://{}", address));
+        config.batch_size = 1;
+        let config = config.normalize();
+
+        const NOTES: usize = 6;
+        let mut prepared = (0..NOTES)
+            .map(|i| single_chunk_note(&format!("Note{i}.md"), &format!("content {i}")))
+            .collect::<Vec<_>>();
+
+        let error = embed_prepared_notes(&mut prepared, &config, None)
+            .expect_err("a deterministic 4xx must propagate, not retry per-note");
+        assert!(matches!(error, IndexError::Embedding(_)));
+
+        // Exactly N requests from the bulk pass and ZERO from a per-note retry. If the
+        // deterministic error had wrongly fallen back, we'd see ~2N (a second wave of
+        // one request per note).
+        let requests = count.load(Ordering::Relaxed);
+        assert_eq!(
+            requests, NOTES,
+            "deterministic error must not spray a per-note retry wave; saw {requests} requests"
+        );
     }
 }

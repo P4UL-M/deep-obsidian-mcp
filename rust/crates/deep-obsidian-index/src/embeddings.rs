@@ -227,6 +227,35 @@ pub enum EmbeddingError {
     DimensionsMismatch { expected: usize, actual: usize },
 }
 
+impl EmbeddingError {
+    /// Whether a failed BULK embedding call is worth retrying note-by-note.
+    ///
+    /// Only transient failures (timeouts, dropped/refused connections, and 5xx
+    /// server errors) can plausibly succeed when re-attempted with smaller, isolated
+    /// inputs. Deterministic failures — HTTP 4xx (bad model name, malformed/oversized
+    /// input, auth), misconfiguration (`NotConfigured` / `UnsupportedProvider` /
+    /// `MissingBaseUrl`), a contract violation (`VectorCountMismatch`), or a
+    /// dimension mismatch — will fail identically on every note, so the per-note path
+    /// would only spray N wasted requests. `DimensionsMismatch` is additionally fatal
+    /// and is propagated by the caller (see `embed_prepared_notes_per_note`).
+    ///
+    /// `reqwest` maps both request timeouts and connection errors to
+    /// `RequestFailed { status: 0, .. }` (see `embed_texts_with_client`), so status 0
+    /// is treated as transient.
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            EmbeddingError::RequestFailed { status, .. } => {
+                *status == 0 || (500..600).contains(status)
+            }
+            EmbeddingError::NotConfigured
+            | EmbeddingError::UnsupportedProvider(_)
+            | EmbeddingError::MissingBaseUrl
+            | EmbeddingError::VectorCountMismatch
+            | EmbeddingError::DimensionsMismatch { .. } => false,
+        }
+    }
+}
+
 fn clamp_chars(text: &str, max_chars: usize) -> String {
     let safe_max = max_chars.max(1);
     if text.chars().count() <= safe_max {
@@ -909,6 +938,53 @@ mod tests {
                 actual: 3
             }
         ));
+    }
+
+    #[test]
+    fn embedding_error_transient_classification() {
+        // Transient: timeouts/connection errors (status 0) and 5xx server errors.
+        assert!(EmbeddingError::RequestFailed {
+            status: 0,
+            body: "timed out".to_string(),
+        }
+        .is_transient());
+        assert!(EmbeddingError::RequestFailed {
+            status: 500,
+            body: String::new(),
+        }
+        .is_transient());
+        assert!(EmbeddingError::RequestFailed {
+            status: 503,
+            body: String::new(),
+        }
+        .is_transient());
+
+        // Deterministic: 4xx (bad model name, oversized input, auth), misconfig,
+        // contract violations, and dimension mismatches.
+        assert!(!EmbeddingError::RequestFailed {
+            status: 400,
+            body: "bad model".to_string(),
+        }
+        .is_transient());
+        assert!(!EmbeddingError::RequestFailed {
+            status: 404,
+            body: String::new(),
+        }
+        .is_transient());
+        assert!(!EmbeddingError::RequestFailed {
+            status: 422,
+            body: String::new(),
+        }
+        .is_transient());
+        assert!(!EmbeddingError::NotConfigured.is_transient());
+        assert!(!EmbeddingError::UnsupportedProvider("x".to_string()).is_transient());
+        assert!(!EmbeddingError::MissingBaseUrl.is_transient());
+        assert!(!EmbeddingError::VectorCountMismatch.is_transient());
+        assert!(!EmbeddingError::DimensionsMismatch {
+            expected: 2,
+            actual: 3,
+        }
+        .is_transient());
     }
 
     #[test]
