@@ -3,10 +3,10 @@
 class DeepObsidianMcp < Formula
   desc "Filesystem-first MCP server for deep Obsidian vault access"
   homepage "https://github.com/P4UL-M/deep-obsidian-mcp"
-  url "https://github.com/P4UL-M/deep-obsidian-mcp/archive/refs/tags/v0.1.0-alpha.1.tar.gz"
-  sha256 "082c9a8eccaf2c72cb692cb94991c568e08bce971f3fb03c55a42e22a2b75d4e"
+  url "https://github.com/P4UL-M/deep-obsidian-mcp/archive/refs/tags/v0.1.0-alpha.10.tar.gz"
+  sha256 "6e1248f80d901eb8994351293796409bbc0090149774c84c89fd1ce7a69810bd"
   license "MIT"
-  version "0.1.0-alpha.1"
+  version "0.1.0-alpha.10"
 
   depends_on "rust" => :build
   depends_on "ripgrep"
