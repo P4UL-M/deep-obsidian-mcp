@@ -37,8 +37,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use deep_obsidian_index::embeddings::{self, EmbeddingConfig, EmbeddingProvider};
 use deep_obsidian_index::index::{build_index_from_snapshots, collect_snapshots, tokenize};
 use deep_obsidian_index::search::{
-    bm25_search_with_options, hybrid_search_with_options, semantic_search_with_options,
-    RankingOptions, SearchMatch,
+    bm25_search_with_options, hybrid_search_with_options, related_notes,
+    semantic_search_with_options, RankingOptions, SearchMatch,
 };
 
 // ---------------------------------------------------------------------------
@@ -625,6 +625,62 @@ fn build_eval_index() -> (PathBuf, deep_obsidian_index::index::SearchIndex) {
     let snapshots = collect_snapshots(&root).expect("collect snapshots");
     let index = build_index_from_snapshots(&root, None, snapshots, Some(&config)).expect("build index");
     (root, index)
+}
+
+/// Late-interaction (max-sim) note relatedness: a note sharing the source's topical
+/// vocabulary must outrank an unrelated note. Dedicated tiny vault (the recall baseline
+/// above is untouched). Exercises the per-source-chunk sqlite-vec KNN + max-then-sum
+/// aggregation that replaced the dropped note-level dense vector.
+#[test]
+fn related_notes_late_interaction_ranks_topical_neighbor() {
+    let root = unique_temp_dir("related-maxsim");
+    fs::create_dir_all(&root).expect("temp dir");
+    write_fixture(
+        &root,
+        "Source.md",
+        "# Source\n\nThe quantum flux capacitor stabilizes the warp lattice resonance.\n",
+    );
+    // Shares the source's distinctive topical vocabulary.
+    write_fixture(
+        &root,
+        "Neighbor.md",
+        "# Neighbor\n\nThe quantum flux capacitor stabilizes the warp lattice resonance field.\n",
+    );
+    // Shares no topical vocabulary with the source.
+    write_fixture(
+        &root,
+        "Unrelated.md",
+        "# Unrelated\n\nSourdough bread recipes rely on wild yeast fermentation and rye.\n",
+    );
+
+    let base_url = spawn_pseudo_embedding_server();
+    let config = eval_config(base_url);
+    let snapshots = collect_snapshots(&root).expect("collect snapshots");
+    let index = build_index_from_snapshots(&root, None, snapshots, Some(&config))
+        .expect("build index");
+    assert_eq!(
+        index.semantic_backend,
+        deep_obsidian_index::index::SemanticBackend::Embedding
+    );
+
+    let related = related_notes(&index, "Source.md").expect("related_notes");
+    assert!(
+        !related.is_empty(),
+        "expected related notes via late interaction"
+    );
+    assert!(
+        related.iter().all(|m| m.path != "Source.md"),
+        "the source note must be excluded from its own related set"
+    );
+    let rank = |path: &str| related.iter().position(|m| m.path == path);
+    let neighbor = rank("Neighbor.md").expect("topical neighbour present");
+    let unrelated = rank("Unrelated.md");
+    assert!(
+        unrelated.map_or(true, |u| neighbor < u),
+        "the topical neighbour should rank above the unrelated note (neighbor={neighbor:?}, unrelated={unrelated:?})"
+    );
+
+    fs::remove_dir_all(root).ok();
 }
 
 #[test]

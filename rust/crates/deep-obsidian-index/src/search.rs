@@ -234,6 +234,22 @@ fn semantic_search_with_query_vector_sql(
         .map_err(|error| IndexError::Embedding(error.to_string()))
 }
 
+/// Bounded per-source-chunk KNN used for late-interaction (max-sim) note relatedness.
+/// Each source chunk contributes its top-K nearest chunks vault-wide; K trades recall
+/// for cost. On a small vault K covers most chunks (near-exact); on a large vault it
+/// caps per-query work. 64 is a reasonable balance for average hardware. Clamped to the
+/// chunk count so sqlite-vec never receives `k` larger than the corpus.
+const RELATED_NOTES_MAXSIM_K: usize = 64;
+
+/// Note-to-note relatedness via late interaction (max-sim) over the persisted CHUNK
+/// vectors. For source note X with chunks {x_i}, candidate note Y scores
+/// `sum_i max_{y in Y} cos(x_i, y)`: one sqlite-vec KNN per source chunk (sqlite-vec
+/// does the nearest-chunk lookup) followed by a max-then-sum aggregation by note. No
+/// note-level vector is stored -- this reads only `chunk_embeddings_vec`.
+///
+/// Returns `MissingNoteEmbedding` when the source note has no chunk embeddings (a note
+/// that failed to embed in a partial index, or a sparse backend) so the caller degrades
+/// to the sparse term-overlap path.
 fn related_notes_with_embeddings_sql(
     index: &SearchIndex,
     note_path: &str,
@@ -244,77 +260,113 @@ fn related_notes_with_embeddings_sql(
         .ok_or_else(|| IndexError::NoteNotFound(note_path.to_string()))?;
     let note_links: BTreeSet<_> = note.links.iter().cloned().collect();
     let connection = open_index_connection_for_index(index, true)?;
-    // NOTE: as of schema v6 `note_embeddings_vec` is intentionally never populated
-    // (the note-level dense vector was dropped as redundant). This lookup therefore
-    // always misses, and the caller (`related_notes_with_options`) maps the resulting
-    // `MissingNoteEmbedding` to the sparse term-overlap path. The query is kept so the
-    // sparse-fallback contract has a single, well-tested entry point.
-    let source_embedding = connection
-        .query_row(
-            r#"
-            SELECT v.embedding
-            FROM note_embeddings_vec v
-            JOIN notes n ON n.id = v.rowid
-            WHERE n.path = ?1
-            "#,
-            params![note_path],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .map_err(|_| IndexError::MissingNoteEmbedding(note_path.to_string()))?;
+
+    // The source note's own chunk vectors are the "queries" for late interaction.
+    let source_vectors: Vec<Vec<u8>> = {
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT v.embedding
+                FROM chunk_embeddings_vec v
+                JOIN chunks c ON c.id = v.rowid
+                WHERE c.path = ?1
+                "#,
+            )
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        let rows = statement
+            .query_map(params![note_path], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| IndexError::Embedding(error.to_string()))?
+    };
+    if source_vectors.is_empty() {
+        return Err(IndexError::MissingNoteEmbedding(note_path.to_string()));
+    }
+
+    // Clamp k to the corpus so sqlite-vec never sees k > number of stored vectors.
+    let k = RELATED_NOTES_MAXSIM_K.min(index.chunks.len().max(1)) as i64;
 
     let mut statement = connection
         .prepare(
             r#"
             SELECT
-              n.path,
+              c.path,
               n.title,
-              matches.distance,
-              n.links_json
+              n.links_json,
+              matches.distance
             FROM (
               SELECT rowid, distance
-              FROM note_embeddings_vec
+              FROM chunk_embeddings_vec
               WHERE embedding MATCH ?1 AND k = ?2
             ) matches
-            JOIN notes n ON n.id = matches.rowid
-            WHERE n.path <> ?3
-            ORDER BY matches.distance
-            LIMIT ?4
+            JOIN chunks c ON c.id = matches.rowid
+            JOIN notes n ON n.path = c.path
+            WHERE c.path <> ?3
             "#,
         )
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
-    let rows = statement
-        .query_map(
-            params![
-                source_embedding,
-                (limit.max(1) + 1) as i64,
-                note_path,
-                limit.max(1) as i64
-            ],
-            |row| {
-                let links: Vec<String> =
-                    serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                Ok(RelatedNoteMatch {
-                    path: row.get::<_, String>(0)?,
-                    title: row.get::<_, String>(1)?,
-                    score: sql_distance_score(row.get::<_, f64>(2)?),
-                    shared_links: links
-                        .into_iter()
-                        .filter(|link| note_links.contains(link))
-                        .take(10)
-                        .collect(),
-                })
-            },
-        )
-        .map_err(|error| IndexError::Embedding(error.to_string()))?;
 
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|error| IndexError::Embedding(error.to_string()))
+    // note path -> (title, links_json, summed late-interaction score)
+    let mut scored: HashMap<String, (String, String, f64)> = HashMap::new();
+
+    for source_vector in &source_vectors {
+        // This source chunk's best (max) similarity to each candidate note.
+        let hits: Vec<(String, String, String, f64)> = statement
+            .query_map(params![source_vector, k, note_path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    sql_distance_score(row.get::<_, f64>(3)?),
+                ))
+            })
+            .map_err(|error| IndexError::Embedding(error.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+
+        let mut best_this_chunk: HashMap<String, (String, String, f64)> = HashMap::new();
+        for (path, title, links_json, sim) in hits {
+            best_this_chunk
+                .entry(path)
+                .and_modify(|entry| {
+                    if sim > entry.2 {
+                        entry.2 = sim;
+                    }
+                })
+                .or_insert((title, links_json, sim));
+        }
+        for (path, (title, links_json, sim)) in best_this_chunk {
+            scored
+                .entry(path)
+                .and_modify(|entry| entry.2 += sim)
+                .or_insert((title, links_json, sim));
+        }
+    }
+
+    let mut matches: Vec<RelatedNoteMatch> = scored
+        .into_iter()
+        .map(|(path, (title, links_json, score))| {
+            let links: Vec<String> = serde_json::from_str(&links_json).unwrap_or_default();
+            RelatedNoteMatch {
+                path,
+                title,
+                score,
+                shared_links: links
+                    .into_iter()
+                    .filter(|link| note_links.contains(link))
+                    .take(10)
+                    .collect(),
+            }
+        })
+        .collect();
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    matches.truncate(limit.max(1));
+    Ok(matches)
 }
 
 /// Build the exact string sent to the embedding backend for a query.
