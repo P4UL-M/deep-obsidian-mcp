@@ -380,6 +380,45 @@ fn write_fixture_vault(root: &Path) {
          \n\
          The administrative capital city is Lindholm, home to the parliament.\n",
     );
+
+    // Large MULTI-SECTION note for small-to-big retrieval (issue #6 item #4). Its
+    // `## Maintenance Protocol` section is intentionally oversized (well past the 512-token
+    // `SECTION_CHUNK_TARGET_TOKENS` budget) so the item-#1 chunker MUST split it into
+    // several sub-chunks at paragraph boundaries. Sentinels are placed so a hit on a LATER
+    // sub-chunk only "sees" the heading line and the first-paragraph sibling sentinel if
+    // small-to-big expansion pulled in the whole enclosing section:
+    //   * `siblingsentinel_qux42`     -> FIRST paragraph (the heading-bearing sub-chunk)
+    //   * `distinctiveterm_zylophone` -> a LATER paragraph (the query target term)
+    //   * `adjacentsentinel_grobnak7` -> a DIFFERENT section (must NOT be captured)
+    // All identifiers are unique nonsense disjoint from every existing gold query so the
+    // note cannot perturb the committed aggregate baseline. The filler uses long, distinct,
+    // non-stopword tokens because the chunker sizes sections by `tokenize`d token count
+    // (short words / stopwords are dropped), so raw word count would understate the budget.
+    // Each paragraph's filler alone exceeds the 512-token target so the packer places every
+    // paragraph in its OWN sub-chunk; the heading-bearing first paragraph and the
+    // distinctive-term later paragraph therefore land in DIFFERENT sub-chunks.
+    let protocol_filler = "calibration telemetry harmonic resonance throughput \
+        diagnostic subsystem actuator manifold turbine compressor lubrication \
+        bearing tolerance vibration alignment torque hydraulic pneumatic coolant "
+        .repeat(40);
+    let maintenance_note = format!(
+        "# Maintenance Handbook\n\
+         \n\
+         ## Maintenance Protocol\n\
+         The opening guidance establishes the siblingsentinel_qux42 baseline before any work begins.\n\
+         {protocol_filler}\n\
+         \n\
+         The recurring inspection cadence keeps the assembly within published tolerances.\n\
+         {protocol_filler}\n\
+         \n\
+         The escalation step records the distinctiveterm_zylophone signature for the audit trail.\n\
+         {protocol_filler}\n\
+         \n\
+         ## Unrelated Appendix\n\
+         This appendix is a separate section and carries the adjacentsentinel_grobnak7 marker.\n\
+         It must never appear in the returned text of a Maintenance Protocol chunk hit.\n",
+    );
+    write_fixture(root, "Manuals/Maintenance Handbook.md", &maintenance_note);
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +733,98 @@ fn retrieval_eval_meets_committed_baseline() {
         bm25_aggregate.mrr,
         semantic_aggregate.mrr
     );
+
+    fs::remove_dir_all(root).ok();
+}
+
+/// Small-to-big retrieval (issue #6 item #4): a chunk hit in a multi-section note must
+/// RETURN its enclosing heading SECTION (the "big" context), while matching/ranking stays
+/// at chunk granularity. Kept SEPARATE from the aggregate baseline test (and out of
+/// `gold_queries()`) so it cannot move the committed recall@k/MRR numbers.
+#[test]
+fn small_to_big_returns_enclosing_section_for_chunk_hit() {
+    let (root, index) = build_eval_index();
+    let path = "Manuals/Maintenance Handbook.md";
+    let limit = 5;
+
+    // The target section is oversized on purpose; confirm the item-#1 chunker actually
+    // split it into MULTIPLE sub-chunks, with the heading-bearing sentinel and the
+    // distinctive query term in DIFFERENT sub-chunks (otherwise the assertions are vacuous).
+    let head_chunk = index
+        .chunks
+        .iter()
+        .find(|chunk| chunk.path == path && chunk.text.contains("siblingsentinel_qux42"))
+        .expect("head sub-chunk");
+    let term_chunk = index
+        .chunks
+        .iter()
+        .find(|chunk| chunk.path == path && chunk.text.contains("distinctiveterm_zylophone"))
+        .expect("term sub-chunk");
+    assert_ne!(
+        head_chunk.chunk_index, term_chunk.chunk_index,
+        "fixture must split the Maintenance Protocol section so heading and term are in different sub-chunks"
+    );
+    assert!(
+        !term_chunk.text.contains("siblingsentinel_qux42")
+            && !term_chunk.text.contains("## Maintenance Protocol"),
+        "the matched (term) sub-chunk must not already contain the heading or sibling sentinel"
+    );
+
+    // Query the LATER paragraph's distinctive term. BM25 (exact-term) must rank the note #1
+    // (recall unaffected). The term lives in a non-first sub-chunk, so the matching chunk's
+    // OWN text contains neither the heading line nor the first-paragraph sibling sentinel.
+    let query = "distinctiveterm_zylophone signature audit";
+    for (label, results) in [
+        ("bm25", bm25_search_with_options(&index, query, options(limit)).expect("bm25")),
+        ("semantic", semantic_search_with_options(&index, query, options(limit)).expect("semantic")),
+        ("hybrid", hybrid_search_with_options(&index, query, options(limit)).expect("hybrid")),
+    ] {
+        assert_eq!(
+            rank_of(&results, path),
+            Some(1),
+            "{label}: distinctive-term query must rank the handbook #1 (recall unaffected)"
+        );
+        let hit = results
+            .iter()
+            .find(|item| item.path == path)
+            .expect("handbook hit");
+
+        // "big": the returned text is the FULL enclosing section, so it contains the
+        // heading line AND the first-paragraph sibling sentinel (which only appears if
+        // expansion pulled in the heading-bearing sub-chunk), not just the matching window.
+        assert!(
+            hit.text.contains("## Maintenance Protocol"),
+            "{label}: expanded text must include the section heading line\n--- got ---\n{}",
+            hit.text
+        );
+        assert!(
+            hit.text.contains("siblingsentinel_qux42"),
+            "{label}: expanded text must include the FIRST-paragraph sibling sentinel (full section, not just the matching sub-chunk)"
+        );
+        assert!(
+            hit.text.contains("distinctiveterm_zylophone"),
+            "{label}: expanded text must still contain the matched term"
+        );
+
+        // No over-capture: the ADJACENT section's sentinel must be absent (proves we
+        // returned the enclosing section, not the whole note nor an 80-line window).
+        assert!(
+            !hit.text.contains("adjacentsentinel_grobnak7"),
+            "{label}: expanded text must NOT bleed into the adjacent section"
+        );
+
+        // Non-vacuity: the returned text is strictly larger than the matched sub-chunk's
+        // own text, and spans the full section line range (heading sub-chunk .. term
+        // sub-chunk), proving expansion to the "big" section genuinely happened.
+        assert!(
+            hit.text.len() > term_chunk.text.len(),
+            "{label}: expanded text must exceed the matched sub-chunk's own text"
+        );
+        assert!(
+            hit.start_line <= head_chunk.start_line && hit.end_line >= term_chunk.end_line,
+            "{label}: returned range must cover both the heading and term sub-chunks"
+        );
+    }
 
     fs::remove_dir_all(root).ok();
 }

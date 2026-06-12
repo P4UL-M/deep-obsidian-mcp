@@ -757,6 +757,42 @@ fn section_chunks(
     Some(chunks)
 }
 
+/// "Small-to-big" expansion helper (issue #6 item #4, query-time only). Given a note's
+/// full `content` and a 1-based source `line` (typically a chunk hit's `start_line`),
+/// return the enclosing heading SECTION as `(start_line, end_line, text)` with 1-based
+/// inclusive line numbers and the raw source slice.
+///
+/// The section is reconstructed with the SAME fence-aware, FLAT tiling the chunker uses
+/// (`scan_heading_boundaries`, not the fence-blind / level-aware `extract_heading_sections`):
+/// the section is `[b_i.line, b_{i+1}.line - 1]` where `b_i` is the last heading boundary
+/// with `b_i.line <= line` and `b_{i+1}` is the next boundary of ANY level (or end of note).
+/// This mirrors the indexer's `section_chunks` tiling exactly, so the returned span is the
+/// coherent unit the oversize splitter may have cut into multiple sub-chunks — never the
+/// whole note. Returns `None` when `line` precedes the first heading (preamble /
+/// heading-less note), so callers fall back to the chunk's own text/range (no expansion).
+pub(crate) fn enclosing_heading_section(
+    content: &str,
+    line: usize,
+) -> Option<(usize, usize, String)> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let boundaries = scan_heading_boundaries(&lines);
+    // Last boundary at or before `line`; `None` when the line sits in the preamble.
+    let index = boundaries
+        .iter()
+        .rposition(|boundary| boundary.line <= line)?;
+    let start_line = boundaries[index].line;
+    let end_line = boundaries
+        .get(index + 1)
+        .map(|next| next.line - 1)
+        .unwrap_or(lines.len());
+    // Guard against a malformed/out-of-range line that lands past the section's tail.
+    if start_line > end_line || start_line > lines.len() {
+        return None;
+    }
+    let text = lines[start_line - 1..end_line].join("\n");
+    Some((start_line, end_line, text))
+}
+
 fn merge_small_tiles(tiles: Vec<SectionChunk>, min_tokens: usize) -> Vec<SectionChunk> {
     let mut merged: Vec<SectionChunk> = Vec::new();
     for tile in tiles {
@@ -4468,6 +4504,52 @@ mod tests {
     }
 
     #[test]
+    fn enclosing_heading_section_mirrors_flat_chunker_tiling() {
+        // Flat tiling: each section runs to the NEXT heading of ANY level. A line under
+        // `## Two` maps to the `## Two` section [3..end], NOT the enclosing `# One`.
+        let content = "# One\nalpha\n## Two\nbeta\ngamma\n## Three\ndelta\n";
+        // Line 4 (`beta`) is inside the `## Two` section: lines 3..5 (heading .. before `## Three`).
+        let (start, end, text) =
+            enclosing_heading_section(content, 4).expect("line 4 has an enclosing section");
+        assert_eq!((start, end), (3, 5));
+        assert_eq!(text, "## Two\nbeta\ngamma");
+        assert!(!text.contains("# One"), "flat tiling must not balloon to the parent");
+        assert!(!text.contains("## Three"), "must stop at the next heading");
+
+        // The H1 heading line itself maps to the `# One` section, which (flat) ends at `## Two`.
+        let (start, end, _) = enclosing_heading_section(content, 1).expect("heading line section");
+        assert_eq!((start, end), (1, 2));
+    }
+
+    #[test]
+    fn enclosing_heading_section_falls_back_for_preamble_and_heading_less() {
+        // Preamble: a line BEFORE the first heading has no enclosing section.
+        let with_preamble = "intro paragraph\nmore intro\n# Body\ntext\n";
+        assert!(enclosing_heading_section(with_preamble, 1).is_none());
+        assert!(enclosing_heading_section(with_preamble, 2).is_none());
+        // The heading and below still resolve.
+        assert!(enclosing_heading_section(with_preamble, 3).is_some());
+
+        // Heading-less note: no boundaries at all -> always None (caller keeps chunk text).
+        let heading_less = "just prose\nno headings here\n";
+        assert!(enclosing_heading_section(heading_less, 1).is_none());
+        assert!(enclosing_heading_section(heading_less, 2).is_none());
+    }
+
+    #[test]
+    fn enclosing_heading_section_is_fence_aware() {
+        // A `#`-prefixed line inside a fence must NOT be read as a heading (matches the
+        // fence-aware chunker, unlike fence-blind `extract_heading_sections`).
+        let content = "# Real\nbefore\n```bash\n# not a heading\n```\nafter\n";
+        let (start, end, text) = enclosing_heading_section(content, 4).expect("fenced line section");
+        assert_eq!(start, 1, "the only heading is the real H1 at line 1");
+        // `split('\n')` on a trailing-newline string yields a final empty element, so the
+        // section runs to lines.len() = 7 (matching the chunker's own line accounting).
+        assert_eq!(end, 7);
+        assert!(text.contains("# not a heading"), "fenced pseudo-heading stays in the section");
+    }
+
+    #[test]
     fn heading_and_block_extraction_follow_expected_rules() {
         let content =
             "# Title\n\n## Section One\nBody\n\ninline ^block-id\n\nParagraph\n^block-two\n";
@@ -5829,3 +5911,4 @@ mod tests {
         assert_eq!(runtime.query_instruction.as_deref(), Some("Custom task"));
     }
 }
+
