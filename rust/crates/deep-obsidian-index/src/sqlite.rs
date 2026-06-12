@@ -9,7 +9,15 @@ pub const INDEX_FILENAME: &str = "index.sqlite";
 // embedding text changed (heading-path prefix), so existing indexes must rebuild. The
 // load path maps a version mismatch to `Ok(None)` -> `get_search_index` rebuilds. No DDL
 // change accompanies this bump; a full rebuild regenerates the chunk rows.
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+//
+// Bumped 5 -> 6 for dropping the note-level DENSE vector: `note_embeddings_vec` is no
+// longer populated (chunk dense vectors and note BM25 `term_counts` stay). The note
+// vector was redundant given section chunks + small-to-big expansion, and was the
+// vector most damaged by the embedding char-clamp. Existing indexes still hold note
+// vectors, so they must rebuild to drop them; the version mismatch forces it. No DDL
+// change — the (now-empty) `note_embeddings_vec` table is still created so the load
+// gate and `has_vector_tables` (which expects 2 vector tables) stay unchanged.
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 static SQLITE_VEC_REGISTER: Once = Once::new();
 

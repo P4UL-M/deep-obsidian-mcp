@@ -2249,46 +2249,25 @@ fn embed_prepared_notes_per_note(
     })
 }
 
-/// Assign chunk vectors pulled from `chunk_iter` to a note's chunks, and derive the
-/// note vector as the normalized mean of its own chunk vectors. The whole-note text
-/// is never embedded (it can exceed the backend context window); mean-pooling reuses
-/// the chunk vectors at no extra HTTP cost. A note with no chunk vectors keeps
-/// `embedding = None`.
+/// Assign chunk vectors pulled from `chunk_iter` to a note's chunks. The note-level
+/// dense vector is INTENTIONALLY no longer derived (`note.embedding` stays `None`):
+/// with heading-aware section chunks plus small-to-big parent expansion the note-level
+/// dense vector is largely redundant, and it was the vector most damaged by the
+/// embedding char-clamp. Note-level lexical recall is preserved via BM25 (`term_counts`),
+/// and note→note semantic relations degrade to the sparse term-overlap path. The
+/// whole-note text is never embedded (it can exceed the backend context window).
 fn assign_note_chunk_embeddings(
     prepared: &mut PreparedNote,
     chunk_iter: &mut impl Iterator<Item = Vec<f64>>,
 ) -> Result<()> {
-    let mut accumulator: Option<Vec<f64>> = None;
-    let mut count = 0usize;
     for chunk in &mut prepared.chunks {
         let embedding = chunk_iter.next().ok_or_else(|| {
             IndexError::Embedding("embedding provider returned too few chunk vectors".to_string())
         })?;
-        match accumulator.as_mut() {
-            Some(acc) if acc.len() == embedding.len() => {
-                for (slot, value) in acc.iter_mut().zip(embedding.iter()) {
-                    *slot += *value;
-                }
-                count += 1;
-            }
-            Some(_) => {}
-            None => {
-                accumulator = Some(embedding.clone());
-                count = 1;
-            }
-        }
         chunk.embedding = Some(embedding);
     }
-    prepared.note.embedding = match accumulator {
-        Some(acc) if count > 0 => {
-            let mean = acc
-                .iter()
-                .map(|value| value / count as f64)
-                .collect::<Vec<_>>();
-            Some(normalize_dense_vector(&mean))
-        }
-        _ => None,
-    };
+    // Note-level dense vector deliberately dropped; see doc comment above.
+    prepared.note.embedding = None;
     Ok(())
 }
 
@@ -5072,9 +5051,7 @@ mod tests {
         persisted.embedding_model = Some("text-embedding-test".to_string());
         persisted.embedding_dimensions = Some(3);
         persisted.embedding_base_url = Some("http://persisted.example".to_string());
-        for note in &mut persisted.notes {
-            note.embedding = Some(vec![1.0, 0.0, 0.0]);
-        }
+        // Note-level dense vectors are dropped (v6): only chunk vectors are persisted.
         for chunk in &mut persisted.chunks {
             chunk.embedding = Some(vec![1.0, 0.0, 0.0]);
         }
@@ -5082,11 +5059,14 @@ mod tests {
         write_search_index_to_connection(&mut connection, &persisted).expect("persist");
         let home_id = note_id(&root, "Home.md").expect("home id");
         let home_chunks = chunk_ids(&root, "Home.md");
-        // Note vectors are mean-pooled from chunk vectors, so incremental refresh
-        // issues a single embedding request (chunks of the changed note only).
+        // Incremental refresh embeds only the changed note's chunks (a single request);
+        // no note-level vector is produced.
         let (base_url, seen_inputs) = start_embedding_server(1);
 
-        write_fixture(&root, "New.md", "# New\n\nFresh embedding target.\n");
+        // New.md shares the term "anchor" with Home.md so the sparse related-notes
+        // path (no note dense vector under v6) can still link them. The chunk text
+        // never contains "Home", preserving the embedding-request assertions below.
+        write_fixture(&root, "New.md", "# New\n\nFresh anchor target.\n");
         let runtime_config = EmbeddingConfig {
             provider: Some(EmbeddingProvider::OpenAiCompatible),
             model: Some("text-embedding-test".to_string()),
@@ -5108,7 +5088,10 @@ mod tests {
         assert_eq!(updated.note_count, 2);
         assert_eq!(note_id(&root, "Home.md"), Some(home_id));
         assert_eq!(chunk_ids(&root, "Home.md"), home_chunks);
-        assert_eq!(vector_counts(&root), (2, 2));
+        // No note vectors are stored (v6); both notes' chunks carry vectors.
+        assert_eq!(vector_counts(&root), (0, 2));
+        // related_notes degrades to the sparse term-overlap path (no note dense vector)
+        // and must still surface the new note without erroring.
         let related = crate::search::related_notes(&updated, "Home.md").expect("related notes");
         assert!(related.iter().any(|item| item.path == "New.md"));
         let seen = seen_inputs.lock().expect("inputs lock");
@@ -5149,9 +5132,10 @@ mod tests {
     }
 
     #[test]
-    fn note_embedding_is_mean_pool_of_chunk_vectors() {
-        // Two chunks -> one embedding request; the note vector must equal the
-        // normalized mean of its chunk vectors, and the full note is never sent.
+    fn note_dense_vector_is_dropped_while_chunk_vectors_remain() {
+        // As of schema v6 the note-level dense vector is no longer computed: chunk
+        // vectors are still assigned (one embedding request for the two chunks), the
+        // note keeps `embedding = None`, and the full note body is never embedded.
         let (base_url, seen_inputs) = start_embedding_server(1);
         let config = EmbeddingConfig {
             provider: Some(EmbeddingProvider::OpenAiCompatible),
@@ -5206,27 +5190,15 @@ mod tests {
             .iter()
             .map(|chunk| chunk.embedding.clone().expect("chunk embedding"))
             .collect();
-        assert_eq!(chunk_vecs.len(), 2);
-        let dims = chunk_vecs[0].len();
-        let mut mean = vec![0.0_f64; dims];
-        for vector in &chunk_vecs {
-            for (slot, value) in mean.iter_mut().zip(vector.iter()) {
-                *slot += value / chunk_vecs.len() as f64;
-            }
-        }
-        let expected = normalize_dense_vector(&mean);
-        let note_embedding = prepared[0]
-            .note
-            .embedding
-            .clone()
-            .expect("note embedding present");
-        assert_eq!(note_embedding.len(), dims);
-        for (actual, want) in note_embedding.iter().zip(expected.iter()) {
-            assert!(
-                (actual - want).abs() < 1e-9,
-                "note vector must be the normalized mean of its chunk vectors"
-            );
-        }
+        assert_eq!(chunk_vecs.len(), 2, "both chunk vectors must be assigned");
+
+        // The note-level dense vector is intentionally dropped (v6); note-level recall
+        // is preserved via BM25 and note->note relations degrade to sparse.
+        assert!(
+            prepared[0].note.embedding.is_none(),
+            "note dense vector must no longer be computed"
+        );
+
         // Exactly one request, and the full note body was never embedded.
         let seen = seen_inputs.lock().expect("inputs lock");
         assert_eq!(seen.len(), 1);
@@ -5403,12 +5375,13 @@ mod tests {
         let outcome = embed_prepared_notes(&mut prepared, &config, None)
             .expect("partial failure must not abort the build");
 
-        // Good note: dense vector on note and chunk.
-        assert!(
-            prepared[0].note.embedding.is_some(),
-            "good note must keep its dense vector"
-        );
+        // Good note: chunk dense vector present. The note-level dense vector is
+        // intentionally never computed (v6), so it stays None even on success.
         assert!(prepared[0].chunks[0].embedding.is_some());
+        assert!(
+            prepared[0].note.embedding.is_none(),
+            "note dense vector is dropped (v6) even for a successfully embedded note"
+        );
 
         // Failing note: no dense vector anywhere, reported in failed_paths.
         assert!(
@@ -5455,19 +5428,20 @@ mod tests {
         assert_eq!(index.semantic_backend, SemanticBackend::Embedding);
         assert_eq!(index.embedding_dimensions, Some(3));
 
-        // Good note keeps a dense vector; the failing note has none.
+        // Note-level dense vectors are dropped (v6); neither note carries one.
         assert!(
-            index.note("Good.md").and_then(|n| n.embedding.as_ref()).is_some(),
-            "good note must be embedded"
+            index.note("Good.md").and_then(|n| n.embedding.as_ref()).is_none(),
+            "note dense vector is no longer computed (v6)"
         );
         assert!(
             index.note("Bad.md").and_then(|n| n.embedding.as_ref()).is_none(),
             "failing note must fall back to BM25/sparse (no dense vector)"
         );
 
-        // Persisted index is loadable and holds exactly the embedded vectors.
+        // Persisted index is loadable. No note vectors are written (v6); only the good
+        // note's chunk vector is persisted (the failing note's chunk has none).
         let (note_vectors, chunk_vectors) = vector_counts(&root);
-        assert_eq!(note_vectors, 1, "only the good note's vector is persisted");
+        assert_eq!(note_vectors, 0, "note dense vectors are no longer persisted (v6)");
         assert_eq!(chunk_vectors, 1, "only the good note's chunk vector is persisted");
         let loaded = load_index(&root, None)
             .expect("load partial index")
@@ -5575,7 +5549,12 @@ mod tests {
         assert_eq!(first.semantic_backend, SemanticBackend::Embedding);
         // Persisted state is the source of truth: vectors live in the sqlite-vec
         // tables, not the in-memory note/chunk structs (load leaves those `None`).
-        assert_eq!(vector_counts(&root), (1, 1), "initial index embeds the only note");
+        // Note dense vectors are dropped (v6); only the chunk vector is stored.
+        assert_eq!(
+            vector_counts(&root),
+            (0, 1),
+            "initial index embeds the only note's chunk (no note dense vector)"
+        );
 
         // Add a note whose chunk text triggers the backend 500.
         write_fixture(&root, "Bad.md", &format!("# Bad\n\n{SENTINEL} anchor.\n"));
@@ -5583,11 +5562,12 @@ mod tests {
             .expect("incremental reindex must not abort on a failing note");
         assert!(rebuilt_second);
         assert_eq!(updated.note_count, 2);
-        // Only the original note's vector persists; the failing note has none.
+        // Only the original note's chunk vector persists; the failing note has none,
+        // and note dense vectors are dropped (v6).
         assert_eq!(
             vector_counts(&root),
-            (1, 1),
-            "failing new note adds no vector; original note's vector is preserved"
+            (0, 1),
+            "failing new note adds no vector; original note's chunk vector is preserved"
         );
 
         // Reloads cleanly with the partial vector set, and the failing note is still
