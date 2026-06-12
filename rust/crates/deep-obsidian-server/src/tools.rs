@@ -4009,6 +4009,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn small_to_big_expanded_section_is_subject_to_output_cap() {
+        // A chunk hit's returned text is expanded to its enclosing section (issue #6 item #4).
+        // That grown text must still flow through the per-result snippet cap (item #6): a
+        // section far larger than the snippet cap is truncated, not emitted whole.
+        let vault_path = temp_dir("small-to-big-cap");
+        // One oversized section so the chunker splits it; the distinctive term lives in a
+        // LATER paragraph (its own sub-chunk), so the hit expands to the whole big section.
+        let filler = "calibration telemetry harmonic resonance throughput diagnostic \
+            subsystem actuator manifold turbine compressor lubrication bearing tolerance "
+            .repeat(40);
+        let content = format!(
+            "# Handbook\n\n## Protocol\nThe opening paragraph.\n{filler}\n\n\
+             The later paragraph carries the term gizmotron.\n{filler}\n"
+        );
+        fs::write(vault_path.join("Handbook.md"), content).expect("write note");
+        let state = test_state(vault_path).await;
+
+        // Default snippet cap (no maxTextChars override) = DEFAULT_SEARCH_SNIPPET_CHARS.
+        let result = call_tool(&state, "bm25_search", &json!({"query": "gizmotron", "limit": 5}))
+            .await
+            .expect("bm25_search should succeed");
+        let matches = result.structured_content["matches"]
+            .as_array()
+            .expect("matches array");
+        // Locate by path (the matched term itself may sit past the truncation point).
+        let hit = matches
+            .iter()
+            .find(|item| {
+                item.get("path").and_then(serde_json::Value::as_str) == Some("Handbook.md")
+            })
+            .expect("handbook hit");
+        let text = hit["text"].as_str().expect("text field");
+        // The expanded Protocol section is ~12KB; the emitted snippet is capped well below it.
+        assert!(
+            text.chars().count() <= super::DEFAULT_SEARCH_SNIPPET_CHARS,
+            "expanded section snippet must be capped, got {} chars",
+            text.chars().count()
+        );
+        // Truncation is signaled on the match (the cap actually fired on the grown text).
+        assert_eq!(hit.get("textTruncated").and_then(serde_json::Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
     async fn bm25_search_small_response_is_not_truncated() {
         let vault_path = temp_dir("bm25-small");
         fs::write(

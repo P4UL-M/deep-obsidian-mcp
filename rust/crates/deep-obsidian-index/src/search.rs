@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::graph::resolve_wiki_link_target;
 use crate::index::{
     artifact_embedding_runtime_config, average, bm25_score, cosine_similarity, count_terms,
-    embedding_runtime_config, matches_pattern, normalize_dense_vector,
+    embedding_runtime_config, enclosing_heading_section, matches_pattern, normalize_dense_vector,
     open_index_connection_for_index, query_vector_blob, vector_norm, IndexError,
     Result, SearchIndex, SearchNote, SemanticBackend,
 };
@@ -424,6 +424,49 @@ pub fn find_files_with_options(
     Ok(files)
 }
 
+/// "Small-to-big" retrieval (issue #6 item #4, query-time / presentation only). Matching
+/// and ranking happen at CHUNK granularity; this grows the RETURNED `text` (and line range)
+/// of each chunk hit to its enclosing heading SECTION so the caller sees a coherent unit
+/// instead of a sub-chunk window. Scores are untouched — expansion never re-ranks.
+///
+/// For each match, the enclosing section is reconstructed from the parent note's in-memory
+/// `content` using `enclosing_heading_section` (the same fence-aware, flat tiling the
+/// chunker uses). A chunk in the preamble / a heading-less note has no enclosing section and
+/// keeps its own text/range (no expansion). Per-note section lookups are memoized so a note
+/// is parsed at most once per call even when several of its sub-chunks survive into the
+/// candidate pool.
+///
+/// Call this AFTER sort + truncate so it runs only over returned results and cannot perturb
+/// ordering. The grown `text` still flows through the server's per-result snippet cap and
+/// aggregate budget (issue #6 item #6), so large sections truncate-with-continuation as usual.
+fn expand_chunk_matches_to_sections(index: &SearchIndex, matches: &mut [SearchMatch]) {
+    // Cache the resolved section per (path, chunk start_line). Sub-chunks have distinct
+    // start_lines, so this only collapses the rare case where the same chunk appears twice;
+    // the dominant cost is `enclosing_heading_section`, which re-scans the note's content
+    // each call. The candidate pool is bounded (<= the search limit at these call sites), so
+    // a re-scan per match is acceptable; a note is small relative to that bound.
+    let mut section_cache: HashMap<(String, usize), Option<(usize, usize, String)>> =
+        HashMap::new();
+    for match_item in matches.iter_mut() {
+        let key = (match_item.path.clone(), match_item.start_line);
+        let section = section_cache
+            .entry(key)
+            .or_insert_with(|| {
+                index
+                    .note(&match_item.path)
+                    .and_then(|note| {
+                        enclosing_heading_section(&note.content, match_item.start_line)
+                    })
+            })
+            .clone();
+        if let Some((start_line, end_line, text)) = section {
+            match_item.start_line = start_line;
+            match_item.end_line = end_line;
+            match_item.text = text;
+        }
+    }
+}
+
 pub fn bm25_search(index: &SearchIndex, query: &str) -> Result<Vec<SearchMatch>> {
     bm25_search_with_options(index, query, RankingOptions::default())
 }
@@ -438,10 +481,16 @@ pub fn bm25_search_with_options(
     if query_terms.is_empty() {
         return Ok(Vec::new());
     }
-    if let Ok(Some(matches)) = bm25_search_with_sql_candidates(index, &query_terms, &options) {
-        return Ok(matches);
-    }
-    bm25_search_in_memory(index, &query_terms, options)
+    let mut matches =
+        if let Ok(Some(matches)) = bm25_search_with_sql_candidates(index, &query_terms, &options) {
+            matches
+        } else {
+            bm25_search_in_memory(index, &query_terms, options)?
+        };
+    // Small-to-big: grow each chunk hit's returned text to its enclosing section. Runs after
+    // the inner helpers sorted + truncated, so ranking/order is untouched (presentation only).
+    expand_chunk_matches_to_sections(index, &mut matches);
+    Ok(matches)
 }
 
 fn bm25_search_in_memory(
@@ -649,6 +698,9 @@ pub fn semantic_search_with_options(
             .then_with(|| left.chunk_index.cmp(&right.chunk_index))
     });
     matches.truncate(options.limit.max(1));
+    // Small-to-big: grow each chunk hit's returned text to its enclosing section. Runs after
+    // sort + truncate, so ranking/order is untouched (presentation only).
+    expand_chunk_matches_to_sections(index, &mut matches);
     Ok(matches)
 }
 
@@ -986,6 +1038,95 @@ mod tests {
         let hybrid = hybrid_search(&index, "install runtime").expect("hybrid");
         assert!(!hybrid.is_empty());
         assert!(hybrid[0].score > 0.0);
+    }
+
+    /// Build an index over a single multi-section note whose `## Beta` section is oversized
+    /// (past the 512-token target) so the chunker splits it; used to exercise small-to-big.
+    fn small_to_big_index() -> SearchIndex {
+        let root = unique_temp_dir("small-to-big");
+        fs::create_dir_all(&root).expect("temp dir");
+        // Each paragraph's filler alone exceeds the 512-token target, so the packer puts
+        // every paragraph in its OWN sub-chunk: betafirst (with the heading) and betalater
+        // (with the query term) land in DIFFERENT sub-chunks.
+        let filler = "calibration telemetry harmonic resonance throughput diagnostic \
+            subsystem actuator manifold turbine compressor lubrication bearing tolerance "
+            .repeat(45);
+        let content = format!(
+            "# Handbook\n\n## Alpha\nThe alpha overview mentions widgetonium upfront.\n\n\
+             ## Beta\nThe betafirst paragraph carries marker_betahead.\n{filler}\n\n\
+             The betalater paragraph carries marker_betatail and the term gizmotron.\n{filler}\n\n\
+             ## Gamma\nThe gamma section carries marker_gamma and stays separate.\n"
+        );
+        write_fixture(&root, "Handbook.md", &content);
+        let index = crate::index::build_index(&root, None, None).expect("build index");
+        fs::remove_dir_all(root).ok();
+        index
+    }
+
+    #[test]
+    fn chunk_hit_expands_to_enclosing_section() {
+        let index = small_to_big_index();
+        // Confirm the Beta section split into >=2 sub-chunks (otherwise the test is vacuous).
+        let beta_subchunks = index
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.text.contains("marker_betahead") || chunk.text.contains("gizmotron"))
+            .count();
+        assert!(beta_subchunks >= 2, "Beta must split: {beta_subchunks}");
+
+        // The query term lives in the LATER Beta sub-chunk; the returned text must grow to
+        // the full Beta section: heading line + first-paragraph sibling marker present,
+        // adjacent Alpha/Gamma markers absent.
+        // The matched chunk (gizmotron's sub-chunk) on its OWN contains neither the heading
+        // nor the first-paragraph sibling marker; only expansion to the full section adds them.
+        let matched_chunk = index
+            .chunks
+            .iter()
+            .find(|chunk| chunk.text.contains("gizmotron"))
+            .expect("gizmotron chunk");
+        assert!(!matched_chunk.text.contains("## Beta"));
+        assert!(!matched_chunk.text.contains("marker_betahead"));
+
+        let results = bm25_search(&index, "gizmotron marker_betatail").expect("bm25");
+        let hit = results
+            .iter()
+            .find(|item| item.text.contains("gizmotron"))
+            .expect("beta hit");
+        assert!(hit.text.contains("## Beta"), "heading line included");
+        assert!(hit.text.contains("marker_betahead"), "sibling sub-chunk included");
+        assert!(!hit.text.contains("marker_gamma"), "adjacent section excluded");
+        assert!(!hit.text.contains("## Alpha"), "previous section excluded");
+        // Expansion grew the returned text beyond the matched sub-chunk's own text.
+        assert!(hit.text.len() > matched_chunk.text.len(), "returned text expanded");
+    }
+
+    #[test]
+    fn preamble_chunk_does_not_expand() {
+        // A heading-less note falls back to chunk_lines; its chunk starts in the preamble
+        // (no enclosing heading section), so the returned text equals the chunk's own text.
+        let root = unique_temp_dir("preamble");
+        fs::create_dir_all(&root).expect("temp dir");
+        write_fixture(
+            &root,
+            "Plain.md",
+            "Just prose with the distinctive token snorklewump and no headings at all here.\n",
+        );
+        let index = crate::index::build_index(&root, None, None).expect("build index");
+        fs::remove_dir_all(root).ok();
+
+        let results = bm25_search(&index, "snorklewump").expect("bm25");
+        let hit = results
+            .iter()
+            .find(|item| item.path == "Plain.md")
+            .expect("plain hit");
+        let chunk = index
+            .chunks
+            .iter()
+            .find(|chunk| chunk.path == "Plain.md")
+            .expect("plain chunk");
+        // No expansion: text and range are exactly the chunk's own.
+        assert_eq!(hit.text, chunk.text);
+        assert_eq!((hit.start_line, hit.end_line), (chunk.start_line, chunk.end_line));
     }
 
     /// Build a minimal SearchMatch keyed only by path (chunk_index 0); the score field
