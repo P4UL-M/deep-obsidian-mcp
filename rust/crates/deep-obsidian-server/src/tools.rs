@@ -1749,6 +1749,10 @@ async fn live_grep_matches(
             args.push("--glob".to_string());
             args.push("*.md".to_string());
         }
+        // End-of-options separator: everything after `--` is treated by ripgrep
+        // strictly as positionals, so a user `query` (or path) beginning with `-`
+        // cannot be parsed as a flag (e.g. `--pre=<interpreter>` argv injection).
+        args.push("--".to_string());
         args.push(query);
         args.push(vault_path.to_string_lossy().into_owned());
 
@@ -3219,6 +3223,35 @@ mod tests {
         assert_eq!(matches[0].line_number, 3);
         assert_eq!(matches[0].context_before[0].line_text, "before");
         assert_eq!(matches[0].context_after[0].line_text, "after");
+    }
+
+    #[tokio::test]
+    async fn grep_search_treats_flaglike_query_as_literal_pattern() {
+        // A query beginning with `-`/`--` must be searched as a literal pattern,
+        // not parsed by ripgrep as a flag (argv injection guard via `--`).
+        let vault_path = temp_dir("grep-flaglike");
+        fs::write(
+            vault_path.join("Flags.md"),
+            "ordinary line\ncontains --pre=/bin/echo here\ntrailing line\n",
+        )
+        .expect("write note");
+
+        let matches = live_grep_matches(
+            super::resolve_ripgrep(),
+            vault_path,
+            "--pre=/bin/echo".to_string(),
+            false,
+            true,
+            None,
+            0,
+            10,
+        )
+        .await
+        .expect("flag-like query must be a literal search, not an rg flag error");
+
+        assert_eq!(matches.len(), 1, "literal flag-like string should match once");
+        assert_eq!(matches[0].line_number, 2);
+        assert!(matches[0].line_text.contains("--pre=/bin/echo"));
     }
 
     #[tokio::test]
