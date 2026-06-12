@@ -83,7 +83,35 @@ pub fn ensure_inside_vault(vault_path: &Path, relative_path: &str) -> Result<Pat
         return Err(VaultError::PathEscapesVault(relative_path.to_string()));
     }
 
-    Ok(vault_path.join(relative))
+    let candidate = vault_path.join(relative);
+
+    // Canonicalization guard: the lexical checks above cannot catch a path that
+    // traverses a pre-existing in-vault symlink pointing outside the vault. We
+    // canonicalize the deepest EXISTING ancestor of the candidate (itself when it
+    // exists; otherwise the nearest existing parent, so not-yet-created write
+    // targets still work) and require it to stay under the canonical vault root.
+    // Both sides are canonicalized so a vault root that is itself under a symlink
+    // is not a false positive. If the vault root does not yet exist on disk there
+    // is no symlink to traverse and the lexical guard suffices.
+    if let Ok(canonical_vault) = fs::canonicalize(vault_path) {
+        let mut existing = candidate.as_path();
+        let canonical_ancestor = loop {
+            match fs::canonicalize(existing) {
+                Ok(canonical) => break Some(canonical),
+                Err(_) => match existing.parent() {
+                    Some(parent) => existing = parent,
+                    None => break None,
+                },
+            }
+        };
+        if let Some(canonical_ancestor) = canonical_ancestor {
+            if !canonical_ancestor.starts_with(&canonical_vault) {
+                return Err(VaultError::PathEscapesVault(relative_path.to_string()));
+            }
+        }
+    }
+
+    Ok(candidate)
 }
 
 pub fn read_text(vault_path: &Path, relative_path: &str) -> Result<String, VaultError> {
@@ -213,4 +241,73 @@ pub fn read_file(
         line_count: selected.split('\n').count(),
         text: selected,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), nanos))
+    }
+
+    #[test]
+    fn ensure_inside_vault_allows_existing_and_new_in_vault_paths() {
+        let vault = temp_dir("svault-inside-ok");
+        fs::create_dir_all(vault.join("Notes")).unwrap();
+        fs::write(vault.join("Notes/Existing.md"), "hi").unwrap();
+
+        let existing = ensure_inside_vault(&vault, "Notes/Existing.md").unwrap();
+        assert_eq!(existing, vault.join("Notes/Existing.md"));
+        let new = ensure_inside_vault(&vault, "Notes/New.md").unwrap();
+        assert_eq!(new, vault.join("Notes/New.md"));
+
+        let _ = fs::remove_dir_all(&vault);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_inside_vault_rejects_symlink_traversal_for_reads_and_writes() {
+        let vault = temp_dir("svault-symlink-escape");
+        let outside = temp_dir("soutside-symlink-target");
+        fs::create_dir_all(&vault).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, vault.join("escape")).unwrap();
+        fs::write(outside.join("secret.md"), "secret").unwrap();
+
+        let read_err = ensure_inside_vault(&vault, "escape/secret.md")
+            .expect_err("symlinked read path should be rejected");
+        assert!(matches!(read_err, VaultError::PathEscapesVault(_)));
+        let write_err = ensure_inside_vault(&vault, "escape/new.md")
+            .expect_err("symlinked write destination should be rejected");
+        assert!(matches!(write_err, VaultError::PathEscapesVault(_)));
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_inside_vault_accepts_paths_when_vault_root_is_under_a_symlink() {
+        let real_root = temp_dir("svault-real-root");
+        fs::create_dir_all(real_root.join("Notes")).unwrap();
+        fs::write(real_root.join("Notes/Existing.md"), "hi").unwrap();
+        let link_root = temp_dir("svault-link-root");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        let existing = ensure_inside_vault(&link_root, "Notes/Existing.md")
+            .expect("legitimate path under symlinked vault root should resolve");
+        assert_eq!(existing, link_root.join("Notes/Existing.md"));
+        let new = ensure_inside_vault(&link_root, "Notes/New.md")
+            .expect("new path under symlinked vault root should resolve");
+        assert_eq!(new, link_root.join("Notes/New.md"));
+
+        let _ = fs::remove_file(&link_root);
+        let _ = fs::remove_dir_all(&real_root);
+    }
 }

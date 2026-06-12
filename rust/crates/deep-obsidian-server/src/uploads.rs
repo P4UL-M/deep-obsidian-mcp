@@ -75,7 +75,10 @@ impl UploadStore {
     pub fn mint(&self, pending: PendingUpload) -> Result<String, String> {
         let token = random_token();
         let now = SystemTime::now();
-        let mut map = self.inner.lock().expect("upload store mutex poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::purge_expired(&mut map, now);
         if map.len() >= MAX_OUTSTANDING_TOKENS {
             return Err("too many outstanding upload tokens; retry later".to_string());
@@ -91,7 +94,10 @@ impl UploadStore {
     /// NOT removed yet — only a successful commit consumes it.
     pub fn claim(&self, token: &str) -> Result<PendingUpload, ClaimError> {
         let now = SystemTime::now();
-        let mut map = self.inner.lock().expect("upload store mutex poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Lazily purge OTHER expired entries. The requested token is handled
         // explicitly so an expired-but-present token reports `Expired` (410)
         // rather than `Unknown` (403). Orphan temp files (from a crashed
@@ -113,14 +119,20 @@ impl UploadStore {
 
     /// Consume a token after a successful commit (remove it permanently).
     pub fn consume(&self, token: &str) {
-        let mut map = self.inner.lock().expect("upload store mutex poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         map.remove(token);
     }
 
     /// Release an in-flight claim without consuming the token, so a transient
     /// failure can be retried until the TTL expires.
     pub fn release(&self, token: &str) {
-        let mut map = self.inner.lock().expect("upload store mutex poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(pending) = map.get_mut(token) {
             pending.in_flight = false;
         }
@@ -128,7 +140,10 @@ impl UploadStore {
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("upload store mutex poisoned").len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 }
 
@@ -434,6 +449,25 @@ mod tests {
         store.claim(&token).unwrap();
         store.release(&token);
         assert!(store.claim(&token).is_ok());
+    }
+
+    #[test]
+    fn store_recovers_after_mutex_poison() {
+        let store = UploadStore::new();
+        let token = store.mint(pending("a/b.bin", TOKEN_TTL)).unwrap();
+        // Poison the mutex by panicking while holding the lock.
+        let poison_target = store.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison_target.inner.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        // Despite poisoning, all lock sites recover the inner data and keep working.
+        assert_eq!(store.len(), 1);
+        assert!(store.claim(&token).is_ok());
+        store.release(&token);
+        store.consume(&token);
+        assert_eq!(store.claim(&token), Err(ClaimError::Unknown));
+        assert!(store.mint(pending("c/d.bin", TOKEN_TTL)).is_ok());
     }
 
     #[test]

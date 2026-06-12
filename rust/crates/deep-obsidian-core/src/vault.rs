@@ -211,12 +211,41 @@ pub fn ensure_inside_vault(vault_path: &Path, relative_path: &str) -> Result<Pat
     let vault_path = normalize_path(vault_path);
     let normalized = normalize_vault_relative_path(relative_path)?;
     let candidate = normalize_path(&vault_path.join(normalized));
-    match candidate.strip_prefix(&vault_path) {
-        Ok(_) => Ok(candidate),
-        Err(_) => Err(VaultError::InvalidVaultRelativePath(
+    // Lexical guard: the normalized candidate must stay under the (lexical) root.
+    if candidate.strip_prefix(&vault_path).is_err() {
+        return Err(VaultError::InvalidVaultRelativePath(
             relative_path.to_string(),
-        )),
+        ));
     }
+
+    // Canonicalization guard: defeat a lexically-inside path that traverses a
+    // pre-existing in-vault symlink to land outside the vault. We canonicalize
+    // the deepest EXISTING ancestor of the candidate (the candidate itself when
+    // it exists; otherwise the nearest existing parent, since write targets need
+    // not exist yet) and require it to stay under the canonical vault root.
+    if let Ok(canonical_vault) = fs::canonicalize(&vault_path) {
+        // If the vault root itself does not yet exist, there is nothing on disk
+        // (and thus no symlink) to traverse; the lexical guard above suffices.
+        let mut existing = candidate.as_path();
+        let canonical_ancestor = loop {
+            match fs::canonicalize(existing) {
+                Ok(canonical) => break Some(canonical),
+                Err(_) => match existing.parent() {
+                    Some(parent) => existing = parent,
+                    None => break None,
+                },
+            }
+        };
+        if let Some(canonical_ancestor) = canonical_ancestor {
+            if !canonical_ancestor.starts_with(&canonical_vault) {
+                return Err(VaultError::InvalidVaultRelativePath(
+                    relative_path.to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(candidate)
 }
 
 pub fn read_text_file(
@@ -499,6 +528,73 @@ mod tests {
         let vault = temp_dir("vault");
         let error = ensure_inside_vault(&vault, "../escape.md").expect_err("escape should fail");
         assert!(matches!(error, VaultError::InvalidVaultRelativePath(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_inside_vault_rejects_symlink_traversal_for_reads_and_writes() {
+        let vault = temp_dir("vault-symlink-escape");
+        let outside = temp_dir("outside-symlink-target");
+        fs::create_dir_all(&vault).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // A pre-existing in-vault symlink pointing outside the vault.
+        std::os::unix::fs::symlink(&outside, vault.join("escape")).unwrap();
+        // An existing file beyond the symlink (read target).
+        fs::write(outside.join("secret.md"), "secret").unwrap();
+
+        // Read path that resolves through the symlink must be rejected.
+        let read_err = ensure_inside_vault(&vault, "escape/secret.md")
+            .expect_err("symlinked read path should be rejected");
+        assert!(matches!(read_err, VaultError::InvalidVaultRelativePath(_)));
+
+        // Not-yet-existing write destination beyond the symlink must be rejected.
+        let write_err = ensure_inside_vault(&vault, "escape/new.md")
+            .expect_err("symlinked write destination should be rejected");
+        assert!(matches!(write_err, VaultError::InvalidVaultRelativePath(_)));
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn ensure_inside_vault_allows_existing_and_new_in_vault_paths() {
+        let vault = temp_dir("vault-inside-ok");
+        fs::create_dir_all(vault.join("Notes")).unwrap();
+        fs::write(vault.join("Notes/Existing.md"), "hi").unwrap();
+
+        // Existing in-vault file resolves.
+        let existing = ensure_inside_vault(&vault, "Notes/Existing.md").unwrap();
+        assert_eq!(existing, vault.join("Notes/Existing.md"));
+        // Not-yet-existing in-vault write target (existing parent dir) resolves.
+        let new = ensure_inside_vault(&vault, "Notes/New.md").unwrap();
+        assert_eq!(new, vault.join("Notes/New.md"));
+        // Top-level new file (deepest existing ancestor == vault root) resolves.
+        let top = ensure_inside_vault(&vault, "Top.md").unwrap();
+        assert_eq!(top, vault.join("Top.md"));
+
+        let _ = fs::remove_dir_all(&vault);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_inside_vault_accepts_paths_when_vault_root_is_under_a_symlink() {
+        // A vault whose root is reached through a symlink must not be a false
+        // positive: both sides canonicalize through the same link.
+        let real_root = temp_dir("vault-real-root");
+        fs::create_dir_all(real_root.join("Notes")).unwrap();
+        fs::write(real_root.join("Notes/Existing.md"), "hi").unwrap();
+        let link_root = temp_dir("vault-link-root");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        let existing = ensure_inside_vault(&link_root, "Notes/Existing.md")
+            .expect("legitimate path under symlinked vault root should resolve");
+        assert_eq!(existing, link_root.join("Notes/Existing.md"));
+        let new = ensure_inside_vault(&link_root, "Notes/New.md")
+            .expect("new path under symlinked vault root should resolve");
+        assert_eq!(new, link_root.join("Notes/New.md"));
+
+        let _ = fs::remove_file(&link_root);
+        let _ = fs::remove_dir_all(&real_root);
     }
 
     #[test]
