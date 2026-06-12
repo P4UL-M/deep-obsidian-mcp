@@ -17,6 +17,14 @@ const HYBRID_SEARCH_CANDIDATE_CAP: usize = 512;
 /// (2009); larger `k` flattens the contribution of top ranks, smaller `k` sharpens it.
 const RRF_K: f64 = 60.0;
 
+/// Graph-aware re-rank (issue #6 item #5). After RRF fusion, candidate chunks whose note
+/// is one wikilink hop from one of the top-ranked notes get a small score bonus, lightly
+/// promoting vault-linked context. Conservative by design: it breaks ties and lifts
+/// near-misses without overriding strong direct matches. The bonus is ~half a single
+/// list's rank-1 RRF contribution. A bonus of 0 reproduces pure-RRF order exactly.
+const GRAPH_RERANK_TOP_N: usize = 5;
+const GRAPH_PROXIMITY_BONUS: f64 = 0.5 / RRF_K;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilePathMatch {
     pub path: String,
@@ -126,6 +134,39 @@ impl Default for RelatedNoteOptions {
 /// contributes 0 to its fused score (the issue's requirement).
 fn rrf_contribution(rank_one_based: usize, weight: f64, k: f64) -> f64 {
     weight / (k + rank_one_based as f64)
+}
+
+/// Graph-aware re-rank applied in place over the fused hybrid candidates. `matches` must
+/// already be sorted by score (descending) so the top `top_n` distinct notes can be read
+/// off the front as anchors. For each candidate whose note is one wikilink hop (outgoing
+/// or incoming) from an anchor, add `bonus` to its score. Builds the link adjacency once
+/// (not per candidate). No-op when `bonus <= 0` (pure RRF is then recoverable), when
+/// `top_n == 0`, or when no candidate is link-adjacent. The caller re-sorts afterward.
+fn apply_graph_proximity_rerank(
+    index: &SearchIndex,
+    matches: &mut [SearchMatch],
+    top_n: usize,
+    bonus: f64,
+) {
+    if bonus <= 0.0 || top_n == 0 || matches.is_empty() {
+        return;
+    }
+    let mut anchors: BTreeSet<String> = BTreeSet::new();
+    for match_item in matches.iter() {
+        anchors.insert(match_item.path.clone());
+        if anchors.len() >= top_n {
+            break;
+        }
+    }
+    let neighbors = crate::graph::one_hop_neighbor_notes(index, &anchors);
+    if neighbors.is_empty() {
+        return;
+    }
+    for match_item in matches.iter_mut() {
+        if neighbors.contains(&match_item.path) {
+            match_item.score += bonus;
+        }
+    }
 }
 
 fn sql_distance_score(distance: f64) -> f64 {
@@ -803,13 +844,21 @@ fn hybrid_search_with_candidate_limit(
         .filter(|match_item| match_item.score > 0.0)
         .collect::<Vec<_>>();
 
-    matches.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.chunk_index.cmp(&right.chunk_index))
-    });
+    let sort_by_fused_score = |matches: &mut Vec<SearchMatch>| {
+        matches.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.chunk_index.cmp(&right.chunk_index))
+        });
+    };
+    // Sort by fused score, then lightly re-rank link-adjacent candidates and re-sort.
+    // The re-rank runs over the full oversampled candidate set BEFORE truncation, so a
+    // 1-hop neighbor that fusion left just outside `requested_limit` can still surface.
+    sort_by_fused_score(&mut matches);
+    apply_graph_proximity_rerank(index, &mut matches, GRAPH_RERANK_TOP_N, GRAPH_PROXIMITY_BONUS);
+    sort_by_fused_score(&mut matches);
     matches.truncate(requested_limit);
     Ok(matches)
 }
@@ -996,6 +1045,71 @@ mod tests {
         let index = crate::index::build_index(&root, None, None).expect("build index");
         fs::remove_dir_all(root).ok();
         index
+    }
+
+    fn graph_rerank_index() -> SearchIndex {
+        let root = unique_temp_dir("graph-rerank");
+        fs::create_dir_all(&root).expect("temp dir");
+        // A links to B; C is unlinked. So B is one hop from A, C is not.
+        write_fixture(&root, "A.md", "# A\n\nAnchor note. See [[B]].\n");
+        write_fixture(&root, "B.md", "# B\n\nLinked neighbour.\n");
+        write_fixture(&root, "C.md", "# C\n\nUnlinked note.\n");
+        let index = crate::index::build_index(&root, None, None).expect("build index");
+        fs::remove_dir_all(root).ok();
+        index
+    }
+
+    fn match_at(path: &str, score: f64) -> SearchMatch {
+        SearchMatch {
+            path: path.to_string(),
+            title: path.to_string(),
+            chunk_index: 0,
+            start_line: 1,
+            end_line: 1,
+            score,
+            semantic_score: 0.0,
+            bm25_score: 0.0,
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn graph_rerank_promotes_link_adjacent_candidate() {
+        let index = graph_rerank_index();
+        // Pre-rerank fused order: A (top), C (mid), B (low). B is 1 hop from the #1 note A,
+        // C is unlinked. A small bonus to the link-adjacent B should lift it above C.
+        let mut matches = vec![
+            match_at("A.md", 0.030),
+            match_at("C.md", 0.020),
+            match_at("B.md", 0.015),
+        ];
+        apply_graph_proximity_rerank(&index, &mut matches, 1, 0.010);
+        matches.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let order: Vec<&str> = matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["A.md", "B.md", "C.md"],
+            "the link-adjacent note B should be promoted above the unlinked C"
+        );
+    }
+
+    #[test]
+    fn graph_rerank_zero_bonus_is_noop() {
+        let index = graph_rerank_index();
+        let original = vec![
+            match_at("A.md", 0.030),
+            match_at("C.md", 0.020),
+            match_at("B.md", 0.015),
+        ];
+        let mut matches = original.clone();
+        // A bonus of 0 must reproduce pure-RRF state exactly (no score change at all).
+        apply_graph_proximity_rerank(&index, &mut matches, GRAPH_RERANK_TOP_N, 0.0);
+        assert_eq!(matches, original);
     }
 
     #[test]
