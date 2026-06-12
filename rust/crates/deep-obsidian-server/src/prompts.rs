@@ -47,10 +47,10 @@ Workflow:
    - strong: top chunks directly discuss the requested topic
    - partial: results are adjacent, generic, or mostly indexes/contracts/task lists
    - weak: results do not contain direct evidence for the requested topic
-5. If the result is partial or weak, run one narrower follow-up search with hybrid_search or bm25_search using exact technical terms, filenames, product names, or decision keywords from the user request.
+5. If the result is partial or weak, run one narrower follow-up search with hybrid_search using exact technical terms, filenames, product names, or decision keywords from the user request.
 6. Inspect only the most central notes:
    - use note_outline before reading long notes
-   - use read_chunk when a specific section is enough
+   - use read_file (with startLine/endLine) when a specific section is enough
    - use read_file only for short notes or genuinely central sources
 7. Use graph_traverse only when links, backlinks, dependencies, or related decisions could change the answer.
 8. Synthesize a compact working memory: relevant notes, durable facts, decisions, open questions, useful wiki links, and explicit gaps.

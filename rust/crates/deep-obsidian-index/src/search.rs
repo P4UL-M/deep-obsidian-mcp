@@ -1022,14 +1022,6 @@ pub fn related_notes_with_options(
     Ok(matches)
 }
 
-pub fn backlinks(
-    index: &SearchIndex,
-    note_path: &str,
-    limit: usize,
-) -> Result<Vec<crate::graph::BacklinkMatch>> {
-    crate::graph::backlinks(index, note_path, limit)
-}
-
 pub fn graph_traverse(
     index: &SearchIndex,
     note_path: &str,
