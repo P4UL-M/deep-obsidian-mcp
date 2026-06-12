@@ -883,7 +883,7 @@ pub fn hybrid_search(index: &SearchIndex, query: &str) -> Result<Vec<SearchMatch
 
 /// Backward-compatible hybrid search that discards the degradation signal. Still degrades
 /// internally (never errors on a backend-unavailable failure), so callers that don't report
-/// the flag (e.g. `find_similar_notes` subject mode, `recommend_folder`) stop leaking the
+/// the flag (e.g. `recommend_folder`) stop leaking the
 /// raw upstream error automatically.
 pub fn hybrid_search_with_options(
     index: &SearchIndex,
@@ -1842,8 +1842,8 @@ mod tests {
 
     #[test]
     fn hybrid_search_backward_compat_wrapper_degrades_without_erroring() {
-        // The legacy `hybrid_search_with_options` (used by find_similar_notes subject mode
-        // and recommend_folder) must also degrade internally rather than leak the raw error.
+        // The legacy `hybrid_search_with_options` (used by recommend_folder) must also
+        // degrade internally rather than leak the raw error.
         let (mut index, root) = embedding_backed_index();
         index.embedding_base_url = Some(DEAD_BACKEND_URL.to_string());
         let matches =

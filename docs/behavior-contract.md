@@ -96,7 +96,6 @@ The black-box surface must preserve:
 - `build_index`
 - `hybrid_search` (with `bm25Weight`/`semanticWeight` flags for BM25-only or semantic-only ranking)
 - `related_notes`
-- `find_similar_notes`
 - `graph_traverse` (with `direction:"incoming"` for backlinks)
 - `upsert_note`
 - `update_note_section`

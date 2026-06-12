@@ -2,6 +2,15 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.1.0-alpha.10 — 2026-06-12
+
+### ⚠️ Breaking changes (MCP tool surface: 19 → 18 tools)
+
+- **Removed `find_similar_notes`.** The editorial style/structure/tone/format
+  similarity tool had no internal callers and overlapped conceptually with
+  `related_notes` (subject similarity). For content-relevant neighbours use
+  `related_notes` (by note path) or `hybrid_search` (by query).
+
 ## v0.1.0-alpha.9
 
 A large release centred on a retrieval-pipeline overhaul, a security pass, and a

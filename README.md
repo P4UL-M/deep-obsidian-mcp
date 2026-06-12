@@ -309,7 +309,6 @@ Or with explicit flags and a config secret reference created by the wizard:
 - `build_index`
 - `hybrid_search` (set `bm25Weight:0` for semantic-only, `semanticWeight:0` for BM25-only ranking)
 - `related_notes`
-- `find_similar_notes`
 - `graph_traverse` (use `direction:"incoming"`, `depth:1` for backlinks)
 - `upsert_note`
 - `update_note_section`
@@ -331,7 +330,6 @@ Additional authoring helpers:
 - `update_note_section`: replace the preamble or a named heading section without rewriting the full note
 - `request_vault_upload`: mint an out-of-band upload URL for binary or large non-markdown files
 - `list_children`: inspect actual vault structure instead of guessing from search (use `foldersOnly:true` for subfolders)
-- `find_similar_notes`: rank notes by editorial style, structure, tone, or format
 
 ## MCP Resources
 
@@ -409,5 +407,3 @@ The Rust runtime now includes the authoring and structure tools that were previo
   - mint an out-of-band upload URL for binary or large non-note files
 - `list_children`
   - inspect the actual vault structure directly (use `foldersOnly:true` to list only subfolders)
-- `find_similar_notes`
-  - rank notes by editorial `style`, `structure`, `tone`, or `format`
