@@ -57,6 +57,13 @@ pub enum IndexError {
     MissingNoteEmbedding(String),
     #[error("embedding configuration is not available in the loaded index")]
     MissingEmbeddingConfig,
+    /// The embedding backend was unreachable / crashed at QUERY time (connection
+    /// refused, timeout, 5xx, or a llama-server worker that died mid-request). Distinct
+    /// from `Embedding` (a deterministic embedding failure) so the query layer can
+    /// degrade to a lexical fallback instead of surfacing a raw upstream error. The
+    /// string carries the underlying cause for logging/status reporting.
+    #[error("embedding backend unavailable: {0}")]
+    EmbeddingBackendUnavailable(String),
     #[error("index context is not available for SQLite-backed vector operations")]
     MissingIndexContext,
     #[error("embedding error: {0}")]

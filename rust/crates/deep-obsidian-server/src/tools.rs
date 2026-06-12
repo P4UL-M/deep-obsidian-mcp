@@ -15,7 +15,7 @@ use deep_obsidian_core::vault::{
     list_top_level_folders, read_text_file, write_text_file, VaultChildEntry, VaultEntryKind,
 };
 use deep_obsidian_index::graph as index_graph;
-use deep_obsidian_index::index::{artifact_kind, artifact_mime_type, SearchIndex};
+use deep_obsidian_index::index::{artifact_kind, artifact_mime_type, IndexError, SearchIndex};
 use deep_obsidian_index::search::{self as index_search, RankingOptions, RelatedNoteOptions};
 use regex::RegexBuilder;
 use serde_json::{json, Map, Value};
@@ -43,6 +43,11 @@ const TRUNCATION_NOTE: &str =
 /// could not be resolved at startup (or a spawn unexpectedly fails with
 /// `NotFound`). Never surface the raw `os error 2` for this case.
 const RIPGREP_UNAVAILABLE_MESSAGE: &str = "grep_search is unavailable: ripgrep (rg) not found on PATH. Install ripgrep or fix the service PATH, then restart.";
+
+/// Clear, actionable message for `search_artifacts` when the artifact embedding backend is
+/// unreachable at query time. Artifacts have no lexical (BM25) fallback, so the tool errors
+/// — but with this message instead of the raw upstream 400/connection error.
+const ARTIFACT_EMBEDDING_BACKEND_UNAVAILABLE_MESSAGE: &str = "artifact embedding backend unavailable — check the artifact embedding service (it may be down or restarting), then retry.";
 
 /// Resolve the absolute path to the `rg` (ripgrep) binary.
 ///
@@ -1910,13 +1915,17 @@ fn populate_grep_context(
     Ok(())
 }
 
+/// Run hybrid search off the async runtime, surfacing the degradation signal. When the
+/// embedding backend is unavailable the core function degrades to BM25-only internally and
+/// returns `degraded = true` (never an Err for that case), so the tool layer can set a
+/// non-fatal `degraded` flag rather than string-matching a leaked upstream error.
 async fn hybrid_search_matches(
     index: std::sync::Arc<deep_obsidian_index::index::SearchIndex>,
     query: String,
     options: RankingOptions,
-) -> Result<Vec<index_search::SearchMatch>, String> {
+) -> Result<index_search::HybridSearchOutcome, String> {
     tokio::task::spawn_blocking(move || {
-        index_search::hybrid_search_with_options(index.as_ref(), &query, options)
+        index_search::hybrid_search_with_options_degradable(index.as_ref(), &query, options)
             .map_err(|error| error.to_string())
     })
     .await
@@ -1932,9 +1941,37 @@ pub async fn call_tool(
     match name {
         "vault_info" => {
             let snapshot = state.runtime.fresh_snapshot("vault_info").await?;
-            Ok(json_text_result(build_vault_overview_payload(
-                config, &snapshot,
-            )))
+            let mut payload = build_vault_overview_payload(config, &snapshot);
+            // Non-fatal live health probe for the note embedding backend. vault_info must
+            // never error when the backend is down — it reports the status as a field.
+            // The probe is a bounded blocking HTTP call, so run it off the async runtime.
+            let probe_index = snapshot.index.clone();
+            let health = tokio::task::spawn_blocking(move || {
+                index_search::probe_embedding_backend(probe_index.as_ref())
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            if let Some(object) = payload.as_object_mut() {
+                match health {
+                    // Sparse backend: nothing to probe, so omit the status field entirely.
+                    index_search::EmbeddingBackendHealth::NotApplicable => {}
+                    index_search::EmbeddingBackendHealth::Reachable => {
+                        object.insert(
+                            "embeddingBackendStatus".to_string(),
+                            json!("reachable"),
+                        );
+                    }
+                    index_search::EmbeddingBackendHealth::Unreachable(reason) => {
+                        object.insert(
+                            "embeddingBackendStatus".to_string(),
+                            json!("unreachable"),
+                        );
+                        object
+                            .insert("embeddingBackendError".to_string(), json!(reason));
+                    }
+                }
+            }
+            Ok(json_text_result(payload))
         }
         "list_children" => {
             let path = optional_string_arg(arguments, "path");
@@ -2172,7 +2209,7 @@ pub async fn call_tool(
             let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
             let snapshot = state.runtime.fresh_snapshot("hybrid_search").await?;
             let index = snapshot.index;
-            let matches = hybrid_search_matches(
+            let outcome = hybrid_search_matches(
                 index.clone(),
                 query.clone(),
                 RankingOptions {
@@ -2182,8 +2219,11 @@ pub async fn call_tool(
                 },
             )
             .await?;
-            let count = matches.len();
-            let mut match_values = matches
+            let degraded = outcome.degraded;
+            let degradation_reason = outcome.degradation_reason.clone();
+            let count = outcome.matches.len();
+            let mut match_values = outcome
+                .matches
                 .into_iter()
                 .map(|item| hybrid_search_match_json(&item, text_options))
                 .collect::<Vec<_>>();
@@ -2198,6 +2238,13 @@ pub async fn call_tool(
             );
             result.insert("semanticWeight".to_string(), json!(semantic_weight));
             result.insert("bm25Weight".to_string(), json!(bm25_weight));
+            // Non-fatal degradation flag: when the embedding backend was unavailable the
+            // matches above are BM25-only lexical results. `degraded` is always present
+            // (false on the healthy path) so callers can branch without probing.
+            result.insert("degraded".to_string(), json!(degraded));
+            if let Some(reason) = degradation_reason {
+                result.insert("degradationReason".to_string(), json!(reason));
+            }
             result.insert("count".to_string(), json!(count));
             result.insert("matches".to_string(), json!(match_values));
             insert_response_truncation_flags(&mut result, response_truncated);
@@ -2227,7 +2274,15 @@ pub async fn call_tool(
             })
             .await
             .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
+            // search_artifacts has no lexical fallback (artifacts carry no BM25 terms), so a
+            // dead artifact backend can only surface as an error. Map the backend-unavailable
+            // case to a clear, actionable message instead of leaking the raw upstream 400.
+            .map_err(|error| match error {
+                IndexError::EmbeddingBackendUnavailable(_) => {
+                    ARTIFACT_EMBEDDING_BACKEND_UNAVAILABLE_MESSAGE.to_string()
+                }
+                other => other.to_string(),
+            })?;
             Ok(json_text_result_from_arguments(
                 arguments,
                 json!({
@@ -2324,7 +2379,7 @@ pub async fn call_tool(
                 .flatten()
                 .collect::<Vec<_>>()
                 .join(" ");
-            let chunk_matches = hybrid_search_matches(
+            let chunk_outcome = hybrid_search_matches(
                 index.clone(),
                 query.clone(),
                 RankingOptions {
@@ -2334,10 +2389,12 @@ pub async fn call_tool(
                 },
             )
             .await?;
+            let degraded = chunk_outcome.degraded;
+            let degradation_reason = chunk_outcome.degradation_reason.clone();
 
             let mut chunk_paths = Vec::new();
             let mut chunks = Vec::new();
-            for chunk in chunk_matches {
+            for chunk in chunk_outcome.matches {
                 if !chunk_paths.iter().any(|existing| existing == &chunk.path) {
                     chunk_paths.push(chunk.path.clone());
                 }
@@ -2453,6 +2510,13 @@ pub async fn call_tool(
                 "semanticBackend".to_string(),
                 json!(index.semantic_backend.as_str()),
             );
+            // Non-fatal degradation flag: when the embedding backend was unavailable the
+            // chunk retrieval fell back to BM25-only (related-note/graph context still
+            // applies). Always present (false on the healthy path).
+            result.insert("degraded".to_string(), json!(degraded));
+            if let Some(reason) = degradation_reason {
+                result.insert("degradationReason".to_string(), json!(reason));
+            }
             result.insert("notes".to_string(), json!(notes));
             result.insert("chunks".to_string(), json!(chunks));
             result.insert("graph".to_string(), graph);
@@ -2481,6 +2545,8 @@ pub async fn call_tool(
                 .flatten()
                 .collect::<Vec<_>>()
                 .join(" ");
+            // recommend_folder does not report degradation; it just needs candidate paths,
+            // and a BM25-only fallback is fine here, so discard the degradation signal.
             let matches = hybrid_search_matches(
                 index.clone(),
                 query.clone(),
@@ -2490,7 +2556,8 @@ pub async fn call_tool(
                     ..RankingOptions::default()
                 },
             )
-            .await?;
+            .await?
+            .matches;
             let query_terms: HashSet<String> = tokenize(&query).into_iter().collect();
             let mut scores = folders
                 .into_iter()
@@ -2787,8 +2854,8 @@ mod tests {
     use crate::mcp::AppState;
     use crate::runtime::RuntimeState;
     use deep_obsidian_types::{
-        AutoReindexConfig, EmbeddingConfig, HttpConfig, ResolvedServiceConfig, StdioMode,
-        TransportMode,
+        AutoReindexConfig, EmbeddingConfig, EmbeddingProvider, HttpConfig, ResolvedServiceConfig,
+        StdioMode, TransportMode,
     };
     use serde_json::json;
     use std::fs;
@@ -2836,6 +2903,91 @@ mod tests {
             .await
             .expect("bootstrap runtime");
         AppState::new(config, runtime)
+    }
+
+    /// An unroutable base URL (loopback, reserved port) that refuses connections
+    /// immediately, so a live embed against it fails fast with a connection error.
+    const DEAD_BACKEND_URL: &str = "http://127.0.0.1:1";
+
+    /// Healthy-path: `hybrid_search` on a sparse index always reports `degraded:false`
+    /// and omits `degradationReason`. The degraded:true path (backend down) is proven
+    /// deterministically in the index crate (`hybrid_search_degrades_to_bm25_*`).
+    #[tokio::test]
+    async fn hybrid_search_reports_not_degraded_on_healthy_backend() {
+        let vault_path = temp_dir("hybrid-not-degraded");
+        fs::write(
+            vault_path.join("Note.md"),
+            "# Note\n\nInstall the service and validate the runtime.\n",
+        )
+        .expect("write note");
+        let state = test_state(vault_path).await;
+        let result = call_tool(&state, "hybrid_search", &json!({"query": "install runtime"}))
+            .await
+            .expect("hybrid_search should succeed");
+        assert_eq!(result.structured_content["degraded"], json!(false));
+        assert!(result.structured_content.get("degradationReason").is_none());
+    }
+
+    /// Healthy-path: `load_knowledge` on a sparse index reports `degraded:false`.
+    #[tokio::test]
+    async fn load_knowledge_reports_not_degraded_on_healthy_backend() {
+        let vault_path = temp_dir("load-knowledge-not-degraded");
+        fs::write(
+            vault_path.join("Note.md"),
+            "# Note\n\nInstall the service and validate the runtime.\n",
+        )
+        .expect("write note");
+        let state = test_state(vault_path).await;
+        let result = call_tool(&state, "load_knowledge", &json!({"subject": "install runtime"}))
+            .await
+            .expect("load_knowledge should succeed");
+        assert_eq!(result.structured_content["degraded"], json!(false));
+        assert!(result.structured_content.get("degradationReason").is_none());
+    }
+
+    /// vault_info must NEVER error and, on a sparse index, must not claim an embedding
+    /// backend status (NotApplicable → field omitted).
+    #[tokio::test]
+    async fn vault_info_is_non_fatal_and_omits_backend_status_when_sparse() {
+        let vault_path = temp_dir("vault-info-sparse");
+        fs::write(vault_path.join("Note.md"), "# Note\n\nbody\n").expect("write note");
+        let state = test_state(vault_path).await;
+        let result = call_tool(&state, "vault_info", &json!({}))
+            .await
+            .expect("vault_info must not error");
+        assert!(result
+            .structured_content
+            .get("embeddingBackendStatus")
+            .is_none());
+    }
+
+    /// `search_artifacts` against an unreachable artifact embedding backend must surface
+    /// the clear, actionable message — never the raw upstream connection/400 error.
+    #[tokio::test]
+    async fn search_artifacts_yields_actionable_message_when_backend_unavailable() {
+        let vault_path = temp_dir("search-artifacts-down");
+        fs::write(vault_path.join("Note.md"), "# Note\n\nbody\n").expect("write note");
+        let mut config = test_config(vault_path);
+        // Note backend stays sparse; only the artifact backend is configured (and dead).
+        config.artifact_embedding = EmbeddingConfig {
+            provider: Some(EmbeddingProvider::OpenAiCompatible),
+            model: Some("artifact-embed-test".to_string()),
+            base_url: Some(DEAD_BACKEND_URL.to_string()),
+            ..EmbeddingConfig::default()
+        };
+        let (runtime, _auto_reindex) = RuntimeState::bootstrap(config.clone())
+            .await
+            .expect("bootstrap runtime");
+        let state = AppState::new(config, runtime);
+
+        let error = call_tool(&state, "search_artifacts", &json!({"query": "diagram"}))
+            .await
+            .expect_err("search_artifacts must error when the artifact backend is down");
+        assert_eq!(error, super::ARTIFACT_EMBEDDING_BACKEND_UNAVAILABLE_MESSAGE);
+        assert!(
+            !error.contains("127.0.0.1") && !error.to_lowercase().contains("connection"),
+            "must not leak the raw upstream error, got: {error}"
+        );
     }
 
     #[test]

@@ -383,11 +383,25 @@ fn query_embedding_input(config: &crate::embeddings::EmbeddingConfig, query: &st
     }
 }
 
+/// Map a typed embedding error from a QUERY-time embed into an `IndexError`, preserving
+/// the transient/backend-unavailable distinction. Transient failures (connection refused,
+/// timeout, 5xx, a crashed llama-server worker) become `EmbeddingBackendUnavailable` so the
+/// query layer can degrade to a lexical fallback; deterministic failures keep mapping to
+/// `Embedding`. This is the single point where the `EmbeddingError` type is still available
+/// at the query boundary, per the issue's "handle it as close to the call as possible".
+fn map_query_embedding_error(error: crate::embeddings::EmbeddingError) -> IndexError {
+    if error.is_transient() {
+        IndexError::EmbeddingBackendUnavailable(error.to_string())
+    } else {
+        IndexError::Embedding(error.to_string())
+    }
+}
+
 fn embed_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
     let config = embedding_runtime_config(index).ok_or(IndexError::MissingEmbeddingConfig)?;
     let input = query_embedding_input(&config, query);
-    let result = crate::embeddings::embed_texts(&[input], &config)
-        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    let result =
+        crate::embeddings::embed_texts(&[input], &config).map_err(map_query_embedding_error)?;
     let vector = result.vectors.into_iter().next().unwrap_or_default();
     if let Some(expected) = index.embedding_dimensions {
         if vector.len() != expected {
@@ -400,6 +414,39 @@ fn embed_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
     Ok(normalize_dense_vector(&vector))
 }
 
+/// Outcome of a non-fatal embedding-backend health probe (see [`probe_embedding_backend`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddingBackendHealth {
+    /// The index is not on the Embedding backend (sparse), so there is no backend to probe.
+    NotApplicable,
+    /// A tiny embed round-trip succeeded: the backend is reachable.
+    Reachable,
+    /// The backend was unreachable / errored. Carries a short cause for status reporting.
+    Unreachable(String),
+}
+
+/// Bounded, NON-fatal health probe for the note embedding backend, used by `vault_info` to
+/// surface backend availability without ever erroring. Issues a single tiny embed against a
+/// SHORT-timeout client (so a hung/dead backend resolves quickly rather than blocking on the
+/// 60s default). Returns `NotApplicable` for sparse indexes (nothing to probe), `Reachable`
+/// on success, and `Unreachable` on any failure. This never returns `Err`.
+pub fn probe_embedding_backend(index: &SearchIndex) -> EmbeddingBackendHealth {
+    let Some(config) = embedding_runtime_config(index) else {
+        return EmbeddingBackendHealth::NotApplicable;
+    };
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return EmbeddingBackendHealth::Unreachable(error.to_string()),
+    };
+    match crate::embeddings::embed_texts_with_client(&["ping".to_string()], &config, &client) {
+        Ok(_) => EmbeddingBackendHealth::Reachable,
+        Err(error) => EmbeddingBackendHealth::Unreachable(error.to_string()),
+    }
+}
+
 fn embed_artifact_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
     if let Some(error) = &index.artifact_embedding_error {
         return Err(IndexError::Embedding(format!(
@@ -409,7 +456,7 @@ fn embed_artifact_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
     let config =
         artifact_embedding_runtime_config(index).ok_or(IndexError::MissingEmbeddingConfig)?;
     let result = crate::embeddings::embed_texts(&[query.to_string()], &config)
-        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        .map_err(map_query_embedding_error)?;
     let vector = result.vectors.into_iter().next().unwrap_or_default();
     if let Some(expected) = index.artifact_embedding_dimensions {
         if vector.len() != expected {
@@ -811,18 +858,76 @@ pub fn artifact_semantic_search_with_options(
     artifact_search_with_query_vector_sql(index, &query_embedding, options.limit.max(1))
 }
 
+/// Outcome of a hybrid search that may have degraded to a lexical-only fallback.
+///
+/// When the embedding backend is unavailable at query time (`EmbeddingBackendUnavailable`
+/// from the semantic-candidate step), `hybrid_search_with_options_degradable` returns the
+/// BM25-only ranking with `degraded = true` and a short, human-readable
+/// `degradation_reason` instead of erroring. On the healthy path `degraded` is `false`,
+/// `degradation_reason` is `None`, and `matches` are byte-identical to the pre-existing
+/// hybrid output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridSearchOutcome {
+    pub matches: Vec<SearchMatch>,
+    pub degraded: bool,
+    pub degradation_reason: Option<String>,
+}
+
+/// Short, user-facing explanation set on `degraded` hybrid responses.
+pub const HYBRID_DEGRADATION_REASON: &str =
+    "embedding backend unavailable; returned lexical (BM25) results";
+
 pub fn hybrid_search(index: &SearchIndex, query: &str) -> Result<Vec<SearchMatch>> {
     hybrid_search_with_options(index, query, RankingOptions::default())
 }
 
+/// Backward-compatible hybrid search that discards the degradation signal. Still degrades
+/// internally (never errors on a backend-unavailable failure), so callers that don't report
+/// the flag (e.g. `find_similar_notes` subject mode, `recommend_folder`) stop leaking the
+/// raw upstream error automatically.
 pub fn hybrid_search_with_options(
     index: &SearchIndex,
     query: &str,
     options: RankingOptions,
 ) -> Result<Vec<SearchMatch>> {
+    Ok(hybrid_search_with_options_degradable(index, query, options)?.matches)
+}
+
+/// Hybrid search that surfaces whether it degraded to BM25-only. See [`HybridSearchOutcome`].
+pub fn hybrid_search_with_options_degradable(
+    index: &SearchIndex,
+    query: &str,
+    options: RankingOptions,
+) -> Result<HybridSearchOutcome> {
     let requested_limit = options.limit.max(1);
     let candidate_limit = hybrid_candidate_limit(index.chunk_count, requested_limit);
     hybrid_search_with_candidate_limit(index, query, options, candidate_limit)
+}
+
+/// BM25-only fallback used when the embedding backend is unavailable. Returns results at the
+/// REQUESTED limit (not the oversampled candidate limit) since there is no second list to
+/// fuse. The graph-proximity rerank is intentionally skipped here: with no semantic signal
+/// the fused-candidate-pool rationale for it no longer holds, and lexical results stand alone.
+fn hybrid_degraded_to_bm25(
+    index: &SearchIndex,
+    query: &str,
+    options: &RankingOptions,
+    requested_limit: usize,
+) -> Result<HybridSearchOutcome> {
+    let bm25_matches = bm25_search_with_options(
+        index,
+        query,
+        RankingOptions {
+            limit: requested_limit,
+            semantic_weight: options.semantic_weight,
+            bm25_weight: options.bm25_weight,
+        },
+    )?;
+    Ok(HybridSearchOutcome {
+        matches: bm25_matches,
+        degraded: true,
+        degradation_reason: Some(HYBRID_DEGRADATION_REASON.to_string()),
+    })
 }
 
 fn hybrid_search_with_candidate_limit(
@@ -830,10 +935,10 @@ fn hybrid_search_with_candidate_limit(
     query: &str,
     options: RankingOptions,
     candidate_limit: usize,
-) -> Result<Vec<SearchMatch>> {
+) -> Result<HybridSearchOutcome> {
     let requested_limit = options.limit.max(1);
     let candidate_limit = candidate_limit.max(1);
-    let semantic_matches = semantic_search_with_options(
+    let semantic_matches = match semantic_search_with_options(
         index,
         query,
         RankingOptions {
@@ -841,7 +946,15 @@ fn hybrid_search_with_candidate_limit(
             semantic_weight: options.semantic_weight,
             bm25_weight: options.bm25_weight,
         },
-    )?;
+    ) {
+        Ok(matches) => matches,
+        // The embedding backend died mid-query: fall back to BM25-only ranking and flag
+        // the response as degraded rather than surfacing the raw upstream error.
+        Err(IndexError::EmbeddingBackendUnavailable(_)) => {
+            return hybrid_degraded_to_bm25(index, query, &options, requested_limit);
+        }
+        Err(error) => return Err(error),
+    };
     let bm25_matches = bm25_search_with_options(
         index,
         query,
@@ -912,7 +1025,11 @@ fn hybrid_search_with_candidate_limit(
     apply_graph_proximity_rerank(index, &mut matches, GRAPH_RERANK_TOP_N, GRAPH_PROXIMITY_BONUS);
     sort_by_fused_score(&mut matches);
     matches.truncate(requested_limit);
-    Ok(matches)
+    Ok(HybridSearchOutcome {
+        matches,
+        degraded: false,
+        degradation_reason: None,
+    })
 }
 
 /// Pure Reciprocal Rank Fusion over two ranked lists.
@@ -950,7 +1067,10 @@ fn hybrid_search_exhaustive_with_options(
     query: &str,
     options: RankingOptions,
 ) -> Result<Vec<SearchMatch>> {
-    hybrid_search_with_candidate_limit(index, query, options, index.chunk_count.max(1))
+    Ok(
+        hybrid_search_with_candidate_limit(index, query, options, index.chunk_count.max(1))?
+            .matches,
+    )
 }
 
 /// Sparse term-overlap related-notes computation: cosine similarity over term counts,
@@ -1557,6 +1677,232 @@ mod tests {
             "sparse degradation should still surface the related sibling"
         );
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A healthy embedding server that returns a fixed 3-dim vector for every input,
+    /// derived from input length so distinct chunks get distinct vectors. Used to build a
+    /// real Embedding-backed index; the caller then points the backend down for query-time.
+    fn start_healthy_embedding_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind healthy server");
+        let address = listener.local_addr().expect("server address");
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                let mut buffer = Vec::new();
+                let mut header_end = None;
+                while header_end.is_none() {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    header_end = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+                }
+                let Some(header_end) = header_end.map(|end| end + 4) else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .expect("content length header");
+                while buffer.len() < header_end + content_length {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).expect("read body");
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+                let body = &buffer[header_end..header_end + content_length];
+                let payload: serde_json::Value =
+                    serde_json::from_slice(body).expect("json request");
+                let inputs = payload
+                    .get("input")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("input array")
+                    .iter()
+                    .map(|value| value.as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>();
+                let data = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| {
+                        serde_json::json!({
+                            "index": index,
+                            "embedding": [1.0, text.len() as f64 + 1.0, 0.5],
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let response_body = serde_json::json!({ "data": data }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        format!("http://{}", address)
+    }
+
+    fn embedding_backend_config(base_url: String) -> crate::embeddings::EmbeddingConfig {
+        crate::embeddings::EmbeddingConfig {
+            provider: Some(crate::embeddings::EmbeddingProvider::OpenAiCompatible),
+            model: Some("text-embedding-test".to_string()),
+            base_url: Some(base_url),
+            api_key: None,
+            max_chars: crate::embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
+            batch_size: crate::embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_input_tokens: crate::embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+            context_tokens: crate::embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
+            chars_per_token: crate::embeddings::DEFAULT_CHARS_PER_TOKEN,
+            query_instruction: None,
+        }
+        .normalize()
+    }
+
+    /// Build an Embedding-backed index over a small fixture vault, embedding via a healthy
+    /// server. Returns the index and its `root` (kept alive for query-time sqlite reads).
+    fn embedding_backed_index() -> (SearchIndex, PathBuf) {
+        let root = unique_temp_dir("embedding-backed");
+        fs::create_dir_all(&root).expect("temp dir");
+        write_fixture(
+            &root,
+            "Home.md",
+            "# Home\n\nInstall the brew service and validate the runtime.\n\nSee [[Projects/Brew Service]].\n",
+        );
+        write_fixture(
+            &root,
+            "Projects/Brew Service.md",
+            "# Brew Service\n\nInstall the service and validate the runtime.\n\nReference [[Home]].\n",
+        );
+        let base_url = start_healthy_embedding_server();
+        let config = embedding_backend_config(base_url);
+        let index =
+            crate::index::build_index(&root, None, Some(&config)).expect("embedding-backed build");
+        assert_eq!(index.semantic_backend, SemanticBackend::Embedding);
+        (index, root)
+    }
+
+    /// An unroutable base URL: the discard/zero port refuses connections immediately, so a
+    /// query-time embed fails fast with a connection error (classified transient).
+    const DEAD_BACKEND_URL: &str = "http://127.0.0.1:1";
+
+    #[test]
+    fn hybrid_search_degrades_to_bm25_when_backend_unavailable() {
+        let (mut index, root) = embedding_backed_index();
+        // Healthy baseline: identical results, NOT degraded.
+        let healthy = hybrid_search_with_options_degradable(
+            &index,
+            "install runtime",
+            RankingOptions::default(),
+        )
+        .expect("healthy hybrid");
+        assert!(!healthy.degraded, "healthy backend must not degrade");
+        assert!(healthy.degradation_reason.is_none());
+        assert!(!healthy.matches.is_empty());
+
+        // Point the embedding backend at a refused port: the query-time embed fails with a
+        // connection error -> EmbeddingBackendUnavailable -> hybrid degrades to BM25-only.
+        index.embedding_base_url = Some(DEAD_BACKEND_URL.to_string());
+        let degraded = hybrid_search_with_options_degradable(
+            &index,
+            "install runtime",
+            RankingOptions::default(),
+        )
+        .expect("hybrid must degrade, not error, when the backend is down");
+        assert!(degraded.degraded, "down backend must flag degraded");
+        assert_eq!(
+            degraded.degradation_reason.as_deref(),
+            Some(HYBRID_DEGRADATION_REASON)
+        );
+        assert!(
+            !degraded.matches.is_empty(),
+            "BM25 fallback should still return lexical matches"
+        );
+        // The degraded results are exactly BM25-only ranking at the requested limit.
+        let bm25 = bm25_search_with_options(&index, "install runtime", RankingOptions::default())
+            .expect("bm25");
+        assert_eq!(degraded.matches, bm25);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn hybrid_search_backward_compat_wrapper_degrades_without_erroring() {
+        // The legacy `hybrid_search_with_options` (used by find_similar_notes subject mode
+        // and recommend_folder) must also degrade internally rather than leak the raw error.
+        let (mut index, root) = embedding_backed_index();
+        index.embedding_base_url = Some(DEAD_BACKEND_URL.to_string());
+        let matches =
+            hybrid_search_with_options(&index, "install runtime", RankingOptions::default())
+                .expect("legacy wrapper must degrade, not error");
+        assert!(!matches.is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn probe_embedding_backend_reports_reachable_then_unreachable() {
+        let (mut index, root) = embedding_backed_index();
+        // Healthy backend (the build server is still accepting): reachable.
+        assert_eq!(
+            probe_embedding_backend(&index),
+            EmbeddingBackendHealth::Reachable
+        );
+        // Point at a refused port: unreachable, but NEVER an Err.
+        index.embedding_base_url = Some(DEAD_BACKEND_URL.to_string());
+        assert!(matches!(
+            probe_embedding_backend(&index),
+            EmbeddingBackendHealth::Unreachable(_)
+        ));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn probe_embedding_backend_is_not_applicable_for_sparse_index() {
+        // A sparse index has no embedding backend to probe.
+        let index = sample_index();
+        assert_eq!(index.semantic_backend, SemanticBackend::Sparse);
+        assert_eq!(
+            probe_embedding_backend(&index),
+            EmbeddingBackendHealth::NotApplicable
+        );
+    }
+
+    #[test]
+    fn artifact_semantic_search_surfaces_backend_unavailable_error() {
+        // search_artifacts has no lexical fallback; a down artifact backend must surface a
+        // clear EmbeddingBackendUnavailable error (mapped to an actionable message by the
+        // tool layer) rather than leaking the raw upstream body.
+        let (mut index, root) = embedding_backed_index();
+        // Configure an artifact embedding backend pointed at a refused port.
+        index.artifact_embedding_provider = Some("openai-compatible".to_string());
+        index.artifact_embedding_model = Some("artifact-embed-test".to_string());
+        index.artifact_embedding_base_url = Some(DEAD_BACKEND_URL.to_string());
+        index.artifact_embedding_dimensions = Some(3);
+
+        let error = artifact_semantic_search_with_options(
+            &index,
+            "diagram",
+            RankingOptions::default(),
+        )
+        .expect_err("artifact search must error when its backend is down");
+        assert!(
+            matches!(error, IndexError::EmbeddingBackendUnavailable(_)),
+            "expected EmbeddingBackendUnavailable, got {error:?}"
+        );
         fs::remove_dir_all(root).ok();
     }
 
