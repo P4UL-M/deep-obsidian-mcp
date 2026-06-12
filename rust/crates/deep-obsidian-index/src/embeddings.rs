@@ -8,7 +8,6 @@ use thiserror::Error;
 use crate::index::SemanticBackend;
 
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
-#[allow(dead_code)]
 pub(crate) const DEFAULT_EMBEDDING_MAX_CONCURRENCY: usize = 4;
 /// Hard character ceiling on a single embedding input. Acts as a backstop on top
 /// of the token budget below; the effective per-input cap is the smaller of the two.
@@ -174,7 +173,6 @@ pub struct ArtifactEmbeddingInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct EmbeddingBatchMetrics {
     pub text_count: usize,
     pub batch_count: usize,
@@ -182,7 +180,6 @@ pub(crate) struct EmbeddingBatchMetrics {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct EmbeddingBatchResult {
     pub vectors: Vec<Vec<f64>>,
     pub dimensions: usize,
@@ -190,7 +187,6 @@ pub(crate) struct EmbeddingBatchResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct EmbeddingBatchOptions {
     pub batch_size: usize,
     pub max_concurrency: usize,
@@ -215,7 +211,6 @@ impl EmbeddingBatchOptions {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn normalized(mut self) -> Self {
         self.batch_size = self.batch_size.max(1);
         self.max_concurrency = self.max_concurrency.max(1);
@@ -311,7 +306,6 @@ pub fn embed_texts(
     embed_texts_with_client(texts, config, &client)
 }
 
-#[allow(dead_code)]
 pub(crate) fn embed_text_batches(
     texts: &[String],
     config: &EmbeddingConfig,
@@ -330,7 +324,6 @@ pub(crate) fn embed_text_batches(
     embed_text_batches_with_client(texts, config, &client, &options)
 }
 
-#[allow(dead_code)]
 pub(crate) fn embed_text_batches_with_client(
     texts: &[String],
     config: &EmbeddingConfig,
@@ -421,7 +414,6 @@ pub(crate) fn embed_text_batches_with_client(
 /// Pack inputs into request batches, closing a batch when EITHER the input count
 /// reaches `batch_size` OR the estimated token total reaches `max_request_tokens`.
 /// A single oversized input still gets its own batch (it is clamped at send time).
-#[allow(dead_code)]
 fn pack_batches(
     texts: &[String],
     config: &EmbeddingConfig,
@@ -454,7 +446,6 @@ fn pack_batches(
 /// the whole batch. Splits in half and retries each half down to a single input;
 /// a size-1 input that still fails propagates its error. The 1:1 input→vector
 /// contract is preserved (we never split an input's text here).
-#[allow(dead_code)]
 fn embed_batch_with_bisect(
     texts: &[String],
     config: &EmbeddingConfig,
