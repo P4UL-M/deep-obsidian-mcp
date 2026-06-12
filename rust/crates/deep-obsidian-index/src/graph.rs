@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -229,6 +229,35 @@ pub fn resolve_wiki_link_target(
 
 pub fn get_outgoing_edges(index: &SearchIndex) -> Vec<GraphEdge> {
     GraphAdjacency::build(index).outgoing_edges
+}
+
+/// Notes within one wikilink hop (outgoing or incoming) of any note in `anchors`,
+/// excluding the anchors themselves. Builds the adjacency once. Used by the hybrid
+/// graph-aware re-rank to lightly boost candidates that are link-adjacent to the
+/// current top hits (issue #6 item #5).
+pub(crate) fn one_hop_neighbor_notes(
+    index: &SearchIndex,
+    anchors: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let adjacency = GraphAdjacency::build(index);
+    let mut neighbors = BTreeSet::new();
+    for anchor in anchors {
+        if let Some(edges) = adjacency.outgoing_by_source.get(anchor) {
+            for edge in edges {
+                neighbors.insert(edge.target.clone());
+            }
+        }
+        if let Some(edges) = adjacency.incoming_by_source.get(anchor) {
+            for edge in edges {
+                neighbors.insert(edge.target.clone());
+            }
+        }
+    }
+    // A note that is itself a top hit gets no self-bonus.
+    for anchor in anchors {
+        neighbors.remove(anchor);
+    }
+    neighbors
 }
 
 pub fn backlinks(index: &SearchIndex, note_path: &str, limit: usize) -> Result<Vec<BacklinkMatch>> {
