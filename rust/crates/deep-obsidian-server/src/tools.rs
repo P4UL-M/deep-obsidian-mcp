@@ -1464,6 +1464,20 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
+            name: "search_artifacts".to_string(),
+            description: "Semantically search non-markdown vault artifacts (PDF, image, audio, video) by their multimodal embeddings. Requires a configured artifact embedding backend; returns artifact metadata, not chunk text.".to_string(),
+            annotations: Some(tool_annotations(true, None, None)),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema(
+                vec![
+                    ("query", json!({"type":"string","description":"Natural-language query, embedded via the artifact (multimodal) model and matched against artifact embeddings."})),
+                    ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
+                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
+                ],
+                vec!["query"],
+            ),
+        },
+        ToolDefinition {
             name: "related_notes".to_string(),
             description: "Return notes with similar subjects to a given note path using the local note index.".to_string(),
             annotations: Some(tool_annotations(true, None, None)),
@@ -2190,6 +2204,50 @@ pub async fn call_tool(
             Ok(json_text_result_from_arguments(
                 arguments,
                 Value::Object(result),
+            ))
+        }
+        "search_artifacts" => {
+            let query = string_arg(arguments, "query")?;
+            validate_format_arg(arguments)?;
+            let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
+            let snapshot = state.runtime.fresh_snapshot("search_artifacts").await?;
+            let index = snapshot.index;
+            let query_for_search = query.clone();
+            // artifact_semantic_search embeds the query via the (multimodal) artifact
+            // backend over HTTP, so run it off the async runtime.
+            let matches = tokio::task::spawn_blocking(move || {
+                index_search::artifact_semantic_search_with_options(
+                    index.as_ref(),
+                    &query_for_search,
+                    RankingOptions {
+                        limit,
+                        ..RankingOptions::default()
+                    },
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+            Ok(json_text_result_from_arguments(
+                arguments,
+                json!({
+                    "query": query,
+                    "rebuilt": snapshot.rebuilt,
+                    "count": matches.len(),
+                    "matches": matches
+                        .into_iter()
+                        .map(|item| json!({
+                            "path": item.path,
+                            "title": item.title,
+                            "kind": item.kind,
+                            "mimeType": item.mime_type,
+                            "size": item.size,
+                            "score": item.score,
+                            "metadata": serde_json::from_str::<Value>(&item.metadata_json)
+                                .unwrap_or(Value::Null),
+                        }))
+                        .collect::<Vec<_>>()
+                }),
             ))
         }
         "related_notes" => {
@@ -3456,6 +3514,42 @@ mod tests {
         );
         // Omission must be surgical: every other tool stays registered.
         assert_eq!(unavailable.len(), available.len() - 1);
+    }
+
+    #[test]
+    fn consolidated_tool_surface() {
+        let definitions = super::tool_definitions(true);
+        let names: Vec<&str> = definitions
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        // search_artifacts re-exposes artifact semantic search (dropped with semantic_search's scope).
+        assert!(names.contains(&"search_artifacts"));
+        // The decommissioned/merged tools must be gone.
+        for removed in [
+            "write_file_to_vault",
+            "bm25_search",
+            "semantic_search",
+            "list_folders",
+            "backlinks",
+            "read_chunk",
+        ] {
+            assert!(
+                !names.contains(&removed),
+                "{removed} should have been decommissioned/merged"
+            );
+        }
+        // Their replacements remain.
+        for kept in [
+            "hybrid_search",
+            "request_vault_upload",
+            "list_children",
+            "graph_traverse",
+            "read_file",
+            "upsert_note",
+        ] {
+            assert!(names.contains(&kept), "{kept} must still be registered");
+        }
     }
 
     #[tokio::test]
