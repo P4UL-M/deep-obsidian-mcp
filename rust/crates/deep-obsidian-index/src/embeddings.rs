@@ -254,8 +254,14 @@ impl EmbeddingError {
     /// is treated as transient.
     pub(crate) fn is_transient(&self) -> bool {
         match self {
-            EmbeddingError::RequestFailed { status, .. } => {
-                *status == 0 || (500..600).contains(status)
+            EmbeddingError::RequestFailed { status, body } => {
+                *status == 0
+                    || (500..600).contains(status)
+                    // llama.cpp / llama-server surfaces a crashed worker as a 400 whose
+                    // body says the process is gone. That is a backend-availability
+                    // failure (the worker died), not a deterministic bad-input 4xx, so
+                    // treat this specific body as transient even though the status is 400.
+                    || body.contains("process no longer running")
             }
             EmbeddingError::NotConfigured
             | EmbeddingError::UnsupportedProvider(_)
@@ -963,6 +969,15 @@ mod tests {
         assert!(EmbeddingError::RequestFailed {
             status: 503,
             body: String::new(),
+        }
+        .is_transient());
+
+        // Transient despite a 400 status: a llama-server worker that crashed surfaces a
+        // 400 whose body reports the process is gone. That is a backend-availability
+        // failure, so it must classify as transient to drive graceful degradation.
+        assert!(EmbeddingError::RequestFailed {
+            status: 400,
+            body: "embedding request failed: llama-server process no longer running".to_string(),
         }
         .is_transient());
 
