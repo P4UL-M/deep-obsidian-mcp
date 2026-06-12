@@ -203,6 +203,11 @@ fn related_notes_with_embeddings_sql(
         .ok_or_else(|| IndexError::NoteNotFound(note_path.to_string()))?;
     let note_links: BTreeSet<_> = note.links.iter().cloned().collect();
     let connection = open_index_connection_for_index(index, true)?;
+    // NOTE: as of schema v6 `note_embeddings_vec` is intentionally never populated
+    // (the note-level dense vector was dropped as redundant). This lookup therefore
+    // always misses, and the caller (`related_notes_with_options`) maps the resulting
+    // `MissingNoteEmbedding` to the sparse term-overlap path. The query is kept so the
+    // sparse-fallback contract has a single, well-tested entry point.
     let source_embedding = connection
         .query_row(
             r#"
