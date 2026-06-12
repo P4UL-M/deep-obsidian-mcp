@@ -76,7 +76,7 @@ Workspace/
    - `_Agent/Tasks/<Project>.md`
    - `_Agent/Log.md`
    - `_Wiki/Index.md`
-4. Use `deep_obsidian.list_folders` or `deep_obsidian.list_children` only when direct reads are inconclusive or the project name may already exist with a variant spelling.
+4. Use `deep_obsidian.list_children` (optionally with `foldersOnly:true`) only when direct reads are inconclusive or the project name may already exist with a variant spelling.
 5. Read an existing scaffold note before updating it.
 6. If `Projets/<Project>/` does not exist, create the folder with a minimal `.keep.md`; do not create a project hub note unless the user explicitly asks.
 7. Create only missing scaffold notes. For existing notes, append only missing sections or leave them unchanged. Do not create `_Agent/Raw/<Project>/Index.md` unless raw material is explicitly supplied or already present.
@@ -388,8 +388,7 @@ Project wiki initialized for <Project>. I can also create a recurring Deep Obsid
 
 - `vault_info`: verify connectivity and index state
 - `read_file`: check existing scaffold notes and verify writes
-- `list_folders`: disambiguate project folders when direct path checks are not enough
-- `list_children`: inspect only the specific folder being initialized
+- `list_children`: inspect a specific folder being initialized (use `foldersOnly:true` to disambiguate project folders when direct path checks are not enough)
 - `upsert_note`: create missing scaffold notes
 - `update_note_section`: add missing sections without rewriting whole notes
-- `write_file_to_vault`: create minimal placeholder files when folder creation requires a file
+- `request_vault_upload`: create non-markdown placeholder/binary files when folder creation requires a file

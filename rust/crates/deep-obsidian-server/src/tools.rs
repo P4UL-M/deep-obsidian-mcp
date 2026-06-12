@@ -11,9 +11,8 @@ use deep_obsidian_core::text::{
     note_title, tokenize,
 };
 use deep_obsidian_core::vault::{
-    chunk_lines, ensure_inside_vault, list_children as vault_list_children,
-    list_folders as vault_list_folders, list_markdown_files, list_top_level_folders,
-    read_text_file, write_binary_file, write_text_file, VaultChildEntry, VaultEntryKind,
+    ensure_inside_vault, list_children as vault_list_children, list_markdown_files,
+    list_top_level_folders, read_text_file, write_text_file, VaultChildEntry, VaultEntryKind,
 };
 use deep_obsidian_index::graph as index_graph;
 use deep_obsidian_index::index::{artifact_kind, artifact_mime_type, SearchIndex};
@@ -38,7 +37,7 @@ const DEFAULT_SEARCH_SNIPPET_CHARS: usize = 2_000;
 /// per-field `max_text_chars` cap alone cannot provide for multi-result tools.
 const RESPONSE_TEXT_BUDGET_CHARS: usize = 24_000;
 const TRUNCATION_NOTE: &str =
-    "Response text truncated to fit the aggregate budget; later matches' text was omitted. Lower `limit` or call read_file/read_chunk for full text.";
+    "Response text truncated to fit the aggregate budget; later matches' text was omitted. Lower `limit` or call read_file for full text.";
 
 /// Clear, actionable error surfaced when `grep_search` is invoked but ripgrep
 /// could not be resolved at startup (or a spawn unexpectedly fails with
@@ -377,15 +376,6 @@ fn is_protected_write_path(path: &str) -> bool {
     path.trim_start_matches('/').split('/').any(|segment| {
         segment.eq_ignore_ascii_case("template") || segment.eq_ignore_ascii_case("templates")
     })
-}
-
-fn existing_file_bytes(vault_path: &Path, path: &str) -> Result<Option<Vec<u8>>, String> {
-    let absolute_path = ensure_inside_vault(vault_path, path).map_err(|error| error.to_string())?;
-    match fs::read(&absolute_path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
 }
 
 fn expected_hash_arg(arguments: &Value) -> Option<String> {
@@ -777,16 +767,6 @@ fn update_or_create_note_section(
         merged.extend(body_lines);
     }
     Ok((join_note_lines(merged), "created", heading_level))
-}
-
-fn decode_file_content(content: &str, encoding: &str) -> Result<Vec<u8>, String> {
-    match encoding {
-        "utf-8" | "utf8" => Ok(content.as_bytes().to_vec()),
-        "base64" => BASE64_STANDARD
-            .decode(content)
-            .map_err(|error| format!("invalid base64 content: {}", error)),
-        other => Err(format!("unsupported encoding: {}", other)),
-    }
 }
 
 fn vault_child_entry_json(entry: &VaultChildEntry) -> Value {
@@ -1332,22 +1312,6 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "write_file_to_vault".to_string(),
-            description: "Create or update a non-note file inside the vault using UTF-8 text or base64-encoded bytes.".to_string(),
-            annotations: Some(tool_annotations(false, Some(false), Some(true))),
-            execution: Some(json!({"taskSupport":"forbidden"})),
-            input_schema: object_schema(
-                vec![
-                    ("path", json!({"type":"string","description":"Vault-relative file path to create or update."})),
-                    ("content", json!({"type":"string","description":"File content as UTF-8 text or base64."})),
-                    ("encoding", json!({"type":"string","enum":["utf-8","base64"],"default":"utf-8"})),
-                    ("dryRun", json!({"type":"boolean","default":false,"description":"Preview the write without changing the vault."})),
-                    ("expectedHash", json!({"type":"string","description":"Optional hash of the current file content. If it does not match, no write occurs."})),
-                ],
-                vec!["path","content"],
-            ),
-        },
-        ToolDefinition {
             name: "request_vault_upload".to_string(),
             description: "Mint a short-lived, single-use upload URL for a binary file too large to inline as base64. Bytes are uploaded out-of-band (e.g. via curl) to the returned URL, which writes them to the bound vault path. Requires the HTTP service transport.".to_string(),
             annotations: Some(tool_annotations(false, Some(false), Some(false))),
@@ -1363,28 +1327,13 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "list_children".to_string(),
-            description: "List the direct children of a vault directory, including non-markdown files and subfolders.".to_string(),
+            description: "List the direct children of a vault directory, including non-markdown files and subfolders. Set foldersOnly:true to return only the subfolders (direct subdirectories).".to_string(),
             annotations: Some(tool_annotations(true, None, None)),
             execution: Some(json!({"taskSupport":"forbidden"})),
             input_schema: object_schema(
                 vec![
                     ("path", json!({"type":"string","description":"Optional vault-relative directory path. Defaults to the vault root."})),
-                    ("includeHidden", json!({"type":"boolean","default":false})),
-                    ("includeIgnored", json!({"type":"boolean","default":false})),
-                ],
-                vec![],
-            ),
-        },
-        ToolDefinition {
-            name: "list_folders".to_string(),
-            description: "List folders in the vault or under a subdirectory, optionally recursively.".to_string(),
-            annotations: Some(tool_annotations(true, None, None)),
-            execution: Some(json!({"taskSupport":"forbidden"})),
-            input_schema: object_schema(
-                vec![
-                    ("path", json!({"type":"string","description":"Optional vault-relative directory path. Defaults to the vault root."})),
-                    ("recursive", json!({"type":"boolean","default":false})),
-                    ("depth", json!({"type":"integer","minimum":1,"maximum":12,"default":3})),
+                    ("foldersOnly", json!({"type":"boolean","default":false,"description":"When true, return only the direct subfolders of the directory."})),
                     ("includeHidden", json!({"type":"boolean","default":false})),
                     ("includeIgnored", json!({"type":"boolean","default":false})),
                 ],
@@ -1435,24 +1384,6 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
                     ("path", json!({"type":"string","description":"Vault-relative artifact path."})),
                     ("includeBase64", json!({"type":"boolean","default":false})),
                     ("maxBytes", json!({"type":"integer","minimum":0,"maximum":1048576,"default":0})),
-                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
-                ],
-                vec!["path"],
-            ),
-        },
-        ToolDefinition {
-            name: "read_chunk".to_string(),
-            description: "Read a deterministic line-based chunk from a file.".to_string(),
-            annotations: Some(tool_annotations(true, None, None)),
-            execution: Some(json!({"taskSupport":"forbidden"})),
-            input_schema: object_schema(
-                vec![
-                    ("path", json!({"type":"string","description":"Vault-relative markdown path."})),
-                    ("chunkIndex", json!({"type":"integer","minimum":0,"maximum":MAX_SAFE_INTEGER,"default":0})),
-                    ("chunkSizeLines", json!({"type":"integer","exclusiveMinimum":0,"maximum":MAX_SAFE_INTEGER,"default":120})),
-                    ("overlapLines", json!({"type":"integer","minimum":0,"maximum":MAX_SAFE_INTEGER,"default":20})),
-                    ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["path"],
@@ -1515,41 +1446,8 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
             input_schema: object_schema(vec![], vec![]),
         },
         ToolDefinition {
-            name: "bm25_search".to_string(),
-            description: "Search note chunks with classic BM25 lexical ranking.".to_string(),
-            annotations: Some(tool_annotations(true, None, None)),
-            execution: Some(json!({"taskSupport":"forbidden"})),
-            input_schema: object_schema(
-                vec![
-                    ("query", json!({"type":"string","description":"Lexical query."})),
-                    ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
-                    ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
-                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
-                ],
-                vec!["query"],
-            ),
-        },
-        ToolDefinition {
-            name: "semantic_search".to_string(),
-            description: "Search semantically similar note chunks using the local vectorized chunk index.".to_string(),
-            annotations: Some(tool_annotations(true, None, None)),
-            execution: Some(json!({"taskSupport":"forbidden"})),
-            input_schema: object_schema(
-                vec![
-                    ("query", json!({"type":"string","description":"Natural-language search query."})),
-                    ("scope", json!({"type":"string","enum":["chunks","artifacts","all"],"default":"chunks"})),
-                    ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
-                    ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
-                    ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
-                ],
-                vec!["query"],
-            ),
-        },
-        ToolDefinition {
             name: "hybrid_search".to_string(),
-            description: "Combine BM25 lexical ranking with semantic similarity over note chunks using Reciprocal Rank Fusion (rank-based, scale-free).".to_string(),
+            description: "Combine BM25 lexical ranking with semantic similarity over note chunks using Reciprocal Rank Fusion (rank-based, scale-free). Set bm25Weight:0 for semantic-only ranking, or semanticWeight:0 for BM25-only ranking.".to_string(),
             annotations: Some(tool_annotations(true, None, None)),
             execution: Some(json!({"taskSupport":"forbidden"})),
             input_schema: object_schema(
@@ -1579,21 +1477,8 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
             ),
         },
         ToolDefinition {
-            name: "backlinks".to_string(),
-            description: "List notes in the vault that link to the given note.".to_string(),
-            annotations: Some(tool_annotations(true, None, None)),
-            execution: Some(json!({"taskSupport":"forbidden"})),
-            input_schema: object_schema(
-                vec![
-                    ("path", json!({"type":"string","description":"Vault-relative note path."})),
-                    ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":200,"default":50})),
-                ],
-                vec!["path"],
-            ),
-        },
-        ToolDefinition {
             name: "graph_traverse".to_string(),
-            description: "Traverse the Obsidian wiki-link graph around a note, including backlinks.".to_string(),
+            description: "Traverse the Obsidian wiki-link graph around a note. For backlinks (notes that link to the given note), use direction:\"incoming\" with depth:1.".to_string(),
             annotations: Some(tool_annotations(true, None, None)),
             execution: Some(json!({"taskSupport":"forbidden"})),
             input_schema: object_schema(
@@ -1619,20 +1504,6 @@ pub fn list_tools(rg_available: bool) -> Vec<ToolDefinition> {
     tool_definitions(rg_available)
 }
 
-fn search_match_json(match_item: &index_search::SearchMatch, options: TextPayloadOptions) -> Value {
-    let mut object = Map::from_iter([
-        ("path".to_string(), json!(match_item.path.clone())),
-        ("title".to_string(), json!(match_item.title.clone())),
-        ("resourceUri".to_string(), json!(note_uri(&match_item.path))),
-        ("chunkIndex".to_string(), json!(match_item.chunk_index)),
-        ("startLine".to_string(), json!(match_item.start_line)),
-        ("endLine".to_string(), json!(match_item.end_line)),
-        ("score".to_string(), json!(match_item.score)),
-    ]);
-    insert_optional_text(&mut object, "text", &match_item.text, options);
-    Value::Object(object)
-}
-
 fn hybrid_search_match_json(
     match_item: &index_search::SearchMatch,
     options: TextPayloadOptions,
@@ -1653,24 +1524,6 @@ fn hybrid_search_match_json(
     ]);
     insert_optional_text(&mut object, "text", &match_item.text, options);
     Value::Object(object)
-}
-
-fn artifact_search_match_json(match_item: &index_search::ArtifactSearchMatch) -> Value {
-    let metadata =
-        serde_json::from_str::<Value>(&match_item.metadata_json).unwrap_or_else(|_| json!({}));
-    Value::Object(Map::from_iter([
-        ("path".to_string(), json!(match_item.path.clone())),
-        ("title".to_string(), json!(match_item.title.clone())),
-        (
-            "resourceUri".to_string(),
-            json!(artifact_uri(&match_item.path)),
-        ),
-        ("kind".to_string(), json!(match_item.kind.clone())),
-        ("mimeType".to_string(), json!(match_item.mime_type.clone())),
-        ("size".to_string(), json!(match_item.size)),
-        ("score".to_string(), json!(match_item.score)),
-        ("metadata".to_string(), metadata),
-    ]))
 }
 
 fn file_path_match_json(match_item: &index_search::FilePathMatch) -> Value {
@@ -2039,32 +1892,6 @@ fn populate_grep_context(
     Ok(())
 }
 
-async fn semantic_search_matches(
-    index: std::sync::Arc<deep_obsidian_index::index::SearchIndex>,
-    query: String,
-    options: RankingOptions,
-) -> Result<Vec<index_search::SearchMatch>, String> {
-    tokio::task::spawn_blocking(move || {
-        index_search::semantic_search_with_options(index.as_ref(), &query, options)
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
-async fn artifact_semantic_search_matches(
-    index: std::sync::Arc<deep_obsidian_index::index::SearchIndex>,
-    query: String,
-    options: RankingOptions,
-) -> Result<Vec<index_search::ArtifactSearchMatch>, String> {
-    tokio::task::spawn_blocking(move || {
-        index_search::artifact_semantic_search_with_options(index.as_ref(), &query, options)
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-}
-
 async fn hybrid_search_matches(
     index: std::sync::Arc<deep_obsidian_index::index::SearchIndex>,
     query: String,
@@ -2093,6 +1920,7 @@ pub async fn call_tool(
         }
         "list_children" => {
             let path = optional_string_arg(arguments, "path");
+            let folders_only = bool_arg(arguments, "foldersOnly", false);
             let include_hidden = bool_arg(arguments, "includeHidden", false);
             let include_ignored = bool_arg(arguments, "includeIgnored", false);
             let entries = vault_list_children(
@@ -2102,34 +1930,26 @@ pub async fn call_tool(
                 include_ignored,
             )
             .map_err(|error| error.to_string())?;
-            Ok(json_text_result(json!({
-                "path": path,
-                "count": entries.len(),
-                "children": entries.into_iter().map(|entry| vault_child_entry_json(&entry)).collect::<Vec<_>>()
-            })))
-        }
-        "list_folders" => {
-            let path = optional_string_arg(arguments, "path");
-            let recursive = bool_arg(arguments, "recursive", false);
-            let depth = clamped_usize_arg(arguments, "depth", 3, 1, 12);
-            let include_hidden = bool_arg(arguments, "includeHidden", false);
-            let include_ignored = bool_arg(arguments, "includeIgnored", false);
-            let folders = vault_list_folders(
-                &config.vault_path,
-                path.as_deref(),
-                recursive,
-                depth,
-                include_hidden,
-                include_ignored,
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(json_text_result(json!({
-                "path": path,
-                "recursive": recursive,
-                "depth": depth,
-                "count": folders.len(),
-                "folders": folders
-            })))
+            if folders_only {
+                let folders = entries
+                    .into_iter()
+                    .filter(|entry| matches!(entry.kind, VaultEntryKind::Directory))
+                    .map(|entry| entry.path)
+                    .collect::<Vec<_>>();
+                Ok(json_text_result(json!({
+                    "path": path,
+                    "foldersOnly": true,
+                    "count": folders.len(),
+                    "folders": folders
+                })))
+            } else {
+                Ok(json_text_result(json!({
+                    "path": path,
+                    "foldersOnly": false,
+                    "count": entries.len(),
+                    "children": entries.into_iter().map(|entry| vault_child_entry_json(&entry)).collect::<Vec<_>>()
+                })))
+            }
         }
         "read_file" => {
             let path = string_arg(arguments, "path")?;
@@ -2230,47 +2050,6 @@ pub async fn call_tool(
                 Value::Object(result),
             ))
         }
-        "read_chunk" => {
-            let path = string_arg(arguments, "path")?;
-            validate_format_arg(arguments)?;
-            let text_options = TextPayloadOptions::from_arguments(arguments, true);
-            let chunk_index =
-                clamped_usize_arg(arguments, "chunkIndex", 0, 0, MAX_SAFE_INTEGER as usize);
-            let chunk_size_lines = clamped_usize_arg(arguments, "chunkSizeLines", 120, 1, 10_000);
-            let overlap_lines = clamped_usize_arg(
-                arguments,
-                "overlapLines",
-                20,
-                0,
-                chunk_size_lines.saturating_sub(1),
-            );
-            let file =
-                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
-            let chunks = chunk_lines(&file.text, chunk_size_lines, overlap_lines);
-            let chunk = chunks.get(chunk_index).ok_or_else(|| {
-                format!(
-                    "Chunk {} does not exist for {}. Available chunks: {}",
-                    chunk_index,
-                    path,
-                    chunks.len()
-                )
-            })?;
-            let mut result = Map::from_iter([
-                ("path".to_string(), json!(path.clone())),
-                ("resourceUri".to_string(), json!(note_uri(&path))),
-                ("chunkIndex".to_string(), json!(chunk_index)),
-                ("chunkCount".to_string(), json!(chunks.len())),
-                ("chunkSizeLines".to_string(), json!(chunk_size_lines)),
-                ("overlapLines".to_string(), json!(overlap_lines)),
-                ("startLine".to_string(), json!(chunk.start_line)),
-                ("endLine".to_string(), json!(chunk.end_line)),
-            ]);
-            insert_optional_text(&mut result, "text", &chunk.text, text_options);
-            Ok(json_text_result_from_arguments(
-                arguments,
-                Value::Object(result),
-            ))
-        }
         "find_files" => {
             let query = string_arg(arguments, "query")?;
             let mode = optional_enum_string_arg(arguments, "mode", &["substring", "regex"])?
@@ -2365,157 +2144,6 @@ pub async fn call_tool(
             }
             Ok(json_text_result(Value::Object(result)))
         }
-        "bm25_search" => {
-            let query = string_arg(arguments, "query")?;
-            validate_format_arg(arguments)?;
-            let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
-            let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
-            let snapshot = state.runtime.fresh_snapshot("bm25_search").await?;
-            let index = snapshot.index;
-            let matches = index_search::bm25_search_with_options(
-                &index,
-                &query,
-                RankingOptions {
-                    limit,
-                    semantic_weight: 0.6,
-                    bm25_weight: 0.4,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-            let count = matches.len();
-            let mut match_values = matches
-                .into_iter()
-                .map(|item| search_match_json(&item, text_options))
-                .collect::<Vec<_>>();
-            let response_truncated =
-                apply_response_text_budget(&mut match_values, "text", RESPONSE_TEXT_BUDGET_CHARS);
-            let mut result = Map::new();
-            result.insert("query".to_string(), json!(query));
-            result.insert("rebuilt".to_string(), json!(snapshot.rebuilt));
-            result.insert("count".to_string(), json!(count));
-            result.insert("matches".to_string(), json!(match_values));
-            insert_response_truncation_flags(&mut result, response_truncated);
-            Ok(json_text_result_from_arguments(
-                arguments,
-                Value::Object(result),
-            ))
-        }
-        "semantic_search" => {
-            let query = string_arg(arguments, "query")?;
-            validate_format_arg(arguments)?;
-            let scope =
-                optional_enum_string_arg(arguments, "scope", &["chunks", "artifacts", "all"])?
-                    .unwrap_or_else(|| "chunks".to_string());
-            let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
-            let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
-            let snapshot = state.runtime.fresh_snapshot("semantic_search").await?;
-            let index = snapshot.index;
-            let options = RankingOptions {
-                limit,
-                semantic_weight: 1.0,
-                bm25_weight: 0.0,
-            };
-            match scope.as_str() {
-                "chunks" => {
-                    let matches =
-                        semantic_search_matches(index.clone(), query.clone(), options).await?;
-                    let count = matches.len();
-                    let mut match_values = matches
-                        .into_iter()
-                        .map(|item| search_match_json(&item, text_options))
-                        .collect::<Vec<_>>();
-                    let response_truncated = apply_response_text_budget(
-                        &mut match_values,
-                        "text",
-                        RESPONSE_TEXT_BUDGET_CHARS,
-                    );
-                    let mut result = Map::new();
-                    result.insert("query".to_string(), json!(query));
-                    result.insert("scope".to_string(), json!(scope));
-                    result.insert("rebuilt".to_string(), json!(snapshot.rebuilt));
-                    result.insert(
-                        "semanticBackend".to_string(),
-                        json!(index.semantic_backend.as_str()),
-                    );
-                    result.insert("count".to_string(), json!(count));
-                    result.insert("matches".to_string(), json!(match_values));
-                    insert_response_truncation_flags(&mut result, response_truncated);
-                    Ok(json_text_result_from_arguments(
-                        arguments,
-                        Value::Object(result),
-                    ))
-                }
-                "artifacts" => {
-                    let matches =
-                        artifact_semantic_search_matches(index.clone(), query.clone(), options)
-                            .await?;
-                    Ok(json_text_result_from_arguments(
-                        arguments,
-                        json!({
-                            "query": query,
-                            "scope": scope,
-                            "rebuilt": snapshot.rebuilt,
-                            "semanticBackend": index.semantic_backend.as_str(),
-                            "artifactEmbeddingProvider": index.artifact_embedding_provider.clone(),
-                            "artifactEmbeddingModel": index.artifact_embedding_model.clone(),
-                            "count": matches.len(),
-                            "matches": matches.into_iter().map(|item| artifact_search_match_json(&item)).collect::<Vec<_>>()
-                        }),
-                    ))
-                }
-                "all" => {
-                    let chunk_matches =
-                        semantic_search_matches(index.clone(), query.clone(), options.clone())
-                            .await?;
-                    let artifact_result =
-                        artifact_semantic_search_matches(index.clone(), query.clone(), options)
-                            .await;
-                    let (artifact_matches, artifact_error) = match artifact_result {
-                        Ok(matches) => (matches, None),
-                        Err(error) => (Vec::new(), Some(error)),
-                    };
-                    let chunk_count = chunk_matches.len();
-                    let mut chunk_values = chunk_matches
-                        .into_iter()
-                        .map(|item| search_match_json(&item, text_options))
-                        .collect::<Vec<_>>();
-                    let response_truncated = apply_response_text_budget(
-                        &mut chunk_values,
-                        "text",
-                        RESPONSE_TEXT_BUDGET_CHARS,
-                    );
-                    let mut result = Map::new();
-                    result.insert("query".to_string(), json!(query));
-                    result.insert("scope".to_string(), json!(scope));
-                    result.insert("rebuilt".to_string(), json!(snapshot.rebuilt));
-                    result.insert(
-                        "semanticBackend".to_string(),
-                        json!(index.semantic_backend.as_str()),
-                    );
-                    result.insert(
-                        "chunks".to_string(),
-                        json!({
-                            "count": chunk_count,
-                            "matches": chunk_values
-                        }),
-                    );
-                    result.insert(
-                        "artifacts".to_string(),
-                        json!({
-                            "count": artifact_matches.len(),
-                            "error": artifact_error,
-                            "matches": artifact_matches.into_iter().map(|item| artifact_search_match_json(&item)).collect::<Vec<_>>()
-                        }),
-                    );
-                    insert_response_truncation_flags(&mut result, response_truncated);
-                    Ok(json_text_result_from_arguments(
-                        arguments,
-                        Value::Object(result),
-                    ))
-                }
-                _ => unreachable!(),
-            }
-        }
         "hybrid_search" => {
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
@@ -2579,22 +2207,6 @@ pub async fn call_tool(
                 "matches": matches.into_iter().map(|item| note_result_json(item.path, item.title, |object| {
                     object.insert("score".to_string(), json!(item.score));
                     object.insert("sharedLinks".to_string(), json!(item.shared_links));
-                })).collect::<Vec<_>>()
-            })))
-        }
-        "backlinks" => {
-            let path = string_arg(arguments, "path")?;
-            let limit = clamped_usize_arg(arguments, "limit", 50, 1, 200);
-            let snapshot = state.runtime.fresh_snapshot("backlinks").await?;
-            let index = snapshot.index;
-            let backlinks =
-                index_graph::backlinks(&index, &path, limit).map_err(|error| error.to_string())?;
-            Ok(json_text_result(json!({
-                "path": path,
-                "rebuilt": snapshot.rebuilt,
-                "count": backlinks.len(),
-                "backlinks": backlinks.into_iter().map(|item| note_result_json(item.path, item.title, |object| {
-                    object.insert("matchedLinks".to_string(), json!(item.matched_links));
                 })).collect::<Vec<_>>()
             })))
         }
@@ -2971,42 +2583,13 @@ pub async fn call_tool(
                 "newHash": new_hash
             })))
         }
-        "write_file_to_vault" => {
-            let path = string_arg(arguments, "path")?;
-            let content = string_arg(arguments, "content")?;
-            let encoding =
-                optional_string_arg(arguments, "encoding").unwrap_or_else(|| "utf-8".to_string());
-            let dry_run = bool_arg(arguments, "dryRun", false);
-            let expected_hash = expected_hash_arg(arguments);
-            let bytes = decode_file_content(&content, &encoding)?;
-            let existing_bytes = existing_file_bytes(&config.vault_path, &path)?;
-            let previous_hash = existing_bytes.as_ref().map(|bytes| content_hash(bytes));
-            validate_expected_hash(expected_hash.as_deref(), previous_hash.as_deref(), &path)?;
-            let new_hash = content_hash(&bytes);
-            let created = existing_bytes.is_none();
-            if !dry_run {
-                write_binary_file(&config.vault_path, &path, &bytes)
-                    .map_err(|error| error.to_string())?;
-            }
-            Ok(json_text_result(json!({
-                "action": if created { "created" } else { "updated" },
-                "path": path,
-                "resourceUri": if path.to_lowercase().ends_with(".md") { json!(note_uri(&path)) } else { Value::Null },
-                "encoding": encoding,
-                "created": created,
-                "dryRun": dry_run,
-                "previousHash": previous_hash,
-                "newHash": new_hash,
-                "bytesWritten": bytes.len()
-            })))
-        }
         "request_vault_upload" => {
             let path = string_arg(arguments, "path")?;
             let expected_hash = expected_hash_arg(arguments);
             let mime_type = optional_string_arg(arguments, "mimeType");
             // Reject traversal NOW, at mint, before issuing any capability.
             ensure_inside_vault(&config.vault_path, &path).map_err(|error| error.to_string())?;
-            // Match write_file_to_vault's protected-path policy: never let an
+            // Enforce the vault's protected-path policy: never let an
             // upload land inside Template(s)/ folders. Checked at mint so the
             // capability is never even issued for a protected destination.
             if is_protected_write_path(&path) {
@@ -3952,7 +3535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bm25_search_caps_aggregate_text_and_signals_truncation() {
+    async fn hybrid_search_caps_aggregate_text_and_signals_truncation() {
         let vault_path = temp_dir("bm25-budget");
         // A large body so each chunk snippet is sizable. Many notes sharing the
         // query term so the response carries multiple text-bearing matches.
@@ -3972,11 +3555,11 @@ mod tests {
         // Force large per-result snippets so a few matches blow past the budget.
         let result = call_tool(
             &state,
-            "bm25_search",
+            "hybrid_search",
             &json!({"query": "needle", "limit": 50, "maxTextChars": 20000}),
         )
         .await
-        .expect("bm25_search should succeed");
+        .expect("hybrid_search should succeed");
 
         let matches = result.structured_content["matches"]
             .as_array()
@@ -4027,9 +3610,9 @@ mod tests {
         let state = test_state(vault_path).await;
 
         // Default snippet cap (no maxTextChars override) = DEFAULT_SEARCH_SNIPPET_CHARS.
-        let result = call_tool(&state, "bm25_search", &json!({"query": "gizmotron", "limit": 5}))
+        let result = call_tool(&state, "hybrid_search", &json!({"query": "gizmotron", "limit": 5}))
             .await
-            .expect("bm25_search should succeed");
+            .expect("hybrid_search should succeed");
         let matches = result.structured_content["matches"]
             .as_array()
             .expect("matches array");
@@ -4052,7 +3635,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bm25_search_small_response_is_not_truncated() {
+    async fn hybrid_search_small_response_is_not_truncated() {
         let vault_path = temp_dir("bm25-small");
         fs::write(
             vault_path.join("Only.md"),
@@ -4061,9 +3644,9 @@ mod tests {
         .expect("write note");
         let state = test_state(vault_path).await;
 
-        let result = call_tool(&state, "bm25_search", &json!({"query": "needle"}))
+        let result = call_tool(&state, "hybrid_search", &json!({"query": "needle"}))
             .await
-            .expect("bm25_search should succeed");
+            .expect("hybrid_search should succeed");
 
         let matches = result.structured_content["matches"]
             .as_array()

@@ -38,13 +38,6 @@ impl Default for GraphDirection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BacklinkMatch {
-    pub path: String,
-    pub title: String,
-    pub matched_links: Vec<String>,
-}
-
 fn strip_md_extension(note_path: &str) -> &str {
     if note_path.to_lowercase().ends_with(".md") {
         &note_path[..note_path.len().saturating_sub(3)]
@@ -260,42 +253,6 @@ pub(crate) fn one_hop_neighbor_notes(
     neighbors
 }
 
-pub fn backlinks(index: &SearchIndex, note_path: &str, limit: usize) -> Result<Vec<BacklinkMatch>> {
-    if index.note(note_path).is_none() {
-        return Err(IndexError::NoteNotFound(note_path.to_string()));
-    }
-
-    let mut matches = Vec::new();
-    let adjacency = GraphAdjacency::build(index);
-    for note in &index.notes {
-        let matched_links =
-            adjacency
-                .outgoing_by_source
-                .get(&note.path)
-                .map_or_else(Vec::new, |edges| {
-                    edges
-                        .iter()
-                        .filter(|edge| edge.target == note_path)
-                        .map(|edge| edge.raw_link.clone())
-                        .collect::<Vec<_>>()
-                });
-        if matched_links.is_empty() {
-            continue;
-        }
-
-        matches.push(BacklinkMatch {
-            path: note.path.clone(),
-            title: note.title.clone(),
-            matched_links,
-        });
-        if matches.len() >= limit.max(1) {
-            break;
-        }
-    }
-
-    Ok(matches)
-}
-
 pub fn graph_traverse(
     index: &SearchIndex,
     note_path: &str,
@@ -459,20 +416,6 @@ mod tests {
         index
     }
 
-    fn repeated_backlink_index() -> SearchIndex {
-        let root = unique_temp_dir("repeated-backlink");
-        fs::create_dir_all(&root).expect("temp dir");
-        write_fixture(&root, "Home.md", "# Home\n\nAnchor.\n");
-        write_fixture(
-            &root,
-            "Mention.md",
-            "# Mention\n\nSee [[Home]] and [[Home#Details]].\n",
-        );
-        let index = crate::index::build_index(&root, None, None).expect("build index");
-        fs::remove_dir_all(root).ok();
-        index
-    }
-
     #[test]
     fn resolve_links_prefers_exact_and_relative_matches() {
         let index = sample_index();
@@ -484,24 +427,6 @@ mod tests {
             resolve_wiki_link_target(&index, "Projects/Brew Service.md", "Home"),
             Some("Home.md".to_string())
         );
-    }
-
-    #[test]
-    fn backlinks_return_inbound_matches() {
-        let index = sample_index();
-        let matches = backlinks(&index, "Home.md", 20).expect("backlinks");
-        assert!(matches
-            .iter()
-            .any(|entry| entry.path == "Projects/Brew Service.md"));
-    }
-
-    #[test]
-    fn backlinks_keep_all_matching_raw_links_for_each_source() {
-        let index = repeated_backlink_index();
-        let matches = backlinks(&index, "Home.md", 20).expect("backlinks");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].path, "Mention.md");
-        assert_eq!(matches[0].matched_links, vec!["Home", "Home#Details"]);
     }
 
     #[test]

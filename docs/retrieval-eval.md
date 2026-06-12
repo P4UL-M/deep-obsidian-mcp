@@ -87,11 +87,12 @@ cargo run -p deep-obsidian-cli -- \
 
 ### Step B — run the fixed query list against the search tools
 
-Retrieval is exposed through the MCP tools `hybrid_search`, `semantic_search`, and
-`bm25_search` (each takes a `query` and an optional `limit`). Drive them through
-whatever MCP client you use (the Deep Obsidian MCP integration, or a raw JSON-RPC
-client over the stdio/http transport). For each query, capture the **top-5** paths from
-`hybrid_search` and from `semantic_search`.
+Retrieval is exposed through the MCP tool `hybrid_search` (it takes a `query` and an
+optional `limit`, plus `bm25Weight`/`semanticWeight` to isolate the BM25-only or
+semantic-only ranking). Drive it through whatever MCP client you use (the Deep Obsidian
+MCP integration, or a raw JSON-RPC client over the stdio/http transport). For each query,
+capture the **top-5** paths from the default `hybrid_search` and from a semantic-only run
+(`bm25Weight:0`).
 
 Use the **same fixed query list** before and after the change so the comparison is
 apples-to-apples. Suggested list (adapt the nouns to your vault, keep the intent):

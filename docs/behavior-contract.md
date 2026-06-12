@@ -89,23 +89,18 @@ The black-box surface must preserve:
 - `vault_info`
 - `load_knowledge`
 - `recommend_folder`
-- `list_children`
-- `list_folders`
+- `list_children` (with `foldersOnly` flag for subfolder-only listing)
 - `read_file`
-- `read_chunk`
 - `find_files`
 - `grep_search`
 - `build_index`
-- `bm25_search`
-- `semantic_search`
-- `hybrid_search`
+- `hybrid_search` (with `bm25Weight`/`semanticWeight` flags for BM25-only or semantic-only ranking)
 - `related_notes`
 - `find_similar_notes`
-- `backlinks`
-- `graph_traverse`
+- `graph_traverse` (with `direction:"incoming"` for backlinks)
 - `upsert_note`
 - `update_note_section`
-- `write_file_to_vault`
+- `request_vault_upload`
 - `upsert_session_note`
 
 `upsert_note` must preserve explicit author control. If `content` is provided, it must be written as-is. If `title` or `frontmatter` are provided, they must only be written when explicitly requested.

@@ -62,8 +62,8 @@ For recurring maintenance, perform at most one small task per run.
 
 ## Efficiency Rules
 
-- Prefer `note_outline`, `hybrid_search`, `grep_search`, `backlinks`, and `graph_traverse` before `read_file` on large notes.
-- Prefer `read_chunk` over `read_file` when only one section is needed.
+- Prefer `note_outline`, `hybrid_search`, `grep_search`, and `graph_traverse` (use `direction:"incoming"` for backlinks) before `read_file` on large notes.
+- Prefer `read_file` with `startLine`/`endLine` over a full read when only one section is needed.
 - Do not scan the whole vault manually.
 - Do not read every session note. Search or inspect indexes first.
 - Prefer updating an existing durable note over creating near-duplicates.
@@ -252,11 +252,9 @@ Do not log trivial read-only exploration.
 ## Preferred MCP Tools
 
 - `vault_info`: verify connectivity and index state
-- `read_file`: read contracts, selected targets, and verify writes
-- `read_chunk`: inspect relevant sections without loading whole notes
+- `read_file`: read contracts, selected targets, and verify writes (use `startLine`/`endLine` to inspect a section without loading the whole note)
 - `note_outline`: inspect long notes cheaply
 - `hybrid_search`: find candidate source and target notes
 - `grep_search`: find exact phrases, IDs, file paths, decisions, or headings
-- `backlinks`: inspect incoming links before refactors
-- `graph_traverse`: inspect local graph context
+- `graph_traverse`: inspect local graph context (use `direction:"incoming"`, `depth:1` for backlinks before refactors)
 - `upsert_note` or write tools: create/update durable notes with hash guards when available
