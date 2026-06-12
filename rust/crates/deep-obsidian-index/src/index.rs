@@ -677,7 +677,6 @@ fn section_chunks(
     note_title: &str,
     target_tokens: usize,
     min_tokens: usize,
-    max_chars: usize,
 ) -> Option<Vec<SectionChunk>> {
     let lines: Vec<&str> = content.split('\n').collect();
     let boundaries = scan_heading_boundaries(&lines);
@@ -752,7 +751,7 @@ fn section_chunks(
     // Split any tile that still exceeds the target token budget.
     let mut chunks = Vec::new();
     for tile in merged {
-        split_oversized_tile(&lines, tile, target_tokens, max_chars, &mut chunks);
+        split_oversized_tile(&lines, tile, target_tokens, &mut chunks);
     }
     Some(chunks)
 }
@@ -820,7 +819,6 @@ fn split_oversized_tile(
     lines: &[&str],
     tile: SectionChunk,
     target_tokens: usize,
-    max_chars: usize,
     out: &mut Vec<SectionChunk>,
 ) {
     if token_len(&tile.text) <= target_tokens {
@@ -887,7 +885,7 @@ fn split_oversized_tile(
                 heading_path: path,
                 group_id: tile.group_id,
             };
-            split_oversized_tile(lines, child, target_tokens, max_chars, out);
+            split_oversized_tile(lines, child, target_tokens, out);
         }
         return;
     }
@@ -1841,7 +1839,6 @@ fn prepare_note_from_snapshot(
         &title,
         SECTION_CHUNK_TARGET_TOKENS,
         SECTION_CHUNK_MIN_TOKENS,
-        DEFAULT_CHUNK_MAX_CHARS,
     ) {
         Some(sections) => sections
             .into_iter()
@@ -4549,7 +4546,6 @@ mod tests {
             title,
             SECTION_CHUNK_TARGET_TOKENS,
             SECTION_CHUNK_MIN_TOKENS,
-            DEFAULT_CHUNK_MAX_CHARS,
         )
         .expect("note has headings")
     }
@@ -4562,7 +4558,6 @@ mod tests {
             "Untitled",
             SECTION_CHUNK_TARGET_TOKENS,
             SECTION_CHUNK_MIN_TOKENS,
-            DEFAULT_CHUNK_MAX_CHARS,
         )
         .is_none());
     }
@@ -4687,7 +4682,7 @@ mod tests {
             .collect();
         let content = format!("# Solo\n{}\n", lines.join("\n"));
         let src: Vec<&str> = content.split('\n').collect();
-        let chunks = section_chunks(&content, "Solo", 64, 16, DEFAULT_CHUNK_MAX_CHARS)
+        let chunks = section_chunks(&content, "Solo", 64, 16)
             .expect("has heading");
         assert!(chunks.len() > 1, "oversized multiline section must split");
         for chunk in &chunks {
@@ -4708,7 +4703,7 @@ mod tests {
         // pieces share one source line number (sub-line caveat) but stay under budget.
         let body = "alpha beta gamma delta epsilon zeta eta theta iota kappa ".repeat(120);
         let content = format!("# Solo\n{body}\n");
-        let chunks = section_chunks(&content, "Solo", 64, 16, DEFAULT_CHUNK_MAX_CHARS)
+        let chunks = section_chunks(&content, "Solo", 64, 16)
             .expect("has heading");
         assert!(chunks.len() > 1, "oversized single line must word-split");
         for chunk in &chunks {
