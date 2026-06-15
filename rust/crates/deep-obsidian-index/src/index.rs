@@ -33,6 +33,44 @@ impl Default for SemanticBackend {
     }
 }
 
+/// Renders an `IndexError::Io` message. A bare `Operation not permitted` /
+/// `Permission denied` from the filesystem is opaque to users, so when the OS
+/// reports `PermissionDenied` we surface the actual cause — the server process
+/// lacks access to the vault folder — together with the concrete remediation.
+/// This is the common failure when the vault lives in a macOS TCC-protected
+/// location (Documents/Desktop/Downloads/iCloud Drive) and the server runs as a
+/// background launchd service that was never granted file access. Non-permission
+/// IO errors keep their original wording.
+fn describe_io_error(path: &Path, source: &std::io::Error) -> String {
+    if source.kind() != std::io::ErrorKind::PermissionDenied {
+        return format!("io error for {}: {source}", path.display());
+    }
+
+    let base = format!(
+        "permission denied accessing {} — the deep-obsidian-mcp server process is not authorized \
+to read this folder",
+        path.display()
+    );
+
+    if cfg!(target_os = "macos") {
+        format!(
+            "{base}. On macOS, protected folders (Documents, Desktop, Downloads, iCloud Drive) \
+require explicit access. Grant the deep-obsidian-mcp binary Full Disk Access in System Settings → \
+Privacy & Security → Full Disk Access \
+(x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles), then restart the \
+service with `brew services restart deep-obsidian-mcp`. Verify the process — not just your \
+terminal — can read the vault with `deep-obsidian-mcp doctor`. Alternatively, move the vault \
+outside the protected folder and update the configured vault path. (os error {})",
+            source.raw_os_error().unwrap_or_default()
+        )
+    } else {
+        format!(
+            "{base}. Ensure the service has read/write access to the vault path (check folder \
+ownership/permissions and any sandbox confinement), then restart it. ({source})"
+        )
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum IndexError {
     #[error("vault path does not exist or is not a directory: {0}")]
@@ -41,7 +79,7 @@ pub enum IndexError {
     InvalidVaultRelativePath(String),
     #[error("pattern error for {pattern:?}: {message}")]
     InvalidRegex { pattern: String, message: String },
-    #[error("io error for {path}: {source}")]
+    #[error("{}", describe_io_error(.path, .source))]
     Io {
         path: PathBuf,
         #[source]
@@ -4254,6 +4292,51 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn io_permission_denied_surfaces_actionable_remediation() {
+        let error = IndexError::Io {
+            path: PathBuf::from("/Users/someone/Documents/Vault"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("permission denied accessing /Users/someone/Documents/Vault"),
+            "should name the inaccessible path: {message}"
+        );
+        assert!(
+            message.contains("not authorized"),
+            "should explain the server lacks access: {message}"
+        );
+        // Both the macOS and the generic branch tell the user to restart the service.
+        assert!(
+            message.contains("restart"),
+            "should include remediation steps: {message}"
+        );
+        if cfg!(target_os = "macos") {
+            assert!(
+                message.contains("Full Disk Access"),
+                "macOS message should reference Full Disk Access: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn io_non_permission_error_keeps_original_wording() {
+        let error = IndexError::Io {
+            path: PathBuf::from("/tmp/missing"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        let message = error.to_string();
+        assert!(
+            message.starts_with("io error for /tmp/missing:"),
+            "non-permission IO errors keep their original wording: {message}"
+        );
+        assert!(
+            !message.contains("Full Disk Access"),
+            "non-permission IO errors must not show permission remediation: {message}"
+        );
+    }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
