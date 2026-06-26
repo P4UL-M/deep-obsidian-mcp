@@ -7,7 +7,7 @@ This document tracks what is still missing before `deep-obsidian-mcp` can be tre
 ## Missing Packaging Work
 
 - [ ] Publish a real release source tarball or bottle artifact for the Rust build.
-- [ ] Replace the placeholder `url` and `sha256` in [Formula/deep-obsidian-mcp.rb](/Users/paul.mairesse/Documents/Playground/deep-obsidian-mcp/Formula/deep-obsidian-mcp.rb).
+- [ ] Replace the placeholder `url` and `sha256` in [Formula/deep-obsidian-mcp.rb](../Formula/deep-obsidian-mcp.rb).
 - [ ] Validate `brew install deep-obsidian-mcp` from a clean machine without using the developer checkout.
 - [ ] Decide whether the formula installs from source with Cargo or from a prebuilt release artifact.
 - [ ] Document the supported macOS architectures and the bottle strategy.
