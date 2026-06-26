@@ -119,6 +119,10 @@ pub enum Command {
         /// Without this flag, auth is left as configured (off for a new config).
         #[arg(long, action = clap::ArgAction::SetTrue)]
         auth: bool,
+        /// Disable HTTP bearer auth and delete the stored token. Takes
+        /// precedence over `--auth`.
+        #[arg(long = "no-auth", action = clap::ArgAction::SetTrue)]
+        no_auth: bool,
     },
     Doctor {
         #[arg(long = "probe-timeout-ms", default_value_t = 5_000)]
