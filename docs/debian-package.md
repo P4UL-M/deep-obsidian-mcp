@@ -8,7 +8,14 @@ Packages are published for **amd64** and **arm64**.
 ## Install from the APT repository (recommended)
 
 The project hosts a signed APT repository on GitHub Pages, so you get updates
-through normal `apt upgrade`:
+through normal `apt upgrade`. The one-liner adds the key + repository and
+installs:
+
+```bash
+curl -fsSL https://p4ul-m.github.io/deep-obsidian-mcp/install.sh | sudo bash
+```
+
+If you'd rather not pipe a script to `bash`, run the same steps yourself:
 
 ```bash
 # 1. Trust the repository signing key
@@ -23,6 +30,9 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/deep-
 sudo apt update
 sudo apt install deep-obsidian-mcp
 ```
+
+(The one-liner just runs steps 1–3; the script is published at
+`/install.sh` on the same Pages site.)
 
 ## Install a single `.deb` (alternative)
 

@@ -21,6 +21,8 @@ KEYID="${3:?missing <gpg-key-id>}"
 SUITE="${SUITE:-stable}"
 COMPONENT="${COMPONENT:-main}"
 ARCHES=(amd64 arm64)
+# Public base URL the repo is served from (GitHub Pages). Override for forks.
+BASE_URL="${BASE_URL:-https://p4ul-m.github.io/deep-obsidian-mcp}"
 
 DEB_DIR="$(cd "$DEB_DIR" && pwd)"
 rm -rf "$OUT"
@@ -58,12 +60,53 @@ fi
 # Publish the public key (armored) for clients to fetch and dearmor.
 gpg --armor --export "$KEYID" > "deep-obsidian-mcp.gpg"
 
-cat > index.html <<'HTML'
+# One-line installer: `curl -fsSL <base>/install.sh | sudo bash`.
+# BASE_URL is baked in now; the runtime expansions stay literal (quoted heredoc).
+{
+  printf '#!/usr/bin/env bash\n'
+  printf '# Add the deep-obsidian-mcp APT repository and install the package.\n'
+  printf 'set -euo pipefail\n'
+  printf 'BASE_URL="%s"\n' "$BASE_URL"
+  printf 'SUITE="%s"\n' "$SUITE"
+  printf 'COMPONENT="%s"\n' "$COMPONENT"
+  cat <<'SCRIPT'
+KEYRING=/usr/share/keyrings/deep-obsidian-mcp.gpg
+LIST=/etc/apt/sources.list.d/deep-obsidian-mcp.list
+
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  SUDO="sudo"
+fi
+
+echo "Installing prerequisites (curl, gnupg)..."
+$SUDO apt-get update
+$SUDO apt-get install -y ca-certificates curl gnupg
+
+echo "Adding the deep-obsidian-mcp signing key and repository..."
+curl -fsSL "$BASE_URL/deep-obsidian-mcp.gpg" | $SUDO gpg --dearmor -o "$KEYRING"
+echo "deb [arch=$(dpkg --print-architecture) signed-by=$KEYRING] $BASE_URL $SUITE $COMPONENT" \
+  | $SUDO tee "$LIST" >/dev/null
+
+echo "Installing deep-obsidian-mcp..."
+$SUDO apt-get update
+$SUDO apt-get install -y deep-obsidian-mcp
+
+echo
+echo "Installed. Next steps:"
+echo "  deep-obsidian-mcp setup-service --vault ~/Vault"
+echo "  systemctl --user enable --now deep-obsidian-mcp"
+SCRIPT
+} > install.sh
+chmod +x install.sh
+
+cat > index.html <<HTML
 <!doctype html>
 <meta charset="utf-8">
 <title>deep-obsidian-mcp APT repository</title>
 <h1>deep-obsidian-mcp APT repository</h1>
-<p>Install instructions:
+<p>Quick install:</p>
+<pre>curl -fsSL ${BASE_URL}/install.sh | sudo bash</pre>
+<p>Manual steps and details:
 <a href="https://github.com/P4UL-M/deep-obsidian-mcp/blob/main/docs/debian-package.md">docs/debian-package.md</a>.</p>
 HTML
 

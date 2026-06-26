@@ -103,15 +103,11 @@ jobs:
             unset APT_GPG_PASSPHRASE
           fi
           KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')
-          scripts/build-apt-repo.sh debs public "$KEYID"
-          # End-to-end: install from the freshly built repo over file:// with
-          # signature verification (no [trusted=yes]).
-          gpg --dearmor < public/deep-obsidian-mcp.gpg \
-            | sudo tee /usr/share/keyrings/deep-obsidian-mcp.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/deep-obsidian-mcp.gpg] file://$PWD/public stable main" \
-            | sudo tee /etc/apt/sources.list.d/deep-obsidian-mcp.list
-          sudo apt-get update
-          sudo apt-get install -y deep-obsidian-mcp
+          # Point the generated install.sh at the local repo so we can run the
+          # real installer end-to-end (with signature verification, no trusted=yes).
+          BASE_URL="file://$PWD/public" scripts/build-apt-repo.sh debs public "$KEYID"
+          bash -n public/install.sh
+          sudo bash public/install.sh
           deep-obsidian-mcp version
 
   # Publishes the signed repo to GitHub Pages and attaches the .debs to the

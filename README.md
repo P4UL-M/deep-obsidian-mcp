@@ -86,17 +86,13 @@ See [docs/homebrew-service.md](./docs/homebrew-service.md) for the full Homebrew
 
 ## Debian / Ubuntu (`apt`) Quick Start
 
-On Debian/Ubuntu (amd64 or arm64), add the signed APT repository and install — `apt` pulls in `ripgrep` automatically and you get updates via `apt upgrade`:
+On Debian/Ubuntu (amd64 or arm64), one line adds the signed APT repository and installs the package (`apt` pulls in `ripgrep`; you get updates via `apt upgrade`):
 
 ```bash
-curl -fsSL https://p4ul-m.github.io/deep-obsidian-mcp/deep-obsidian-mcp.gpg \
-  | sudo gpg --dearmor -o /usr/share/keyrings/deep-obsidian-mcp.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/deep-obsidian-mcp.gpg] https://p4ul-m.github.io/deep-obsidian-mcp stable main" \
-  | sudo tee /etc/apt/sources.list.d/deep-obsidian-mcp.list
-sudo apt update && sudo apt install deep-obsidian-mcp
+curl -fsSL https://p4ul-m.github.io/deep-obsidian-mcp/install.sh | sudo bash
 ```
 
-Or install a single `.deb` from the [GitHub release](https://github.com/P4UL-M/deep-obsidian-mcp/releases): `sudo apt install ./deep-obsidian-mcp_<version>_<arch>.deb`.
+Prefer not to pipe to `bash`? The manual key + sources steps are in [docs/debian-package.md](./docs/debian-package.md). Or install a single `.deb` from the [GitHub release](https://github.com/P4UL-M/deep-obsidian-mcp/releases): `sudo apt install ./deep-obsidian-mcp_<version>_<arch>.deb`.
 
 Configure for your vault, then run it as a systemd **user** service:
 
