@@ -156,7 +156,13 @@ Enable it through the wizard:
 deep-obsidian-mcp setup-service --wizard
 ```
 
-When you answer yes to *"Enable HTTP bearer authentication"*, the CLI generates a random 256-bit token, stores it via the same secret store used for API keys (OS keyring, or the encrypted-file fallback) as a `tokenRef` in `config.json`, and prints the token to stdout **once**. Configure your MCP client to send it:
+Or non-interactively with the flag-driven setup (CI / automation):
+
+```bash
+deep-obsidian-mcp setup-service --vault ~/Vault --auth
+```
+
+Either way, when auth is enabled the CLI generates a random 256-bit token, stores it via the same secret store used for API keys (OS keyring, or the encrypted-file fallback) as a `tokenRef` in `config.json`, and prints the token to stdout **once**. Without `--auth` (and outside the wizard) auth is left as configured — off for a new config. Configure your MCP client to send it:
 
 ```
 Authorization: Bearer <token>

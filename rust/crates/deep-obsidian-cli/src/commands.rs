@@ -33,7 +33,7 @@ const CONFIG_PRECEDENCE: [&str; 4] = ["cli", "config", "env", "default"];
 const HELP_TEXT: &str = "\
 Usage:
   deep-obsidian-mcp [serve] [--config <path>] [--vault <path>] [--transport stdio|http] [--packaged]
-  deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--dry-run]
+  deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--auth] [--dry-run]
   deep-obsidian-mcp setup-service --wizard [--config <path>] [--dry-run]
   deep-obsidian-mcp doctor [--config <path>] [--json]
   deep-obsidian-mcp print-config [--config <path>]
@@ -263,7 +263,11 @@ pub async fn run() -> Result<()> {
             mcp,
             skills,
             vault_snippets,
+            auth,
         } => {
+            // `--auth` enables and provisions a token; without it, auth is left
+            // as configured (off for a fresh config).
+            let auth_choice = if auth { Some(true) } else { None };
             let report = if wizard {
                 setup_service_wizard(
                     &cli.options,
@@ -275,7 +279,16 @@ pub async fn run() -> Result<()> {
                 )?
             } else {
                 let resolved = crate::config::resolve_runtime_config(&cli.options)?;
-                setup_service(&resolved, dry_run, overwrite, mcp, skills, vault_snippets)?
+                setup_service(
+                    &resolved,
+                    dry_run,
+                    overwrite,
+                    mcp,
+                    skills,
+                    vault_snippets,
+                    auth_choice,
+                    false,
+                )?
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -612,6 +625,12 @@ pub fn setup_service(
     install_mcp: bool,
     install_skills: bool,
     install_vault_snippets: bool,
+    // `Some(true)` enables auth (generates/stores/prints a token), `Some(false)`
+    // disables it, `None` leaves the resolved auth config untouched.
+    enable_auth: Option<bool>,
+    // When true (wizard), prompt before the encrypted-file fallback; when false
+    // (flag-driven), fall back automatically.
+    interactive_auth: bool,
 ) -> Result<SetupServiceReport> {
     let mut service = ensure_service_transport_http(resolved.service.clone())?;
     service.vault_path = absolute_path(&service.vault_path)?;
@@ -625,6 +644,19 @@ pub fn setup_service(
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| config_path.clone());
+
+    // Apply the auth choice before building the persisted config so it is
+    // reflected in both the dry-run preview and the written file. A change here
+    // forces a config write below even without `--overwrite`.
+    match enable_auth {
+        Some(true) => provision_auth_token(&mut service.auth, dry_run, interactive_auth)?,
+        Some(false) => {
+            service.auth.enabled = false;
+            service.auth.token_ref = None;
+        }
+        None => {}
+    }
+    let auth_changed = enable_auth.is_some();
 
     let config = to_persisted_config(&service);
     let mut messages = vec![
@@ -673,7 +705,7 @@ pub fn setup_service(
     ensure_writable_directory(&config_dir)?;
     let mut wrote_config = false;
     let mut final_messages = messages.clone();
-    if config_path.exists() && !overwrite {
+    if config_path.exists() && !overwrite && !auth_changed {
         if !(install_mcp || install_skills || install_vault_snippets) {
             return Err(anyhow!(
                 "config file already exists: {}",
@@ -789,7 +821,10 @@ fn setup_service_wizard(
         }
     }
 
-    configure_auth_wizard(&mut resolved, dry_run)?;
+    let enable_auth = prompt_bool(
+        "Enable HTTP bearer authentication (required for non-loopback exposure)?",
+        false,
+    )?;
 
     setup_service(
         &resolved,
@@ -798,22 +833,21 @@ fn setup_service_wizard(
         install_mcp,
         install_skills,
         install_vault_snippets,
+        Some(enable_auth),
+        true,
     )
 }
 
-/// Prompt to enable HTTP bearer authentication. When enabled, generate a token,
-/// store it through the shared secret store, and print it to stdout exactly
-/// once so the operator can configure their client.
-fn configure_auth_wizard(resolved: &mut ResolvedRuntimeConfig, dry_run: bool) -> Result<()> {
-    let enable_auth = prompt_bool(
-        "Enable HTTP bearer authentication (required for non-loopback exposure)?",
-        false,
-    )?;
-    if !enable_auth {
-        resolved.service.auth.enabled = false;
-        return Ok(());
-    }
-
+/// Generate an HTTP bearer token, store it through the shared secret store, and
+/// print it to stdout exactly once so the operator can configure their client.
+/// Wires the resulting reference into `auth`. In `dry_run` nothing is stored.
+/// When `interactive` is false the encrypted-file fallback is used automatically
+/// if the OS keyring is unavailable (no prompt), suiting flag-driven automation.
+fn provision_auth_token(
+    auth: &mut deep_obsidian_types::AuthConfig,
+    dry_run: bool,
+    interactive: bool,
+) -> Result<()> {
     let token = deep_obsidian_server::auth::generate_token();
     let reference = SecretRef::OsKeyring {
         service: "deep-obsidian-mcp".to_string(),
@@ -821,8 +855,8 @@ fn configure_auth_wizard(resolved: &mut ResolvedRuntimeConfig, dry_run: bool) ->
     };
 
     if dry_run {
-        resolved.service.auth.enabled = true;
-        resolved.service.auth.token_ref = Some(reference);
+        auth.enabled = true;
+        auth.token_ref = Some(reference);
         println!("dry-run: would generate and store an HTTP bearer token");
         return Ok(());
     }
@@ -832,7 +866,13 @@ fn configure_auth_wizard(resolved: &mut ResolvedRuntimeConfig, dry_run: bool) ->
         Ok(()) => reference,
         Err(error) => {
             println!("OS keyring unavailable: {error}");
-            if prompt_bool("Use encrypted local file fallback?", true)? {
+            let use_file = if interactive {
+                prompt_bool("Use encrypted local file fallback?", true)?
+            } else {
+                println!("Falling back to encrypted local file storage.");
+                true
+            };
+            if use_file {
                 let fallback = SecretRef::EncryptedFile {
                     id: "http-auth-token".to_string(),
                 };
@@ -844,8 +884,8 @@ fn configure_auth_wizard(resolved: &mut ResolvedRuntimeConfig, dry_run: bool) ->
         }
     };
 
-    resolved.service.auth.enabled = true;
-    resolved.service.auth.token_ref = Some(stored_reference);
+    auth.enabled = true;
+    auth.token_ref = Some(stored_reference);
 
     println!();
     println!("HTTP bearer authentication enabled. Save this token now (shown only once):");
@@ -2880,6 +2920,14 @@ mod tests {
             chunk_rows: None,
             file_snapshot_rows: None,
         }
+    }
+
+    #[test]
+    fn provision_auth_token_dry_run_sets_ref_without_storing() {
+        let mut auth = deep_obsidian_types::AuthConfig::default();
+        super::provision_auth_token(&mut auth, true, false).expect("dry-run provision");
+        assert!(auth.enabled);
+        assert!(auth.token_ref.is_some());
     }
 
     #[test]
