@@ -1,0 +1,19 @@
+[Unit]
+Description=Deep Obsidian MCP server
+Documentation=https://github.com/P4UL-M/deep-obsidian-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Packaged mode keeps indexes out of the vault, under the XDG data dir.
+Environment=DEEP_OBSIDIAN_PACKAGED=1
+# Vault path, port, embeddings, and auth are read from the user's config.json
+# (~/.config/deep-obsidian-mcp/config.json). Create it first with:
+#   deep-obsidian-mcp setup-service --vault ~/Vault
+ExecStart=/usr/bin/deep-obsidian-mcp serve --packaged --transport http
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

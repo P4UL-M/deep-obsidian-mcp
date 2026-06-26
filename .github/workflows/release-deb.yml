@@ -1,0 +1,168 @@
+name: release-deb
+
+# Builds the Debian/Ubuntu .deb for amd64 and arm64, validates a signed APT
+# repository, and on a pushed v* tag publishes that repo to GitHub Pages and
+# attaches the .debs to the release.
+#
+# Publishing requires repository secrets:
+#   APT_GPG_PRIVATE_KEY  - armored private key used to sign the repo (required on tags)
+#   APT_GPG_PASSPHRASE   - passphrase for that key (optional)
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "skills/**"
+      - "obsidian-snippets/**"
+      - "assets/**"
+      - "packaging/**"
+      - "scripts/build-deb.sh"
+      - "scripts/build-apt-repo.sh"
+      - ".github/workflows/release-deb.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+      - name: Derive .deb version from tag
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "deb_version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "deb_version=" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build .deb
+        run: scripts/build-deb.sh "${{ steps.ver.outputs.deb_version }}"
+      - name: Install and smoke-test the package
+        run: |
+          set -euo pipefail
+          deb=$(ls -1 target/debian/*.deb | head -1)
+          echo "Installing $deb"
+          sudo apt-get update
+          sudo apt-get install -y "./$deb"
+          deep-obsidian-mcp version
+          deep-obsidian-mcp help | grep -q "Usage:"
+          command -v rg
+          test -f /usr/share/deep-obsidian-mcp/skills/obsidian-capture-session/SKILL.md
+          test -f /usr/lib/systemd/user/deep-obsidian-mcp.service
+          systemd-analyze verify /usr/lib/systemd/user/deep-obsidian-mcp.service || true
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: target/debian/*.deb
+
+  # Validates the signed APT repo + a real `apt install` from it on every run,
+  # using the real signing key when available or an ephemeral key otherwise.
+  apt-repo:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download .deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: debs
+      - name: Build and validate the APT repository
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils gnupg
+          export GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"
+          if [[ -n "${APT_GPG_PRIVATE_KEY:-}" ]]; then
+            echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          else
+            echo "No APT_GPG_PRIVATE_KEY secret; generating an ephemeral key for validation."
+            gpg --batch --passphrase '' --quick-generate-key \
+              "deep-obsidian-mcp CI <ci@example.invalid>" default default never
+            unset APT_GPG_PASSPHRASE
+          fi
+          KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')
+          # Point the generated install.sh at the local repo so we can run the
+          # real installer end-to-end (with signature verification, no trusted=yes).
+          BASE_URL="file://$PWD/public" scripts/build-apt-repo.sh debs public "$KEYID"
+          bash -n public/install.sh
+          sudo bash public/install.sh
+          deep-obsidian-mcp version
+
+  # Publishes the signed repo to GitHub Pages and attaches the .debs to the
+  # release. Tag pushes only; requires the signing-key secret.
+  publish:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download .deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: debs
+      - name: Require signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${APT_GPG_PRIVATE_KEY:-}" ]]; then
+            echo "APT_GPG_PRIVATE_KEY secret is required to publish the APT repo." >&2
+            exit 1
+          fi
+      - name: Build the signed APT repository
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils gnupg
+          export GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"
+          echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')
+          scripts/build-apt-repo.sh debs public "$KEYID"
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - name: Deploy to Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+      - name: Attach .debs to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: debs/*.deb

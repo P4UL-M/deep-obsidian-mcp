@@ -83,12 +83,35 @@ pub fn default_index_dir(vault_path: &Path) -> PathBuf {
 }
 
 pub fn default_packaged_index_dir(vault_path: &Path) -> PathBuf {
+    packaged_data_dir()
+        .join("indexes")
+        .join(stable_vault_hash(vault_path))
+}
+
+/// Per-user application data directory used in packaged mode (where indexes live
+/// outside the vault). Platform-native: macOS Application Support, otherwise the
+/// XDG data home (Linux/apt installs).
+#[cfg(target_os = "macos")]
+fn packaged_data_dir() -> PathBuf {
     home_dir()
         .join("Library")
         .join("Application Support")
         .join(DEFAULT_CONFIG_APP_DIR)
-        .join("indexes")
-        .join(stable_vault_hash(vault_path))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn packaged_data_dir() -> PathBuf {
+    if let Some(xdg) = env::var_os("XDG_DATA_HOME") {
+        let xdg = PathBuf::from(xdg);
+        // The XDG spec requires absolute paths; ignore relative overrides.
+        if xdg.is_absolute() {
+            return xdg.join(DEFAULT_CONFIG_APP_DIR);
+        }
+    }
+    home_dir()
+        .join(".local")
+        .join("share")
+        .join(DEFAULT_CONFIG_APP_DIR)
 }
 
 fn stable_vault_hash(vault_path: &Path) -> String {
@@ -485,6 +508,7 @@ mod tests {
         assert_eq!(expand_home_path("~"), home_path);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn default_packaged_index_dir_uses_application_support() {
         let home = std::env::var("HOME").expect("HOME");
@@ -496,6 +520,18 @@ mod tests {
                 .join(DEFAULT_CONFIG_APP_DIR)
                 .join("indexes")
         ));
+        assert_eq!(path.file_name().unwrap().to_string_lossy().len(), 16);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn default_packaged_index_dir_uses_xdg_data_home() {
+        let path = default_packaged_index_dir(std::path::Path::new("~/Vault"));
+        // Lives under <app-dir>/indexes/<16-hex-hash>, regardless of whether
+        // XDG_DATA_HOME is set in the environment.
+        let rendered = path.to_string_lossy();
+        assert!(rendered.contains(DEFAULT_CONFIG_APP_DIR));
+        assert!(path.parent().unwrap().ends_with("indexes"));
         assert_eq!(path.file_name().unwrap().to_string_lossy().len(), 16);
     }
 }
