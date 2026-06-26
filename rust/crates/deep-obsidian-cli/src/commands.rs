@@ -33,7 +33,7 @@ const CONFIG_PRECEDENCE: [&str; 4] = ["cli", "config", "env", "default"];
 const HELP_TEXT: &str = "\
 Usage:
   deep-obsidian-mcp [serve] [--config <path>] [--vault <path>] [--transport stdio|http] [--packaged]
-  deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--auth] [--dry-run]
+  deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--auth|--no-auth] [--dry-run]
   deep-obsidian-mcp setup-service --wizard [--config <path>] [--dry-run]
   deep-obsidian-mcp doctor [--config <path>] [--json]
   deep-obsidian-mcp print-config [--config <path>]
@@ -264,10 +264,18 @@ pub async fn run() -> Result<()> {
             skills,
             vault_snippets,
             auth,
+            no_auth,
         } => {
-            // `--auth` enables and provisions a token; without it, auth is left
-            // as configured (off for a fresh config).
-            let auth_choice = if auth { Some(true) } else { None };
+            // `--no-auth` disables (and deletes the token); `--auth` enables and
+            // provisions one; without either, auth is left as configured (off for
+            // a fresh config). `--no-auth` wins if both are passed.
+            let auth_choice = if no_auth {
+                Some(false)
+            } else if auth {
+                Some(true)
+            } else {
+                None
+            };
             let report = if wizard {
                 setup_service_wizard(
                     &cli.options,
@@ -650,10 +658,7 @@ pub fn setup_service(
     // forces a config write below even without `--overwrite`.
     match enable_auth {
         Some(true) => provision_auth_token(&mut service.auth, dry_run, interactive_auth)?,
-        Some(false) => {
-            service.auth.enabled = false;
-            service.auth.token_ref = None;
-        }
+        Some(false) => deprovision_auth_token(&mut service.auth, dry_run),
         None => {}
     }
     let auth_changed = enable_auth.is_some();
@@ -896,6 +901,36 @@ fn provision_auth_token(
     println!();
 
     Ok(())
+}
+
+/// Disable HTTP bearer auth, deleting any stored token from the secret store so
+/// it does not linger orphaned. Deletion is best-effort: a failure (e.g. a
+/// locked keyring) is reported but does not block disabling. In `dry_run`
+/// nothing is deleted.
+fn deprovision_auth_token(auth: &mut deep_obsidian_types::AuthConfig, dry_run: bool) {
+    let previous_ref = auth.token_ref.take();
+    auth.enabled = false;
+
+    if dry_run {
+        if previous_ref.is_some() {
+            println!("dry-run: would disable auth and delete the stored HTTP bearer token");
+        } else {
+            println!("dry-run: would disable HTTP bearer authentication");
+        }
+        return;
+    }
+
+    match previous_ref {
+        Some(reference) => match SecretResolver::new().delete(&reference) {
+            Ok(()) => {
+                println!("HTTP bearer authentication disabled; stored token deleted.")
+            }
+            Err(error) => println!(
+                "HTTP bearer authentication disabled; could not delete stored token: {error}"
+            ),
+        },
+        None => println!("HTTP bearer authentication disabled."),
+    }
 }
 
 fn prompt_string(label: &str, default: Option<&str>) -> Result<String> {
@@ -2928,6 +2963,29 @@ mod tests {
         super::provision_auth_token(&mut auth, true, false).expect("dry-run provision");
         assert!(auth.enabled);
         assert!(auth.token_ref.is_some());
+    }
+
+    #[test]
+    fn deprovision_auth_token_clears_enabled_and_ref() {
+        let mut auth = deep_obsidian_types::AuthConfig {
+            enabled: true,
+            token_ref: Some(deep_obsidian_types::SecretRef::EncryptedFile {
+                id: "http-auth-token".to_string(),
+            }),
+            allowed_origins: Vec::new(),
+        };
+        // dry-run must not touch the secret store yet still clear the config.
+        super::deprovision_auth_token(&mut auth, true);
+        assert!(!auth.enabled);
+        assert!(auth.token_ref.is_none());
+    }
+
+    #[test]
+    fn deprovision_auth_token_on_already_disabled_is_noop() {
+        let mut auth = deep_obsidian_types::AuthConfig::default();
+        super::deprovision_auth_token(&mut auth, false);
+        assert!(!auth.enabled);
+        assert!(auth.token_ref.is_none());
     }
 
     #[test]
