@@ -1,0 +1,77 @@
+name: release-deb
+
+# Builds the Debian/Ubuntu .deb, installs it, and smoke-tests the result.
+# - On pull requests touching packaging/code: validates the package builds and installs.
+# - On a pushed v* tag: also attaches the .deb to the GitHub release.
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "skills/**"
+      - "obsidian-snippets/**"
+      - "assets/**"
+      - "packaging/**"
+      - "scripts/build-deb.sh"
+      - ".github/workflows/release-deb.yml"
+  workflow_dispatch:
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Derive .deb version from tag
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "deb_version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "deb_version=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build .deb
+        run: scripts/build-deb.sh "${{ steps.ver.outputs.deb_version }}"
+
+      - name: Install and smoke-test the package
+        run: |
+          set -euo pipefail
+          deb=$(ls -1 target/debian/*.deb | head -1)
+          echo "Installing $deb"
+          sudo apt-get update
+          sudo apt-get install -y "./$deb"
+          # Binary on PATH and runnable.
+          deep-obsidian-mcp version
+          deep-obsidian-mcp help | grep -q "Usage:"
+          # Runtime dependency resolved.
+          command -v rg
+          # Packaged assets landed under the FHS share dir.
+          test -f /usr/share/deep-obsidian-mcp/skills/obsidian-capture-session/SKILL.md
+          test -d /usr/share/deep-obsidian-mcp/obsidian-snippets
+          # systemd user unit installed (validate syntax; no system bus in CI).
+          test -f /usr/lib/systemd/user/deep-obsidian-mcp.service
+          systemd-analyze verify /usr/lib/systemd/user/deep-obsidian-mcp.service || true
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deep-obsidian-mcp-deb
+          path: target/debian/*.deb
+
+      - name: Attach .deb to release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/debian/*.deb

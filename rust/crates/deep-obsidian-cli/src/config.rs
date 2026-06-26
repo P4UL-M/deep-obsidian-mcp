@@ -688,11 +688,11 @@ mod tests {
         let resolved = resolve_runtime_config(&options).expect("resolve config");
 
         assert_eq!(resolved.sources.index_dir, ResolvedSource::Default);
-        assert!(resolved
-            .service
-            .index_dir
-            .to_string_lossy()
-            .contains("Application Support"));
+        // Packaged mode relocates indexes out of the vault into the per-user
+        // data dir (platform-native location), under an `indexes/<hash>` path.
+        let index_dir = resolved.service.index_dir.to_string_lossy();
+        assert!(index_dir.contains("deep-obsidian-mcp"));
+        assert!(index_dir.contains("indexes"));
         assert_ne!(resolved.service.index_dir, vault.join(".deep-obsidian-mcp"));
     }
 

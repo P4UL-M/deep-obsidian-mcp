@@ -2,6 +2,32 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.1.0-alpha.11 — 2026-06-26
+
+### Added
+
+- **Debian/Ubuntu packaging (`apt`).** The server now ships a `.deb` alongside
+  the Homebrew tap: `sudo apt install ./deep-obsidian-mcp_<version>_amd64.deb`.
+  It installs the binary to `/usr/bin`, packaged skills/snippets/assets to
+  `/usr/share/deep-obsidian-mcp/`, and a systemd **user** unit to
+  `/usr/lib/systemd/user/` (`systemctl --user enable --now deep-obsidian-mcp`).
+  Built with `cargo-deb` (`scripts/build-deb.sh`) and a `release-deb` GitHub
+  Actions workflow that builds, installs, and smoke-tests the package. See
+  [docs/debian-package.md](./docs/debian-package.md).
+- **Optional HTTP bearer authentication** for the HTTP transport (off by
+  default). Enable via `setup-service --wizard` or `setup-service --auth`
+  (generates, stores, and prints a token once); disable with
+  `setup-service --no-auth`. `DEEP_OBSIDIAN_AUTH_TOKEN` provides a literal-token
+  override. Protected routes (`/mcp`, `/upload`) require the token; health stays
+  open. Includes Origin validation and a fail-closed guard that refuses to bind a
+  non-loopback host without auth (`--insecure-no-auth` to override).
+
+### Changed
+
+- **Packaged index location is now platform-native.** On Linux, packaged-mode
+  indexes live under `$XDG_DATA_HOME/deep-obsidian-mcp/indexes/` (default
+  `~/.local/share/...`) instead of the macOS-only `Application Support` path.
+
 ## v0.1.0-alpha.10 — 2026-06-12
 
 ### ⚠️ Breaking changes (MCP tool surface: 19 → 18 tools)

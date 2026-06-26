@@ -84,6 +84,27 @@ brew uninstall deep-obsidian-mcp
 
 See [docs/homebrew-service.md](./docs/homebrew-service.md) for the full Homebrew service model and troubleshooting notes.
 
+## Debian / Ubuntu (`apt`) Quick Start
+
+On Debian/Ubuntu, install the `.deb` from the [GitHub release](https://github.com/P4UL-M/deep-obsidian-mcp/releases) (`apt` pulls in `ripgrep` automatically):
+
+```bash
+sudo apt install ./deep-obsidian-mcp_<version>_amd64.deb
+```
+
+Configure for your vault, then run it as a systemd **user** service:
+
+```bash
+deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
+systemctl --user enable --now deep-obsidian-mcp
+loginctl enable-linger "$USER"   # keep it running after logout
+
+deep-obsidian-mcp doctor
+curl -fsS http://127.0.0.1:4100/readyz
+```
+
+Packaged mode keeps indexes out of the vault under `~/.local/share/deep-obsidian-mcp/indexes/` (or `$XDG_DATA_HOME`). The package installs the binary to `/usr/bin`, templates to `/usr/share/deep-obsidian-mcp/`, and the unit to `/usr/lib/systemd/user/`. See [docs/debian-package.md](./docs/debian-package.md) for the full model, building from source, and uninstall steps.
+
 ## Source Usage
 
 ```bash

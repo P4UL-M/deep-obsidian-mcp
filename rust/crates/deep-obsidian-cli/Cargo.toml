@@ -3,6 +3,7 @@ name = "deep-obsidian-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Filesystem-first MCP server for deep Obsidian vault access"
 publish = false
 
 [lib]
@@ -27,3 +28,30 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
+
+# Debian/Ubuntu packaging via `cargo deb` (https://github.com/kornelski/cargo-deb).
+# Build with `scripts/build-deb.sh` or the release-deb GitHub Actions workflow.
+# Asset source paths are relative to this crate directory; the packaged data
+# (skills/snippets/assets) lives at the workspace root, hence the `../../../`.
+[package.metadata.deb]
+name = "deep-obsidian-mcp"
+maintainer = "P4UL-M <noreply@github.com>"
+copyright = "2026, P4UL-M"
+section = "utils"
+priority = "optional"
+# ripgrep powers grep_search; $auto pulls in detected shared-library deps (glibc).
+depends = "$auto, ripgrep"
+extended-description = """\
+Deep Obsidian MCP is a filesystem-first Model Context Protocol server that gives \
+agents deep, indexed access to an Obsidian vault (search, graph traversal, \
+authoring). Run it as a long-lived HTTP service via the bundled systemd user \
+unit, then configure it with `deep-obsidian-mcp setup-service`."""
+assets = [
+    ["target/release/deep-obsidian-mcp", "usr/bin/", "755"],
+    ["../../../skills/**/*", "usr/share/deep-obsidian-mcp/skills/", "644"],
+    ["../../../obsidian-snippets/**/*", "usr/share/deep-obsidian-mcp/obsidian-snippets/", "644"],
+    ["../../../assets/**/*", "usr/share/deep-obsidian-mcp/assets/", "644"],
+    ["../../../README.md", "usr/share/doc/deep-obsidian-mcp/README.md", "644"],
+    ["../../../docs/debian-package.md", "usr/share/doc/deep-obsidian-mcp/debian-package.md", "644"],
+    ["../../../packaging/systemd/deep-obsidian-mcp.service", "usr/lib/systemd/user/deep-obsidian-mcp.service", "644"],
+]
