@@ -6,14 +6,17 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 ### Added
 
-- **Debian/Ubuntu packaging (`apt`).** The server now ships a `.deb` alongside
-  the Homebrew tap: `sudo apt install ./deep-obsidian-mcp_<version>_amd64.deb`.
-  It installs the binary to `/usr/bin`, packaged skills/snippets/assets to
-  `/usr/share/deep-obsidian-mcp/`, and a systemd **user** unit to
-  `/usr/lib/systemd/user/` (`systemctl --user enable --now deep-obsidian-mcp`).
-  Built with `cargo-deb` (`scripts/build-deb.sh`) and a `release-deb` GitHub
-  Actions workflow that builds, installs, and smoke-tests the package. See
-  [docs/debian-package.md](./docs/debian-package.md).
+- **Debian/Ubuntu packaging (`apt`), amd64 + arm64.** The server now installs
+  via `apt` alongside the Homebrew tap. Add the signed APT repository hosted on
+  GitHub Pages and `apt install deep-obsidian-mcp`, or grab a single `.deb` from
+  the release. It installs the binary to `/usr/bin`, packaged
+  skills/snippets/assets to `/usr/share/deep-obsidian-mcp/`, and a systemd
+  **user** unit to `/usr/lib/systemd/user/`
+  (`systemctl --user enable --now deep-obsidian-mcp`). Built with `cargo-deb`
+  (`scripts/build-deb.sh`); a `release-deb` GitHub Actions workflow builds both
+  architectures natively, smoke-tests each package, validates the signed repo by
+  installing from it, and on tags publishes the repo to Pages and attaches the
+  `.deb`s to the release. See [docs/debian-package.md](./docs/debian-package.md).
 - **Optional HTTP bearer authentication** for the HTTP transport (off by
   default). Enable via `setup-service --wizard` or `setup-service --auth`
   (generates, stores, and prints a token once); disable with
