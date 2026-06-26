@@ -259,6 +259,7 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
         artifact_embedding: config_file
             .as_ref()
             .and_then(|config| config.artifact_embedding.clone()),
+        auth: config_file.as_ref().and_then(|config| config.auth.clone()),
         config_file_path: Some(config_path.clone()),
     };
     let mut service = normalize_service_config(input)?;
@@ -592,6 +593,7 @@ mod tests {
             vault_path: Some(vault),
             index_dir: None,
             packaged: false,
+            insecure_no_auth: false,
             transport: None,
             stdio_mode: None,
             host: None,

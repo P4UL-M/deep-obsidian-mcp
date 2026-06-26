@@ -33,6 +33,18 @@ if [[ -n "${EMBEDDING_API_KEY_VALUE}" ]]; then
 fi
 export DEEP_OBSIDIAN_PACKAGED="${DEEP_OBSIDIAN_PACKAGED:-1}"
 
+# Optional HTTP authentication. When DEEP_OBSIDIAN_AUTH_TOKEN is set it enables
+# bearer auth with that literal token (overriding any configured tokenRef) —
+# convenient for tunnels/containers where the OS keyring is unavailable. The
+# binary reads these directly from the environment; re-export so they survive
+# launchd's minimal env.
+if [[ -n "${DEEP_OBSIDIAN_AUTH_TOKEN:-}" ]]; then
+  export DEEP_OBSIDIAN_AUTH_TOKEN
+fi
+if [[ -n "${DEEP_OBSIDIAN_ALLOW_INSECURE:-}" ]]; then
+  export DEEP_OBSIDIAN_ALLOW_INSECURE
+fi
+
 typeset -a args
 args=(
   "serve"

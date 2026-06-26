@@ -57,6 +57,10 @@ pub struct ServiceOptions {
     #[arg(long = "packaged", global = true, action = clap::ArgAction::SetTrue)]
     pub packaged: bool,
 
+    /// Allow binding a non-loopback host without authentication (escape hatch).
+    #[arg(long = "insecure-no-auth", global = true, action = clap::ArgAction::SetTrue)]
+    pub insecure_no_auth: bool,
+
     #[arg(long, global = true, value_enum)]
     pub transport: Option<TransportMode>,
 
@@ -111,6 +115,10 @@ pub enum Command {
         skills: bool,
         #[arg(long = "vault-snippets", action = clap::ArgAction::SetTrue)]
         vault_snippets: bool,
+        /// Enable HTTP bearer auth: generate a token, store it, and print it once.
+        /// Without this flag, auth is left as configured (off for a new config).
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        auth: bool,
     },
     Doctor {
         #[arg(long = "probe-timeout-ms", default_value_t = 5_000)]

@@ -146,6 +146,37 @@ Encrypted local secret storage prevents accidental plaintext exposure in config 
 
 The service mode is intentionally stateless and returns JSON responses over the Streamable HTTP endpoint. That keeps the process long-lived and the index warm, while letting MCP clients connect over HTTP without spawning the server process.
 
+### HTTP authentication
+
+HTTP authentication is **optional and disabled by default**, so existing loopback (`127.0.0.1`) setups keep working unchanged. Enable it when you expose the service beyond the local machine (binding `0.0.0.0` or fronting it with a tunnel).
+
+Enable it through the wizard:
+
+```bash
+deep-obsidian-mcp setup-service --wizard
+```
+
+Or non-interactively with the flag-driven setup (CI / automation):
+
+```bash
+deep-obsidian-mcp setup-service --vault ~/Vault --auth
+```
+
+Either way, when auth is enabled the CLI generates a random 256-bit token, stores it via the same secret store used for API keys (OS keyring, or the encrypted-file fallback) as a `tokenRef` in `config.json`, and prints the token to stdout **once**. Without `--auth` (and outside the wizard) auth is left as configured — off for a new config. Configure your MCP client to send it:
+
+```
+Authorization: Bearer <token>
+```
+
+Once enabled, `POST /mcp` and `PUT /upload/{token}` require the token; `/healthz` and `/readyz` stay open for liveness probes. Invalid or missing tokens get `401` with a `WWW-Authenticate: Bearer` challenge.
+
+Two behaviors protect against accidental exposure:
+
+- **Fail-closed bind**: the server refuses to start on a non-loopback host with auth disabled. Override deliberately with `--insecure-no-auth` or `DEEP_OBSIDIAN_ALLOW_INSECURE=1`.
+- **Origin validation**: requests carrying a browser `Origin` header are rejected unless the origin is in `auth.allowedOrigins` (DNS-rebinding defence). Non-browser clients (Claude Code, curl) omit `Origin` and are unaffected.
+
+For containers, tunnels, or headless hosts where the OS keyring is unavailable, set `DEEP_OBSIDIAN_AUTH_TOKEN` to a literal token; it enables auth and overrides any configured `tokenRef`.
+
 Useful endpoints:
 
 - MCP: `http://127.0.0.1:4100/mcp`

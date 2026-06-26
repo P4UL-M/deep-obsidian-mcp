@@ -7,7 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use deep_obsidian_types::{EmbeddingConfig, SecretRef};
+use deep_obsidian_types::{AuthConfig, EmbeddingConfig, SecretRef};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
@@ -295,6 +295,21 @@ impl SecretResolver {
         embedding: &EmbeddingConfig,
     ) -> Result<Option<SecretString>, SecretError> {
         let Some(reference) = &embedding.api_key_ref else {
+            return Ok(None);
+        };
+        self.get(reference)?
+            .ok_or(SecretError::MissingSecret)
+            .map(Some)
+    }
+
+    /// Resolve the HTTP bearer token referenced by [`AuthConfig::token_ref`].
+    /// Returns `Ok(None)` when no reference is configured; errors when a
+    /// reference is set but the underlying secret is missing.
+    pub fn resolve_auth_token(
+        &self,
+        auth: &AuthConfig,
+    ) -> Result<Option<SecretString>, SecretError> {
+        let Some(reference) = &auth.token_ref else {
             return Ok(None);
         };
         self.get(reference)?

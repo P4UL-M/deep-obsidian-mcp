@@ -114,6 +114,38 @@ pub struct EmbeddingConfigInput {
     pub query_instruction: Option<String>,
 }
 
+/// HTTP transport authentication. Optional and disabled by default so existing
+/// loopback deployments keep working untouched. The bearer token itself is never
+/// stored here; only a [`SecretRef`] pointing at the OS keyring or the encrypted
+/// secrets file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthConfig {
+    /// When true, `/mcp` and `/upload` require a matching `Authorization: Bearer`
+    /// token.
+    pub enabled: bool,
+    /// Reference to the stored bearer token. Resolved at startup through the
+    /// shared secret store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<SecretRef>,
+    /// Browser `Origin` values permitted to reach the protected routes. Empty
+    /// means any request that sends an `Origin` header is rejected (DNS-rebinding
+    /// protection); non-browser clients that omit `Origin` are always allowed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthConfigInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<SecretRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_origins: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceConfigInput {
@@ -125,6 +157,7 @@ pub struct ServiceConfigInput {
     pub auto_reindex: Option<AutoReindexConfigInput>,
     pub embedding: Option<EmbeddingConfigInput>,
     pub artifact_embedding: Option<EmbeddingConfigInput>,
+    pub auth: Option<AuthConfigInput>,
     pub config_file_path: Option<PathBuf>,
 }
 
@@ -139,6 +172,8 @@ pub struct PersistedServiceConfig {
     pub auto_reindex: Option<AutoReindexConfigInput>,
     pub embedding: Option<EmbeddingConfigInput>,
     pub artifact_embedding: Option<EmbeddingConfigInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthConfigInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +187,8 @@ pub struct ResolvedServiceConfig {
     pub auto_reindex: AutoReindexConfig,
     pub embedding: EmbeddingConfig,
     pub artifact_embedding: EmbeddingConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
     pub config_file_path: Option<PathBuf>,
 }
 
