@@ -57,6 +57,10 @@ pub struct ServiceOptions {
     #[arg(long = "packaged", global = true, action = clap::ArgAction::SetTrue)]
     pub packaged: bool,
 
+    /// Allow binding a non-loopback host without authentication (escape hatch).
+    #[arg(long = "insecure-no-auth", global = true, action = clap::ArgAction::SetTrue)]
+    pub insecure_no_auth: bool,
+
     #[arg(long, global = true, value_enum)]
     pub transport: Option<TransportMode>,
 

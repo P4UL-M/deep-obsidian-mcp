@@ -4,23 +4,127 @@ use std::net::SocketAddr;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use futures_util::StreamExt as _;
-use deep_obsidian_config::{build_service_endpoints, normalize_service_config};
+use deep_obsidian_config::secrets::SecretResolver;
+use deep_obsidian_config::{build_service_endpoints, is_loopback_host, normalize_service_config};
 use deep_obsidian_types::{
     ResolvedServiceConfig, ServiceConfigInput, ServiceEndpoints, TransportMode,
 };
+use futures_util::StreamExt as _;
+use secrecy::SecretString;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use crate::auth::AuthState;
 use crate::health::{build_health_payload, build_readiness_payload, readiness_status_code};
 use crate::mcp::{handle_request, AppState};
 use crate::protocol::JsonRpcRequest;
 use crate::runtime::{AutoReindexHandle, RuntimeState};
 use crate::vault::ensure_vault_path;
+
+/// Environment variable carrying a literal bearer token. When set and non-empty
+/// it enables authentication and overrides any configured `token_ref` — useful
+/// for containers, tunnels, and headless hosts where the OS keyring is absent.
+const AUTH_TOKEN_ENV: &str = "DEEP_OBSIDIAN_AUTH_TOKEN";
+
+/// Environment variable that, when truthy, allows binding a non-loopback host
+/// without authentication (the fail-closed escape hatch).
+const ALLOW_INSECURE_ENV: &str = "DEEP_OBSIDIAN_ALLOW_INSECURE";
+
+fn env_is_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Resolve the authentication state for the HTTP transport from the environment
+/// override and persisted config. Errors when auth is enabled but no token can
+/// be resolved (fail closed rather than silently allow).
+fn resolve_auth_state(config: &ResolvedServiceConfig) -> Result<AuthState, io::Error> {
+    let allowed_origins = Arc::new(config.auth.allowed_origins.clone());
+
+    if let Ok(token) = std::env::var(AUTH_TOKEN_ENV) {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            info!("HTTP authentication enabled via {AUTH_TOKEN_ENV}");
+            return Ok(AuthState {
+                enabled: true,
+                token: Some(SecretString::new(token)),
+                allowed_origins,
+            });
+        }
+    }
+
+    if !config.auth.enabled {
+        return Ok(AuthState {
+            enabled: false,
+            token: None,
+            allowed_origins,
+        });
+    }
+
+    let token = SecretResolver::new()
+        .resolve_auth_token(&config.auth)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "HTTP authentication is enabled but the token could not be resolved: {error}"
+                ),
+            )
+        })?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HTTP authentication is enabled but no token reference is configured; \
+                 run `deep-obsidian-mcp setup-service --wizard` or set DEEP_OBSIDIAN_AUTH_TOKEN",
+            )
+        })?;
+
+    info!("HTTP authentication enabled (bearer token)");
+    Ok(AuthState {
+        enabled: true,
+        token: Some(token),
+        allowed_origins,
+    })
+}
+
+/// Fail closed: refuse to expose a non-loopback bind without authentication
+/// unless the operator explicitly opts out via [`ALLOW_INSECURE_ENV`].
+fn enforce_auth_exposure(
+    config: &ResolvedServiceConfig,
+    auth_enabled: bool,
+) -> Result<(), io::Error> {
+    if auth_enabled || is_loopback_host(&config.http.host) {
+        return Ok(());
+    }
+    if env_is_truthy(ALLOW_INSECURE_ENV) {
+        warn!(
+            "binding {} without authentication ({ALLOW_INSECURE_ENV} is set); the vault is exposed to the network",
+            config.http.host
+        );
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "refusing to bind non-loopback host {} without authentication; \
+             enable auth with `deep-obsidian-mcp setup-service --wizard`, set DEEP_OBSIDIAN_AUTH_TOKEN, \
+             or override with DEEP_OBSIDIAN_ALLOW_INSECURE=1",
+            config.http.host
+        ),
+    ))
+}
 
 pub struct ServiceBootstrapContext {
     pub config: ResolvedServiceConfig,
@@ -207,19 +311,32 @@ pub async fn run_http_service(
     ensure_vault_path(&config.vault_path)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
+    let auth_state = resolve_auth_state(&config)?;
+    enforce_auth_exposure(&config, auth_state.enabled)?;
+
     let endpoints = build_service_endpoints(&config);
     let runtime = RuntimeState::new(config.clone());
-    let state =
-        AppState::new(config.clone(), runtime.clone()).with_upload_base(upload_base_url(&config));
-    let mut router = Router::new()
-        .route(config.http.health_path.as_str(), get(health_handler))
+    let state = AppState::new(config.clone(), runtime.clone())
+        .with_upload_base(upload_base_url(&config))
+        .with_auth(auth_state);
+
+    // Protected routes share an auth/origin middleware layer; health and
+    // readiness are intentionally left open for liveness probes.
+    let protected = Router::new()
         .route(config.http.mcp_path.as_str(), post(mcp_handler))
         .route(
             "/upload/{token}",
             // Disable axum's default 2MB body limit; our own per-token
             // `max_bytes` cap (enforced while streaming) is the sole authority.
             put(upload_handler).layer(axum::extract::DefaultBodyLimit::disable()),
-        );
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_auth,
+        ));
+    let mut router = Router::new()
+        .route(config.http.health_path.as_str(), get(health_handler))
+        .merge(protected);
     if config.http.health_path != "/readyz" {
         router = router.route("/readyz", get(ready_handler));
     }
@@ -259,4 +376,144 @@ pub async fn bootstrap_from_input(
 ) -> Result<ServiceBootstrapContext, Box<dyn std::error::Error + Send + Sync>> {
     let config = normalize_service_config(input)?;
     Ok(run_http_service(config).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deep_obsidian_types::{
+        AuthConfig, AutoReindexConfig, EmbeddingConfig, HttpConfig, StdioMode,
+    };
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    // Serializes the env-var mutations below; these globals are process-wide.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn config_with(host: &str, auth_enabled: bool) -> ResolvedServiceConfig {
+        ResolvedServiceConfig {
+            vault_path: PathBuf::from("/tmp/vault"),
+            index_dir: PathBuf::from("/tmp/index"),
+            transport: TransportMode::Http,
+            stdio_mode: StdioMode::Auto,
+            http: HttpConfig {
+                host: host.to_string(),
+                port: 4100,
+                mcp_path: "/mcp".to_string(),
+                health_path: "/healthz".to_string(),
+            },
+            auto_reindex: AutoReindexConfig::default(),
+            embedding: EmbeddingConfig::default(),
+            artifact_embedding: EmbeddingConfig::default(),
+            auth: AuthConfig {
+                enabled: auth_enabled,
+                ..AuthConfig::default()
+            },
+            config_file_path: None,
+        }
+    }
+
+    #[test]
+    fn exposure_allows_loopback_without_auth() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(ALLOW_INSECURE_ENV);
+        assert!(enforce_auth_exposure(&config_with("127.0.0.1", false), false).is_ok());
+        assert!(enforce_auth_exposure(&config_with("localhost", false), false).is_ok());
+    }
+
+    #[test]
+    fn exposure_allows_non_loopback_with_auth() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(ALLOW_INSECURE_ENV);
+        assert!(enforce_auth_exposure(&config_with("0.0.0.0", true), true).is_ok());
+    }
+
+    #[test]
+    fn exposure_rejects_non_loopback_without_auth() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(ALLOW_INSECURE_ENV);
+        assert!(enforce_auth_exposure(&config_with("0.0.0.0", false), false).is_err());
+    }
+
+    #[test]
+    fn exposure_escape_hatch_allows_insecure_bind() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var(ALLOW_INSECURE_ENV, "1");
+        let result = enforce_auth_exposure(&config_with("0.0.0.0", false), false);
+        std::env::remove_var(ALLOW_INSECURE_ENV);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn env_token_enables_auth_and_overrides_config() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var(AUTH_TOKEN_ENV, "env-token");
+        let state = resolve_auth_state(&config_with("0.0.0.0", false));
+        std::env::remove_var(AUTH_TOKEN_ENV);
+        let state = state.expect("auth state");
+        assert!(state.enabled);
+        assert!(state.token.is_some());
+    }
+
+    #[test]
+    fn disabled_auth_resolves_to_disabled_state() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(AUTH_TOKEN_ENV);
+        let state = resolve_auth_state(&config_with("127.0.0.1", false)).expect("auth state");
+        assert!(!state.enabled);
+        assert!(state.token.is_none());
+    }
+
+    // End-to-end proof of the serve-side path: a token stored in the shared
+    // secret store (encrypted-file backend, the headless-representative path) is
+    // resolved back through `resolve_auth_state` exactly as the HTTP bootstrap
+    // does at startup. `SecretResolver::new()` reads the default secrets path,
+    // which honours `XDG_CONFIG_HOME`, so point it at a temp dir.
+    #[test]
+    fn enabled_auth_resolves_token_from_encrypted_file_store() {
+        use deep_obsidian_config::secrets::SecretResolver;
+        use deep_obsidian_types::SecretRef;
+        use secrecy::ExposeSecret;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(AUTH_TOKEN_ENV);
+
+        let dir = std::env::temp_dir().join(format!(
+            "deep-obsidian-auth-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let token = crate::auth::generate_token();
+        let reference = SecretRef::EncryptedFile {
+            id: "http-auth-token".to_string(),
+        };
+        SecretResolver::new()
+            .put(&reference, secrecy::SecretString::new(token.clone()))
+            .expect("store token");
+
+        let mut config = config_with("0.0.0.0", true);
+        config.auth.token_ref = Some(reference);
+
+        let state = resolve_auth_state(&config);
+
+        // Restore env before asserting so a failure can't leak XDG_CONFIG_HOME.
+        match previous_xdg {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let state = state.expect("auth state resolves from store");
+        assert!(state.enabled);
+        assert_eq!(
+            state.token.expect("token present").expose_secret(),
+            &token
+        );
+    }
 }

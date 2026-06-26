@@ -2456,6 +2456,7 @@ mod tests {
             },
             embedding: EmbeddingConfig::default(),
             artifact_embedding: EmbeddingConfig::default(),
+            auth: deep_obsidian_types::AuthConfig::default(),
             config_file_path: None,
         }
     }
@@ -3278,6 +3279,7 @@ mod tests {
         let state = AppState {
             config: std::sync::Arc::new(config),
             runtime,
+            auth: std::sync::Arc::new(crate::auth::AuthState::disabled()),
             ripgrep_path: std::sync::Arc::new(PathBuf::from("rg")),
             rg_available: false,
             uploads: crate::uploads::UploadStore::new(),

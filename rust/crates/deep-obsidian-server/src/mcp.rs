@@ -4,6 +4,7 @@ use std::sync::Arc;
 use deep_obsidian_types::ResolvedServiceConfig;
 use serde_json::{json, Value};
 
+use crate::auth::AuthState;
 use crate::protocol::{
     InitializeResult, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
     PromptGetResult, PromptListResult, ResourceListResult, ResourceReadResult,
@@ -17,6 +18,9 @@ use crate::{prompts, resources, tools};
 pub struct AppState {
     pub config: Arc<ResolvedServiceConfig>,
     pub runtime: Arc<RuntimeState>,
+    /// Resolved HTTP authentication state. Disabled by default; populated by the
+    /// HTTP bootstrap via [`AppState::with_auth`]. Unused under stdio.
+    pub auth: Arc<AuthState>,
     /// Absolute path to the resolved `rg` (ripgrep) binary, resolved once at
     /// startup. When ripgrep cannot be found this is the bare `rg` fallback and
     /// `rg_available` is `false`.
@@ -41,6 +45,7 @@ impl AppState {
         Self {
             config: Arc::new(config),
             runtime,
+            auth: Arc::new(AuthState::disabled()),
             ripgrep_path: Arc::new(ripgrep_path),
             rg_available,
             uploads: UploadStore::new(),
@@ -51,6 +56,12 @@ impl AppState {
     /// Attach an upload base URL, enabling `request_vault_upload`.
     pub fn with_upload_base(mut self, upload_base: String) -> Self {
         self.upload_base = Some(upload_base);
+        self
+    }
+
+    /// Attach resolved authentication state (used by the HTTP transport).
+    pub fn with_auth(mut self, auth: AuthState) -> Self {
+        self.auth = Arc::new(auth);
         self
     }
 }

@@ -1,7 +1,7 @@
 use deep_obsidian_types::{
-    AutoReindexConfig, AutoReindexConfigInput, EmbeddingConfig, EmbeddingConfigInput,
-    EmbeddingProvider, HttpConfig, HttpConfigInput, PersistedServiceConfig, ResolvedServiceConfig,
-    ServiceConfigInput, StdioMode, TransportMode,
+    AuthConfig, AuthConfigInput, AutoReindexConfig, AutoReindexConfigInput, EmbeddingConfig,
+    EmbeddingConfigInput, EmbeddingProvider, HttpConfig, HttpConfigInput, PersistedServiceConfig,
+    ResolvedServiceConfig, ServiceConfigInput, StdioMode, TransportMode,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -141,6 +141,7 @@ pub fn normalize_service_config(
     let auto_reindex = normalize_auto_reindex_input(input.auto_reindex);
     let embedding = normalize_embedding_input(input.embedding);
     let artifact_embedding = normalize_embedding_input(input.artifact_embedding);
+    let auth = normalize_auth_input(input.auth);
 
     Ok(ResolvedServiceConfig {
         vault_path,
@@ -151,8 +152,19 @@ pub fn normalize_service_config(
         auto_reindex,
         embedding,
         artifact_embedding,
+        auth,
         config_file_path: input.config_file_path.map(expand_home_path),
     })
+}
+
+/// True for hosts that only accept connections from the local machine. Used to
+/// decide whether running without authentication is safe.
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host == "[::1]"
+        || host.starts_with("127.")
 }
 
 pub fn normalize_persisted_config(
@@ -167,6 +179,7 @@ pub fn normalize_persisted_config(
         auto_reindex: input.auto_reindex,
         embedding: input.embedding,
         artifact_embedding: input.artifact_embedding,
+        auth: input.auth,
         config_file_path: None,
     })?;
 
@@ -218,6 +231,37 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
         } else {
             None
         },
+        auth: if config.auth.enabled
+            || config.auth.token_ref.is_some()
+            || !config.auth.allowed_origins.is_empty()
+        {
+            Some(AuthConfigInput {
+                enabled: Some(config.auth.enabled),
+                token_ref: config.auth.token_ref.clone(),
+                allowed_origins: if config.auth.allowed_origins.is_empty() {
+                    None
+                } else {
+                    Some(config.auth.allowed_origins.clone())
+                },
+            })
+        } else {
+            None
+        },
+    }
+}
+
+fn normalize_auth_input(input: Option<AuthConfigInput>) -> AuthConfig {
+    let input = input.unwrap_or_default();
+    AuthConfig {
+        enabled: input.enabled.unwrap_or(false),
+        token_ref: input.token_ref,
+        allowed_origins: input
+            .allowed_origins
+            .unwrap_or_default()
+            .into_iter()
+            .map(|origin| origin.trim().to_string())
+            .filter(|origin| !origin.is_empty())
+            .collect(),
     }
 }
 
@@ -377,7 +421,61 @@ pub mod secrets;
 
 #[cfg(test)]
 mod tests {
-    use super::{default_packaged_index_dir, expand_home_path, DEFAULT_CONFIG_APP_DIR};
+    use super::{
+        default_packaged_index_dir, expand_home_path, is_loopback_host, normalize_service_config,
+        to_persisted_config, DEFAULT_CONFIG_APP_DIR,
+    };
+    use deep_obsidian_types::{AuthConfigInput, SecretRef, ServiceConfigInput};
+
+    #[test]
+    fn is_loopback_host_recognizes_local_addresses() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.1.2.3"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("192.168.1.10"));
+        assert!(!is_loopback_host("example.com"));
+    }
+
+    #[test]
+    fn auth_config_round_trips_through_persisted_config() {
+        let input = ServiceConfigInput {
+            vault_path: Some(std::path::PathBuf::from("/tmp/vault")),
+            auth: Some(AuthConfigInput {
+                enabled: Some(true),
+                token_ref: Some(SecretRef::OsKeyring {
+                    service: "deep-obsidian-mcp".to_string(),
+                    account: "http-auth-token".to_string(),
+                }),
+                allowed_origins: Some(vec!["https://app.example".to_string()]),
+            }),
+            ..ServiceConfigInput::default()
+        };
+        let resolved = normalize_service_config(input).expect("normalize");
+        assert!(resolved.auth.enabled);
+        assert_eq!(resolved.auth.allowed_origins, vec!["https://app.example"]);
+
+        let persisted = to_persisted_config(&resolved);
+        let auth = persisted.auth.as_ref().expect("auth persisted");
+        assert_eq!(auth.enabled, Some(true));
+        assert!(auth.token_ref.is_some());
+
+        // The serialized form references the secret, never a plaintext token.
+        let serialized = serde_json::to_string(&persisted).expect("serialize");
+        assert!(serialized.contains("tokenRef"));
+        assert!(serialized.contains("osKeyring"));
+    }
+
+    #[test]
+    fn auth_omitted_when_disabled_and_empty() {
+        let input = ServiceConfigInput {
+            vault_path: Some(std::path::PathBuf::from("/tmp/vault")),
+            ..ServiceConfigInput::default()
+        };
+        let resolved = normalize_service_config(input).expect("normalize");
+        assert!(to_persisted_config(&resolved).auth.is_none());
+    }
 
     #[test]
     fn expand_home_path_expands_tilde_prefix() {

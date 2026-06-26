@@ -238,6 +238,11 @@ pub async fn run() -> Result<()> {
     let json = cli.options.json && !cli.options.no_json;
     let dry_run = cli.options.dry_run && !cli.options.no_dry_run;
 
+    if cli.options.insecure_no_auth {
+        // The bootstrap reads this env var as the fail-closed escape hatch.
+        std::env::set_var("DEEP_OBSIDIAN_ALLOW_INSECURE", "1");
+    }
+
     match cli.command.unwrap_or(Command::Serve) {
         Command::Help => {
             println!("{HELP_TEXT}");
@@ -784,6 +789,8 @@ fn setup_service_wizard(
         }
     }
 
+    configure_auth_wizard(&mut resolved, dry_run)?;
+
     setup_service(
         &resolved,
         dry_run,
@@ -792,6 +799,63 @@ fn setup_service_wizard(
         install_skills,
         install_vault_snippets,
     )
+}
+
+/// Prompt to enable HTTP bearer authentication. When enabled, generate a token,
+/// store it through the shared secret store, and print it to stdout exactly
+/// once so the operator can configure their client.
+fn configure_auth_wizard(resolved: &mut ResolvedRuntimeConfig, dry_run: bool) -> Result<()> {
+    let enable_auth = prompt_bool(
+        "Enable HTTP bearer authentication (required for non-loopback exposure)?",
+        false,
+    )?;
+    if !enable_auth {
+        resolved.service.auth.enabled = false;
+        return Ok(());
+    }
+
+    let token = deep_obsidian_server::auth::generate_token();
+    let reference = SecretRef::OsKeyring {
+        service: "deep-obsidian-mcp".to_string(),
+        account: "http-auth-token".to_string(),
+    };
+
+    if dry_run {
+        resolved.service.auth.enabled = true;
+        resolved.service.auth.token_ref = Some(reference);
+        println!("dry-run: would generate and store an HTTP bearer token");
+        return Ok(());
+    }
+
+    let resolver = SecretResolver::new();
+    let stored_reference = match resolver.put(&reference, SecretString::from(token.clone())) {
+        Ok(()) => reference,
+        Err(error) => {
+            println!("OS keyring unavailable: {error}");
+            if prompt_bool("Use encrypted local file fallback?", true)? {
+                let fallback = SecretRef::EncryptedFile {
+                    id: "http-auth-token".to_string(),
+                };
+                resolver.put(&fallback, SecretString::from(token.clone()))?;
+                fallback
+            } else {
+                return Err(anyhow!("HTTP bearer token was not stored"));
+            }
+        }
+    };
+
+    resolved.service.auth.enabled = true;
+    resolved.service.auth.token_ref = Some(stored_reference);
+
+    println!();
+    println!("HTTP bearer authentication enabled. Save this token now (shown only once):");
+    println!();
+    println!("    {token}");
+    println!();
+    println!("Configure your MCP client with header: Authorization: Bearer {token}");
+    println!();
+
+    Ok(())
 }
 
 fn prompt_string(label: &str, default: Option<&str>) -> Result<String> {
@@ -1441,6 +1505,9 @@ pub async fn doctor(
     ) {
         checks.push(check);
     }
+    if let Some(check) = secret_reference_check("authToken", service.auth.token_ref.as_ref()) {
+        checks.push(check);
+    }
 
     let ok = checks.iter().all(|check| check.status != "fail");
     let config = redact_config(&to_persisted_config(&service));
@@ -1485,7 +1552,7 @@ pub fn print_config(resolved: &ResolvedRuntimeConfig, redact: bool) -> Result<Pr
 pub async fn probe(resolved: &ResolvedRuntimeConfig, timeout_ms: u64) -> Result<ProbeReport> {
     let service = ensure_service_transport_http(resolved.service.clone())?;
     let endpoints = build_service_endpoints(&service);
-    let client = http_client(timeout_ms)?;
+    let client = http_client_with_bearer(timeout_ms, resolve_probe_token(&service))?;
     let health = probe_health(&client, &endpoints.health).await;
     let mcp = probe_mcp(&client, &endpoints.mcp).await;
 
@@ -1502,11 +1569,30 @@ pub async fn serve(resolved: &ResolvedRuntimeConfig) -> Result<ServeReport> {
             let service = ensure_service_transport_http(resolved.service.clone())?;
             let endpoints = build_service_endpoints(&service);
             let report = endpoint_report(&endpoints);
+            // Capture auth state before `service` is moved into the bootstrap so
+            // the operator gets a clear startup signal (the CLI does not install
+            // a tracing subscriber, so the library's log lines are not shown).
+            let auth_enabled = service.auth.enabled
+                || std::env::var("DEEP_OBSIDIAN_AUTH_TOKEN")
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+            let host = service.http.host.clone();
+            let host_is_loopback = deep_obsidian_config::is_loopback_host(&host);
             let mut bootstrap = run_http_service(service).await?;
             eprintln!(
                 "deep-obsidian-mcp native server running at {} (health={})",
                 report.mcp, report.health
             );
+            if auth_enabled {
+                eprintln!("auth: bearer token required on {}", report.mcp);
+            } else {
+                eprintln!("auth: disabled (no client authentication)");
+                if !host_is_loopback {
+                    eprintln!(
+                        "WARNING: serving without authentication on non-loopback host {host}"
+                    );
+                }
+            }
             tokio::select! {
                 shutdown = wait_for_shutdown_signal() => {
                     shutdown?;
@@ -2555,6 +2641,38 @@ fn http_client(timeout_ms: u64) -> Result<Client> {
         .context("failed to build HTTP client")
 }
 
+/// Build an HTTP client that sends `Authorization: Bearer <token>` on every
+/// request when a token is available, so `probe` works against an authenticated
+/// server.
+fn http_client_with_bearer(timeout_ms: u64, token: Option<String>) -> Result<Client> {
+    let mut builder = Client::builder().timeout(std::time::Duration::from_millis(timeout_ms));
+    if let Some(token) = token {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(mut value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+    }
+    builder.build().context("failed to build HTTP client")
+}
+
+/// Resolve the bearer token for probing: the env override first, then the
+/// configured secret reference. Returns `None` when auth is not configured.
+fn resolve_probe_token(service: &ResolvedServiceConfig) -> Option<String> {
+    if let Ok(token) = std::env::var("DEEP_OBSIDIAN_AUTH_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    SecretResolver::new()
+        .resolve_auth_token(&service.auth)
+        .ok()
+        .flatten()
+        .map(|secret| secret.expose_secret().to_string())
+}
+
 fn redact_config(config: &PersistedServiceConfig) -> PersistedServiceConfig {
     config.clone()
 }
@@ -2743,6 +2861,7 @@ mod tests {
             },
             embedding: EmbeddingConfig::default(),
             artifact_embedding: EmbeddingConfig::default(),
+            auth: deep_obsidian_types::AuthConfig::default(),
             config_file_path: None,
         }
     }
