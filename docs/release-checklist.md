@@ -2,6 +2,17 @@
 
 Use this checklist when preparing a Homebrew-ready release artifact.
 
+## Cutting a Release (`vX.Y.Z`)
+
+Do **all** of these — the two Homebrew formula copies and the apt tap are easy to miss.
+
+1. [ ] **CHANGELOG.md** — add the new version section on `main`.
+2. [ ] **Push the tag** `vX.Y.Z` on `main`. The `release-deb` workflow then builds the `.deb` for **amd64 + arm64**, signs and publishes the APT repo to GitHub Pages, and attaches both `.deb`s to the GitHub Release.
+   - Requires repo secret `APT_GPG_PRIVATE_KEY`, and the `github-pages` environment must allow `v*` tag deploys.
+3. [ ] **This repo's `Formula/deep-obsidian-mcp.rb`** — bump `url` + `sha256` + `version` (sha256 of the tag source tarball). Canonical copy, but **not** what `brew install` uses.
+4. [ ] **Separate tap repo `P4UL-M/homebrew-tap` → `Formula/deep-obsidian-mcp.rb`** — bump the same `url`/`sha256`/`version`. **`brew tap P4UL-M/tap` installs from here, not from this project's `Formula/` dir.** Skipping it leaves `brew upgrade` on the old version. Direct commit to the tap's default branch is the normal process.
+5. [ ] **Verify live:** the GitHub Release has both `.deb`s; `https://p4ul-m.github.io/deep-obsidian-mcp/install.sh` returns 200; the tap formula shows the new version.
+
 ## Build And Verify
 
 - [ ] Build the Rust workspace successfully with `cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp`.
