@@ -4,6 +4,11 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 ## v0.1.0-alpha.12 — 2026-07-02
 
+### Improved
+
+- **Vault IO errors now carry the offending path and permission remediation
+  hints**, and the server warns when the startup scan stalls (#34).
+
 ### Fixed
 
 - **The `.deb` installs again on Debian 12 and Ubuntu 22.04.** The alpha.11
