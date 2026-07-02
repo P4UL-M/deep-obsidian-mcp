@@ -7,8 +7,8 @@ pub use text::{
     HeadingSection,
 };
 pub use vault::{
-    chunk_lines, ensure_inside_vault, ensure_vault_path, list_children, list_folders,
-    list_markdown_files, list_top_level_folders, read_text_file, slice_lines, write_binary_file,
-    write_text_file, ChunkSection, ReadTextFileResult, VaultChildEntry, VaultEntryKind, VaultError,
-    WriteBinaryFileResult, WriteTextFileResult, DEFAULT_IGNORED_DIRS,
+    chunk_lines, describe_io_error, ensure_inside_vault, ensure_vault_path, list_children,
+    list_folders, list_markdown_files, list_top_level_folders, read_text_file, slice_lines,
+    write_binary_file, write_text_file, ChunkSection, ReadTextFileResult, VaultChildEntry,
+    VaultEntryKind, VaultError, WriteBinaryFileResult, WriteTextFileResult, DEFAULT_IGNORED_DIRS,
 };

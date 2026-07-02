@@ -23,6 +23,11 @@ use tracing::{info, warn};
 
 pub const DEFAULT_FRESH_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(2);
 
+/// How long the startup vault scan may run before the watchdog warns that it
+/// may be blocked (e.g. on a macOS permission prompt). A healthy scan of even
+/// a large vault finishes well under this.
+const STARTUP_SCAN_WARN_AFTER: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone)]
 pub struct RuntimeIndexSnapshot {
     pub index: Arc<SearchIndex>,
@@ -283,7 +288,7 @@ impl RuntimeState {
         config: ResolvedServiceConfig,
     ) -> Result<(Arc<Self>, Option<AutoReindexHandle>), String> {
         let runtime = Self::new(config);
-        runtime.refresh("startup").await?;
+        runtime.startup_refresh_with_watchdog().await?;
 
         let handle = if runtime.config.auto_reindex.enabled {
             Some(start_auto_reindex_tasks(runtime.clone()))
@@ -294,10 +299,34 @@ impl RuntimeState {
         Ok((runtime, handle))
     }
 
+    /// Runs the startup refresh with a watchdog: if the vault scan has not
+    /// completed after `STARTUP_SCAN_WARN_AFTER`, log what is happening and the
+    /// most likely cause. A macOS TCC consent dialog suspends the scan's
+    /// `open()` syscall inside the kernel, so without this warning the server
+    /// hangs with no output at all — nothing else can observe the stall.
+    async fn startup_refresh_with_watchdog(&self) -> Result<RuntimeIndexSnapshot, String> {
+        let refresh = self.refresh("startup");
+        tokio::pin!(refresh);
+        match tokio::time::timeout(STARTUP_SCAN_WARN_AFTER, &mut refresh).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    "initial vault scan of {} still running after {}s — if it never completes, \
+the process is likely blocked on a macOS permission prompt for the vault folder; approve the \
+dialog, or grant the deep-obsidian-mcp binary Full Disk Access in System Settings → Privacy & \
+Security and restart the service",
+                    self.config.vault_path.display(),
+                    STARTUP_SCAN_WARN_AFTER.as_secs(),
+                );
+                refresh.await
+            }
+        }
+    }
+
     pub fn start_initial_refresh(self: &Arc<Self>) -> JoinHandle<()> {
         let runtime = self.clone();
         tokio::spawn(async move {
-            match runtime.refresh("startup").await {
+            match runtime.startup_refresh_with_watchdog().await {
                 Ok(snapshot) => {
                     info!(
                         "initial index {} at {}",

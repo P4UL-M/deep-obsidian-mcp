@@ -49,8 +49,22 @@ pub enum VaultError {
     InvalidVaultRelativePath(String),
     #[error("path escapes the vault: {0}")]
     PathEscapesVault(String),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("{}", deep_obsidian_core::describe_io_error(.path, .source))]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl VaultError {
+    /// Returns a `map_err` closure that attaches `path` to an IO error.
+    fn io(path: &Path) -> impl FnOnce(std::io::Error) -> VaultError + '_ {
+        move |source| VaultError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
 }
 
 pub fn ensure_vault_path(vault_path: &Path) -> Result<(), VaultError> {
@@ -117,7 +131,7 @@ pub fn ensure_inside_vault(vault_path: &Path, relative_path: &str) -> Result<Pat
 pub fn read_text(vault_path: &Path, relative_path: &str) -> Result<String, VaultError> {
     ensure_vault_path(vault_path)?;
     let path = ensure_inside_vault(vault_path, relative_path)?;
-    Ok(fs::read_to_string(path)?)
+    fs::read_to_string(&path).map_err(VaultError::io(&path))
 }
 
 pub fn write_text(
@@ -129,9 +143,9 @@ pub fn write_text(
     let path = ensure_inside_vault(vault_path, relative_path)?;
     let created = !path.exists();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(VaultError::io(parent))?;
     }
-    fs::write(&path, text)?;
+    fs::write(&path, text).map_err(VaultError::io(&path))?;
     Ok(WriteFileResult {
         absolute_path: path,
         created,
@@ -154,10 +168,10 @@ fn walk_markdown_files(
     current: &Path,
     files: &mut Vec<String>,
 ) -> Result<(), VaultError> {
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
+    for entry in fs::read_dir(current).map_err(VaultError::io(current))? {
+        let entry = entry.map_err(VaultError::io(current))?;
         let path = entry.path();
-        let file_type = entry.file_type()?;
+        let file_type = entry.file_type().map_err(VaultError::io(&path))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
 
@@ -192,9 +206,9 @@ pub fn list_markdown_files(vault_path: &Path) -> Result<Vec<String>, VaultError>
 pub fn list_top_level_folders(vault_path: &Path) -> Result<Vec<String>, VaultError> {
     ensure_vault_path(vault_path)?;
     let mut folders = BTreeSet::new();
-    for entry in fs::read_dir(vault_path)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+    for entry in fs::read_dir(vault_path).map_err(VaultError::io(vault_path))? {
+        let entry = entry.map_err(VaultError::io(vault_path))?;
+        let file_type = entry.file_type().map_err(VaultError::io(&entry.path()))?;
         let name = entry.file_name().to_string_lossy().to_string();
         if file_type.is_dir() && !is_ignored_dir(&name) {
             folders.insert(name);
