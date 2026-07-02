@@ -54,6 +54,44 @@ pub struct ChunkSection {
     pub text: String,
 }
 
+/// Renders an IO error message with the affected path. A bare `Operation not
+/// permitted` / `Permission denied` from the filesystem is opaque to users, so
+/// when the OS reports `PermissionDenied` we surface the actual cause — the
+/// server process lacks access to the vault folder — together with the concrete
+/// remediation. This is the common failure when the vault lives in a macOS
+/// TCC-protected location (Documents/Desktop/Downloads/iCloud Drive) and the
+/// server runs as a background launchd service that was never granted file
+/// access. Non-permission IO errors keep their original wording.
+pub fn describe_io_error(path: &Path, source: &std::io::Error) -> String {
+    if source.kind() != std::io::ErrorKind::PermissionDenied {
+        return format!("io error for {}: {source}", path.display());
+    }
+
+    let base = format!(
+        "permission denied accessing {} — the deep-obsidian-mcp server process is not authorized \
+to read this folder",
+        path.display()
+    );
+
+    if cfg!(target_os = "macos") {
+        format!(
+            "{base}. On macOS, protected folders (Documents, Desktop, Downloads, iCloud Drive) \
+require explicit access. Grant the deep-obsidian-mcp binary Full Disk Access in System Settings → \
+Privacy & Security → Full Disk Access \
+(x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles), then restart the \
+service with `brew services restart deep-obsidian-mcp`. Verify the process — not just your \
+terminal — can read the vault with `deep-obsidian-mcp doctor`. Alternatively, move the vault \
+outside the protected folder and update the configured vault path. (os error {})",
+            source.raw_os_error().unwrap_or_default()
+        )
+    } else {
+        format!(
+            "{base}. Ensure the service has read/write access to the vault path (check folder \
+ownership/permissions and any sandbox confinement), then restart it. ({source})"
+        )
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum VaultError {
     #[error("vault path does not exist or is not a directory: {0}")]
@@ -64,8 +102,22 @@ pub enum VaultError {
     ProtectedWritePath(String),
     #[error("path is not a directory: {0}")]
     NotDirectory(PathBuf),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("{}", describe_io_error(.path, .source))]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl VaultError {
+    /// Returns a `map_err` closure that attaches `path` to an IO error.
+    pub fn io(path: &Path) -> impl FnOnce(std::io::Error) -> VaultError + '_ {
+        move |source| VaultError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
 }
 
 fn current_dir_fallback() -> PathBuf {
@@ -157,16 +209,16 @@ fn walk_markdown_files(
     current: &Path,
     files: &mut Vec<String>,
 ) -> Result<(), VaultError> {
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
+    for entry in fs::read_dir(current).map_err(VaultError::io(current))? {
+        let entry = entry.map_err(VaultError::io(current))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if ensure_markdown_dir_ignored(&name) {
             continue;
         }
 
-        let file_type = entry.file_type()?;
         let path = entry.path();
+        let file_type = entry.file_type().map_err(VaultError::io(&path))?;
         if file_type.is_dir() {
             walk_markdown_files(root, &path, files)?;
             continue;
@@ -253,7 +305,7 @@ pub fn read_text_file(
     relative_path: &str,
 ) -> Result<ReadTextFileResult, VaultError> {
     let absolute_path = ensure_inside_vault(vault_path, relative_path)?;
-    let text = fs::read_to_string(&absolute_path)?;
+    let text = fs::read_to_string(&absolute_path).map_err(VaultError::io(&absolute_path))?;
     Ok(ReadTextFileResult {
         absolute_path,
         text,
@@ -269,9 +321,9 @@ pub fn write_text_file(
     let absolute_path = ensure_inside_vault(vault_path, relative_path)?;
     let created = fs::metadata(&absolute_path).is_err();
     if let Some(parent) = absolute_path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(VaultError::io(parent))?;
     }
-    fs::write(&absolute_path, text)?;
+    fs::write(&absolute_path, text).map_err(VaultError::io(&absolute_path))?;
     Ok(WriteTextFileResult {
         absolute_path,
         created,
@@ -287,9 +339,9 @@ pub fn write_binary_file(
     let absolute_path = ensure_inside_vault(vault_path, relative_path)?;
     let created = fs::metadata(&absolute_path).is_err();
     if let Some(parent) = absolute_path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(VaultError::io(parent))?;
     }
-    fs::write(&absolute_path, bytes)?;
+    fs::write(&absolute_path, bytes).map_err(VaultError::io(&absolute_path))?;
     Ok(WriteBinaryFileResult {
         absolute_path,
         created,
@@ -309,7 +361,7 @@ fn resolve_directory_path(
         Some(relative) => ensure_inside_vault(&resolved_vault, relative)?,
         None => resolved_vault.clone(),
     };
-    let metadata = fs::metadata(&absolute_path)?;
+    let metadata = fs::metadata(&absolute_path).map_err(VaultError::io(&absolute_path))?;
     if metadata.is_dir() {
         Ok((resolved_vault, absolute_path))
     } else {
@@ -326,15 +378,15 @@ pub fn list_children(
     let (resolved_vault, directory_path) = resolve_directory_path(vault_path, relative_path)?;
     let mut entries = Vec::new();
 
-    for entry in fs::read_dir(&directory_path)? {
-        let entry = entry?;
+    for entry in fs::read_dir(&directory_path).map_err(VaultError::io(&directory_path))? {
+        let entry = entry.map_err(VaultError::io(&directory_path))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if should_ignore_entry(&name, include_hidden, include_ignored) {
             continue;
         }
 
         let absolute_path = entry.path();
-        let file_type = entry.file_type()?;
+        let file_type = entry.file_type().map_err(VaultError::io(&absolute_path))?;
         if !file_type.is_dir() && !file_type.is_file() {
             continue;
         }
@@ -350,7 +402,7 @@ pub fn list_children(
             .collect::<Vec<_>>()
             .join("/");
 
-        let metadata = entry.metadata()?;
+        let metadata = entry.metadata().map_err(VaultError::io(&absolute_path))?;
         entries.push(VaultChildEntry {
             name,
             path: relative,
@@ -400,19 +452,18 @@ pub fn list_folders(
             return Ok(());
         }
 
-        for entry in fs::read_dir(current)? {
-            let entry = entry?;
+        for entry in fs::read_dir(current).map_err(VaultError::io(current))? {
+            let entry = entry.map_err(VaultError::io(current))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if should_ignore_entry(&name, include_hidden, include_ignored) {
                 continue;
             }
 
-            let file_type = entry.file_type()?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(VaultError::io(&path))?;
             if !file_type.is_dir() {
                 continue;
             }
-
-            let path = entry.path();
             let relative = path
                 .strip_prefix(resolved_vault)
                 .unwrap_or(&path)
@@ -712,6 +763,42 @@ mod tests {
         assert!(entries[1].is_markdown);
         assert_eq!(entries[2].path, "Notes/data.json");
         assert!(!entries[2].is_markdown);
+    }
+
+    #[test]
+    fn io_permission_error_explains_grant_and_restart() {
+        let error = VaultError::Io {
+            path: PathBuf::from("/Users/someone/Documents/Vault"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("permission denied accessing /Users/someone/Documents/Vault"),
+            "should name the inaccessible path: {message}"
+        );
+        assert!(
+            message.contains("restart"),
+            "should include remediation steps: {message}"
+        );
+        if cfg!(target_os = "macos") {
+            assert!(
+                message.contains("Full Disk Access"),
+                "macOS message should reference Full Disk Access: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn io_non_permission_error_keeps_original_wording() {
+        let error = VaultError::Io {
+            path: PathBuf::from("/tmp/missing"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        let message = error.to_string();
+        assert!(
+            message.starts_with("io error for /tmp/missing:"),
+            "non-permission IO errors keep their original wording: {message}"
+        );
     }
 
     #[test]

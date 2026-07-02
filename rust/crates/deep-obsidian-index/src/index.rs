@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, Utc};
+use deep_obsidian_core::describe_io_error;
 use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -30,44 +31,6 @@ impl SemanticBackend {
 impl Default for SemanticBackend {
     fn default() -> Self {
         SemanticBackend::Sparse
-    }
-}
-
-/// Renders an `IndexError::Io` message. A bare `Operation not permitted` /
-/// `Permission denied` from the filesystem is opaque to users, so when the OS
-/// reports `PermissionDenied` we surface the actual cause — the server process
-/// lacks access to the vault folder — together with the concrete remediation.
-/// This is the common failure when the vault lives in a macOS TCC-protected
-/// location (Documents/Desktop/Downloads/iCloud Drive) and the server runs as a
-/// background launchd service that was never granted file access. Non-permission
-/// IO errors keep their original wording.
-fn describe_io_error(path: &Path, source: &std::io::Error) -> String {
-    if source.kind() != std::io::ErrorKind::PermissionDenied {
-        return format!("io error for {}: {source}", path.display());
-    }
-
-    let base = format!(
-        "permission denied accessing {} — the deep-obsidian-mcp server process is not authorized \
-to read this folder",
-        path.display()
-    );
-
-    if cfg!(target_os = "macos") {
-        format!(
-            "{base}. On macOS, protected folders (Documents, Desktop, Downloads, iCloud Drive) \
-require explicit access. Grant the deep-obsidian-mcp binary Full Disk Access in System Settings → \
-Privacy & Security → Full Disk Access \
-(x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles), then restart the \
-service with `brew services restart deep-obsidian-mcp`. Verify the process — not just your \
-terminal — can read the vault with `deep-obsidian-mcp doctor`. Alternatively, move the vault \
-outside the protected folder and update the configured vault path. (os error {})",
-            source.raw_os_error().unwrap_or_default()
-        )
-    } else {
-        format!(
-            "{base}. Ensure the service has read/write access to the vault path (check folder \
-ownership/permissions and any sandbox confinement), then restart it. ({source})"
-        )
     }
 }
 
@@ -757,7 +720,10 @@ fn section_chunks(
             group_id += 1;
         }
         // Pop ancestors that do not strictly enclose this heading.
-        while stack.last().is_some_and(|(level, _)| *level >= boundary.level) {
+        while stack
+            .last()
+            .is_some_and(|(level, _)| *level >= boundary.level)
+        {
             stack.pop();
         }
         // Heading path: ancestors + this heading. Drop a leading entry that duplicates
@@ -4579,7 +4545,10 @@ mod tests {
             enclosing_heading_section(content, 4).expect("line 4 has an enclosing section");
         assert_eq!((start, end), (3, 5));
         assert_eq!(text, "## Two\nbeta\ngamma");
-        assert!(!text.contains("# One"), "flat tiling must not balloon to the parent");
+        assert!(
+            !text.contains("# One"),
+            "flat tiling must not balloon to the parent"
+        );
         assert!(!text.contains("## Three"), "must stop at the next heading");
 
         // The H1 heading line itself maps to the `# One` section, which (flat) ends at `## Two`.
@@ -4607,12 +4576,16 @@ mod tests {
         // A `#`-prefixed line inside a fence must NOT be read as a heading (matches the
         // fence-aware chunker, unlike fence-blind `extract_heading_sections`).
         let content = "# Real\nbefore\n```bash\n# not a heading\n```\nafter\n";
-        let (start, end, text) = enclosing_heading_section(content, 4).expect("fenced line section");
+        let (start, end, text) =
+            enclosing_heading_section(content, 4).expect("fenced line section");
         assert_eq!(start, 1, "the only heading is the real H1 at line 1");
         // `split('\n')` on a trailing-newline string yields a final empty element, so the
         // section runs to lines.len() = 7 (matching the chunker's own line accounting).
         assert_eq!(end, 7);
-        assert!(text.contains("# not a heading"), "fenced pseudo-heading stays in the section");
+        assert!(
+            text.contains("# not a heading"),
+            "fenced pseudo-heading stays in the section"
+        );
     }
 
     #[test]
@@ -4659,7 +4632,11 @@ mod tests {
         let content = "# Guide\n\n## A\nalpha text\n\n### B\nbeta text\n\n```bash\n# not a heading\nrun --flag\n```\n";
         let chunks = section_chunks_default(content, "Guide");
         // The whole note is well under the merge floor, so it is a single chunk.
-        assert_eq!(chunks.len(), 1, "tiny multi-heading note merges to one chunk");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "tiny multi-heading note merges to one chunk"
+        );
         let chunk = &chunks[0];
         assert!(chunk.text.contains("```bash"));
         assert!(chunk.text.contains("# not a heading"));
@@ -4677,7 +4654,11 @@ mod tests {
             "# Big\n\n## A\n{filler}\n\n## B\n{filler}\n\n```python\n# inside fence\nx = 1\ny = 2\n```\n{filler}\n",
         );
         let chunks = section_chunks_default(&content, "Big");
-        assert!(chunks.len() >= 2, "oversized note must split: {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "oversized note must split: {}",
+            chunks.len()
+        );
         // Exactly one chunk contains the opening fence, and it also contains the close.
         let fence_chunks: Vec<&SectionChunk> = chunks
             .iter()
@@ -4697,14 +4678,18 @@ mod tests {
 
     #[test]
     fn section_chunks_do_not_split_a_table_mid_table() {
-        let filler = "padding words to grow the section beyond the merge floor and target budget ".repeat(12);
+        let filler = "padding words to grow the section beyond the merge floor and target budget "
+            .repeat(12);
         let content = format!(
             "# Codes\n\n## Intro\n{filler}\n\n## Table\n| Code | Meaning |\n| --- | --- |\n| ERR_1 | one |\n| ERR_2 | two |\n| ERR_3 | three |\n{filler}\n",
         );
         let chunks = section_chunks_default(&content, "Codes");
         // Every table row must live in a single chunk (none split across chunks).
         for row in ["| ERR_1 | one |", "| ERR_2 | two |", "| ERR_3 | three |"] {
-            let count = chunks.iter().filter(|chunk| chunk.text.contains(row)).count();
+            let count = chunks
+                .iter()
+                .filter(|chunk| chunk.text.contains(row))
+                .count();
             assert_eq!(count, 1, "table row {row:?} appears in exactly one chunk");
         }
         // The header and its rows stay in the same chunk (contiguous table run).
@@ -4740,9 +4725,8 @@ mod tests {
             "filler must clear the merge floor: {}",
             token_len(&filler)
         );
-        let content = format!(
-            "# Service\n{filler}\n\n## Setup\n{filler}\n\n### Steps\n{filler}\n",
-        );
+        let content =
+            format!("# Service\n{filler}\n\n## Setup\n{filler}\n\n### Steps\n{filler}\n",);
         let chunks = section_chunks_default(&content, "Service");
         // No path should start with the title twice.
         for chunk in &chunks {
@@ -4751,7 +4735,10 @@ mod tests {
                 chunk.heading_path.get(1).map(String::as_str),
                 "title must not be duplicated at the front of the path"
             );
-            assert_eq!(chunk.heading_path.first().map(String::as_str), Some("Service"));
+            assert_eq!(
+                chunk.heading_path.first().map(String::as_str),
+                Some("Service")
+            );
         }
         // A nested chunk carries the full path Service › Setup › Steps.
         assert!(chunks.iter().any(|chunk| chunk.heading_path
@@ -4772,8 +4759,7 @@ mod tests {
             .collect();
         let content = format!("# Solo\n{}\n", lines.join("\n"));
         let src: Vec<&str> = content.split('\n').collect();
-        let chunks = section_chunks(&content, "Solo", 64, 16)
-            .expect("has heading");
+        let chunks = section_chunks(&content, "Solo", 64, 16).expect("has heading");
         assert!(chunks.len() > 1, "oversized multiline section must split");
         for chunk in &chunks {
             assert!(
@@ -4793,8 +4779,7 @@ mod tests {
         // pieces share one source line number (sub-line caveat) but stay under budget.
         let body = "alpha beta gamma delta epsilon zeta eta theta iota kappa ".repeat(120);
         let content = format!("# Solo\n{body}\n");
-        let chunks = section_chunks(&content, "Solo", 64, 16)
-            .expect("has heading");
+        let chunks = section_chunks(&content, "Solo", 64, 16).expect("has heading");
         assert!(chunks.len() > 1, "oversized single line must word-split");
         for chunk in &chunks {
             assert!(
@@ -5515,24 +5500,39 @@ mod tests {
 
         // Note-level dense vectors are dropped (v6); neither note carries one.
         assert!(
-            index.note("Good.md").and_then(|n| n.embedding.as_ref()).is_none(),
+            index
+                .note("Good.md")
+                .and_then(|n| n.embedding.as_ref())
+                .is_none(),
             "note dense vector is no longer computed (v6)"
         );
         assert!(
-            index.note("Bad.md").and_then(|n| n.embedding.as_ref()).is_none(),
+            index
+                .note("Bad.md")
+                .and_then(|n| n.embedding.as_ref())
+                .is_none(),
             "failing note must fall back to BM25/sparse (no dense vector)"
         );
 
         // Persisted index is loadable. No note vectors are written (v6); only the good
         // note's chunk vector is persisted (the failing note's chunk has none).
         let (note_vectors, chunk_vectors) = vector_counts(&root);
-        assert_eq!(note_vectors, 0, "note dense vectors are no longer persisted (v6)");
-        assert_eq!(chunk_vectors, 1, "only the good note's chunk vector is persisted");
+        assert_eq!(
+            note_vectors, 0,
+            "note dense vectors are no longer persisted (v6)"
+        );
+        assert_eq!(
+            chunk_vectors, 1,
+            "only the good note's chunk vector is persisted"
+        );
         let loaded = load_index(&root, None)
             .expect("load partial index")
             .expect("persisted index present");
         assert_eq!(loaded.note_count, 2);
-        assert!(loaded.note("Bad.md").is_some(), "failing note still indexed for BM25");
+        assert!(
+            loaded.note("Bad.md").is_some(),
+            "failing note still indexed for BM25"
+        );
 
         // Usable: BM25 still surfaces the un-embedded note, and semantic search
         // (KNN by rowid) returns the embedded note without choking on the missing
@@ -5772,7 +5772,11 @@ mod tests {
 
         // Every note is recorded as failed (the first K attempted, the rest
         // short-circuited without an attempt) and has no dense vector.
-        assert_eq!(outcome.failed_paths.len(), 8, "all notes recorded as failed");
+        assert_eq!(
+            outcome.failed_paths.len(),
+            8,
+            "all notes recorded as failed"
+        );
         assert!(prepared.iter().all(|p| p.note.embedding.is_none()));
         assert!(prepared.iter().all(|p| p.chunks[0].embedding.is_none()));
 
@@ -5976,4 +5980,3 @@ mod tests {
         assert_eq!(runtime.query_instruction.as_deref(), Some("Custom task"));
     }
 }
-
