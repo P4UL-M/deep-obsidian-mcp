@@ -1,3 +1,4 @@
 **/.deep-obsidian-mcp/
 target/
 .DS_Store
+outputs/

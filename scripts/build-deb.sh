@@ -41,4 +41,4 @@ cargo "${ARGS[@]}"
 
 echo
 echo "Built packages:"
-ls -1 target/debian/*.deb
+ls -1 "${CARGO_TARGET_DIR:-target}"/debian/*.deb

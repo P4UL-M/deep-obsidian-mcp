@@ -25,7 +25,8 @@ Full service model and troubleshooting: [docs/homebrew-service.md](./docs/homebr
 
 ## Debian / Ubuntu (apt)
 
-Packages are published for **amd64** and **arm64**.
+Packages are published for **amd64** and **arm64**, and support Debian 12+
+and Ubuntu 22.04+ (glibc 2.35 or newer).
 
 The one-liner adds the signed APT repository and installs the package (you then
 get updates through normal `apt upgrade`):
