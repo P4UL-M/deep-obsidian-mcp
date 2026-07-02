@@ -101,9 +101,32 @@ scripts/build-deb.sh 0.1.0-alpha.11   # stamp an explicit version
 ```
 
 CI builds both architectures natively (`ubuntu-24.04` for amd64,
-`ubuntu-24.04-arm` for arm64), installs and smoke-tests each `.deb`, and
-validates a signed APT repo by installing from it over `file://`
-(`.github/workflows/release-deb.yml`).
+`ubuntu-24.04-arm` for arm64) inside a Debian bookworm container, installs and
+smoke-tests each `.deb`, and validates a signed APT repo by installing from it
+over `file://` (`.github/workflows/release-deb.yml`).
+
+**glibc compatibility:** the package links against the build host's glibc, and
+`cargo-deb` stamps the required symbol versions as the `libc6` floor. Building
+inside bookworm keeps the requirement low (currently `libc6 (>= 2.34)`), so
+the package installs on Debian 12+ and Ubuntu 22.04+. Building directly on an
+Ubuntu 24.04 host would stamp `libc6 (>= 2.39)` and lock out everything older
+than Ubuntu 24.04 — the CI smoke test fails if the floor rises above 2.35.
+
+## Local integration test (Docker)
+
+To reproduce the full install path locally — build the `.deb` from HEAD in a
+bookworm container, then install and exercise it (binary, packaged files,
+systemd unit, `setup-service`, HTTP + stdio MCP transports) in clean
+Debian 12, Ubuntu 24.04, and Ubuntu 22.04 containers:
+
+```bash
+scripts/run-linux-integration-docker.sh                # locally built .deb
+scripts/run-linux-integration-docker.sh --published    # also test the live APT repo
+```
+
+Logs land in `outputs/linux-integration/`. The per-image smoke test is
+`scripts/linux-smoke-test.sh`, the same script CI runs after installing the
+package.
 
 ## Maintainer: publishing the APT repository
 

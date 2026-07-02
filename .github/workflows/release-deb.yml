@@ -37,9 +37,13 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # Build inside Debian bookworm so cargo-deb stamps a low libc6 floor
+    # (currently 2.34) and the .deb installs on Debian 12+ / Ubuntu 22.04+.
+    # Building directly on the ubuntu-24.04 runners stamps `libc6 (>= 2.39)`,
+    # which locks out every distro older than Ubuntu 24.04.
+    container: rust:1-bookworm
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
@@ -58,14 +62,20 @@ jobs:
           set -euo pipefail
           deb=$(ls -1 target/debian/*.deb | head -1)
           echo "Installing $deb"
-          sudo apt-get update
-          sudo apt-get install -y "./$deb"
-          deep-obsidian-mcp version
-          deep-obsidian-mcp help | grep -q "Usage:"
-          command -v rg
-          test -f /usr/share/deep-obsidian-mcp/skills/obsidian-capture-session/SKILL.md
-          test -f /usr/lib/systemd/user/deep-obsidian-mcp.service
-          systemd-analyze verify /usr/lib/systemd/user/deep-obsidian-mcp.service || true
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y systemd "./$deb"
+          deb_depends=$(dpkg-deb -f "$deb" Depends)
+          echo "Depends: $deb_depends"
+          # Guard the glibc floor: INSTALL.md promises Debian 12 (glibc 2.36)
+          # and Ubuntu 22.04 (glibc 2.35), so the stamped requirement must not
+          # exceed 2.35.
+          glibc_floor=$(echo "$deb_depends" | grep -oE 'libc6 \(>= [0-9.]+\)' | sed -E 's/.*>= ([0-9.]+).*/\1/')
+          if [ -n "$glibc_floor" ] && ! dpkg --compare-versions "$glibc_floor" le 2.35; then
+            echo "glibc requirement $glibc_floor is above 2.35 — the .deb would not install on Ubuntu 22.04 / Debian 12" >&2
+            exit 1
+          fi
+          bash scripts/linux-smoke-test.sh
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
