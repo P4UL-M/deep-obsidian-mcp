@@ -133,16 +133,18 @@ pub async fn run_stdio_service(config: ResolvedServiceConfig) -> io::Result<()> 
                 break;
             };
 
-            let response = handle_request(state.clone(), message)
-                .await
-                .map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        serde_json::to_string(&error).unwrap_or_else(|_| error.error.message),
-                    )
-                })?;
-            if let Some(response) = response {
-                send_message(&mut stdout, &response, output_mode)?;
+            // A request-level failure (failed tool call, bad params, unknown
+            // method) is a JSON-RPC error response for the client, not a
+            // reason to exit: the server must keep serving later requests.
+            match handle_request(state.clone(), message).await {
+                Ok(Some(response)) => send_message(&mut stdout, &response, output_mode)?,
+                Ok(None) => {}
+                Err(error) => {
+                    let payload = serde_json::to_value(&error).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error)
+                    })?;
+                    send_message(&mut stdout, &payload, output_mode)?;
+                }
             }
         }
     }

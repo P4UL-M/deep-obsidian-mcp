@@ -102,7 +102,7 @@ The black-box surface must preserve:
 - `request_vault_upload`
 - `upsert_session_note`
 
-`upsert_note` must preserve explicit author control. If `content` is provided, it must be written as-is. If `title` or `frontmatter` are provided, they must only be written when explicitly requested.
+`upsert_note` must preserve explicit author control. If `content` is provided, it must be written as-is. If `title` or `frontmatter` are provided, they must only be written when explicitly requested. `content` and the compose fields (`body`/`title`/`frontmatter`) are mutually exclusive; as a robustness concession to clients that fill every schema property, a call providing both `content` and `body` with identical text succeeds (writing `content`, with a `warning` in the result), while diverging text is rejected.
 
 `upsert_session_note` must preserve the provided markdown body as-is, except for optional trailing `## Manual Notes` preservation when requested. It must not inject an implicit title or heading.
 

@@ -24,7 +24,11 @@ and usage, see the top-level [USAGE.md](../USAGE.md).
 ### Authoring tool notes
 
 - **`upsert_note`** — generic create/update with explicit `content`, or
-  `frontmatter` + `title` + `body`. No implicit title injection.
+  `frontmatter` + `title` + `body` — mutually exclusive modes (the input
+  schema encodes this as a `oneOf`). Sending both `content` and `body` is
+  accepted only when their text is identical (the call succeeds with a
+  `warning` in the result); diverging text is rejected. No implicit title
+  injection.
 - **`update_note_section`** — patch the preamble or one heading section without
   rewriting the whole note.
 - **`request_vault_upload`** — for binary or large non-markdown files, returns a
