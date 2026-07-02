@@ -1,0 +1,74 @@
+name: publish-apt-pages
+
+# Manually (re)publish the signed APT repository to GitHub Pages from the
+# .deb assets already attached to a GitHub Release. Use this when the
+# release-deb publish job fails after the release assets exist (e.g. the
+# Pages deployment queue exceeded the deploy action's timeout — reruns of
+# release-deb are pinned to the workflow definition at the tag, so they
+# cannot pick up a longer timeout).
+#
+# Requires the APT_GPG_PRIVATE_KEY secret (and APT_GPG_PASSPHRASE if set).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag whose .deb assets to publish (e.g. v0.1.0-alpha.12)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Download release .debs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir debs
+          gh release download "${{ inputs.tag }}" --pattern '*.deb' --dir debs
+          ls -1 debs
+      - name: Build the signed APT repository
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APT_GPG_PRIVATE_KEY:-}" ]]; then
+            echo "APT_GPG_PRIVATE_KEY secret is required." >&2
+            exit 1
+          fi
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils gnupg
+          export GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"
+          echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')
+          scripts/build-apt-repo.sh debs public "$KEYID"
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - name: Deploy to Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+        with:
+          # The repo's Pages deployments regularly sit queued/in_progress past
+          # the action's 10-minute default, which then cancels an otherwise
+          # healthy deployment. Give it 30 minutes.
+          timeout: 1800000
