@@ -42,6 +42,11 @@ jobs:
     # Building directly on the ubuntu-24.04 runners stamps `libc6 (>= 2.39)`,
     # which locks out every distro older than Ubuntu 24.04.
     container: rust:1-bookworm
+    defaults:
+      run:
+        # In a container the default step shell is `sh` (dash), which rejects
+        # `set -o pipefail`; the scripts below assume bash.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
