@@ -2,10 +2,18 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
-## Unreleased
+## v0.1.0-alpha.12 — 2026-07-02
 
 ### Fixed
 
+- **The `.deb` installs again on Debian 12 and Ubuntu 22.04.** The alpha.11
+  package was built on Ubuntu 24.04 runners, so it declared
+  `libc6 (>= 2.39)` and `apt install` failed with unmet dependencies on every
+  older distro. Release builds now run inside a Debian bookworm container
+  (floor drops to `libc6 (>= 2.34)`), CI fails if the floor ever rises above
+  2.35, and a local Docker harness
+  (`scripts/run-linux-integration-docker.sh`) reproduces the full
+  install + smoke test on `debian:12`, `ubuntu:24.04`, and `ubuntu:22.04`.
 - **`upsert_note` no longer fails clients that send both `content` and
   `body`.** Some tool-callers (e.g. Grok) fill every schema property on each
   call, and the two fields looked interchangeable, so every call died on the
