@@ -177,6 +177,12 @@ jobs:
       - name: Deploy to Pages
         id: deploy
         uses: actions/deploy-pages@v4
+        with:
+          # This repo's Pages deployments regularly sit queued/in_progress
+          # past the action's 10-minute default, which then cancels an
+          # otherwise healthy deployment (seen on both alpha.11 and
+          # alpha.12). Give it 30 minutes.
+          timeout: 1800000
       - name: Attach .debs to the release
         uses: softprops/action-gh-release@v2
         with:
