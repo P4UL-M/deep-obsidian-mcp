@@ -588,18 +588,33 @@ fn render_frontmatter(value: &Value) -> Result<String, String> {
     Ok(format!("---\n{body}\n---"))
 }
 
-fn compose_explicit_note_content(arguments: &Value) -> Result<String, String> {
+/// Resolves the note text from either `content` (stored exactly) or the
+/// compose fields (`body` + optional `title`/`frontmatter`). Returns the text
+/// plus an optional warning to surface in the tool result.
+fn compose_explicit_note_content(arguments: &Value) -> Result<(String, Option<String>), String> {
     let explicit_content = optional_string_arg(arguments, "content");
-    let body = optional_string_arg(arguments, "body");
+    let mut body = optional_string_arg(arguments, "body");
     let title = optional_string_arg(arguments, "title");
     let frontmatter = arguments.get("frontmatter");
+    let mut warning = None;
+
+    // Some clients fill every schema property and send content and body
+    // together on each call. Identical text is unambiguous, so accept it with
+    // a warning instead of failing; different text stays a hard error.
+    if let (Some(content), Some(duplicate)) = (&explicit_content, &body) {
+        if content.trim_end() != duplicate.trim_end() {
+            return Err("upsert_note received both content and body with different text; provide exactly one of them: content (stored as given) or body (composed with title/frontmatter).".to_string());
+        }
+        warning = Some("content and body were both provided with identical text; content was used. Provide only one of them.".to_string());
+        body = None;
+    }
 
     if explicit_content.is_some() && (body.is_some() || title.is_some() || frontmatter.is_some()) {
         return Err("upsert_note accepts either full content or explicit body/title/frontmatter fields, not both.".to_string());
     }
 
     if let Some(content) = explicit_content {
-        return Ok(content);
+        return Ok((content, warning));
     }
 
     let body = body.ok_or_else(|| "upsert_note requires either content or body.".to_string())?;
@@ -611,7 +626,7 @@ fn compose_explicit_note_content(arguments: &Value) -> Result<String, String> {
         parts.push(format!("# {}", title.trim()));
     }
     parts.push(body.trim_end().to_string());
-    Ok(parts.join("\n\n"))
+    Ok((parts.join("\n\n"), warning))
 }
 
 fn split_note_lines(content: &str) -> Vec<String> {
@@ -879,21 +894,41 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "upsert_note".to_string(),
-            description: "Create or update a markdown note with explicit control over content, title, and frontmatter. This tool does not inject implicit headings.".to_string(),
+            description: "Create or update a markdown note. Provide EITHER content (full markdown stored exactly as given) OR the compose fields body + optional title/frontmatter — never both. This tool does not inject implicit headings.".to_string(),
             annotations: Some(tool_annotations(false, Some(false), Some(true))),
             execution: Some(json!({"taskSupport":"forbidden"})),
-            input_schema: object_schema(
+            input_schema: object_schema_with_extra(
                 vec![
                     ("path", json!({"type":"string","description":"Vault-relative markdown path to create or update."})),
-                    ("content", json!({"type":"string","description":"Full markdown content to store exactly as provided."})),
-                    ("body", json!({"type":"string","description":"Markdown body content used when composing the note explicitly."})),
-                    ("title", json!({"type":"string","description":"Optional explicit H1 title to prepend when using body mode."})),
-                    ("frontmatter", json!({"type":"object","description":"Optional explicit frontmatter object to serialize when using body mode."})),
+                    ("content", json!({"type":"string","description":"Full markdown content to store exactly as provided. Mutually exclusive with body, title, and frontmatter — do not send both content and body."})),
+                    ("body", json!({"type":"string","description":"Markdown body for compose mode, combined with optional title/frontmatter. Mutually exclusive with content — set body or content, never both."})),
+                    ("title", json!({"type":"string","description":"Optional explicit H1 title to prepend in compose (body) mode. Do not combine with content."})),
+                    ("frontmatter", json!({"type":"object","description":"Optional frontmatter object serialized in compose (body) mode. Do not combine with content."})),
                     ("preserveManualNotes", json!({"type":"boolean","default":false})),
                     ("dryRun", json!({"type":"boolean","default":false,"description":"Preview the write without changing the vault."})),
                     ("expectedHash", json!({"type":"string","description":"Optional hash of the current note content. If it does not match, no write occurs."})),
                 ],
                 vec!["path"],
+                // Encode the content XOR body/title/frontmatter contract for
+                // clients that validate: exactly one branch must match, and
+                // each branch explicitly excludes the other mode's fields.
+                vec![(
+                    "oneOf",
+                    json!([
+                        {
+                            "required": ["content"],
+                            "not": {"anyOf": [
+                                {"required": ["body"]},
+                                {"required": ["title"]},
+                                {"required": ["frontmatter"]}
+                            ]}
+                        },
+                        {
+                            "required": ["body"],
+                            "not": {"required": ["content"]}
+                        }
+                    ]),
+                )],
             ),
         },
         ToolDefinition {
@@ -2219,7 +2254,7 @@ pub async fn call_tool(
             }
             let dry_run = bool_arg(arguments, "dryRun", false);
             let expected_hash = expected_hash_arg(arguments);
-            let content = compose_explicit_note_content(arguments)?;
+            let (content, compose_warning) = compose_explicit_note_content(arguments)?;
             let preserve_manual_notes = bool_arg(arguments, "preserveManualNotes", false);
             let existing = read_text_file(&config.vault_path, &path).ok();
             let previous_hash = existing
@@ -2239,7 +2274,7 @@ pub async fn call_tool(
                     .map_err(|error| error.to_string())?;
             }
             let title = note_title_from_content(&path, &final_content);
-            Ok(json_text_result(json!({
+            let mut payload = json!({
                 "action": if existing.is_some() { "updated" } else { "created" },
                 "path": path,
                 "title": title,
@@ -2249,7 +2284,11 @@ pub async fn call_tool(
                 "dryRun": dry_run,
                 "previousHash": previous_hash,
                 "newHash": new_hash
-            })))
+            });
+            if let Some(warning) = compose_warning {
+                payload["warning"] = json!(warning);
+            }
+            Ok(json_text_result(payload))
         }
         "update_note_section" => {
             let path = string_arg(arguments, "path")?;
@@ -2584,7 +2623,7 @@ mod tests {
 
     #[test]
     fn compose_explicit_note_content_supports_frontmatter_title_and_body() {
-        let content = compose_explicit_note_content(&json!({
+        let (content, warning) = compose_explicit_note_content(&json!({
             "path": "Blog/Test.md",
             "frontmatter": {
                 "title": "Hello",
@@ -2595,6 +2634,7 @@ mod tests {
         }))
         .expect("content should compose");
 
+        assert!(warning.is_none());
         assert!(content.starts_with("---\n"));
         assert!(content.contains("title: \"Hello\""));
         assert!(content.contains("tags:"));
@@ -2602,6 +2642,42 @@ mod tests {
         assert!(content.contains("- \"test\""));
         assert!(content.contains("# Hello"));
         assert!(content.ends_with("Body text"));
+    }
+
+    #[test]
+    fn compose_explicit_note_content_accepts_identical_content_and_body_with_warning() {
+        let (content, warning) = compose_explicit_note_content(&json!({
+            "path": "Note.md",
+            "content": "# Note\n\nSame text",
+            "body": "# Note\n\nSame text\n"
+        }))
+        .expect("identical duplicate should be accepted");
+
+        assert_eq!(content, "# Note\n\nSame text");
+        assert!(warning.expect("warning should be set").contains("identical"));
+    }
+
+    #[test]
+    fn compose_explicit_note_content_rejects_diverging_content_and_body() {
+        let error = compose_explicit_note_content(&json!({
+            "path": "Note.md",
+            "content": "one",
+            "body": "two"
+        }))
+        .expect_err("diverging duplicate should fail");
+        assert!(error.contains("different text"));
+        assert!(error.contains("exactly one"));
+    }
+
+    #[test]
+    fn compose_explicit_note_content_rejects_content_with_compose_fields() {
+        let error = compose_explicit_note_content(&json!({
+            "path": "Note.md",
+            "content": "text",
+            "title": "Title"
+        }))
+        .expect_err("content plus title should fail");
+        assert!(error.contains("not both"));
     }
 
     #[test]
@@ -2847,6 +2923,44 @@ mod tests {
         let file_text = fs::read_to_string(vault_path.join("Notes/Dry.md")).expect("read note");
         assert_eq!(file_text, "# Dry\n\nOriginal\n");
         assert_eq!(content_hash(file_text.as_bytes()), previous_hash);
+    }
+
+    #[tokio::test]
+    async fn upsert_note_accepts_identical_content_and_body_and_reports_warning() {
+        let vault_path = temp_dir("upsert-duplicate-fields");
+        let state = test_state(vault_path.clone()).await;
+
+        let result = call_tool(
+            &state,
+            "upsert_note",
+            &json!({
+                "path": "Notes/Dup.md",
+                "content": "# Dup\n\nSame text",
+                "body": "# Dup\n\nSame text"
+            }),
+        )
+        .await
+        .expect("identical content+body should succeed");
+        assert_eq!(result.structured_content["created"], true);
+        assert!(result.structured_content["warning"]
+            .as_str()
+            .expect("warning should be reported")
+            .contains("identical"));
+        let file_text = fs::read_to_string(vault_path.join("Notes/Dup.md")).expect("read note");
+        assert_eq!(file_text, "# Dup\n\nSame text\n");
+
+        let diverging = call_tool(
+            &state,
+            "upsert_note",
+            &json!({
+                "path": "Notes/Dup.md",
+                "content": "# Dup\n\nOne",
+                "body": "# Dup\n\nTwo"
+            }),
+        )
+        .await
+        .expect_err("diverging content+body should fail");
+        assert!(diverging.contains("different text"));
     }
 
     #[tokio::test]

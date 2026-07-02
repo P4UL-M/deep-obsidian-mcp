@@ -2,6 +2,23 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## Unreleased
+
+### Fixed
+
+- **`upsert_note` no longer fails clients that send both `content` and
+  `body`.** Some tool-callers (e.g. Grok) fill every schema property on each
+  call, and the two fields looked interchangeable, so every call died on the
+  server's mutual-exclusion check. Identical text is now accepted (writing
+  `content`, with a `warning` in the result); diverging text still errors. The
+  tool description, the `content`/`body`/`title`/`frontmatter` descriptions,
+  and a new `oneOf` in the input schema now state the exclusivity explicitly.
+- **A failed tool call no longer kills the stdio server.** The stdio loop
+  treated any request-level error (failed tool call, bad params, unknown
+  method) as fatal and exited, so the first error made every subsequent call
+  fail until restart. Errors are now sent to the client as JSON-RPC error
+  responses and the server keeps serving, matching the HTTP transport.
+
 ## v0.1.0-alpha.11 — 2026-06-26
 
 ### Added
