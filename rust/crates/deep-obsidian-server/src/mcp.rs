@@ -11,6 +11,7 @@ use crate::protocol::{
     ResourceTemplateListResult, ServerInfo, ToolCallResult, ToolListResult,
 };
 use crate::runtime::RuntimeState;
+use crate::shared::SharedMountRuntime;
 use crate::uploads::UploadStore;
 use crate::{prompts, resources, tools};
 
@@ -35,6 +36,10 @@ pub struct AppState {
     /// `Some` only under the HTTP transport; `None` under stdio (no HTTP listener),
     /// in which case `request_vault_upload` returns a clear transport error.
     pub upload_base: Option<String>,
+    /// Connected shared Algolia mounts (empty when `shared` is unconfigured).
+    /// A mount that fails to connect at startup is skipped with a warning
+    /// rather than killing a server that mostly serves local content.
+    pub mounts: Arc<Vec<SharedMountRuntime>>,
 }
 
 impl AppState {
@@ -42,6 +47,17 @@ impl AppState {
     pub fn new(config: ResolvedServiceConfig, runtime: Arc<RuntimeState>) -> Self {
         let ripgrep_path = tools::resolve_ripgrep();
         let rg_available = ripgrep_path.is_file();
+        let secrets = deep_obsidian_config::secrets::SecretResolver::new();
+        let mut mounts = Vec::new();
+        for mount_config in &config.shared {
+            match crate::shared::connect_mount(mount_config, &secrets, &config.index_dir) {
+                Ok(mount) => mounts.push(mount),
+                Err(error) => tracing::warn!(
+                    index = %mount_config.index_name,
+                    "skipping shared mount: {error}"
+                ),
+            }
+        }
         Self {
             config: Arc::new(config),
             runtime,
@@ -50,6 +66,7 @@ impl AppState {
             rg_available,
             uploads: UploadStore::new(),
             upload_base: None,
+            mounts: Arc::new(mounts),
         }
     }
 
@@ -120,7 +137,7 @@ pub async fn handle_request(
             serde_json::to_value(json_response(
                 id,
                 ToolListResult {
-                    tools: tools::list_tools(state.rg_available),
+                    tools: tools::list_tools_with_mounts(state.rg_available, !state.mounts.is_empty()),
                 },
             ))
             .expect("tool list response to serialize"),

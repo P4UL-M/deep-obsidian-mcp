@@ -7,6 +7,7 @@ pub mod protocol;
 pub mod resources;
 pub mod runtime;
 pub mod shared;
+pub mod shared_tools;
 pub mod stdio;
 pub mod tools;
 pub mod uploads;

@@ -48,6 +48,7 @@ pub async fn push_note_version(
     content: &str,
     known_files: &[String],
     base_version_id: Option<&str>,
+    resolve_divergence: bool,
 ) -> Result<VersionedWriteOutcome> {
     let head = fetch_head(mount, remote_path).await?;
     let head_version = head.as_ref().map(|note| note.version_id.clone());
@@ -72,8 +73,13 @@ pub async fn push_note_version(
         (Some(head_id), Some(base)) if head_id != base => Some(head_id.clone()),
         _ => None,
     };
-    let has_divergence =
-        forked_from.is_some() || head.as_ref().map(|note| note.has_divergence).unwrap_or(false);
+    // Divergence persists until a writer explicitly resolves it: a head-based
+    // write still hasn't merged the forked content sitting in history.
+    let has_divergence = if resolve_divergence && forked_from.is_none() {
+        false
+    } else {
+        forked_from.is_some() || head.as_ref().map(|note| note.has_divergence).unwrap_or(false)
+    };
 
     let meta = NoteVersionMeta {
         version_id: version_id.clone(),

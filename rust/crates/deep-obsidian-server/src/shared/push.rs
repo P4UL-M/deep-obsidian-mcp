@@ -210,6 +210,7 @@ pub async fn apply_push(
                     content,
                     &all_files,
                     head.as_ref().map(|note| note.version_id.as_str()),
+                    false,
                 )
                 .await?;
                 report.pushed += 1;

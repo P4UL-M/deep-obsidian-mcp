@@ -198,6 +198,7 @@ async fn foreign_notes_are_never_retracted() {
         "# Alice's decision\n\nWritten remotely.\n",
         &[],
         None,
+        false,
     )
     .await
     .expect("alice push");

@@ -144,16 +144,25 @@ pub fn history_index_name(index_name: &str) -> String {
 }
 
 /// Longest-prefix routing: returns the mount owning `path` plus the
-/// mount-relative remote path.
+/// mount-relative remote path. The mount root itself matches with or without
+/// its trailing slash (`_Shared/Team` and `_Shared/Team/` both route).
 pub fn route<'a>(
     mounts: &'a [SharedMountRuntime],
     path: &'a str,
 ) -> Option<(&'a SharedMountRuntime, &'a str)> {
     mounts
         .iter()
-        .filter(|mount| path.starts_with(mount.mount_at()))
-        .max_by_key(|mount| mount.mount_at().len())
-        .map(|mount| (mount, &path[mount.mount_at().len()..]))
+        .filter_map(|mount| {
+            let mount_at = mount.mount_at();
+            if let Some(remote) = path.strip_prefix(mount_at) {
+                Some((mount, remote))
+            } else if path == mount_at.trim_end_matches('/') {
+                Some((mount, ""))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(mount, _)| mount.mount_at().len())
 }
 
 /// Retention keep-set (design §3.1): keep the `min_versions` most recent

@@ -12,7 +12,7 @@ use deep_obsidian_core::text::{
 };
 use deep_obsidian_core::vault::{
     ensure_inside_vault, list_children as vault_list_children, list_markdown_files,
-    list_top_level_folders, read_text_file, write_text_file, VaultChildEntry, VaultEntryKind,
+    list_top_level_folders, write_text_file, VaultChildEntry, VaultEntryKind,
 };
 use deep_obsidian_index::graph as index_graph;
 use deep_obsidian_index::index::{artifact_kind, artifact_mime_type, IndexError};
@@ -832,7 +832,7 @@ fn tool_annotations(read_only: bool, destructive: Option<bool>, idempotent: Opti
     Value::Object(annotations)
 }
 
-fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
+fn tool_definitions(rg_available: bool, has_mounts: bool) -> Vec<ToolDefinition> {
     let mut definitions = vec![
         ToolDefinition {
             name: "load_knowledge".to_string(),
@@ -1150,11 +1150,52 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
     if !rg_available {
         definitions.retain(|definition| definition.name != "grep_search");
     }
+    // Version-history tools exist only when a shared mount is configured:
+    // capability-gated availability, unchanged names/schemas otherwise.
+    if has_mounts {
+        definitions.push(ToolDefinition {
+            name: "note_history".to_string(),
+            description: "List the version history of a note on a shared mount (append-only versions; retention keeps the 5 most recent plus anything younger than 90 days).".to_string(),
+            annotations: Some(tool_annotations(true, None, None)),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema(
+                vec![("path", json!({"type":"string","description":"Mounted vault-relative note path."}))],
+                vec!["path"],
+            ),
+        });
+        definitions.push(ToolDefinition {
+            name: "read_version".to_string(),
+            description: "Read a specific (possibly superseded) version of a shared note, reassembled from its history records.".to_string(),
+            annotations: Some(tool_annotations(true, None, None)),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema(
+                vec![
+                    ("path", json!({"type":"string"})),
+                    ("versionId", json!({"type":"string"})),
+                ],
+                vec!["path", "versionId"],
+            ),
+        });
+        definitions.push(ToolDefinition {
+            name: "resolve_divergence".to_string(),
+            description: "Return a diverged shared note's head, the overtaken version, and their common ancestor so the caller can three-way merge; the server never auto-merges. Clear the flag by writing the merged content with resolveDivergence:true.".to_string(),
+            annotations: Some(tool_annotations(true, None, None)),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema(
+                vec![("path", json!({"type":"string"}))],
+                vec!["path"],
+            ),
+        });
+    }
     definitions
 }
 
 pub fn list_tools(rg_available: bool) -> Vec<ToolDefinition> {
-    tool_definitions(rg_available)
+    tool_definitions(rg_available, false)
+}
+
+pub fn list_tools_with_mounts(rg_available: bool, has_mounts: bool) -> Vec<ToolDefinition> {
+    tool_definitions(rg_available, has_mounts)
 }
 
 fn hybrid_search_match_json(
@@ -1576,6 +1617,11 @@ pub async fn call_tool(
         "vault_info" => {
             let snapshot = state.runtime.fresh_snapshot("vault_info").await?;
             let mut payload = build_vault_overview_payload(config, &snapshot);
+            if let Some(mounts) = crate::shared_tools::vault_info_mounts(state).await {
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("sharedMounts".to_string(), mounts);
+                }
+            }
             // Non-fatal live health probe for the note embedding backend. vault_info must
             // never error when the backend is down — it reports the status as a field.
             // The probe is a bounded blocking HTTP call, so run it off the async runtime.
@@ -1612,6 +1658,17 @@ pub async fn call_tool(
             let folders_only = bool_arg(arguments, "foldersOnly", false);
             let include_hidden = bool_arg(arguments, "includeHidden", false);
             let include_ignored = bool_arg(arguments, "includeIgnored", false);
+            // Mounted directory: answered from the shared index (folders are
+            // facet values, files are note records).
+            if let Some(payload) = crate::shared_tools::list_children_payload(
+                state,
+                path.as_deref().unwrap_or(""),
+                folders_only,
+            )
+            .await?
+            {
+                return Ok(json_text_result(payload));
+            }
             let entries = vault_list_children(
                 &config.vault_path,
                 path.as_deref(),
@@ -1619,12 +1676,19 @@ pub async fn call_tool(
                 include_ignored,
             )
             .map_err(|error| error.to_string())?;
+            // Mount roots appear as synthetic directories while walking the
+            // local tree, so mounted namespaces stay discoverable.
+            let mount_roots =
+                crate::shared_tools::mount_root_entries(state, path.as_deref().unwrap_or(""));
             if folders_only {
-                let folders = entries
+                let mut folders = entries
                     .into_iter()
                     .filter(|entry| matches!(entry.kind, VaultEntryKind::Directory))
                     .map(|entry| entry.path)
                     .collect::<Vec<_>>();
+                folders.extend(mount_roots.iter().filter_map(|entry| {
+                    entry.get("path").and_then(Value::as_str).map(str::to_string)
+                }));
                 Ok(json_text_result(json!({
                     "path": path,
                     "foldersOnly": true,
@@ -1632,11 +1696,16 @@ pub async fn call_tool(
                     "folders": folders
                 })))
             } else {
+                let mut children = entries
+                    .into_iter()
+                    .map(|entry| vault_child_entry_json(&entry))
+                    .collect::<Vec<_>>();
+                children.extend(mount_roots);
                 Ok(json_text_result(json!({
                     "path": path,
                     "foldersOnly": false,
-                    "count": entries.len(),
-                    "children": entries.into_iter().map(|entry| vault_child_entry_json(&entry)).collect::<Vec<_>>()
+                    "count": children.len(),
+                    "children": children
                 })))
             }
         }
@@ -1644,12 +1713,15 @@ pub async fn call_tool(
             let path = string_arg(arguments, "path")?;
             validate_format_arg(arguments)?;
             let text_options = TextPayloadOptions::from_arguments(arguments, true);
-            let file =
-                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            // Route through shared mounts: mounted paths hydrate from the
+            // shared index (exact chunk reassembly), local paths read disk.
+            let (file_text, shared_version) = crate::shared_tools::routed_read(state, &path)
+                .await?
+                .ok_or_else(|| format!("io error for {path}: note not found"))?;
             // Full-file content hash, computed with the same helper the write tools use so a
             // write's `newHash` can be fed straight back into a read's `knownHash`. Always the
             // full-file hash regardless of any startLine/endLine slice.
-            let hash = content_hash(file.text.as_bytes());
+            let hash = content_hash(file_text.as_bytes());
             let known_hash = optional_string_arg(arguments, "knownHash");
             if known_hash.as_deref() == Some(hash.as_str()) {
                 let result = Map::from_iter([
@@ -1672,12 +1744,12 @@ pub async fn call_tool(
                 .map(|value| value as usize);
             let text = if start_line.is_some() || end_line.is_some() {
                 deep_obsidian_core::vault::slice_lines(
-                    &file.text,
+                    &file_text,
                     start_line.unwrap_or(1),
                     end_line.or(start_line).unwrap_or(1),
                 )
             } else {
-                file.text
+                file_text
             };
             let line_count = text.split('\n').count();
             let mut result = Map::from_iter([
@@ -1689,6 +1761,10 @@ pub async fn call_tool(
                 ("endLine".to_string(), json!(end_line.unwrap_or(line_count))),
                 ("lineCount".to_string(), json!(line_count)),
             ]);
+            if let Some(version) = shared_version {
+                result.insert("shared".to_string(), json!(true));
+                result.insert("versionId".to_string(), json!(version));
+            }
             insert_optional_text(&mut result, "text", &text, text_options);
             Ok(json_text_result_from_arguments(
                 arguments,
@@ -1744,10 +1820,16 @@ pub async fn call_tool(
             let mode = optional_enum_string_arg(arguments, "mode", &["substring", "regex"])?
                 .unwrap_or_else(|| "substring".to_string());
             let limit = clamped_usize_arg(arguments, "limit", 20, 1, 200);
-            let matches = live_find_file_matches(&config.vault_path, &query, &mode, limit)?
+            let mut matches = live_find_file_matches(&config.vault_path, &query, &mode, limit)?
                 .into_iter()
                 .map(|item| file_path_match_json(&item))
                 .collect::<Vec<_>>();
+            // Shared mounts answer by path-restricted search (substring mode
+            // only; regex has no remote analogue and is reported local-only).
+            if mode == "substring" {
+                matches.extend(crate::shared_tools::find_files_remote(state, &query, limit).await);
+                matches.truncate(limit.max(1) * 2);
+            }
             Ok(json_text_result(json!({
                 "query": query,
                 "mode": mode,
@@ -1781,18 +1863,49 @@ pub async fn call_tool(
             .into_iter()
             .map(|item| grep_match_json(&item, text_options))
             .collect::<Vec<_>>();
-            Ok(json_text_result_from_arguments(
-                arguments,
-                json!({
-                    "query": query,
-                    "regex": regex_mode,
-                    "caseSensitive": case_sensitive,
-                    "glob": glob,
-                    "contextLines": context_lines,
-                    "count": matches.len(),
-                    "matches": matches
-                }),
-            ))
+            let mut result = json!({
+                "query": query,
+                "regex": regex_mode,
+                "caseSensitive": case_sensitive,
+                "glob": glob,
+                "contextLines": context_lines,
+                "count": matches.len(),
+                "matches": matches
+            });
+            // Shared mounts: candidate-bounded regex (design §4.3). Local
+            // results above stay exhaustive; the scope block states exactly
+            // what the remote pass covered — or why it refused.
+            if !state.mounts.is_empty() && glob.is_none() {
+                let pattern = if regex_mode {
+                    query.clone()
+                } else {
+                    regex::escape(&query)
+                };
+                let (shared_matches, scope) = crate::shared_tools::grep_remote(
+                    state,
+                    &pattern,
+                    case_sensitive,
+                    limit,
+                )
+                .await;
+                if let Some(object) = result.as_object_mut() {
+                    if !shared_matches.is_empty() {
+                        let combined_count = object
+                            .get("count")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize
+                            + shared_matches.len();
+                        object.insert("count".to_string(), json!(combined_count));
+                        if let Some(all) =
+                            object.get_mut("matches").and_then(Value::as_array_mut)
+                        {
+                            all.extend(shared_matches);
+                        }
+                    }
+                    object.insert("sharedScope".to_string(), json!(scope));
+                }
+            }
+            Ok(json_text_result_from_arguments(arguments, result))
         }
         "note_outline" => {
             let path = string_arg(arguments, "path")?;
@@ -1801,11 +1914,12 @@ pub async fn call_tool(
             if arguments.get("maxTextChars").is_none() {
                 text_options.max_text_chars = 4_000;
             }
-            let file =
-                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            let (file_text, _shared_version) = crate::shared_tools::routed_read(state, &path)
+                .await?
+                .ok_or_else(|| format!("io error for {path}: note not found"))?;
             Ok(json_text_result_from_arguments(
                 arguments,
-                outline_payload(&path, &file.text, text_options),
+                outline_payload(&path, &file_text, text_options),
             ))
         }
         "build_index" => {
@@ -1856,15 +1970,23 @@ pub async fn call_tool(
             let degraded = outcome.degraded;
             let degradation_reason = outcome.degradation_reason.clone();
             let count = outcome.matches.len();
-            let mut match_values = outcome
+            let match_values = outcome
                 .matches
                 .into_iter()
                 .map(|item| hybrid_search_match_json(&item, text_options))
                 .collect::<Vec<_>>();
+            // Federate shared mounts into the ranking with N-list RRF: rank-
+            // based fusion is scale-free, so Algolia scores never need
+            // normalizing against BM25/cosine (design §8).
+            let (mut match_values, shared_meta) =
+                crate::shared_tools::federate_matches(state, &query, match_values, limit).await;
             let response_truncated =
                 apply_response_text_budget(&mut match_values, "text", RESPONSE_TEXT_BUDGET_CHARS);
             let mut result = Map::new();
             result.insert("query".to_string(), json!(query));
+            if let Some(shared_meta) = shared_meta {
+                result.insert("shared".to_string(), shared_meta);
+            }
             result.insert("rebuilt".to_string(), json!(snapshot.rebuilt));
             result.insert(
                 "semanticBackend".to_string(),
@@ -1971,6 +2093,13 @@ pub async fn call_tool(
             .unwrap_or_else(|| "both".to_string());
             let depth = clamped_usize_arg(arguments, "depth", 1, 1, 6);
             let limit = clamped_usize_arg(arguments, "limit", 100, 1, 500);
+            // A mounted start node traverses the shared link graph: one
+            // filter query per hop for backlinks, note-record links outgoing.
+            if let Some(payload) =
+                crate::shared_tools::traverse_remote(state, &path, &direction, depth).await?
+            {
+                return Ok(json_text_result(payload));
+            }
             let snapshot = state.runtime.fresh_snapshot("graph_traverse").await?;
             let index = snapshot.index;
             let graph_direction = match direction.as_str() {
@@ -2038,6 +2167,11 @@ pub async fn call_tool(
                 }
                 chunks.push(chunk_value);
             }
+            // Federate the shared corpus into the retrieval phase: remote
+            // chunk hits join the local list before note bucketing, so shared
+            // knowledge participates in load_knowledge's expansion too.
+            let (mut chunks, shared_meta) =
+                crate::shared_tools::federate_matches(state, &query, chunks, limit_chunks).await;
             let response_truncated =
                 apply_response_text_budget(&mut chunks, "text", RESPONSE_TEXT_BUDGET_CHARS);
 
@@ -2148,6 +2282,9 @@ pub async fn call_tool(
             // chunk retrieval fell back to BM25-only (related-note/graph context still
             // applies). Always present (false on the healthy path).
             result.insert("degraded".to_string(), json!(degraded));
+            if let Some(shared_meta) = shared_meta {
+                result.insert("shared".to_string(), shared_meta);
+            }
             if let Some(reason) = degradation_reason {
                 result.insert("degradationReason".to_string(), json!(reason));
             }
@@ -2256,20 +2393,29 @@ pub async fn call_tool(
             let expected_hash = expected_hash_arg(arguments);
             let (content, compose_warning) = compose_explicit_note_content(arguments)?;
             let preserve_manual_notes = bool_arg(arguments, "preserveManualNotes", false);
-            let existing = read_text_file(&config.vault_path, &path).ok();
+            let resolve_divergence = bool_arg(arguments, "resolveDivergence", false);
+            let existing = crate::shared_tools::routed_read(state, &path).await?;
+            let base_version = existing.as_ref().and_then(|(_, version)| version.clone());
             let previous_hash = existing
                 .as_ref()
-                .map(|existing| content_hash(existing.text.as_bytes()));
+                .map(|(text, _)| content_hash(text.as_bytes()));
             validate_expected_hash(expected_hash.as_deref(), previous_hash.as_deref(), &path)?;
             let final_content = existing
                 .as_ref()
-                .map(|existing| {
-                    merge_with_manual_notes(&content, &existing.text, preserve_manual_notes)
-                })
+                .map(|(text, _)| merge_with_manual_notes(&content, text, preserve_manual_notes))
                 .unwrap_or_else(|| finalize_written_content(&content));
             let new_hash = content_hash(final_content.as_bytes());
             let created = existing.is_none();
-            if !dry_run {
+            let shared_fields = crate::shared_tools::routed_write(
+                state,
+                &path,
+                &final_content,
+                base_version.as_deref(),
+                resolve_divergence,
+                dry_run,
+            )
+            .await?;
+            if shared_fields.is_none() && !dry_run {
                 write_text_file(&config.vault_path, &path, &final_content)
                     .map_err(|error| error.to_string())?;
             }
@@ -2285,6 +2431,9 @@ pub async fn call_tool(
                 "previousHash": previous_hash,
                 "newHash": new_hash
             });
+            if let (Some(fields), Some(object)) = (shared_fields, payload.as_object_mut()) {
+                object.extend(fields);
+            }
             if let Some(warning) = compose_warning {
                 payload["warning"] = json!(warning);
             }
@@ -2297,13 +2446,14 @@ pub async fn call_tool(
             let replacement = string_arg(arguments, "content")?;
             let dry_run = bool_arg(arguments, "dryRun", false);
             let expected_hash = expected_hash_arg(arguments);
-            let existing =
-                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
-            let previous_hash = content_hash(existing.text.as_bytes());
+            let (existing_text, base_version) = crate::shared_tools::routed_read(state, &path)
+                .await?
+                .ok_or_else(|| format!("io error for {path}: note not found"))?;
+            let previous_hash = content_hash(existing_text.as_bytes());
             validate_expected_hash(expected_hash.as_deref(), Some(&previous_hash), &path)?;
             let (final_content, action, level, heading) = match target.as_str() {
                 "preamble" => (
-                    replace_note_preamble(&existing.text, &replacement),
+                    replace_note_preamble(&existing_text, &replacement),
                     "updated".to_string(),
                     None,
                     None,
@@ -2315,7 +2465,7 @@ pub async fn call_tool(
                     let level = clamped_usize_arg(arguments, "level", 2, 1, 6);
                     let create_if_missing = bool_arg(arguments, "createIfMissing", true);
                     let (updated, action, actual_level) = update_or_create_note_section(
-                        &existing.text,
+                        &existing_text,
                         &heading,
                         &replacement,
                         level,
@@ -2333,11 +2483,20 @@ pub async fn call_tool(
                 }
             };
             let new_hash = content_hash(final_content.as_bytes());
-            if !dry_run {
+            let shared_fields = crate::shared_tools::routed_write(
+                state,
+                &path,
+                &final_content,
+                base_version.as_deref(),
+                bool_arg(arguments, "resolveDivergence", false),
+                dry_run,
+            )
+            .await?;
+            if shared_fields.is_none() && !dry_run {
                 write_text_file(&config.vault_path, &path, &final_content)
                     .map_err(|error| error.to_string())?;
             }
-            Ok(json_text_result(json!({
+            let mut payload = json!({
                 "action": action,
                 "path": path,
                 "resourceUri": note_uri(&path),
@@ -2348,7 +2507,11 @@ pub async fn call_tool(
                 "dryRun": dry_run,
                 "previousHash": previous_hash,
                 "newHash": new_hash
-            })))
+            });
+            if let (Some(fields), Some(object)) = (shared_fields, payload.as_object_mut()) {
+                object.extend(fields);
+            }
+            Ok(json_text_result(payload))
         }
         "request_vault_upload" => {
             let path = string_arg(arguments, "path")?;
@@ -2410,10 +2573,11 @@ pub async fn call_tool(
                     folder.as_deref().unwrap_or("Knowledge Capture"),
                 )
             });
-            let existing = read_text_file(&config.vault_path, &target_path).ok();
+            let existing = crate::shared_tools::routed_read(state, &target_path).await?;
+            let base_version = existing.as_ref().and_then(|(_, version)| version.clone());
             let previous_hash = existing
                 .as_ref()
-                .map(|existing| content_hash(existing.text.as_bytes()));
+                .map(|(text, _)| content_hash(text.as_bytes()));
             validate_expected_hash(
                 expected_hash.as_deref(),
                 previous_hash.as_deref(),
@@ -2421,16 +2585,25 @@ pub async fn call_tool(
             )?;
             let final_content = finalize_session_note_content(
                 &content,
-                existing.as_ref().map(|existing| existing.text.as_str()),
+                existing.as_ref().map(|(text, _)| text.as_str()),
                 preserve_manual_notes,
             );
             let new_hash = content_hash(final_content.as_bytes());
             let created = existing.is_none();
-            if !dry_run {
+            let shared_fields = crate::shared_tools::routed_write(
+                state,
+                &target_path,
+                &final_content,
+                base_version.as_deref(),
+                false,
+                dry_run,
+            )
+            .await?;
+            if shared_fields.is_none() && !dry_run {
                 write_text_file(&config.vault_path, &target_path, &final_content)
                     .map_err(|error| error.to_string())?;
             }
-            Ok(json_text_result(json!({
+            let mut session_payload = json!({
                 "action": if existing.is_some() { "updated" } else { "created" },
                 "path": target_path,
                 "resourceUri": note_uri(&target_path),
@@ -2439,7 +2612,30 @@ pub async fn call_tool(
                 "dryRun": dry_run,
                 "previousHash": previous_hash,
                 "newHash": new_hash
-            })))
+            });
+            if let (Some(fields), Some(object)) = (shared_fields, session_payload.as_object_mut()) {
+                object.extend(fields);
+            }
+            Ok(json_text_result(session_payload))
+        }
+        "note_history" => {
+            let path = string_arg(arguments, "path")?;
+            Ok(json_text_result(
+                crate::shared_tools::note_history_payload(state, &path).await?,
+            ))
+        }
+        "read_version" => {
+            let path = string_arg(arguments, "path")?;
+            let version_id = string_arg(arguments, "versionId")?;
+            Ok(json_text_result(
+                crate::shared_tools::read_version_payload(state, &path, &version_id).await?,
+            ))
+        }
+        "resolve_divergence" => {
+            let path = string_arg(arguments, "path")?;
+            Ok(json_text_result(
+                crate::shared_tools::resolve_divergence_payload(state, &path).await?,
+            ))
         }
         _ => Err(format!("unknown tool: {}", name)),
     }
@@ -2812,7 +3008,7 @@ mod tests {
 
     #[test]
     fn update_note_section_schema_declares_conditional_heading_requirement() {
-        let definitions = tool_definitions(true);
+        let definitions = tool_definitions(true, false);
         let definition = definitions
             .iter()
             .find(|definition| definition.name == "update_note_section")
@@ -3332,13 +3528,13 @@ mod tests {
 
     #[test]
     fn tool_list_omits_grep_search_when_ripgrep_unavailable() {
-        let available = super::tool_definitions(true);
+        let available = super::tool_definitions(true, false);
         assert!(
             available.iter().any(|tool| tool.name == "grep_search"),
             "grep_search should be present when ripgrep is available"
         );
 
-        let unavailable = super::tool_definitions(false);
+        let unavailable = super::tool_definitions(false, false);
         assert!(
             !unavailable.iter().any(|tool| tool.name == "grep_search"),
             "grep_search must be omitted when ripgrep is unavailable"
@@ -3349,7 +3545,7 @@ mod tests {
 
     #[test]
     fn consolidated_tool_surface() {
-        let definitions = super::tool_definitions(true);
+        let definitions = super::tool_definitions(true, false);
         let names: Vec<&str> = definitions
             .iter()
             .map(|tool| tool.name.as_str())
@@ -3399,6 +3595,7 @@ mod tests {
             rg_available: false,
             uploads: crate::uploads::UploadStore::new(),
             upload_base: None,
+            mounts: std::sync::Arc::new(Vec::new()),
         };
 
         let error = super::call_tool(&state, "grep_search", &json!({"query": "needle"}))
