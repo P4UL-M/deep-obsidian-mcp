@@ -73,9 +73,6 @@ pub enum IndexError {
 
 pub type Result<T> = std::result::Result<T, IndexError>;
 
-fn is_protected_template_segment(segment: &str) -> bool {
-    segment.eq_ignore_ascii_case("template") || segment.eq_ignore_ascii_case("templates")
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSnapshot {
@@ -293,117 +290,44 @@ pub fn ensure_vault_path(vault_path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Maps the shared vault-helper error onto this crate's error type so callers keep
+/// seeing `IndexError`. Both escape variants (bad relative path, protected template
+/// write) collapse to `InvalidVaultRelativePath`, matching this crate's historical
+/// behaviour.
+fn map_vault_error(error: deep_obsidian_core::vault::VaultError) -> IndexError {
+    use deep_obsidian_core::vault::VaultError;
+    match error {
+        VaultError::InvalidVaultPath(path) | VaultError::NotDirectory(path) => {
+            IndexError::InvalidVaultPath(path)
+        }
+        VaultError::InvalidVaultRelativePath(path) | VaultError::ProtectedWritePath(path) => {
+            IndexError::InvalidVaultRelativePath(path)
+        }
+        VaultError::Io { path, source } => IndexError::Io { path, source },
+    }
+}
+
+/// Delegates to the canonical implementation in `deep-obsidian-core`, which adds
+/// the symlink-traversal guard this crate's former lexical-only copy lacked.
 pub fn ensure_inside_vault(vault_path: &Path, relative_path: &str) -> Result<PathBuf> {
-    let normalized = relative_path.trim_start_matches('/');
-    if normalized.is_empty() {
-        return Err(IndexError::InvalidVaultRelativePath(
-            relative_path.to_string(),
-        ));
-    }
-
-    if Path::new(normalized).components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        )
-    }) {
-        return Err(IndexError::InvalidVaultRelativePath(
-            relative_path.to_string(),
-        ));
-    }
-
-    Ok(vault_path.join(normalized))
+    deep_obsidian_core::vault::ensure_inside_vault(vault_path, relative_path)
+        .map_err(map_vault_error)
 }
 
 pub fn read_text_file(vault_path: &Path, relative_path: &str) -> Result<String> {
-    let absolute = ensure_inside_vault(vault_path, relative_path)?;
-    fs::read_to_string(&absolute).map_err(|source| IndexError::Io {
-        path: absolute,
-        source,
-    })
+    deep_obsidian_core::vault::read_text_file(vault_path, relative_path)
+        .map(|result| result.text)
+        .map_err(map_vault_error)
 }
 
 pub fn write_text_file(vault_path: &Path, relative_path: &str, text: &str) -> Result<bool> {
-    let normalized = relative_path.trim_start_matches('/');
-    if Path::new(normalized)
-        .components()
-        .any(|component| match component {
-            std::path::Component::Normal(part) => {
-                is_protected_template_segment(&part.to_string_lossy())
-            }
-            _ => false,
-        })
-    {
-        return Err(IndexError::InvalidVaultRelativePath(
-            relative_path.to_string(),
-        ));
-    }
-    let absolute = ensure_inside_vault(vault_path, relative_path)?;
-    let created = !absolute.exists();
-    if let Some(parent) = absolute.parent() {
-        fs::create_dir_all(parent).map_err(|source| IndexError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    fs::write(&absolute, text).map_err(|source| IndexError::Io {
-        path: absolute,
-        source,
-    })?;
-    Ok(created)
+    deep_obsidian_core::vault::write_text_file(vault_path, relative_path, text)
+        .map(|result| result.created)
+        .map_err(map_vault_error)
 }
 
 pub fn list_markdown_files(vault_path: &Path) -> Result<Vec<String>> {
-    let resolved = ensure_vault_path(vault_path)?;
-    let mut files = Vec::new();
-
-    fn walk(root: &Path, current: &Path, files: &mut Vec<String>) -> Result<()> {
-        for entry in fs::read_dir(current).map_err(|source| IndexError::Io {
-            path: current.to_path_buf(),
-            source,
-        })? {
-            let entry = entry.map_err(|source| IndexError::Io {
-                path: current.to_path_buf(),
-                source,
-            })?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') {
-                continue;
-            }
-
-            let path = entry.path();
-            let file_type = entry.file_type().map_err(|source| IndexError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if file_type.is_dir() {
-                if IGNORED_DIRS.iter().any(|ignored| *ignored == name) {
-                    continue;
-                }
-                walk(root, &path, files)?;
-                continue;
-            }
-
-            if file_type.is_file() && name.to_lowercase().ends_with(".md") {
-                let relative = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .iter()
-                    .map(|segment| segment.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                files.push(relative);
-            }
-        }
-        Ok(())
-    }
-
-    walk(&resolved, &resolved, &mut files)?;
-    files.sort();
-    Ok(files)
+    deep_obsidian_core::vault::list_markdown_files(vault_path).map_err(map_vault_error)
 }
 
 fn artifact_mime_and_kind(path: &Path) -> Option<(&'static str, &'static str)> {
@@ -491,28 +415,7 @@ pub fn list_artifact_files(vault_path: &Path) -> Result<Vec<String>> {
 }
 
 pub fn list_top_level_folders(vault_path: &Path) -> Result<Vec<String>> {
-    let resolved = ensure_vault_path(vault_path)?;
-    let mut folders = Vec::new();
-    for entry in fs::read_dir(&resolved).map_err(|source| IndexError::Io {
-        path: resolved.clone(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| IndexError::Io {
-            path: resolved.clone(),
-            source,
-        })?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy().into_owned();
-        let file_type = entry.file_type().map_err(|source| IndexError::Io {
-            path: entry.path(),
-            source,
-        })?;
-        if file_type.is_dir() && !name.starts_with('.') && !IGNORED_DIRS.contains(&name.as_str()) {
-            folders.push(name);
-        }
-    }
-    folders.sort();
-    Ok(folders)
+    deep_obsidian_core::vault::list_top_level_folders(vault_path).map_err(map_vault_error)
 }
 
 pub fn slice_lines(text: &str, start_line: usize, end_line: usize) -> String {

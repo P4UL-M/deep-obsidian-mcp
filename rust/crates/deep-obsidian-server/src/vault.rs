@@ -1,16 +1,7 @@
-use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-
-const DEFAULT_IGNORED_DIRS: &[&str] = &[
-    ".git",
-    ".obsidian",
-    ".trash",
-    ".deep-obsidian-mcp",
-    "node_modules",
-];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VaultInfo {
@@ -76,56 +67,24 @@ pub fn ensure_vault_path(vault_path: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
+/// Delegates to the canonical implementation in `deep-obsidian-core` (lexical
+/// normalization + symlink-traversal guard), translating its single escape error
+/// into this crate's `PathEscapesVault` while keeping the empty-path case as
+/// `InvalidVaultRelativePath` for backward-compatible error wording.
 pub fn ensure_inside_vault(vault_path: &Path, relative_path: &str) -> Result<PathBuf, VaultError> {
-    let normalized = relative_path.trim_start_matches('/');
-    if normalized.is_empty() {
+    if relative_path.trim_start_matches('/').is_empty() {
         return Err(VaultError::InvalidVaultRelativePath(
             relative_path.to_string(),
         ));
     }
-
-    let relative = Path::new(normalized);
-    if relative.is_absolute() {
-        return Err(VaultError::PathEscapesVault(relative_path.to_string()));
-    }
-    if relative.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        return Err(VaultError::PathEscapesVault(relative_path.to_string()));
-    }
-
-    let candidate = vault_path.join(relative);
-
-    // Canonicalization guard: the lexical checks above cannot catch a path that
-    // traverses a pre-existing in-vault symlink pointing outside the vault. We
-    // canonicalize the deepest EXISTING ancestor of the candidate (itself when it
-    // exists; otherwise the nearest existing parent, so not-yet-created write
-    // targets still work) and require it to stay under the canonical vault root.
-    // Both sides are canonicalized so a vault root that is itself under a symlink
-    // is not a false positive. If the vault root does not yet exist on disk there
-    // is no symlink to traverse and the lexical guard suffices.
-    if let Ok(canonical_vault) = fs::canonicalize(vault_path) {
-        let mut existing = candidate.as_path();
-        let canonical_ancestor = loop {
-            match fs::canonicalize(existing) {
-                Ok(canonical) => break Some(canonical),
-                Err(_) => match existing.parent() {
-                    Some(parent) => existing = parent,
-                    None => break None,
-                },
+    deep_obsidian_core::vault::ensure_inside_vault(vault_path, relative_path).map_err(|error| {
+        match error {
+            deep_obsidian_core::vault::VaultError::Io { path, source } => {
+                VaultError::Io { path, source }
             }
-        };
-        if let Some(canonical_ancestor) = canonical_ancestor {
-            if !canonical_ancestor.starts_with(&canonical_vault) {
-                return Err(VaultError::PathEscapesVault(relative_path.to_string()));
-            }
+            _ => VaultError::PathEscapesVault(relative_path.to_string()),
         }
-    }
-
-    Ok(candidate)
+    })
 }
 
 pub fn read_text(vault_path: &Path, relative_path: &str) -> Result<String, VaultError> {
@@ -152,69 +111,25 @@ pub fn write_text(
     })
 }
 
-fn is_ignored_dir(name: &str) -> bool {
-    name.starts_with('.') || DEFAULT_IGNORED_DIRS.contains(&name)
-}
-
-fn is_markdown_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("md"))
-        .unwrap_or(false)
-}
-
-fn walk_markdown_files(
-    root: &Path,
-    current: &Path,
-    files: &mut Vec<String>,
-) -> Result<(), VaultError> {
-    for entry in fs::read_dir(current).map_err(VaultError::io(current))? {
-        let entry = entry.map_err(VaultError::io(current))?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(VaultError::io(&path))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-
-        if file_type.is_dir() {
-            if is_ignored_dir(&name) {
-                continue;
-            }
-            walk_markdown_files(root, &path, files)?;
-            continue;
+fn map_core_error(error: deep_obsidian_core::vault::VaultError) -> VaultError {
+    use deep_obsidian_core::vault::VaultError as CoreError;
+    match error {
+        CoreError::InvalidVaultPath(path) | CoreError::NotDirectory(path) => {
+            VaultError::InvalidVaultPath(path)
         }
-
-        if file_type.is_file() && is_markdown_file(&path) && !name.starts_with('.') {
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            files.push(relative);
+        CoreError::InvalidVaultRelativePath(path) | CoreError::ProtectedWritePath(path) => {
+            VaultError::PathEscapesVault(path)
         }
+        CoreError::Io { path, source } => VaultError::Io { path, source },
     }
-    Ok(())
 }
 
 pub fn list_markdown_files(vault_path: &Path) -> Result<Vec<String>, VaultError> {
-    ensure_vault_path(vault_path)?;
-    let mut files = Vec::new();
-    walk_markdown_files(vault_path, vault_path, &mut files)?;
-    files.sort();
-    Ok(files)
+    deep_obsidian_core::vault::list_markdown_files(vault_path).map_err(map_core_error)
 }
 
 pub fn list_top_level_folders(vault_path: &Path) -> Result<Vec<String>, VaultError> {
-    ensure_vault_path(vault_path)?;
-    let mut folders = BTreeSet::new();
-    for entry in fs::read_dir(vault_path).map_err(VaultError::io(vault_path))? {
-        let entry = entry.map_err(VaultError::io(vault_path))?;
-        let file_type = entry.file_type().map_err(VaultError::io(&entry.path()))?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if file_type.is_dir() && !is_ignored_dir(&name) {
-            folders.insert(name);
-        }
-    }
-    Ok(folders.into_iter().collect())
+    deep_obsidian_core::vault::list_top_level_folders(vault_path).map_err(map_core_error)
 }
 
 pub fn markdown_file_count(vault_path: &Path) -> Result<usize, VaultError> {
