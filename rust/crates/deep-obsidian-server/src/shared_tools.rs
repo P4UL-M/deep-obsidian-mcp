@@ -238,7 +238,7 @@ be prefiltered lexically and silent under-reporting is refused",
             }));
             continue;
         };
-        match retrieval::search_mount(mount, anchor, 200).await {
+        match retrieval::search_mount_with_distinct(mount, anchor, 200, Some(false)).await {
             Ok(hits) => {
                 let candidate_count = hits.len();
                 let mut mount_matches = 0usize;

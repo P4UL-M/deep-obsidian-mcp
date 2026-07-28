@@ -1,6 +1,9 @@
 # Algolia shared wiki — design proposal
 
-**Status:** proposal, not implemented.
+**Status:** implemented on this branch (stages 0–6 of §13). Run the
+end-to-end demo with `scripts/demo-shared-wiki.sh` — it uses an in-process
+mock of the Algolia REST API, so no account or key is needed; point `baseUrl`
+at nothing (default) with a real `appId`/key to run against actual Algolia.
 
 A large shared corpus lives in Algolia. It is **not** mirrored locally — the
 premise is that it is bigger than any participant wants on disk. Locally there is

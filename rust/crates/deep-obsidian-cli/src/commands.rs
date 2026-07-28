@@ -429,7 +429,17 @@ fn normalize_required_bool_flag(
 fn is_known_command(token: &str) -> bool {
     matches!(
         token,
-        "serve" | "setup-service" | "doctor" | "print-config" | "probe" | "help" | "version"
+        "serve"
+            | "setup-service"
+            | "doctor"
+            | "print-config"
+            | "probe"
+            | "share"
+            | "push"
+            | "status"
+            | "key"
+            | "help"
+            | "version"
     )
 }
 

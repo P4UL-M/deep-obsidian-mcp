@@ -1410,6 +1410,7 @@ fn live_find_file_matches(
 async fn live_grep_matches(
     ripgrep_path: std::path::PathBuf,
     vault_path: std::path::PathBuf,
+    index_dir: Option<std::path::PathBuf>,
     query: String,
     regex_mode: bool,
     case_sensitive: bool,
@@ -1417,6 +1418,12 @@ async fn live_grep_matches(
     context_lines: usize,
     limit: usize,
 ) -> Result<Vec<LiveGrepMatch>, String> {
+    // A custom index dir INSIDE the vault (holding the SQLite index and the
+    // shared-note hydration cache) must never leak into grep results as
+    // phantom vault paths.
+    let index_dir_glob = index_dir
+        .and_then(|dir| dir.strip_prefix(&vault_path).ok().map(|p| p.to_path_buf()))
+        .map(|relative| format!("!{}/**", relative.to_string_lossy()));
     tokio::task::spawn_blocking(move || {
         let mut args = vec![
             "--json".to_string(),
@@ -1430,6 +1437,10 @@ async fn live_grep_matches(
             "--glob".to_string(),
             "!.deep-obsidian-mcp/**".to_string(),
         ];
+        if let Some(exclusion) = index_dir_glob {
+            args.push("--glob".to_string());
+            args.push(exclusion);
+        }
         if !regex_mode {
             args.push("--fixed-strings".to_string());
         }
@@ -1852,6 +1863,7 @@ pub async fn call_tool(
             let matches = live_grep_matches(
                 (*state.ripgrep_path).clone(),
                 config.vault_path.clone(),
+                Some(config.index_dir.clone()),
                 query.clone(),
                 regex_mode,
                 case_sensitive,
@@ -3294,6 +3306,7 @@ mod tests {
         let matches = live_grep_matches(
             super::resolve_ripgrep(),
             vault_path,
+            None,
             "needle".to_string(),
             false,
             true,
@@ -3324,6 +3337,7 @@ mod tests {
         let matches = live_grep_matches(
             super::resolve_ripgrep(),
             vault_path,
+            None,
             "--pre=/bin/echo".to_string(),
             false,
             true,
@@ -3621,6 +3635,7 @@ mod tests {
         let result = live_grep_matches(
             missing_rg,
             vault_path,
+            None,
             "needle".to_string(),
             false,
             true,

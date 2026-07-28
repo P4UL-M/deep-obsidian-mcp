@@ -277,6 +277,11 @@ async fn mounted_tools_read_search_write_and_resolve_divergence() {
             .expect("shared scope");
         assert_eq!(scope[0]["exhaustive"], json!(false));
         assert!(scope[0]["candidateCount"].as_u64().unwrap() >= 1);
+        assert!(
+            scope[0]["matchCount"].as_u64().unwrap() >= 1,
+            "shared grep must surface the matching lines: {:?}",
+            result.structured_content
+        );
 
         // Anchor-less pattern: remote refused with a reason, not silently empty.
         let result = call_tool(

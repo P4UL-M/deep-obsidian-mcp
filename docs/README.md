@@ -16,9 +16,9 @@ the top-level guides instead:** [README](../README.md) ·
 - [homebrew-service.md](./homebrew-service.md) — full Homebrew service model and troubleshooting.
 - [debian-package.md](./debian-package.md) — Debian/Ubuntu `.deb` and APT repository details.
 
-## Proposals
+## Shared wiki (Algolia)
 
-- [algolia-shared-wiki.md](./algolia-shared-wiki.md) — a large shared wiki corpus in Algolia: append-only versioned writes, hydrating reads, bounded local cache (proposal, not implemented).
+- [algolia-shared-wiki.md](./algolia-shared-wiki.md) — a large shared wiki corpus in Algolia: append-only versioned writes, hydrating reads, bounded local cache. Implemented on the `feat/algolia-shared-wiki` branch; demo: `scripts/demo-shared-wiki.sh`.
 
 ## Maintainer / internal
 

@@ -28,6 +28,18 @@ pub async fn search_mount(
     query: &str,
     limit: usize,
 ) -> Result<Vec<RemoteSearchHit>> {
+    search_mount_with_distinct(mount, query, limit, None).await
+}
+
+/// Like [`search_mount`] with explicit distinct control. Grep passes
+/// `Some(false)`: it needs EVERY candidate chunk of a note, not just the
+/// best-ranked one — a match may live in a chunk the ranker did not prefer.
+pub async fn search_mount_with_distinct(
+    mount: &SharedMountRuntime,
+    query: &str,
+    limit: usize,
+    distinct: Option<bool>,
+) -> Result<Vec<RemoteSearchHit>> {
     let response = mount
         .client
         .search(
@@ -36,6 +48,7 @@ pub async fn search_mount(
                 query: query.to_string(),
                 filters: Some("recordType:chunk".to_string()),
                 hits_per_page: Some(limit),
+                distinct,
                 ..SearchRequest::default()
             },
         )
