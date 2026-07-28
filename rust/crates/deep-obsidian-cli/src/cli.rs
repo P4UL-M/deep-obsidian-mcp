@@ -136,6 +136,39 @@ pub enum Command {
         #[arg(long = "timeout-ms", default_value_t = 5_000)]
         timeout_ms: u64,
     },
+    /// Shared Algolia corpus operations (push, status, key generation).
+    Share {
+        #[command(subcommand)]
+        action: ShareAction,
+    },
     Help,
     Version,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ShareAction {
+    /// Publish the configured export prefixes to the shared index.
+    /// The first push to an index prints the full note list and requires
+    /// `--yes` (or interactive confirmation). Use the global `--dry-run` to
+    /// print the plan without writing.
+    Push {
+        /// Skip the first-push confirmation prompt.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        yes: bool,
+        /// Restrict to one mount by index name (default: every mount with an
+        /// export rule).
+        #[arg(long)]
+        index: Option<String>,
+    },
+    /// Show each shared mount's export plan without writing.
+    Status,
+    /// Generate a secured (read-only, filter-scoped) API key for a teammate.
+    Key {
+        /// Index name of the configured mount to derive the key for.
+        #[arg(long)]
+        index: Option<String>,
+        /// Algolia `filters` restriction to embed, e.g. `folders.lvl0:_Wiki`.
+        #[arg(long)]
+        filters: Option<String>,
+    },
 }

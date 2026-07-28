@@ -1,7 +1,7 @@
 use deep_obsidian_types::{
     AuthConfig, AuthConfigInput, AutoReindexConfig, AutoReindexConfigInput, EmbeddingConfig,
     EmbeddingConfigInput, EmbeddingProvider, HttpConfig, HttpConfigInput, PersistedServiceConfig,
-    ResolvedServiceConfig, ServiceConfigInput, StdioMode, TransportMode,
+    ResolvedServiceConfig, ServiceConfigInput, SharedMountConfig, StdioMode, TransportMode,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -165,6 +165,7 @@ pub fn normalize_service_config(
     let embedding = normalize_embedding_input(input.embedding);
     let artifact_embedding = normalize_embedding_input(input.artifact_embedding);
     let auth = normalize_auth_input(input.auth);
+    let shared = normalize_shared_mounts(input.shared);
 
     Ok(ResolvedServiceConfig {
         vault_path,
@@ -176,8 +177,51 @@ pub fn normalize_service_config(
         embedding,
         artifact_embedding,
         auth,
+        shared,
         config_file_path: input.config_file_path.map(expand_home_path),
     })
+}
+
+/// Ensures every mount prefix / export prefix carries a trailing slash so
+/// longest-prefix routing never matches a partial folder name, and trims
+/// whitespace from names. Mounts missing the required fields are dropped.
+fn normalize_shared_mounts(mounts: Vec<SharedMountConfig>) -> Vec<SharedMountConfig> {
+    fn with_trailing_slash(value: &str) -> String {
+        let trimmed = value.trim().trim_start_matches('/');
+        if trimmed.is_empty() || trimmed.ends_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/")
+        }
+    }
+
+    mounts
+        .into_iter()
+        .filter_map(|mut mount| {
+            mount.mount_at = with_trailing_slash(&mount.mount_at);
+            mount.app_id = mount.app_id.trim().to_string();
+            mount.index_name = mount.index_name.trim().to_string();
+            if mount.mount_at.is_empty() || mount.app_id.is_empty() || mount.index_name.is_empty()
+            {
+                return None;
+            }
+            if let Some(export) = mount.export.as_mut() {
+                export.prefixes = export
+                    .prefixes
+                    .iter()
+                    .map(|prefix| with_trailing_slash(prefix))
+                    .filter(|prefix| !prefix.is_empty())
+                    .collect();
+                export.exclude = export
+                    .exclude
+                    .iter()
+                    .map(|prefix| with_trailing_slash(prefix))
+                    .filter(|prefix| !prefix.is_empty())
+                    .collect();
+            }
+            Some(mount)
+        })
+        .collect()
 }
 
 /// True for hosts that only accept connections from the local machine. Used to
@@ -203,6 +247,7 @@ pub fn normalize_persisted_config(
         embedding: input.embedding,
         artifact_embedding: input.artifact_embedding,
         auth: input.auth,
+        shared: input.shared,
         config_file_path: None,
     })?;
 
@@ -254,6 +299,7 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
         } else {
             None
         },
+        shared: config.shared.clone(),
         auth: if config.auth.enabled
             || config.auth.token_ref.is_some()
             || !config.auth.allowed_origins.is_empty()

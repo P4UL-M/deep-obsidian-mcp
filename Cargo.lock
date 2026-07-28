@@ -379,6 +379,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "deep-obsidian-algolia",
  "deep-obsidian-config",
  "deep-obsidian-server",
  "deep-obsidian-types",
@@ -441,6 +442,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "deep-obsidian-algolia",
  "deep-obsidian-config",
  "deep-obsidian-core",
  "deep-obsidian-index",

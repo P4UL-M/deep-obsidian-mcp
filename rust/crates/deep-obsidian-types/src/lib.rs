@@ -146,6 +146,71 @@ pub struct AuthConfigInput {
     pub allowed_origins: Option<Vec<String>>,
 }
 
+/// A shared Algolia-backed corpus attached to the vault.
+///
+/// `mount_at` grafts the remote corpus into the vault namespace as a virtual
+/// read/write prefix; `export` optionally pushes local prefixes up into the
+/// same index. Keys are `SecretRef`s (or the `DEEP_OBSIDIAN_ALGOLIA_API_KEY`
+/// env var); plaintext keys never live in the config file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedMountConfig {
+    /// Vault-relative virtual prefix the remote corpus appears under, with a
+    /// trailing slash (e.g. `_Shared/Team/`).
+    pub mount_at: String,
+    pub app_id: String,
+    /// Main (heads) index; the history index is `{indexName}_history`.
+    pub index_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_ref: Option<SecretRef>,
+    /// Base-URL override, used to point at the in-process mock in tests/demo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub writable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub export: Option<SharedExportConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<SharedCacheConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionConfig>,
+}
+
+/// Which local content is pushed up to the shared index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedExportConfig {
+    /// Local vault-relative folder prefixes to publish (trailing slash).
+    pub prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+}
+
+/// Bounded local cache of hydrated shared notes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedCacheConfig {
+    /// Cache budget in bytes (default applied when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Mounted prefixes exempt from eviction and hydrated eagerly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pin: Vec<String>,
+}
+
+/// History retention: a version is purged only when it is BOTH outside the
+/// `min_versions` most recent AND older than `max_age_days`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_versions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_age_days: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceConfigInput {
@@ -158,6 +223,8 @@ pub struct ServiceConfigInput {
     pub embedding: Option<EmbeddingConfigInput>,
     pub artifact_embedding: Option<EmbeddingConfigInput>,
     pub auth: Option<AuthConfigInput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<SharedMountConfig>,
     pub config_file_path: Option<PathBuf>,
 }
 
@@ -174,6 +241,8 @@ pub struct PersistedServiceConfig {
     pub artifact_embedding: Option<EmbeddingConfigInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthConfigInput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<SharedMountConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +258,8 @@ pub struct ResolvedServiceConfig {
     pub artifact_embedding: EmbeddingConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<SharedMountConfig>,
     pub config_file_path: Option<PathBuf>,
 }
 

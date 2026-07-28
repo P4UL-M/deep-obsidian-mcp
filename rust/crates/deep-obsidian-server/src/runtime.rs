@@ -835,6 +835,7 @@ mod tests {
             embedding: EmbeddingConfig::default(),
             artifact_embedding: EmbeddingConfig::default(),
             auth: deep_obsidian_types::AuthConfig::default(),
+            shared: Vec::new(),
             config_file_path: None,
         }
     }

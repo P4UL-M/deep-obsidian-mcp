@@ -409,6 +409,7 @@ mod tests {
                 enabled: auth_enabled,
                 ..AuthConfig::default()
             },
+            shared: Vec::new(),
             config_file_path: None,
         }
     }

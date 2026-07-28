@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         embedding: None,
         artifact_embedding: None,
         auth: None,
+        shared: Vec::new(),
         config_file_path: None,
     };
 

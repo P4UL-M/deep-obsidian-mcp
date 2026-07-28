@@ -260,6 +260,10 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
             .as_ref()
             .and_then(|config| config.artifact_embedding.clone()),
         auth: config_file.as_ref().and_then(|config| config.auth.clone()),
+        shared: config_file
+            .as_ref()
+            .map(|config| config.shared.clone())
+            .unwrap_or_default(),
         config_file_path: Some(config_path.clone()),
     };
     let mut service = normalize_service_config(input)?;

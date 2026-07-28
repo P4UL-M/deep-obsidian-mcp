@@ -10,7 +10,7 @@
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};

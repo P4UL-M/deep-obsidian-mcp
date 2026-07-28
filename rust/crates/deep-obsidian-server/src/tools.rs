@@ -350,7 +350,7 @@ fn insert_optional_text(
     object.insert(format!("{key}Truncated"), json!(truncated));
 }
 
-pub(crate) fn content_hash(bytes: &[u8]) -> String {
+pub fn content_hash(bytes: &[u8]) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -2496,6 +2496,7 @@ mod tests {
             embedding: EmbeddingConfig::default(),
             artifact_embedding: EmbeddingConfig::default(),
             auth: deep_obsidian_types::AuthConfig::default(),
+            shared: Vec::new(),
             config_file_path: None,
         }
     }

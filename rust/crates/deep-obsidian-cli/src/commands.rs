@@ -325,6 +325,11 @@ pub async fn run() -> Result<()> {
             println!("{}", report.text);
             Ok(())
         }
+        Command::Share { action } => {
+            let resolved = crate::config::resolve_runtime_config(&cli.options)?;
+            crate::share_cmd::run_share(&resolved, &action, cli.options.dry_run).await?;
+            Ok(())
+        }
         Command::Probe { timeout_ms } => {
             let resolved = crate::config::resolve_runtime_config(&cli.options)?;
             let report = probe(&resolved, timeout_ms).await?;
@@ -2937,6 +2942,7 @@ mod tests {
             embedding: EmbeddingConfig::default(),
             artifact_embedding: EmbeddingConfig::default(),
             auth: deep_obsidian_types::AuthConfig::default(),
+            shared: Vec::new(),
             config_file_path: None,
         }
     }

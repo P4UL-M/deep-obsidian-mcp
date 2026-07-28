@@ -1,8 +1,9 @@
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod share_cmd;
 
-pub use cli::{Cli, Command, ServiceOptions, StdioMode, TransportMode};
+pub use cli::{Cli, Command, ServiceOptions, ShareAction, StdioMode, TransportMode};
 pub use commands::{
     doctor, print_config, probe, serve, setup_service, DoctorReport, PrintConfigReport,
     ProbeReport, ServeReport, SetupServiceReport,

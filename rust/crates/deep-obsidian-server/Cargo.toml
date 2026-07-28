@@ -8,6 +8,7 @@ license.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
+deep-obsidian-algolia = { path = "../deep-obsidian-algolia" }
 deep-obsidian-config = { path = "../deep-obsidian-config" }
 deep-obsidian-core = { path = "../deep-obsidian-core" }
 deep-obsidian-index = { path = "../deep-obsidian-index" }

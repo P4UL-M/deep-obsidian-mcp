@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+deep-obsidian-algolia = { path = "../deep-obsidian-algolia" }
 deep-obsidian-config = { path = "../deep-obsidian-config" }
 deep-obsidian-server = { path = "../deep-obsidian-server" }
 deep-obsidian-types = { path = "../deep-obsidian-types" }
