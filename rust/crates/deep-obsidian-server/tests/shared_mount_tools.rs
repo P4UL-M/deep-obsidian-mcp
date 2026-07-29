@@ -13,7 +13,7 @@ use deep_obsidian_types::{
     AutoReindexConfig, EmbeddingConfig, HttpConfig, ResolvedServiceConfig, SharedExportConfig,
     SharedMountConfig, StdioMode, TransportMode,
 };
-use serde_json::{json, Value};
+use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 
