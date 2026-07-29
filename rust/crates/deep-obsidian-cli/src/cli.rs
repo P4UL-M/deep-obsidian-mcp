@@ -162,6 +162,36 @@ pub enum ShareAction {
     },
     /// Show each shared mount's export plan without writing.
     Status,
+    /// One-shot import of local notes into the shared index (model C: the
+    /// wiki lives in the index, authored through the mount). Unlike `push`,
+    /// seed needs no persistent export rule and never retracts anything.
+    Seed {
+        /// Local folder prefix(es) to import, e.g. `--prefix _Wiki/`.
+        /// Repeatable.
+        #[arg(long = "prefix", required = true)]
+        prefixes: Vec<String>,
+        /// Delete the local copies after a verified import, so the index
+        /// holds the only copy (asks for confirmation unless --yes).
+        #[arg(long = "move", action = clap::ArgAction::SetTrue)]
+        move_files: bool,
+        /// Index name of the mount to seed into (default: the only mount).
+        #[arg(long)]
+        index: Option<String>,
+        /// Skip confirmations (first push, --move deletion).
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        yes: bool,
+    },
+    /// Materialize every note of the shared index (head versions) into a
+    /// local directory — backup / exit strategy / human-browsable snapshot.
+    Dump {
+        /// Target directory (created if missing). Avoid a directory inside
+        /// the vault unless you want the dump indexed locally.
+        #[arg(long)]
+        to: PathBuf,
+        /// Index name of the mount to dump (default: the only mount).
+        #[arg(long)]
+        index: Option<String>,
+    },
     /// Store (or replace) the Algolia API key for a configured mount in the
     /// OS keyring (encrypted-file fallback), and record the keyRef in the
     /// config file if missing.

@@ -5,6 +5,26 @@ end-to-end demo with `scripts/demo-shared-wiki.sh` — it uses an in-process
 mock of the Algolia REST API, so no account or key is needed; point `baseUrl`
 at nothing (default) with a real `appId`/key to run against actual Algolia.
 
+**Nominal model (decided post-implementation): mount-only authorship.** The
+standing `export` rule created an asymmetry between writer classes — mount
+writes were fork-aware while an exporter's `share push` silently superseded a
+colleague's head (their version went to history unflagged). Rather than adding
+sync state and pull machinery, the decision is that the shared wiki LIVES in
+the index and every write goes through the mount (versioned, fork-aware,
+symmetric for all participants). Supporting commands:
+
+- `share seed --prefix <folder/> [--move]` — one-shot import of existing local
+  notes, no persistent export rule, never retracts. `--move` deletes the local
+  copies after a per-file verification that the index holds identical content,
+  so exactly one copy exists.
+- `share dump --to <dir>` — materializes every head version to a local
+  directory with a manifest: the backup / exit strategy / human-browsable
+  snapshot for a corpus whose only live copy is the index.
+
+The standing `export` remains supported for the pure-publisher profile
+(read-only consumers), where the asymmetry is harmless because nobody else
+writes.
+
 A large shared corpus lives in Algolia. It is **not** mirrored locally — the
 premise is that it is bigger than any participant wants on disk. Locally there is
 only a **bounded cache** of the notes actually touched. Writes are **append-only

@@ -40,6 +40,8 @@ Usage:
   deep-obsidian-mcp probe [--config <path>] [--json]
   deep-obsidian-mcp share push [--dry-run] [--yes] [--index <name>]
   deep-obsidian-mcp share status
+  deep-obsidian-mcp share seed --prefix <folder/> [--move] [--index <name>] [--yes]
+  deep-obsidian-mcp share dump --to <dir> [--index <name>]
   deep-obsidian-mcp share set-key [--index <name>]
   deep-obsidian-mcp share key [--index <name>] [--filters <algolia-filters>]
 
@@ -443,6 +445,8 @@ fn is_known_command(token: &str) -> bool {
             | "push"
             | "status"
             | "set-key"
+            | "seed"
+            | "dump"
             | "key"
             | "help"
             | "version"
@@ -553,6 +557,10 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
                 | "--embedding-base-url"
                 | "--probe-timeout-ms"
                 | "--timeout-ms"
+                | "--index"
+                | "--filters"
+                | "--to"
+                | "--prefix"
         ) || token.starts_with("--config=")
             || token.starts_with("--index-dir=")
             || token.starts_with("--transport=")
@@ -568,6 +576,10 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
             || token.starts_with("--embedding-base-url=")
             || token.starts_with("--probe-timeout-ms=")
             || token.starts_with("--timeout-ms=")
+            || token.starts_with("--index=")
+            || token.starts_with("--filters=")
+            || token.starts_with("--to=")
+            || token.starts_with("--prefix=")
         {
             let (replacement, next_index) = if token.starts_with("--config") {
                 normalize_value_flag(raw_args, index, "--config", "--config")
@@ -617,6 +629,14 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
                 )
             } else if token.starts_with("--probe-timeout-ms") {
                 normalize_value_flag(raw_args, index, "--probe-timeout-ms", "--probe-timeout-ms")
+            } else if token.starts_with("--index") {
+                normalize_value_flag(raw_args, index, "--index", "--index")
+            } else if token.starts_with("--filters") {
+                normalize_value_flag(raw_args, index, "--filters", "--filters")
+            } else if token.starts_with("--to") {
+                normalize_value_flag(raw_args, index, "--to", "--to")
+            } else if token.starts_with("--prefix") {
+                normalize_value_flag(raw_args, index, "--prefix", "--prefix")
             } else {
                 normalize_value_flag(raw_args, index, "--timeout-ms", "--timeout-ms")
             };

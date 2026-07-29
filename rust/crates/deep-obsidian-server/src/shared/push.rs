@@ -223,3 +223,47 @@ pub async fn apply_push(
     }
     Ok(report)
 }
+
+/// After a verified seed, deletes the local copies of exported notes so the
+/// index holds the only copy (`share seed --move`). Per-file guard: a file is
+/// removed ONLY when a fresh plan classifies it as `Unchanged`, i.e. the
+/// remote head hash equals the local content hash — anything that drifted
+/// between push and deletion is skipped and reported, never dropped.
+/// Empty parent directories are pruned best-effort.
+pub async fn remove_seeded_local_files(
+    vault_path: &Path,
+    mount: &SharedMountRuntime,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let plan = plan_push(vault_path, mount).await?;
+    let mut deleted = Vec::new();
+    let mut skipped = Vec::new();
+    for item in &plan.items {
+        if item.action != PushAction::Unchanged {
+            skipped.push(item.path.clone());
+            continue;
+        }
+        let absolute = deep_obsidian_core::vault::ensure_inside_vault(vault_path, &item.path)
+            .map_err(|error| SharedError::Config(error.to_string()))?;
+        match std::fs::remove_file(&absolute) {
+            Ok(()) => {
+                deleted.push(item.path.clone());
+                // Prune now-empty parents up to the vault root (stops at the
+                // first non-empty directory).
+                let mut parent = absolute.parent();
+                while let Some(dir) = parent {
+                    if !dir.starts_with(vault_path) || dir == vault_path {
+                        break;
+                    }
+                    if std::fs::remove_dir(dir).is_err() {
+                        break;
+                    }
+                    parent = dir.parent();
+                }
+            }
+            Err(error) => {
+                skipped.push(format!("{} ({error})", item.path));
+            }
+        }
+    }
+    Ok((deleted, skipped))
+}

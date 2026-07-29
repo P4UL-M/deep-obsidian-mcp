@@ -9,11 +9,19 @@ use std::fs;
 use std::path::PathBuf;
 
 fn temp_dir(prefix: &str) -> PathBuf {
+    // SystemTime alone is NOT unique across concurrent tests (µs resolution on
+    // macOS): two tests in the same instant would share — and mutate — one
+    // directory. The atomic counter disambiguates.
+    static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+    let unique = UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{nanos}-{unique}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -210,4 +218,49 @@ async fn foreign_notes_are_never_retracted() {
         plan.foreign_orphans,
         vec!["_Wiki/Decisions/Alice own note.md"]
     );
+}
+
+#[tokio::test]
+async fn seed_move_and_dump_round_trip() {
+    std::env::set_var("DEEP_OBSIDIAN_ALGOLIA_API_KEY", "test-key");
+    let (base_url, _mock) = spawn_mock().await;
+    let vault = seed_vault();
+    let index_dir = temp_dir("seed-move-index");
+    let secrets = SecretResolver::new();
+    // Seed = push with an ephemeral export rule and no reconciliation.
+    let mut config = mount_config(&base_url, "paul@test");
+    config.index_name = "seed-wiki".to_string();
+    let mount = connect_mount(&config, &secrets, &index_dir).expect("connect");
+
+    let mut plan = plan_push(&vault, &mount).await.expect("plan");
+    plan.retract.clear();
+    apply_push(&vault, &mount, &plan).await.expect("apply");
+
+    // --move: local copies removed only when the index verifiably holds them.
+    let (deleted, skipped) =
+        deep_obsidian_server::shared::push::remove_seeded_local_files(&vault, &mount)
+            .await
+            .expect("move");
+    assert_eq!(deleted.len(), 2, "both seeded notes removed: {deleted:?}");
+    assert!(skipped.is_empty(), "nothing drifted: {skipped:?}");
+    assert!(!vault
+        .join("_Wiki/Decisions/Keep retrieval architecture-agnostic.md")
+        .exists());
+    // Excluded content untouched: share:false note and _Agent/ stay local.
+    assert!(vault.join("_Wiki/Drafts.md").exists());
+    assert!(vault.join("_Agent/Sessions/session.md").exists());
+    // Empty seeded folders pruned.
+    assert!(!vault.join("_Wiki/Decisions").exists());
+
+    // Dump materializes the index back out, byte-identical.
+    let target = temp_dir("dump-target");
+    let report = reads::dump_all(&mount, &target).await.expect("dump");
+    assert_eq!(report.notes, 2);
+    assert!(report.hash_mismatches.is_empty(), "{:?}", report.hash_mismatches);
+    let restored = std::fs::read_to_string(
+        target.join("_Wiki/Decisions/Keep retrieval architecture-agnostic.md"),
+    )
+    .expect("restored note");
+    assert_eq!(restored, DECISION);
+    assert!(target.join("deep-obsidian-dump.json").exists());
 }

@@ -314,3 +314,67 @@ mod tests {
         assert_eq!(reassemble_chunks(chunks), all.join("\n"));
     }
 }
+
+pub struct DumpReport {
+    pub notes: usize,
+    pub bytes: u64,
+    pub hash_mismatches: Vec<String>,
+}
+
+/// Materializes every live note of the mount's index (head versions) into
+/// `target_dir` — the backup / exit strategy for model C, where the index is
+/// the only copy of the shared wiki. Paths come from remote records, so each
+/// one is revalidated against the target directory (no `..` escape). A
+/// `deep-obsidian-dump.json` manifest records index, app, count, and time.
+pub async fn dump_all(
+    mount: &SharedMountRuntime,
+    target_dir: &std::path::Path,
+) -> Result<DumpReport> {
+    std::fs::create_dir_all(target_dir)?;
+    let records = mount
+        .client
+        .browse_all(mount.index(), Some("recordType:note"))
+        .await?;
+    let mut report = DumpReport {
+        notes: 0,
+        bytes: 0,
+        hash_mismatches: Vec::new(),
+    };
+    for record in records {
+        let (Some(path), Some(version_id)) = (
+            record.get("path").and_then(Value::as_str),
+            record.get("versionId").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if record.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let chunks = fetch_version_chunks(mount, mount.index(), path, version_id).await?;
+        let content = reassemble_chunks(chunks);
+        if let Some(expected) = record.get("contentHash").and_then(Value::as_str) {
+            if crate::tools::content_hash(content.as_bytes()) != expected {
+                report.hash_mismatches.push(path.to_string());
+            }
+        }
+        let absolute = deep_obsidian_core::vault::ensure_inside_vault(target_dir, path)
+            .map_err(|error| SharedError::Config(format!("unsafe dump path {path}: {error}")))?;
+        if let Some(parent) = absolute.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&absolute, &content)?;
+        report.notes += 1;
+        report.bytes += content.len() as u64;
+    }
+    let manifest = serde_json::json!({
+        "indexName": mount.index(),
+        "appId": mount.config.app_id,
+        "noteCount": report.notes,
+        "dumpedAtMs": super::now_ms(),
+    });
+    std::fs::write(
+        target_dir.join("deep-obsidian-dump.json"),
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    )?;
+    Ok(report)
+}

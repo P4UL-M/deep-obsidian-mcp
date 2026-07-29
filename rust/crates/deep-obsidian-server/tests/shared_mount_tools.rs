@@ -18,11 +18,19 @@ use std::fs;
 use std::path::PathBuf;
 
 fn temp_dir(prefix: &str) -> PathBuf {
+    // SystemTime alone is NOT unique across concurrent tests (µs resolution on
+    // macOS): two tests in the same instant would share — and mutate — one
+    // directory. The atomic counter disambiguates.
+    static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+    let unique = UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{nanos}-{unique}",
+        std::process::id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
