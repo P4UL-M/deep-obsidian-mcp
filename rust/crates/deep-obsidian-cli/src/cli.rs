@@ -162,6 +162,15 @@ pub enum ShareAction {
     },
     /// Show each shared mount's export plan without writing.
     Status,
+    /// Store (or replace) the Algolia API key for a configured mount in the
+    /// OS keyring (encrypted-file fallback), and record the keyRef in the
+    /// config file if missing.
+    SetKey {
+        /// Index name of the mount to store the key for (default: the only
+        /// configured mount).
+        #[arg(long)]
+        index: Option<String>,
+    },
     /// Generate a secured (read-only, filter-scoped) API key for a teammate.
     Key {
         /// Index name of the configured mount to derive the key for.

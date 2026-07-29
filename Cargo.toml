@@ -23,7 +23,15 @@ chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 hmac = "0.12"
-keyring = "3"
+# keyring v3 ships NO platform backend by default: without these features every
+# operation silently hits the in-memory mock store (put "succeeds", the secret
+# evaporates when the process exits, and the encrypted-file fallback never
+# triggers because the mock does not error). apple-native = macOS Keychain;
+# windows-native = Credential Manager; sync-secret-service (+ crypto-rust,
+# vendored) = Linux Secret Service over D-Bus with no system libdbus build dep —
+# headless Linux errors cleanly, which is what routes callers to the
+# encrypted-file fallback.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 notify = "6"
 rand = "0.8"
 regex = "1"

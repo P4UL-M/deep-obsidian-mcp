@@ -429,3 +429,53 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod keyring_backend_tests {
+    use super::*;
+    use deep_obsidian_types::SecretRef;
+    use secrecy::{ExposeSecret, SecretString};
+
+    /// Proves the REAL macOS Keychain backend is linked (not keyring's mock
+    /// store, which is what you silently get with no cargo features): the
+    /// stored canary must be visible to the system `security` tool, i.e.
+    /// outside this process. Ignored by default (CI keychains can be locked);
+    /// run manually with: cargo test -p deep-obsidian-config -- --ignored
+    #[test]
+    #[ignore = "touches the user keychain; run manually"]
+    fn keyring_put_reaches_the_system_keychain() {
+        let account = format!("canary-{}", std::process::id());
+        let reference = SecretRef::OsKeyring {
+            service: "deep-obsidian-mcp-test".to_string(),
+            account: account.clone(),
+        };
+        let resolver = SecretResolver::new();
+        resolver
+            .put(&reference, SecretString::from("canary-value".to_string()))
+            .expect("keychain put");
+
+        let output = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "deep-obsidian-mcp-test",
+                "-a",
+                &account,
+                "-w",
+            ])
+            .output()
+            .expect("run security tool");
+        let visible = String::from_utf8_lossy(&output.stdout);
+        let round_trip = resolver.get(&reference).expect("keychain get");
+        resolver.delete(&reference).expect("keychain cleanup");
+
+        assert!(
+            output.status.success() && visible.trim() == "canary-value",
+            "secret must be visible outside this process (mock store leak?): {visible}"
+        );
+        assert_eq!(
+            round_trip.expect("stored secret").expose_secret(),
+            "canary-value"
+        );
+    }
+}

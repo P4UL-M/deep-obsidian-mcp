@@ -40,6 +40,7 @@ Usage:
   deep-obsidian-mcp probe [--config <path>] [--json]
   deep-obsidian-mcp share push [--dry-run] [--yes] [--index <name>]
   deep-obsidian-mcp share status
+  deep-obsidian-mcp share set-key [--index <name>]
   deep-obsidian-mcp share key [--index <name>] [--filters <algolia-filters>]
 
 Commands:
@@ -441,6 +442,7 @@ fn is_known_command(token: &str) -> bool {
             | "share"
             | "push"
             | "status"
+            | "set-key"
             | "key"
             | "help"
             | "version"
@@ -1129,7 +1131,7 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
     }
 }
 
-fn prompt_optional_secret(label: &str) -> Result<Option<SecretString>> {
+pub(crate) fn prompt_optional_secret(label: &str) -> Result<Option<SecretString>> {
     let value = rpassword::prompt_password(format!("{label}: "))
         .context("failed to read secret prompt input")?;
     if value.trim().is_empty() {
