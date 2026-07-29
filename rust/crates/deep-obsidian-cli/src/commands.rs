@@ -12,7 +12,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use deep_obsidian_config::{
     build_service_endpoints, default_packaged_index_dir, secrets::SecretResolver,
-    to_persisted_config, write_config_file,
+    render_config_text, to_persisted_config, write_config_file,
 };
 use deep_obsidian_server::{run_http_service, run_stdio_service};
 use deep_obsidian_types::{
@@ -38,6 +38,9 @@ Usage:
   deep-obsidian-mcp doctor [--config <path>] [--json]
   deep-obsidian-mcp print-config [--config <path>]
   deep-obsidian-mcp probe [--config <path>] [--json]
+  deep-obsidian-mcp share push [--dry-run] [--yes] [--index <name>]
+  deep-obsidian-mcp share status
+  deep-obsidian-mcp share key [--index <name>] [--filters <algolia-filters>]
 
 Commands:
   serve          Start the MCP server using resolved config.
@@ -45,6 +48,7 @@ Commands:
   doctor         Diagnose config, vault access, dependencies, and health.
   print-config   Print the normalized persisted config.
   probe          Probe the configured HTTP health and MCP endpoints.
+  share          Publish, inspect, or mint scoped keys for a shared Algolia wiki.
   help           Show this help.
   version        Print the current version.";
 
@@ -737,6 +741,26 @@ pub fn setup_service(
             config_path.display()
         ));
     } else {
+        // Never clobber silently: when replacing an existing config with
+        // different content, keep the previous file next to the new one so a
+        // wrong wizard answer stays recoverable.
+        if config_path.exists() {
+            let new_text = render_config_text(&config_path, &config)?;
+            let old_text = fs::read_to_string(&config_path).unwrap_or_default();
+            if old_text != new_text {
+                let backup_path = config_path.with_extension("json.bak");
+                fs::copy(&config_path, &backup_path).with_context(|| {
+                    format!(
+                        "failed to back up existing config to {}",
+                        backup_path.display()
+                    )
+                })?;
+                final_messages.push(format!(
+                    "backed up previous config: {}",
+                    backup_path.display()
+                ));
+            }
+        }
         write_config_file(&config_path, &config)?;
         wrote_config = true;
         final_messages.push(format!("wrote config: {}", config_path.display()));
@@ -781,22 +805,56 @@ fn setup_service_wizard(
     vault_snippets: bool,
 ) -> Result<SetupServiceReport> {
     let mut options = options.clone();
+    // Prefill every prompt from the existing config file so re-running the
+    // wizard is an edit, not a from-scratch rewrite: pressing Enter keeps the
+    // current value instead of replacing it.
+    let existing = deep_obsidian_config::read_config_file(
+        options
+            .config
+            .clone()
+            .unwrap_or_else(deep_obsidian_config::default_config_path),
+    )
+    .ok()
+    .flatten();
     if options.vault_path.is_none() {
-        options.vault_path = Some(PathBuf::from(prompt_string("Vault path", None)?));
+        let existing_vault = existing
+            .as_ref()
+            .and_then(|config| config.vault_path.as_ref())
+            .map(|path| path.display().to_string());
+        let answer = prompt_string("Vault path", existing_vault.as_deref())?;
+        if answer.trim().is_empty() {
+            return Err(anyhow!("vault path is required"));
+        }
+        options.vault_path = Some(PathBuf::from(answer));
     }
 
     let install_mcp = mcp || prompt_bool("Configure MCP clients?", false)?;
     let install_skills = skills || prompt_bool("Install packaged skills?", false)?;
     let install_vault_snippets = vault_snippets || prompt_bool("Install vault snippets?", false)?;
-    let enable_embeddings = prompt_bool("Enable embeddings?", false)?;
+    let existing_embedding = existing.as_ref().and_then(|config| config.embedding.clone());
+    let has_embeddings = existing_embedding
+        .as_ref()
+        .map(|embedding| embedding.provider.is_some() || embedding.model.is_some())
+        .unwrap_or(false);
+    let enable_embeddings = prompt_bool("Enable embeddings?", has_embeddings)?;
 
     if enable_embeddings {
         options.embedding_provider = Some("openai-compatible".to_string());
-        let model = prompt_string("Embedding model", None)?;
+        let model = prompt_string(
+            "Embedding model",
+            existing_embedding
+                .as_ref()
+                .and_then(|embedding| embedding.model.as_deref()),
+        )?;
         if !model.trim().is_empty() {
             options.embedding_model = Some(model);
         }
-        let base_url = prompt_string("Embedding base URL", None)?;
+        let base_url = prompt_string(
+            "Embedding base URL",
+            existing_embedding
+                .as_ref()
+                .and_then(|embedding| embedding.base_url.as_deref()),
+        )?;
         if !base_url.trim().is_empty() {
             options.embedding_base_url = Some(base_url);
         }
@@ -845,6 +903,96 @@ fn setup_service_wizard(
         "Enable HTTP bearer authentication (required for non-loopback exposure)?",
         false,
     )?;
+
+    // Shared Algolia wiki mount (design: docs/algolia-shared-wiki.md). The
+    // wizard only ADDS a mount; existing `shared` entries from the config file
+    // are already carried through `resolve_runtime_config` and re-persisted.
+    let shared_prompt = if resolved.service.shared.is_empty() {
+        "Configure a shared Algolia wiki mount?"
+    } else {
+        "Add another shared Algolia wiki mount?"
+    };
+    if prompt_bool(shared_prompt, false)? {
+        let mount_at = prompt_string("Mount path (vault-relative prefix)", Some("_Shared/Team/"))?;
+        let app_id = prompt_string("Algolia application id", None)?;
+        let index_name = prompt_string("Index name", None)?;
+        if app_id.trim().is_empty() || index_name.trim().is_empty() {
+            return Err(anyhow!("shared mount requires an application id and an index name"));
+        }
+        let writable = prompt_bool("Writable (push versioned edits to the shared wiki)?", true)?;
+        let export_raw = prompt_string(
+            "Local prefixes to publish (comma-separated, blank = consume only)",
+            Some(""),
+        )?;
+        let export_prefixes: Vec<String> = export_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(str::to_string)
+            .collect();
+        let participant = prompt_string("Participant id (e.g. your email)", Some(""))?;
+        let key_ref = match prompt_optional_secret(
+            "Algolia API key (blank to rely on DEEP_OBSIDIAN_ALGOLIA_API_KEY)",
+        )? {
+            Some(secret) => {
+                let reference = SecretRef::OsKeyring {
+                    service: "deep-obsidian-mcp".to_string(),
+                    account: format!("algolia-{}", index_name.trim()),
+                };
+                if dry_run {
+                    Some(reference)
+                } else {
+                    let resolver = SecretResolver::new();
+                    match resolver.put(
+                        &reference,
+                        SecretString::from(secret.expose_secret().to_string()),
+                    ) {
+                        Ok(()) => Some(reference),
+                        Err(error) => {
+                            println!("OS keyring unavailable: {error}");
+                            if prompt_bool("Use encrypted local file fallback?", true)? {
+                                let fallback = SecretRef::EncryptedFile {
+                                    id: format!("algolia-{}", index_name.trim()),
+                                };
+                                resolver.put(&fallback, secret)?;
+                                Some(fallback)
+                            } else {
+                                return Err(anyhow!("Algolia API key was not stored"));
+                            }
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
+        resolved.service.shared.push(deep_obsidian_types::SharedMountConfig {
+            mount_at,
+            app_id: app_id.trim().to_string(),
+            index_name: index_name.trim().to_string(),
+            key_ref,
+            base_url: None,
+            writable,
+            participant_id: if participant.trim().is_empty() {
+                None
+            } else {
+                Some(participant.trim().to_string())
+            },
+            export: if export_prefixes.is_empty() {
+                None
+            } else {
+                Some(deep_obsidian_types::SharedExportConfig {
+                    prefixes: export_prefixes,
+                    exclude: Vec::new(),
+                })
+            },
+            cache: None,
+            retention: None,
+        });
+        println!(
+            "Shared mount added. Preview what would be published with \
+`deep-obsidian-mcp share push --dry-run`, then publish with `share push`."
+        );
+    }
 
     setup_service(
         &resolved,
@@ -2908,8 +3056,9 @@ fn render_probe_report(report: &ProbeReport) -> String {
 mod tests {
     use super::{
         embedding_diagnostics, enable_obsidian_snippets, inspect_index, normalize_cli_args,
-        redact_config, IndexDiagnostics, INDEX_SQLITE_FILENAME,
+        redact_config, setup_service, IndexDiagnostics, INDEX_SQLITE_FILENAME,
     };
+    use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
     use deep_obsidian_types::{
         AutoReindexConfig, EmbeddingConfig, EmbeddingConfigInput, EmbeddingProvider, HttpConfig,
         PersistedServiceConfig, ResolvedServiceConfig, SecretRef, StdioMode, TransportMode,
@@ -3216,4 +3365,97 @@ mod tests {
         );
         assert_eq!(appearance["theme"], "obsidian");
     }
+
+    fn resolved_runtime(
+        config_path: PathBuf,
+        service: ResolvedServiceConfig,
+    ) -> ResolvedRuntimeConfig {
+        let default_source = || ResolvedSource::Default;
+        ResolvedRuntimeConfig {
+            config_path,
+            config_file: None,
+            service,
+            sources: ResolvedSources {
+                vault_path: ResolvedSource::Cli,
+                index_dir: ResolvedSource::Cli,
+                transport: default_source(),
+                stdio_mode: default_source(),
+                http_host: default_source(),
+                http_port: default_source(),
+                http_mcp_path: default_source(),
+                http_health_path: default_source(),
+                auto_reindex_enabled: default_source(),
+                auto_reindex_debounce_ms: default_source(),
+                auto_reindex_interval_ms: default_source(),
+                embedding_provider: default_source(),
+                embedding_model: default_source(),
+                embedding_base_url: default_source(),
+                embedding_api_key_ref: default_source(),
+            },
+        }
+    }
+
+    /// Overwriting an existing config must (a) leave a `.bak` copy of the
+    /// previous content and (b) carry the `shared` mounts through the rewrite
+    /// — the two failure modes of the wizard-overwrite accident.
+    #[tokio::test]
+    async fn setup_service_backs_up_and_preserves_shared_on_overwrite() {
+        let root = unique_temp_dir("setup-backup");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).expect("vault dir");
+        fs::write(vault.join("Home.md"), "# Home\n").expect("seed note");
+        let index_dir = root.join("index");
+        let config_path = root.join("config.json");
+
+        let mut service = resolved_config(&vault, &index_dir);
+        service.shared = vec![deep_obsidian_types::SharedMountConfig {
+            mount_at: "_Shared/Team/".to_string(),
+            app_id: "APP".to_string(),
+            index_name: "team-wiki".to_string(),
+            writable: true,
+            ..deep_obsidian_types::SharedMountConfig::default()
+        }];
+
+        // First write.
+        let report = setup_service(
+            &resolved_runtime(config_path.clone(), service.clone()),
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .expect("first setup");
+        assert!(report.written);
+        let first_text = fs::read_to_string(&config_path).expect("config written");
+        assert!(first_text.contains("team-wiki"), "shared persisted: {first_text}");
+
+        // Overwrite with a changed config -> .bak holds the previous content,
+        // and the shared block survives the rewrite.
+        service.http.port = 4200;
+        let report = setup_service(
+            &resolved_runtime(config_path.clone(), service),
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .expect("overwrite setup");
+        assert!(report.written);
+        let backup_path = config_path.with_extension("json.bak");
+        assert_eq!(
+            fs::read_to_string(&backup_path).expect("backup exists"),
+            first_text,
+            "backup must hold the pre-overwrite content"
+        );
+        let new_text = fs::read_to_string(&config_path).expect("new config");
+        assert!(new_text.contains("4200"));
+        assert!(new_text.contains("team-wiki"), "shared survives: {new_text}");
+    }
 }
+

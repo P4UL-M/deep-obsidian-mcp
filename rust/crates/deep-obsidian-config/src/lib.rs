@@ -374,9 +374,20 @@ pub fn write_config_file(
         })?;
     }
 
+    let text = render_config_text(&path, config)?;
+    fs::write(&path, text).map_err(|source| ConfigError::WriteFailed { path, source })
+}
+
+/// The exact text `write_config_file` would write (format chosen by the path's
+/// extension, trailing newline included). Lets callers diff against an existing
+/// file before overwriting it.
+pub fn render_config_text(
+    path: impl AsRef<Path>,
+    config: &PersistedServiceConfig,
+) -> Result<String, ConfigError> {
+    let path = expand_home_path(path);
     let text = serialize_config(&path, config)?;
-    fs::write(&path, format!("{text}\n"))
-        .map_err(|source| ConfigError::WriteFailed { path, source })
+    Ok(format!("{text}\n"))
 }
 
 fn normalize_http_input(input: Option<HttpConfigInput>) -> HttpConfig {
