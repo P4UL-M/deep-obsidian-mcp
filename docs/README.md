@@ -18,7 +18,7 @@ the top-level guides instead:** [README](../README.md) ·
 
 ## Shared wiki (Algolia)
 
-- [algolia-shared-wiki.md](./algolia-shared-wiki.md) — a large shared wiki corpus in Algolia: append-only versioned writes, hydrating reads, bounded local cache. Implemented on the `feat/algolia-shared-wiki` branch; demo: `scripts/demo-shared-wiki.sh`.
+- [algolia-shared-wiki.md](./algolia-shared-wiki.md) — a large shared wiki corpus in Algolia, authored through a virtual mount: append-only versioned writes, hydrating reads, bounded local cache, `share seed`/`dump`/`retract`. Implemented on the `feat/algolia-shared-wiki` branch; demo: `scripts/demo-shared-wiki.sh`.
 
 ## Maintainer / internal
 

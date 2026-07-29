@@ -1,10 +1,10 @@
-//! End-to-end export/push tests against the in-process mock Algolia.
+//! End-to-end seed / dump / retract tests against the in-process mock Algolia.
 
 use deep_obsidian_algolia::mock::spawn_mock;
 use deep_obsidian_config::secrets::SecretResolver;
-use deep_obsidian_server::shared::push::{apply_push, plan_push, PushAction};
+use deep_obsidian_server::shared::seed::{apply_seed, plan_seed, remove_seeded_local_files, SeedAction};
 use deep_obsidian_server::shared::{connect_mount, reads, versioning};
-use deep_obsidian_types::{SharedExportConfig, SharedMountConfig};
+use deep_obsidian_types::SharedMountConfig;
 use std::fs;
 use std::path::PathBuf;
 
@@ -52,6 +52,12 @@ fn seed_vault() -> PathBuf {
     vault
 }
 
+const SEED_PREFIXES: [&str; 1] = ["_Wiki/"];
+
+fn prefixes() -> Vec<String> {
+    SEED_PREFIXES.iter().map(|p| p.to_string()).collect()
+}
+
 fn mount_config(base_url: &str, participant: &str) -> SharedMountConfig {
     SharedMountConfig {
         mount_at: "_Shared/Team/".to_string(),
@@ -61,28 +67,24 @@ fn mount_config(base_url: &str, participant: &str) -> SharedMountConfig {
         base_url: Some(base_url.to_string()),
         writable: true,
         participant_id: Some(participant.to_string()),
-        export: Some(SharedExportConfig {
-            prefixes: vec!["_Wiki/".to_string()],
-            exclude: Vec::new(),
-        }),
         cache: None,
         retention: None,
     }
 }
 
 #[tokio::test]
-async fn push_publishes_reconciles_and_retracts() {
+async fn seed_imports_excludes_and_versions() {
     // Env var supplies the key so no keyring is involved.
     std::env::set_var("DEEP_OBSIDIAN_ALGOLIA_API_KEY", "test-key");
     let (base_url, _mock) = spawn_mock().await;
     let vault = seed_vault();
-    let index_dir = temp_dir("shared-push-index");
+    let index_dir = temp_dir("seed-index");
     let secrets = SecretResolver::new();
     let mount = connect_mount(&mount_config(&base_url, "paul@test"), &secrets, &index_dir)
         .expect("connect mount");
 
-    // First push: plan flags it, share:false note excluded, _Agent/ untouched.
-    let plan = plan_push(&vault, &mount).await.expect("plan");
+    // First import: flagged, share:false note excluded, _Agent/ untouched.
+    let plan = plan_seed(&vault, &mount, &prefixes()).await.expect("plan");
     assert!(plan.first_push);
     let planned_paths: Vec<&str> = plan.items.iter().map(|item| item.path.as_str()).collect();
     assert_eq!(planned_paths.len(), 2, "share:false and _Agent/ excluded");
@@ -92,12 +94,14 @@ async fn push_publishes_reconciles_and_retracts() {
     assert!(plan
         .items
         .iter()
-        .all(|item| item.action == PushAction::Create));
+        .all(|item| item.action == SeedAction::Create));
 
-    let report = apply_push(&vault, &mount, &plan).await.expect("apply");
-    assert_eq!(report.pushed, 2);
+    let report = apply_seed(&vault, &mount, &prefixes(), &plan)
+        .await
+        .expect("apply");
+    assert_eq!(report.seeded, 2);
 
-    // The pushed note hydrates back byte-identical through the read path.
+    // The imported note hydrates back byte-identical through the read path.
     let hydrated = reads::read_note(
         &mount,
         "_Wiki/Decisions/Keep retrieval architecture-agnostic.md",
@@ -105,18 +109,9 @@ async fn push_publishes_reconciles_and_retracts() {
     .await
     .expect("hydrate");
     assert_eq!(hydrated.content, DECISION);
-    // Wiki-link resolved against the exporter's file list.
-    assert_eq!(
-        hydrated.note.links,
-        vec!["_Wiki/Decisions/Keep retrieval architecture-agnostic.md".to_string()]
-            .into_iter()
-            .filter(|_| false)
-            .collect::<Vec<_>>(),
-        "decision note has no outgoing links"
-    );
 
-    // Second push with no changes: everything unchanged.
-    let plan = plan_push(&vault, &mount).await.expect("plan 2");
+    // Re-seeding with no changes: everything already up to date.
+    let plan = plan_seed(&vault, &mount, &prefixes()).await.expect("plan 2");
     assert!(!plan.first_push);
     assert_eq!(plan.changed_count(), 0);
 
@@ -124,9 +119,11 @@ async fn push_publishes_reconciles_and_retracts() {
     let decision_path = vault.join("_Wiki/Decisions/Keep retrieval architecture-agnostic.md");
     let edited = format!("{DECISION}\n## Consequences\n\nNew section added.\n");
     fs::write(&decision_path, &edited).unwrap();
-    let plan = plan_push(&vault, &mount).await.expect("plan 3");
+    let plan = plan_seed(&vault, &mount, &prefixes()).await.expect("plan 3");
     assert_eq!(plan.changed_count(), 1);
-    apply_push(&vault, &mount, &plan).await.expect("apply 3");
+    apply_seed(&vault, &mount, &prefixes(), &plan)
+        .await
+        .expect("apply 3");
 
     let hydrated = reads::read_note(
         &mount,
@@ -161,18 +158,51 @@ async fn push_publishes_reconciles_and_retracts() {
     .await
     .expect("history chunks");
     assert_eq!(reads::reassemble_chunks(old_chunks), DECISION);
+}
 
-    // Retraction: delete the synthesis locally -> tombstoned remotely,
-    // including its history.
-    fs::remove_file(vault.join("_Wiki/Syntheses/Product narrative.md")).unwrap();
-    let plan = plan_push(&vault, &mount).await.expect("plan 4");
-    assert_eq!(plan.retract, vec!["_Wiki/Syntheses/Product narrative.md"]);
-    let report = apply_push(&vault, &mount, &plan).await.expect("apply 4");
-    assert_eq!(report.retracted, 1);
-    assert!(versioning::fetch_head(&mount, "_Wiki/Syntheses/Product narrative.md")
+/// Deleting a note locally must NOT remove it from the index: seed never
+/// reconciles deletions (that is `share retract`, tested below). This is the
+/// property that replaced the old push-time reconciliation.
+#[tokio::test]
+async fn seed_never_removes_remote_notes() {
+    std::env::set_var("DEEP_OBSIDIAN_ALGOLIA_API_KEY", "test-key");
+    let (base_url, _mock) = spawn_mock().await;
+    let vault = seed_vault();
+    let index_dir = temp_dir("seed-no-retract-index");
+    let secrets = SecretResolver::new();
+    let mut config = mount_config(&base_url, "paul@test");
+    config.index_name = "no-retract-wiki".to_string();
+    let mount = connect_mount(&config, &secrets, &index_dir).expect("connect");
+
+    let plan = plan_seed(&vault, &mount, &prefixes()).await.expect("plan");
+    apply_seed(&vault, &mount, &prefixes(), &plan)
         .await
-        .expect("head lookup")
-        .is_none());
+        .expect("apply");
+
+    fs::remove_file(vault.join("_Wiki/Syntheses/Product narrative.md")).unwrap();
+    let plan = plan_seed(&vault, &mount, &prefixes()).await.expect("plan 2");
+    assert_eq!(plan.items.len(), 1, "only the surviving local note is planned");
+    apply_seed(&vault, &mount, &prefixes(), &plan)
+        .await
+        .expect("apply 2");
+    assert!(
+        versioning::fetch_head(&mount, "_Wiki/Syntheses/Product narrative.md")
+            .await
+            .expect("head lookup")
+            .is_some(),
+        "a local deletion must not silently remove the shared note"
+    );
+
+    // Explicit retraction is what removes it — note, chunks, and history.
+    versioning::retract_note(&mount, "_Wiki/Syntheses/Product narrative.md")
+        .await
+        .expect("retract");
+    assert!(
+        versioning::fetch_head(&mount, "_Wiki/Syntheses/Product narrative.md")
+            .await
+            .expect("head lookup")
+            .is_none()
+    );
     let leftover = mount
         .client
         .browse_all(
@@ -182,41 +212,65 @@ async fn push_publishes_reconciles_and_retracts() {
         .await
         .expect("browse main");
     assert!(leftover.is_empty(), "retraction removes note + chunks");
+    let leftover_history = mount
+        .client
+        .browse_all(
+            &mount.history_index,
+            Some("noteId:\"_Wiki/Syntheses/Product narrative.md\""),
+        )
+        .await
+        .expect("browse history");
+    assert!(leftover_history.is_empty(), "retraction purges history too");
 }
 
+/// A colleague's note that was never in this participant's vault stays put:
+/// seed only touches the paths it imports.
 #[tokio::test]
-async fn foreign_notes_are_never_retracted() {
+async fn seed_leaves_foreign_notes_alone() {
     std::env::set_var("DEEP_OBSIDIAN_ALGOLIA_API_KEY", "test-key");
     let (base_url, _mock) = spawn_mock().await;
     let vault = seed_vault();
-    let index_dir = temp_dir("shared-push-index-b");
+    let index_dir = temp_dir("seed-foreign-index");
     let secrets = SecretResolver::new();
-    let paul = connect_mount(&mount_config(&base_url, "paul@test"), &secrets, &index_dir)
-        .expect("connect paul");
+    let mut config = mount_config(&base_url, "paul@test");
+    config.index_name = "foreign-wiki".to_string();
+    let paul = connect_mount(&config, &secrets, &index_dir).expect("connect paul");
 
-    let plan = plan_push(&vault, &paul).await.expect("plan");
-    apply_push(&vault, &paul, &plan).await.expect("apply");
+    let plan = plan_seed(&vault, &paul, &prefixes()).await.expect("plan");
+    apply_seed(&vault, &paul, &prefixes(), &plan)
+        .await
+        .expect("apply");
 
-    // Alice writes a NEW note directly to the shared index (not in Paul's vault).
-    let alice = connect_mount(&mount_config(&base_url, "alice@test"), &secrets, &index_dir)
-        .expect("connect alice");
+    // Alice authors a NEW note directly through the mount.
+    let mut alice_config = config.clone();
+    alice_config.participant_id = Some("alice@test".to_string());
+    let alice = connect_mount(&alice_config, &secrets, &index_dir).expect("connect alice");
     versioning::push_note_version(
         &alice,
         "_Wiki/Decisions/Alice own note.md",
-        "# Alice's decision\n\nWritten remotely.\n",
+        "# Alice's decision\n\nAuthored through the mount.\n",
         &[],
         None,
         false,
     )
     .await
-    .expect("alice push");
+    .expect("alice write");
 
-    // Paul's next reconcile sees the foreign note but does NOT retract it.
-    let plan = plan_push(&vault, &paul).await.expect("plan 2");
-    assert!(plan.retract.is_empty());
-    assert_eq!(
-        plan.foreign_orphans,
-        vec!["_Wiki/Decisions/Alice own note.md"]
+    // Paul re-seeds: Alice's note is untouched and still present.
+    let plan = plan_seed(&vault, &paul, &prefixes()).await.expect("plan 2");
+    assert!(plan
+        .items
+        .iter()
+        .all(|item| item.path != "_Wiki/Decisions/Alice own note.md"));
+    apply_seed(&vault, &paul, &prefixes(), &plan)
+        .await
+        .expect("apply 2");
+    assert!(
+        versioning::fetch_head(&paul, "_Wiki/Decisions/Alice own note.md")
+            .await
+            .expect("head")
+            .is_some(),
+        "a re-seed must not disturb notes authored through the mount"
     );
 }
 
@@ -232,15 +286,15 @@ async fn seed_move_and_dump_round_trip() {
     config.index_name = "seed-wiki".to_string();
     let mount = connect_mount(&config, &secrets, &index_dir).expect("connect");
 
-    let mut plan = plan_push(&vault, &mount).await.expect("plan");
-    plan.retract.clear();
-    apply_push(&vault, &mount, &plan).await.expect("apply");
+    let plan = plan_seed(&vault, &mount, &prefixes()).await.expect("plan");
+    apply_seed(&vault, &mount, &prefixes(), &plan)
+        .await
+        .expect("apply");
 
     // --move: local copies removed only when the index verifiably holds them.
-    let (deleted, skipped) =
-        deep_obsidian_server::shared::push::remove_seeded_local_files(&vault, &mount)
-            .await
-            .expect("move");
+    let (deleted, skipped) = remove_seeded_local_files(&vault, &mount, &prefixes())
+        .await
+        .expect("move");
     assert_eq!(deleted.len(), 2, "both seeded notes removed: {deleted:?}");
     assert!(skipped.is_empty(), "nothing drifted: {skipped:?}");
     assert!(!vault

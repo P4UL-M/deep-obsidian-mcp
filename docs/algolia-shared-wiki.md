@@ -5,25 +5,31 @@ end-to-end demo with `scripts/demo-shared-wiki.sh` — it uses an in-process
 mock of the Algolia REST API, so no account or key is needed; point `baseUrl`
 at nothing (default) with a real `appId`/key to run against actual Algolia.
 
-**Nominal model (decided post-implementation): mount-only authorship.** The
-standing `export` rule created an asymmetry between writer classes — mount
-writes were fork-aware while an exporter's `share push` silently superseded a
-colleague's head (their version went to history unflagged). Rather than adding
-sync state and pull machinery, the decision is that the shared wiki LIVES in
-the index and every write goes through the mount (versioned, fork-aware,
-symmetric for all participants). Supporting commands:
+**Model: mount-only authorship (the standing export was removed).** An earlier
+implementation carried a persistent `export` rule plus a recurring `share
+push`. It created an asymmetry between writer classes — mount writes were
+fork-aware, while an exporter's push silently superseded a colleague's head
+(their version went to history unflagged) — and it duplicated every exported
+note across two addressable paths. Rather than adding sync state and pull
+machinery to patch that, the export path was **deleted**: the shared wiki LIVES
+in the index and every write goes through the mount (versioned, fork-aware,
+symmetric for all participants).
 
-- `share seed --prefix <folder/> [--move]` — one-shot import of existing local
-  notes, no persistent export rule, never retracts. `--move` deletes the local
-  copies after a per-file verification that the index holds identical content,
-  so exactly one copy exists.
-- `share dump --to <dir>` — materializes every head version to a local
-  directory with a manifest: the backup / exit strategy / human-browsable
-  snapshot for a corpus whose only live copy is the index.
+`SharedMountConfig` therefore has no `export` field, and there is no `share
+push`. The command surface is:
 
-The standing `export` remains supported for the pure-publisher profile
-(read-only consumers), where the asymmetry is harmless because nobody else
-writes.
+| Command | Role |
+|---|---|
+| `share seed --prefix <folder/> [--move]` | One-shot import of existing local notes. Only creates/updates — **never** removes anything from the index. `--move` deletes the local copies after a per-file check that the index holds identical content, so exactly one copy exists. |
+| `share dump --to <dir>` | Materializes every head version into a directory with a manifest — backup, exit strategy, human-browsable snapshot for a corpus whose only live copy is the index. |
+| `share status` | Note count, superseded-version count, cache stats, and any diverged notes per mount. |
+| `share retract --path <note>` | The single destructive operation: removes a note, its chunks, and its whole history. |
+| `share set-key`, `share key` | Store the mount's API key (verified round trip); mint a scoped read-only key for a teammate. |
+
+Consequence worth stating: because seed never reconciles deletions, deleting a
+note locally does **not** remove it from the shared index — retraction is
+explicit. That is the deliberate trade for never destroying a colleague's
+contribution by accident, and it is covered by a regression test.
 
 A large shared corpus lives in Algolia. It is **not** mirrored locally — the
 premise is that it is bigger than any participant wants on disk. Locally there is

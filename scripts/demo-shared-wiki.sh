@@ -6,9 +6,10 @@
 # `baseUrl` out of the configs (and use a real app id + key) to run the same
 # flow against actual Algolia.
 #
-#   Paul  (publisher): local vault, exports _Wiki/ to the shared index
-#   Alice (consumer):  empty vault, mounts the corpus at _Shared/Team/,
-#                      reads/searches/writes through MCP over HTTP
+# Model C: the wiki LIVES in the index and is authored through the mount.
+#   Paul  (seeder):   imports his local _Wiki/ once with `share seed --move`
+#   Alice (teammate): empty vault, mounts the corpus at _Shared/Team/,
+#                     reads/searches/writes through MCP over HTTP
 #
 # Usage: scripts/demo-shared-wiki.sh
 set -euo pipefail
@@ -138,18 +139,20 @@ cat > "$ROOT/paul-config.json" <<EOF
       "indexName": "team-wiki",
       "baseUrl": "http://127.0.0.1:$MOCK_PORT",
       "writable": true,
-      "participantId": "paul@demo",
-      "export": { "prefixes": ["_Wiki/"] }
+      "participantId": "paul@demo"
     }
   ]
 }
 EOF
 
-say "Paul: dry-run first (nothing written)"
-run "$BIN" --config "$ROOT/paul-config.json" share push --dry-run
+say "Paul: seed dry-run first (nothing written)"
+run "$BIN" --config "$ROOT/paul-config.json" share seed --prefix _Wiki/ --dry-run
 
-say "Paul: publish (--yes acknowledges the first-push confirmation)"
-run "$BIN" --config "$ROOT/paul-config.json" share push --yes
+say "Paul: seed --move (import once, then the index holds the only copy)"
+run "$BIN" --config "$ROOT/paul-config.json" share seed --prefix _Wiki/ --move --yes
+
+say "Paul's vault after --move: only the private + agent notes remain local"
+find "$PAUL" -type f -name '*.md' | sed "s|$PAUL/||" | sort
 
 # ---------------------------------------------------------------- Alice (consumer)
 say "Alice: empty vault, mounts the shared corpus at _Shared/Team/"
@@ -223,7 +226,15 @@ OLD_VERSION=$(mcp note_history '{"path": "_Shared/Team/_Wiki/Decisions/Spacelift
 mcp read_version "{\"path\": \"_Shared/Team/_Wiki/Decisions/Spacelift for IaC.md\", \"versionId\": \"$OLD_VERSION\"}" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"versionId": d["versionId"], "firstLines": d["text"].split("\n")[:8]}, indent=2))'
 
-say "Paul re-syncs — Alice's edit is now the head he sees (and his push respects it)"
+say "share status — what the index holds, from Paul's side"
+run "$BIN" --config "$ROOT/paul-config.json" share status
+
+say "share dump — the exit strategy: materialize the whole index locally"
+run "$BIN" --config "$ROOT/paul-config.json" share dump --to "$ROOT/backup"
+find "$ROOT/backup" -type f | sed "s|$ROOT/backup/||" | sort
+
+say "share retract — the one destructive op (note + chunks + all history)"
+run "$BIN" --config "$ROOT/paul-config.json" share retract --path "_Wiki/Syntheses/Product narrative.md" --yes
 run "$BIN" --config "$ROOT/paul-config.json" share status
 
 say "Demo complete"

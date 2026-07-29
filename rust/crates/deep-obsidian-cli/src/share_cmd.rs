@@ -1,55 +1,22 @@
-//! `deep-obsidian-mcp share ...` — publish local prefixes to a shared Algolia
-//! index, inspect the plan, and mint secured teammate keys.
+//! `deep-obsidian-mcp share ...` — operate on a shared Algolia wiki.
 //!
-//! Publication is an explicit act (design §9): the FIRST push to an index
-//! prints the complete note list and requires `--yes` or interactive
-//! confirmation; `--dry-run` prints the plan without writing, any time.
+//! Model C (design: docs/algolia-shared-wiki.md): the wiki lives in the index
+//! and is authored through the mount, so there is no standing export and no
+//! recurring push. Local content enters once via `seed`; `dump` materializes
+//! the index back out; `retract` is the single destructive operation.
 
 use anyhow::{anyhow, Context, Result};
 use deep_obsidian_config::secrets::SecretResolver;
-use deep_obsidian_types::SecretRef;
-use secrecy::{ExposeSecret, SecretString};
 use deep_obsidian_server::shared::{
-    connect_mount,
-    push::{apply_push, plan_push, remove_seeded_local_files, PushAction},
-    reads, SharedMountRuntime,
+    connect_mount, reads,
+    seed::{apply_seed, plan_seed, remove_seeded_local_files, SeedAction},
+    versioning, SharedMountRuntime,
 };
-use deep_obsidian_types::{SharedExportConfig, SharedMountConfig};
+use deep_obsidian_types::{SecretRef, SharedMountConfig};
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::cli::ShareAction;
 use crate::config::ResolvedRuntimeConfig;
-
-fn export_mounts(
-    resolved: &ResolvedRuntimeConfig,
-    index_filter: Option<&str>,
-    require_export: bool,
-) -> Result<Vec<SharedMountRuntime>> {
-    let secrets = SecretResolver::new();
-    let mut mounts = Vec::new();
-    for config in &resolved.service.shared {
-        if let Some(filter) = index_filter {
-            if config.index_name != filter {
-                continue;
-            }
-        }
-        if require_export && config.export.is_none() {
-            continue;
-        }
-        mounts.push(
-            connect_mount(config, &secrets, &resolved.service.index_dir)
-                .map_err(|error| anyhow!("mount {}: {error}", config.index_name))?,
-        );
-    }
-    if mounts.is_empty() {
-        return Err(anyhow!(
-            "no shared mount matches (configure `shared` in the config file{})",
-            index_filter
-                .map(|filter| format!(", or check --index {filter}"))
-                .unwrap_or_default()
-        ));
-    }
-    Ok(mounts)
-}
 
 /// Picks exactly one configured mount: the named one, or the only one.
 fn select_mount_config(
@@ -75,52 +42,46 @@ fn select_mount_config(
     }
 }
 
-fn print_plan(mount: &SharedMountRuntime, plan: &deep_obsidian_server::shared::push::PushPlan) {
-    println!(
-        "mount {} (app {}, mounted at {}):",
-        mount.index(),
-        mount.config.app_id,
-        mount.mount_at()
-    );
-    // A frequent wizard-answer trap: exporting the mount path itself. The
-    // mount is a VIRTUAL namespace (nothing on disk), so such a prefix can
-    // never match a local file — say so instead of printing "nothing to do".
-    if let Some(export) = &mount.config.export {
-        for prefix in &export.prefixes {
-            if prefix.starts_with(mount.mount_at()) || mount.mount_at().starts_with(prefix.as_str())
-            {
-                println!(
-                    "  WARNING: export prefix {prefix} lies inside the virtual mount \
-{} — it matches no local files. Export a LOCAL folder instead (e.g. _Wiki/).",
-                    mount.mount_at()
-                );
+fn connect(
+    resolved: &ResolvedRuntimeConfig,
+    config: &SharedMountConfig,
+) -> Result<SharedMountRuntime> {
+    let secrets = SecretResolver::new();
+    connect_mount(config, &secrets, &resolved.service.index_dir)
+        .map_err(|error| anyhow!("mount {}: {error}", config.index_name))
+}
+
+/// Normalizes `--prefix` values to trailing-slash, vault-relative folders.
+fn normalize_prefixes(prefixes: &[String]) -> Result<Vec<String>> {
+    let normalized: Vec<String> = prefixes
+        .iter()
+        .map(|prefix| {
+            let trimmed = prefix.trim().trim_start_matches('/');
+            if trimmed.ends_with('/') {
+                trimmed.to_string()
+            } else {
+                format!("{trimmed}/")
             }
-        }
+        })
+        .filter(|prefix| !prefix.is_empty() && prefix != "/")
+        .collect();
+    if normalized.is_empty() {
+        return Err(anyhow!(
+            "--prefix requires a vault-relative folder, e.g. _Wiki/"
+        ));
     }
-    if plan.first_push {
-        println!("  FIRST PUSH to this index — full note list:");
-    }
-    for item in &plan.items {
-        let label = match item.action {
-            PushAction::Create => "create",
-            PushAction::Update => "update",
-            PushAction::Unchanged => continue,
-        };
-        println!("  {label}  {}", item.path);
-    }
-    let unchanged = plan.items.len() - plan.changed_count();
-    if unchanged > 0 {
-        println!("  ({unchanged} unchanged)");
-    }
-    for path in &plan.retract {
-        println!("  retract  {path}  (removes it AND its history)");
-    }
-    for path in &plan.foreign_orphans {
-        println!("  keep  {path}  (last written by another participant; not retracted)");
-    }
-    if plan.changed_count() == 0 && plan.retract.is_empty() {
-        println!("  nothing to do");
-    }
+    Ok(normalized)
+}
+
+/// Strips the mount prefix from a user-supplied path so both the mounted form
+/// (`_Shared/Team/_Wiki/Foo.md`) and the index-relative form (`_Wiki/Foo.md`)
+/// address the same note.
+fn to_remote_path(mount: &SharedMountRuntime, path: &str) -> String {
+    let trimmed = path.trim().trim_start_matches('/');
+    trimmed
+        .strip_prefix(mount.mount_at())
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 pub async fn run_share(
@@ -129,130 +90,71 @@ pub async fn run_share(
     dry_run: bool,
 ) -> Result<()> {
     match action {
-        ShareAction::Status => {
-            for mount in export_mounts(resolved, None, false)? {
-                if mount.config.export.is_some() {
-                    let plan = plan_push(&resolved.service.vault_path, &mount).await?;
-                    print_plan(&mount, &plan);
-                } else {
-                    println!(
-                        "mount {} (consume-only, mounted at {})",
-                        mount.index(),
-                        mount.mount_at()
-                    );
-                }
-            }
-            Ok(())
-        }
-        ShareAction::Push { yes, index } => {
-            for mount in export_mounts(resolved, index.as_deref(), true)? {
-                let plan = plan_push(&resolved.service.vault_path, &mount).await?;
-                print_plan(&mount, &plan);
-                if dry_run {
-                    println!("(dry-run: nothing written)");
-                    continue;
-                }
-                if plan.changed_count() == 0 && plan.retract.is_empty() {
-                    continue;
-                }
-                if plan.first_push && !yes {
-                    // Opt-out confirmation: protects against a wrong prefix
-                    // shipping unintended content on the very first publish.
-                    if !confirm(&format!(
-                        "Publish these {} note(s) to index {}?",
-                        plan.items.len(),
-                        mount.index()
-                    ))? {
-                        println!("aborted");
-                        continue;
-                    }
-                }
-                let report = apply_push(&resolved.service.vault_path, &mount, &plan).await?;
-                println!(
-                    "pushed {} note(s), {} unchanged, {} retracted",
-                    report.pushed, report.unchanged, report.retracted
-                );
-            }
-            Ok(())
-        }
         ShareAction::Seed {
             prefixes,
             move_files,
             index,
             yes,
         } => {
-            let persistent = select_mount_config(resolved, index.as_deref())?;
-            let normalized: Vec<String> = prefixes
-                .iter()
-                .map(|prefix| {
-                    let trimmed = prefix.trim().trim_start_matches('/');
-                    if trimmed.ends_with('/') {
-                        trimmed.to_string()
-                    } else {
-                        format!("{trimmed}/")
-                    }
-                })
-                .filter(|prefix| !prefix.is_empty() && *prefix != "/")
-                .collect();
-            if normalized.is_empty() {
-                return Err(anyhow!("--prefix requires a vault-relative folder, e.g. _Wiki/"));
-            }
-            // Ephemeral export rule: the config file is NOT modified — seed is
-            // one-shot by design (model C keeps no standing export).
-            let mut seed_config = persistent.clone();
-            seed_config.export = Some(SharedExportConfig {
-                prefixes: normalized.clone(),
-                exclude: Vec::new(),
-            });
-            let secrets = SecretResolver::new();
-            let mount = connect_mount(&seed_config, &secrets, &resolved.service.index_dir)
-                .map_err(|error| anyhow!("mount {}: {error}", seed_config.index_name))?;
+            let normalized = normalize_prefixes(prefixes)?;
+            let config = select_mount_config(resolved, index.as_deref())?;
+            let mount = connect(resolved, &config)?;
 
-            // A PERSISTENT export overlapping the seeded prefixes would retract
-            // everything on the next `share push` once --move removes the local
-            // files. Refuse the foot-gun combination outright.
-            if *move_files {
-                if let Some(export) = &persistent.export {
-                    let overlap: Vec<&String> = export
-                        .prefixes
-                        .iter()
-                        .filter(|kept| {
-                            normalized.iter().any(|seeded| {
-                                kept.starts_with(seeded.as_str())
-                                    || seeded.starts_with(kept.as_str())
-                            })
-                        })
-                        .collect();
-                    if !overlap.is_empty() {
-                        return Err(anyhow!(
-                            "config keeps a persistent export over {overlap:?}: after --move the \
-next `share push` would RETRACT the seeded notes. Remove the export rule from the config first."
-                        ));
-                    }
+            // Seeding the mount's own prefix would "import" the virtual
+            // namespace — there are no files there by construction.
+            for prefix in &normalized {
+                if prefix.starts_with(mount.mount_at())
+                    || mount.mount_at().starts_with(prefix.as_str())
+                {
+                    return Err(anyhow!(
+                        "prefix {prefix} lies inside the virtual mount {} — it matches no local \
+files. Seed a LOCAL folder instead (e.g. _Wiki/).",
+                        mount.mount_at()
+                    ));
                 }
             }
 
-            let mut plan = plan_push(&resolved.service.vault_path, &mount).await?;
-            plan.retract.clear(); // seed only adds, never reconciles deletions
-            print_plan(&mount, &plan);
-            if dry_run {
-                println!("(dry-run: nothing written)");
+            let plan = plan_seed(&resolved.service.vault_path, &mount, &normalized).await?;
+            println!(
+                "mount {} (app {}, mounted at {}):",
+                mount.index(),
+                mount.config.app_id,
+                mount.mount_at()
+            );
+            if plan.first_push {
+                println!("  FIRST IMPORT into this index — full note list:");
+            }
+            for item in &plan.items {
+                let label = match item.action {
+                    SeedAction::Create => "create",
+                    SeedAction::Update => "update",
+                    SeedAction::Unchanged => continue,
+                };
+                println!("  {label}  {}", item.path);
+            }
+            let unchanged = plan.items.len() - plan.changed_count();
+            if unchanged > 0 {
+                println!("  ({unchanged} already up to date)");
+            }
+            if plan.items.is_empty() {
+                println!("  no local notes under {normalized:?}");
                 return Ok(());
             }
-            let seeded_count = plan.items.len();
-            if seeded_count == 0 {
-                println!("no local notes under {:?}", normalized);
+            if dry_run {
+                println!("(dry-run: nothing written)");
                 return Ok(());
             }
             if (plan.first_push || *move_files) && !yes {
                 let question = if *move_files {
                     format!(
-                        "Import {seeded_count} note(s) into index {} and DELETE the local copies?",
+                        "Import {} note(s) into index {} and DELETE the local copies?",
+                        plan.items.len(),
                         mount.index()
                     )
                 } else {
                     format!(
-                        "Import {seeded_count} note(s) into index {}?",
+                        "Import {} note(s) into index {}?",
+                        plan.items.len(),
                         mount.index()
                     )
                 };
@@ -262,19 +164,24 @@ next `share push` would RETRACT the seeded notes. Remove the export rule from th
                 }
             }
             if plan.changed_count() > 0 {
-                let report = apply_push(&resolved.service.vault_path, &mount, &plan).await?;
-                println!("seeded {} note(s), {} already up to date", report.pushed, report.unchanged);
+                let report =
+                    apply_seed(&resolved.service.vault_path, &mount, &normalized, &plan).await?;
+                println!(
+                    "seeded {} note(s), {} already up to date",
+                    report.seeded, report.unchanged
+                );
             } else {
                 println!("index already up to date");
             }
             if *move_files {
                 let (deleted, skipped) =
-                    remove_seeded_local_files(&resolved.service.vault_path, &mount).await?;
+                    remove_seeded_local_files(&resolved.service.vault_path, &mount, &normalized)
+                        .await?;
                 for path in &deleted {
                     println!("  removed local  {path}");
                 }
                 for path in &skipped {
-                    println!("  kept (drifted since push)  {path}");
+                    println!("  kept (drifted since import)  {path}");
                 }
                 println!(
                     "{} local file(s) removed; the index now holds the only copy",
@@ -282,16 +189,14 @@ next `share push` would RETRACT the seeded notes. Remove the export rule from th
                 );
             }
             println!(
-                "read/write the wiki through the mount: {}",
+                "author the wiki through the mount: {} (back it up with `share dump`)",
                 mount.mount_at()
             );
             Ok(())
         }
         ShareAction::Dump { to, index } => {
             let config = select_mount_config(resolved, index.as_deref())?;
-            let secrets = SecretResolver::new();
-            let mount = connect_mount(&config, &secrets, &resolved.service.index_dir)
-                .map_err(|error| anyhow!("mount {}: {error}", config.index_name))?;
+            let mount = connect(resolved, &config)?;
             let target = if to.is_absolute() {
                 to.clone()
             } else {
@@ -304,6 +209,14 @@ locally and show up twice in search.",
                     target.display()
                 );
             }
+            if dry_run {
+                println!(
+                    "(dry-run: would dump index {} to {})",
+                    mount.index(),
+                    target.display()
+                );
+                return Ok(());
+            }
             let report = reads::dump_all(&mount, &target).await?;
             println!(
                 "dumped {} note(s) ({} bytes) from index {} to {}",
@@ -315,6 +228,83 @@ locally and show up twice in search.",
             for path in &report.hash_mismatches {
                 println!("  WARNING: hash mismatch on {path} (reassembly differs from record)");
             }
+            Ok(())
+        }
+        ShareAction::Status => {
+            if resolved.service.shared.is_empty() {
+                println!("no shared mounts configured");
+                return Ok(());
+            }
+            for config in &resolved.service.shared {
+                let mount = connect(resolved, config)?;
+                let notes = mount
+                    .client
+                    .browse_all(mount.index(), Some("recordType:note"))
+                    .await?;
+                let history = mount
+                    .client
+                    .browse_all(&mount.history_index, Some("recordType:note"))
+                    .await
+                    .map(|records| records.len())
+                    .unwrap_or(0);
+                let (cache_entries, cache_bytes) = mount.cache.stats();
+                println!(
+                    "mount {} (app {}, mounted at {}{})",
+                    mount.index(),
+                    mount.config.app_id,
+                    mount.mount_at(),
+                    if mount.config.writable {
+                        ""
+                    } else {
+                        ", read-only"
+                    }
+                );
+                println!("  notes: {}", notes.len());
+                println!("  superseded versions in history: {history}");
+                println!("  local cache: {cache_entries} note(s), {cache_bytes} bytes");
+                for path in notes
+                    .iter()
+                    .filter(|record| {
+                        record
+                            .get("hasDivergence")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|record| record.get("path").and_then(serde_json::Value::as_str))
+                {
+                    println!("  diverged: {path}  (resolve_divergence to reconcile)");
+                }
+            }
+            Ok(())
+        }
+        ShareAction::Retract { path, index, yes } => {
+            let config = select_mount_config(resolved, index.as_deref())?;
+            let mount = connect(resolved, &config)?;
+            let remote = to_remote_path(&mount, path);
+            let head = versioning::fetch_head(&mount, &remote)
+                .await?
+                .ok_or_else(|| anyhow!("note not found in index {}: {remote}", mount.index()))?;
+            println!(
+                "retract {} from index {} (head {} by {})",
+                remote,
+                mount.index(),
+                head.version_id,
+                head.participant_id
+            );
+            if dry_run {
+                println!("(dry-run: nothing removed)");
+                return Ok(());
+            }
+            if !yes
+                && !confirm(
+                    "This deletes the note AND its entire version history, permanently. Proceed?",
+                )?
+            {
+                println!("aborted");
+                return Ok(());
+            }
+            versioning::retract_note(&mount, &remote).await?;
+            println!("retracted {remote} (note, chunks, and history removed)");
             Ok(())
         }
         ShareAction::SetKey { index } => {
@@ -350,7 +340,7 @@ locally and show up twice in search.",
 
             // VERIFY the round trip through a fresh resolver: a backend that
             // accepts writes but cannot return them (the historical mock-store
-            // failure) must fail HERE, not at the next `share push`.
+            // failure) must fail HERE, not at the next mount connection.
             let verified = SecretResolver::new()
                 .get(&stored_reference)
                 .context("verification read failed")?
@@ -365,7 +355,9 @@ system is not persisting values; check the keyring backend"
             // Persist the keyRef if the config file doesn't carry it yet (or
             // carries a different one).
             let mut persisted = deep_obsidian_config::read_config_file(&resolved.config_path)?
-                .ok_or_else(|| anyhow!("config file not found: {}", resolved.config_path.display()))?;
+                .ok_or_else(|| {
+                    anyhow!("config file not found: {}", resolved.config_path.display())
+                })?;
             let mut config_changed = false;
             for mount in persisted.shared.iter_mut() {
                 if mount.index_name == mount_config.index_name
@@ -390,21 +382,17 @@ system is not persisting values; check the keyring backend"
             Ok(())
         }
         ShareAction::Key { index, filters } => {
-            let mounts = export_mounts(resolved, index.as_deref(), false)?;
-            let mount = mounts
-                .first()
-                .ok_or_else(|| anyhow!("no matching shared mount"))?;
+            let config = select_mount_config(resolved, index.as_deref())?;
             let secrets = SecretResolver::new();
-            let parent_key =
-                deep_obsidian_server::shared::resolve_api_key(&mount.config, &secrets)
-                    .map_err(|error| anyhow!("{error}"))?;
+            let parent_key = deep_obsidian_server::shared::resolve_api_key(&config, &secrets)
+                .map_err(|error| anyhow!("{error}"))?;
             let restrictions = filters
                 .as_deref()
                 .map(|filters| format!("filters={}", urlencoding_encode(filters)))
                 .unwrap_or_default();
-            let key =
-                deep_obsidian_algolia::generate_secured_api_key(&parent_key, &restrictions);
-            println!("secured key (read-only{}):",
+            let key = deep_obsidian_algolia::generate_secured_api_key(&parent_key, &restrictions);
+            println!(
+                "secured key (read-only{}):",
                 filters
                     .as_deref()
                     .map(|filters| format!(", scoped to `{filters}`"))

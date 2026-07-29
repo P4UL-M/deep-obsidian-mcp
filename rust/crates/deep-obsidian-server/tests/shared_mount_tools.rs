@@ -1,17 +1,17 @@
 //! Two-participant integration test through the real MCP tool surface:
-//! publisher pushes, consumer reads/lists/searches/writes through mounted
+//! one participant seeds, consumer reads/lists/searches/writes through mounted
 //! paths, divergence is recorded and resolved.
 
 use deep_obsidian_algolia::mock::spawn_mock;
 use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_server::mcp::AppState;
 use deep_obsidian_server::runtime::RuntimeState;
-use deep_obsidian_server::shared::push::{apply_push, plan_push};
+use deep_obsidian_server::shared::seed::{apply_seed, plan_seed};
 use deep_obsidian_server::shared::{connect_mount, versioning};
 use deep_obsidian_server::tools::call_tool;
 use deep_obsidian_types::{
-    AutoReindexConfig, EmbeddingConfig, HttpConfig, ResolvedServiceConfig, SharedExportConfig,
-    SharedMountConfig, StdioMode, TransportMode,
+    AutoReindexConfig, EmbeddingConfig, HttpConfig, ResolvedServiceConfig, SharedMountConfig,
+    StdioMode, TransportMode,
 };
 use serde_json::json;
 use std::fs;
@@ -37,7 +37,7 @@ fn temp_dir(prefix: &str) -> PathBuf {
 
 const DECISION: &str = "---\ntype: wiki-decision\nproject: Deep Obsidian\n---\n\n# Keep retrieval architecture-agnostic\n\n## Decision\n\nRetrieval tools stay generic; workflow rules live in prompts and skills.\n\n## Rationale\n\nA generic retrieval layer is easier to reuse across projects.\n";
 
-fn mount_config(base_url: &str, participant: &str, export: bool) -> SharedMountConfig {
+fn mount_config(base_url: &str, participant: &str) -> SharedMountConfig {
     SharedMountConfig {
         mount_at: "_Shared/Team/".to_string(),
         app_id: "TESTAPP".to_string(),
@@ -46,10 +46,6 @@ fn mount_config(base_url: &str, participant: &str, export: bool) -> SharedMountC
         base_url: Some(base_url.to_string()),
         writable: true,
         participant_id: Some(participant.to_string()),
-        export: export.then(|| SharedExportConfig {
-            prefixes: vec!["_Wiki/".to_string()],
-            exclude: Vec::new(),
-        }),
         cache: None,
         retention: None,
     }
@@ -83,7 +79,7 @@ fn service_config(vault_path: PathBuf, mount: SharedMountConfig) -> ResolvedServ
 async fn consumer_state(base_url: &str, participant: &str) -> AppState {
     let vault = temp_dir("consumer-vault");
     fs::write(vault.join("local-note.md"), "# Local note\n\nStays local.\n").unwrap();
-    let config = service_config(vault, mount_config(base_url, participant, false));
+    let config = service_config(vault, mount_config(base_url, participant));
     let (runtime, _guard) = RuntimeState::bootstrap(config.clone())
         .await
         .expect("bootstrap");
@@ -105,13 +101,16 @@ async fn mounted_tools_read_search_write_and_resolve_divergence() {
     .unwrap();
     let secrets = SecretResolver::new();
     let publisher = connect_mount(
-        &mount_config(&base_url, "paul@test", true),
+        &mount_config(&base_url, "paul@test"),
         &secrets,
         &temp_dir("publisher-index"),
     )
     .expect("publisher mount");
-    let plan = plan_push(&publisher_vault, &publisher).await.expect("plan");
-    apply_push(&publisher_vault, &publisher, &plan)
+    let seed_prefixes = vec!["_Wiki/".to_string()];
+    let plan = plan_seed(&publisher_vault, &publisher, &seed_prefixes)
+        .await
+        .expect("plan");
+    apply_seed(&publisher_vault, &publisher, &seed_prefixes, &plan)
         .await
         .expect("apply");
 

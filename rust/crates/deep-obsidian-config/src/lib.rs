@@ -205,20 +205,6 @@ fn normalize_shared_mounts(mounts: Vec<SharedMountConfig>) -> Vec<SharedMountCon
             {
                 return None;
             }
-            if let Some(export) = mount.export.as_mut() {
-                export.prefixes = export
-                    .prefixes
-                    .iter()
-                    .map(|prefix| with_trailing_slash(prefix))
-                    .filter(|prefix| !prefix.is_empty())
-                    .collect();
-                export.exclude = export
-                    .exclude
-                    .iter()
-                    .map(|prefix| with_trailing_slash(prefix))
-                    .filter(|prefix| !prefix.is_empty())
-                    .collect();
-            }
             Some(mount)
         })
         .collect()

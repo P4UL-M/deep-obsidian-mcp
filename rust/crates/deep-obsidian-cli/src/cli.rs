@@ -136,7 +136,7 @@ pub enum Command {
         #[arg(long = "timeout-ms", default_value_t = 5_000)]
         timeout_ms: u64,
     },
-    /// Shared Algolia corpus operations (push, status, key generation).
+    /// Shared Algolia wiki operations (seed, dump, status, retract, keys).
     Share {
         #[command(subcommand)]
         action: ShareAction,
@@ -147,24 +147,9 @@ pub enum Command {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum ShareAction {
-    /// Publish the configured export prefixes to the shared index.
-    /// The first push to an index prints the full note list and requires
-    /// `--yes` (or interactive confirmation). Use the global `--dry-run` to
-    /// print the plan without writing.
-    Push {
-        /// Skip the first-push confirmation prompt.
-        #[arg(long, action = clap::ArgAction::SetTrue)]
-        yes: bool,
-        /// Restrict to one mount by index name (default: every mount with an
-        /// export rule).
-        #[arg(long)]
-        index: Option<String>,
-    },
-    /// Show each shared mount's export plan without writing.
-    Status,
     /// One-shot import of local notes into the shared index (model C: the
-    /// wiki lives in the index, authored through the mount). Unlike `push`,
-    /// seed needs no persistent export rule and never retracts anything.
+    /// wiki lives in the index and is authored through the mount). Only
+    /// creates or updates — never removes anything from the index.
     Seed {
         /// Local folder prefix(es) to import, e.g. `--prefix _Wiki/`.
         /// Repeatable.
@@ -177,7 +162,7 @@ pub enum ShareAction {
         /// Index name of the mount to seed into (default: the only mount).
         #[arg(long)]
         index: Option<String>,
-        /// Skip confirmations (first push, --move deletion).
+        /// Skip confirmations (first import, --move deletion).
         #[arg(long, action = clap::ArgAction::SetTrue)]
         yes: bool,
     },
@@ -191,6 +176,23 @@ pub enum ShareAction {
         /// Index name of the mount to dump (default: the only mount).
         #[arg(long)]
         index: Option<String>,
+    },
+    /// Show what the shared mounts hold (note count, cache, recall stage).
+    Status,
+    /// Permanently remove a note from the shared index, INCLUDING its whole
+    /// version history. This is the one destructive operation on the wiki —
+    /// it is what makes a mistaken publication withdrawable.
+    Retract {
+        /// Mounted or index-relative note path, e.g.
+        /// `_Shared/Team/_Wiki/Foo.md` or `_Wiki/Foo.md`.
+        #[arg(long)]
+        path: String,
+        /// Index name of the mount (default: the only mount).
+        #[arg(long)]
+        index: Option<String>,
+        /// Skip the confirmation prompt.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        yes: bool,
     },
     /// Store (or replace) the Algolia API key for a configured mount in the
     /// OS keyring (encrypted-file fallback), and record the keyRef in the

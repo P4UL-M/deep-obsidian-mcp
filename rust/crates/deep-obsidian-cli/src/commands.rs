@@ -38,10 +38,10 @@ Usage:
   deep-obsidian-mcp doctor [--config <path>] [--json]
   deep-obsidian-mcp print-config [--config <path>]
   deep-obsidian-mcp probe [--config <path>] [--json]
-  deep-obsidian-mcp share push [--dry-run] [--yes] [--index <name>]
-  deep-obsidian-mcp share status
   deep-obsidian-mcp share seed --prefix <folder/> [--move] [--index <name>] [--yes]
   deep-obsidian-mcp share dump --to <dir> [--index <name>]
+  deep-obsidian-mcp share status
+  deep-obsidian-mcp share retract --path <note.md> [--index <name>] [--yes]
   deep-obsidian-mcp share set-key [--index <name>]
   deep-obsidian-mcp share key [--index <name>] [--filters <algolia-filters>]
 
@@ -51,7 +51,7 @@ Commands:
   doctor         Diagnose config, vault access, dependencies, and health.
   print-config   Print the normalized persisted config.
   probe          Probe the configured HTTP health and MCP endpoints.
-  share          Publish, inspect, or mint scoped keys for a shared Algolia wiki.
+  share          Seed, dump, inspect, retract, or key a shared Algolia wiki.
   help           Show this help.
   version        Print the current version.";
 
@@ -442,11 +442,11 @@ fn is_known_command(token: &str) -> bool {
             | "print-config"
             | "probe"
             | "share"
-            | "push"
-            | "status"
-            | "set-key"
             | "seed"
             | "dump"
+            | "status"
+            | "retract"
+            | "set-key"
             | "key"
             | "help"
             | "version"
@@ -561,6 +561,7 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
                 | "--filters"
                 | "--to"
                 | "--prefix"
+                | "--path"
         ) || token.starts_with("--config=")
             || token.starts_with("--index-dir=")
             || token.starts_with("--transport=")
@@ -580,6 +581,7 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
             || token.starts_with("--filters=")
             || token.starts_with("--to=")
             || token.starts_with("--prefix=")
+            || token.starts_with("--path=")
         {
             let (replacement, next_index) = if token.starts_with("--config") {
                 normalize_value_flag(raw_args, index, "--config", "--config")
@@ -637,6 +639,8 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
                 normalize_value_flag(raw_args, index, "--to", "--to")
             } else if token.starts_with("--prefix") {
                 normalize_value_flag(raw_args, index, "--prefix", "--prefix")
+            } else if token.starts_with("--path") {
+                normalize_value_flag(raw_args, index, "--path", "--path")
             } else {
                 normalize_value_flag(raw_args, index, "--timeout-ms", "--timeout-ms")
             };
@@ -941,17 +945,7 @@ fn setup_service_wizard(
         if app_id.trim().is_empty() || index_name.trim().is_empty() {
             return Err(anyhow!("shared mount requires an application id and an index name"));
         }
-        let writable = prompt_bool("Writable (push versioned edits to the shared wiki)?", true)?;
-        let export_raw = prompt_string(
-            "Local prefixes to publish (comma-separated, blank = consume only)",
-            Some(""),
-        )?;
-        let export_prefixes: Vec<String> = export_raw
-            .split(',')
-            .map(str::trim)
-            .filter(|prefix| !prefix.is_empty())
-            .map(str::to_string)
-            .collect();
+        let writable = prompt_bool("Writable (author versioned edits through the mount)?", true)?;
         let participant = prompt_string("Participant id (e.g. your email)", Some(""))?;
         let key_ref = match prompt_optional_secret(
             "Algolia API key (blank to rely on DEEP_OBSIDIAN_ALGOLIA_API_KEY)",
@@ -987,6 +981,7 @@ fn setup_service_wizard(
             }
             None => None,
         };
+        let mount_at_echo = mount_at.clone();
         resolved.service.shared.push(deep_obsidian_types::SharedMountConfig {
             mount_at,
             app_id: app_id.trim().to_string(),
@@ -999,20 +994,14 @@ fn setup_service_wizard(
             } else {
                 Some(participant.trim().to_string())
             },
-            export: if export_prefixes.is_empty() {
-                None
-            } else {
-                Some(deep_obsidian_types::SharedExportConfig {
-                    prefixes: export_prefixes,
-                    exclude: Vec::new(),
-                })
-            },
             cache: None,
             retention: None,
         });
         println!(
-            "Shared mount added. Preview what would be published with \
-`deep-obsidian-mcp share push --dry-run`, then publish with `share push`."
+            "Shared mount added. The wiki lives in the index and is authored through the \
+mount — agents write to {mount_at_echo}. To import notes you already have locally, run \
+`deep-obsidian-mcp share seed --prefix _Wiki/ --dry-run` first, then without --dry-run \
+(add --move to keep a single copy). Back the index up with `share dump --to <dir>`."
         );
     }
 

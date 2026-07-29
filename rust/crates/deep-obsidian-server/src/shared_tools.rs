@@ -462,12 +462,6 @@ pub async fn vault_info_mounts(state: &AppState) -> Option<Value> {
             "indexName": mount.index(),
             "writable": mount.config.writable,
             "recallStage": recall_stage(mount).await,
-            "exports": mount
-                .config
-                .export
-                .as_ref()
-                .map(|export| export.prefixes.clone())
-                .unwrap_or_default(),
             "cacheEntries": cache_entries,
             "cacheBytes": cache_bytes,
         }));

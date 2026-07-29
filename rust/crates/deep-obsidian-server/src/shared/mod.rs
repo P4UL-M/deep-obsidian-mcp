@@ -1,11 +1,12 @@
 //! Shared Algolia-backed corpus support (design: docs/algolia-shared-wiki.md).
 //!
 //! A [`SharedMountRuntime`] grafts a remote corpus into the vault namespace
-//! under `mount_at` (hydrating reads, versioned writes), and optionally
-//! exports local prefixes up into the same index (`share push`).
+//! under `mount_at` (hydrating reads, versioned writes). Content enters the
+//! index through mount writes or the one-shot `share seed`; explicit removal
+//! is `share retract` (model C: mount-only authorship).
 
 pub mod cache;
-pub mod push;
+pub mod seed;
 pub mod reads;
 pub mod records_build;
 pub mod retrieval;

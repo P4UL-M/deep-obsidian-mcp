@@ -146,12 +146,14 @@ pub struct AuthConfigInput {
     pub allowed_origins: Option<Vec<String>>,
 }
 
-/// A shared Algolia-backed corpus attached to the vault.
+/// A shared Algolia-backed corpus attached to the vault (model C: the wiki
+/// lives in the index and is authored through the mount).
 ///
 /// `mount_at` grafts the remote corpus into the vault namespace as a virtual
-/// read/write prefix; `export` optionally pushes local prefixes up into the
-/// same index. Keys are `SecretRef`s (or the `DEEP_OBSIDIAN_ALGOLIA_API_KEY`
-/// env var); plaintext keys never live in the config file.
+/// read/write prefix. Content enters the index through mount writes or the
+/// one-shot `share seed` command — there is no standing export. Keys are
+/// `SecretRef`s (or the `DEEP_OBSIDIAN_ALGOLIA_API_KEY` env var); plaintext
+/// keys never live in the config file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedMountConfig {
@@ -171,21 +173,9 @@ pub struct SharedMountConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub export: Option<SharedExportConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<SharedCacheConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionConfig>,
-}
-
-/// Which local content is pushed up to the shared index.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct SharedExportConfig {
-    /// Local vault-relative folder prefixes to publish (trailing slash).
-    pub prefixes: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exclude: Vec<String>,
 }
 
 /// Bounded local cache of hydrated shared notes.
