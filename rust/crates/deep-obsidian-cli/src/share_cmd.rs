@@ -432,6 +432,19 @@ anywhere in the index.\n\nCreate a search-only key for this index (Algolia dashb
 from it would be useless"
                 ));
             }
+            // `browse` is a separate ACL from `search`, and several mount reads
+            // need it (listing the mount root, note_history, dump). Without it
+            // the teammate gets a bare 403 from those, so say so up front
+            // rather than letting them discover it.
+            if !acls.iter().any(|acl| acl == "browse") {
+                println!(
+                    "WARNING: the parent key lacks the `browse` ACL (has: {acls:?}).\n\
+Reads that enumerate exhaustively will fail with 403 for the teammate:\n\
+  - list_children on the mount ROOT (subfolders of a named folder still work)\n\
+  - note_history, and `share dump`\n\
+Add `browse` to the key for a fully usable read-only mount.\n"
+                );
+            }
             let restrictions = filters
                 .as_deref()
                 .map(|filters| format!("filters={}", urlencoding_encode(filters)))

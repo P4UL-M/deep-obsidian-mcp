@@ -430,13 +430,14 @@ impl AlgoliaClient {
 }
 
 /// ACLs Algolia reports for an API key.
-pub const WRITE_ACLS: &[&str] = &[
-    "addObject",
-    "deleteObject",
-    "deleteIndex",
-    "editSettings",
-    "settings",
-];
+/// ACLs that let a key MUTATE the index.
+///
+/// `settings` is deliberately absent: in Algolia it grants *reading* index
+/// settings, while `editSettings` is the write counterpart. Treating `settings`
+/// as a write ACL falsely rejected legitimate search-only keys — verified
+/// against a live account, where a `search + listIndexes + settings` key was
+/// refused a record write, a settings edit and an index delete.
+pub const WRITE_ACLS: &[&str] = &["addObject", "deleteObject", "deleteIndex", "editSettings"];
 
 impl AlgoliaClient {
     /// The ACLs granted to `key`. Used to refuse deriving a "read-only"

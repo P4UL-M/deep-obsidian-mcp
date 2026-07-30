@@ -33,6 +33,9 @@ Canonical config shape:
 - `embedding.model`
 - `embedding.baseUrl`
 - `embedding.apiKeyRef`
+- `shared[]` (optional) — `mountAt`, `appId`, `indexName`, `keyRef`, `baseUrl`,
+  `writable`, `participantId`, `cache.maxBytes`, `cache.pin[]`,
+  `retention.minVersions`, `retention.maxAgeDays`
 
 Resolution precedence:
 
@@ -51,6 +54,9 @@ Rules:
 - Encrypted local secret storage prevents accidental plaintext exposure in config files. For stronger local protection, use the OS keyring provider. The encrypted-file fallback is not equivalent to OS keyring storage because the application carries the decryption key.
 - `setup-service` and packaged mode choose an index directory outside the vault when no index directory is explicitly resolved; explicit CLI, config file, or environment values must be preserved.
 - Packaged mode is opt-in through `--packaged` or `DEEP_OBSIDIAN_PACKAGED=1`; ad-hoc dev commands without that opt-in keep the vault-local default index directory for compatibility.
+- `shared[]` is optional and absent by default. A config without it must behave exactly as before shared mounts existed.
+- `shared[].keyRef` stores a reference to the Algolia API key, never the key. `DEEP_OBSIDIAN_ALGOLIA_API_KEY` overrides it for containers and tests.
+- Writing a config must not silently drop a `shared[]` block it does not understand. (A binary predating the field will do so; that is a release-ordering constraint, not permitted behaviour.)
 
 ## Service Contract
 
@@ -102,6 +108,45 @@ The black-box surface must preserve:
 - `request_vault_upload`
 - `upsert_session_note`
 
+Tool availability is capability-gated, not unconditional. A tool is advertised
+only when the running configuration can honour it:
+
+- `grep_search` requires a resolved ripgrep binary.
+- `delete_note`, `note_history`, `read_version`, and `resolve_divergence` require
+  at least one connected shared mount, and must be absent otherwise.
+
+Names and input schemas of the preserved tools above never change; only their
+presence is conditional.
+
+### Shared-mount behaviour
+
+When `shared[]` is configured, a mounted prefix routes to the shared index while
+every other path stays local (longest-prefix wins; the mount root matches with or
+without its trailing slash). Required properties:
+
+- Reads of a mounted path hydrate from the index and must reproduce the stored
+  note byte-for-byte.
+- Writes to a mounted path are append-only versions. A write must never destroy
+  the previous version: it is superseded into a history index and stays readable
+  via `note_history` / `read_version`. A write based on a superseded version must
+  still succeed, recording `forkedFrom` and `hasDivergence` rather than being
+  rejected or silently overwriting.
+- `delete_note` is a soft delete: the note leaves every listing and search, its
+  content stays recoverable, and it is restored by writing the note again. It
+  must refuse local paths — the MCP surface exposes no local file deletion.
+- Permanent removal of a note and its history is a CLI operation (`share
+  retract`), never an MCP tool.
+- `mount.writable: false` must reject writes before any network call.
+- Retrieval over a mount must report its scope honestly: `hybrid_search` and
+  `load_knowledge` expose the mount's `recallStage`, `grep_search` reports
+  `exhaustive: false` with the prefilter used and refuses patterns with no
+  literal anchor, and `list_children` reports `foldersTruncated` when facet
+  enumeration hits Algolia's cap.
+- A path a scoped key may not read must be indistinguishable from a path that
+  does not exist, so a key holder cannot enumerate what is hidden from them.
+- `count` in a retrieval result always describes the returned list, including
+  federated mount hits.
+
 `upsert_note` must preserve explicit author control. If `content` is provided, it must be written as-is. If `title` or `frontmatter` are provided, they must only be written when explicitly requested. `content` and the compose fields (`body`/`title`/`frontmatter`) are mutually exclusive; as a robustness concession to clients that fill every schema property, a call providing both `content` and `body` with identical text succeeds (writing `content`, with a `warning` in the result), while diverging text is rejected.
 
 `upsert_session_note` must preserve the provided markdown body as-is, except for optional trailing `## Manual Notes` preservation when requested. It must not inject an implicit title or heading.
@@ -131,6 +176,10 @@ Expected fixture root for CLI and integration tests:
 Preferred verification commands:
 
 - `cargo test --workspace`
+- Live shared-mount checks (ignored by default, env-gated; they talk to a real
+  Algolia account and must be run against a scratch index):
+  `cargo test -p deep-obsidian-server --test shared_concurrency_live -- --ignored`
+  and `--test shared_secured_key_live -- --ignored`
 - `cargo run -p deep-obsidian-cli --bin deep-obsidian-mcp -- doctor --vault tests/fixtures/vault`
 - `cargo run -p deep-obsidian-cli --bin deep-obsidian-mcp -- print-config --vault tests/fixtures/vault`
 - `cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp`

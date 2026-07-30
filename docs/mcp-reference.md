@@ -21,6 +21,30 @@ and usage, see the top-level [USAGE.md](../USAGE.md).
 - `request_vault_upload` — mint an out-of-band upload URL for binary/large files
 - `upsert_session_note` — create/update a session note
 
+### Shared-mount tools
+
+Registered **only when a shared Algolia mount is configured and connected**
+(see [algolia-shared-wiki.md](./algolia-shared-wiki.md)); absent otherwise:
+
+- `delete_note` — soft-delete a note on a mount. It leaves listings and search,
+  its previous version moves to history, and the content stays recoverable.
+  Writing the note again undeletes it. Refuses local paths.
+- `note_history` — list a mounted note's versions (participant, timestamp,
+  supersession, fork).
+- `read_version` — read a specific, possibly superseded version.
+- `resolve_divergence` — return a diverged note's head, the version it overtook,
+  and their common ancestor, so the caller can three-way merge. The server never
+  merges by itself.
+
+Existing tools behave the same on mounted paths, with their scope reported:
+`hybrid_search` / `load_knowledge` carry the mount's `recallStage`,
+`grep_search` carries `exhaustive: false` plus the prefilter used (and refuses
+patterns with no literal anchor), and `list_children` carries `foldersTruncated`
+when facet enumeration hits Algolia's 100-value cap.
+
+Permanent deletion (note + chunks + entire history) is a CLI operation,
+`share retract`, deliberately not an MCP tool.
+
 ### Authoring tool notes
 
 - **`upsert_note`** — generic create/update with explicit `content`, or

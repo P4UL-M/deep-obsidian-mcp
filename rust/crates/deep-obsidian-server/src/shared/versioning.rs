@@ -33,6 +33,12 @@ pub async fn fetch_head(
     let raw = mount.client.get_objects(mount.index(), &ids).await;
     // Either "no index yet" or "this key may not see that object" means the
     // same thing to a reader: there is no such note here.
+    //
+    // The second case matters for security: Algolia answers 403 `objectID not
+    // allowed` when a secured key's filter restriction excludes the object.
+    // Surfacing that verbatim let a scoped teammate tell "exists but hidden"
+    // from "does not exist" and so enumerate paths outside their scope. An
+    // outright invalid key reports a different message and still errors.
     let mut results = match raw {
         Err(error) if error.is_forbidden_by_key_scope() => Vec::new(),
         other => super::empty_if_missing_index(other, Vec::new())?,

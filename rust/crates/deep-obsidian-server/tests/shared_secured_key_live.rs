@@ -8,14 +8,14 @@
 //!
 //! ```text
 //! DEEP_OBSIDIAN_ALGOLIA_APP_ID=... \
-//! DEEP_OBSIDIAN_ALGOLIA_API_KEY=<a key with search+write on the test index> \
+//! DEEP_OBSIDIAN_ALGOLIA_OWNER_KEY=<write key, seeds the fixtures> \
+//! DEEP_OBSIDIAN_ALGOLIA_SEARCH_KEY=<SEARCH-ONLY key, the secured-key parent> \
 //! DEEP_OBSIDIAN_ALGOLIA_TEST_INDEX=scratch-securedkey \
 //!   cargo test -p deep-obsidian-server --test shared_secured_key_live -- --ignored --test-threads=1
 //! ```
 
 use deep_obsidian_algolia::generate_secured_api_key;
-use deep_obsidian_config::secrets::SecretResolver;
-use deep_obsidian_server::shared::{connect_mount, reads, versioning, SharedMountRuntime};
+use deep_obsidian_server::shared::{reads, versioning, SharedMountRuntime};
 use deep_obsidian_types::SharedMountConfig;
 use std::fs;
 use std::path::PathBuf;
@@ -32,10 +32,15 @@ fn temp_dir(prefix: &str) -> PathBuf {
     dir
 }
 
-fn live_env() -> Option<(String, String, String)> {
+/// (app id, owner write key, search-only parent key, index).
+///
+/// The two keys are distinct on purpose: seeding needs write, and a secured key
+/// must be derived from a search-only parent or it inherits write access.
+fn live_env() -> Option<(String, String, String, String)> {
     Some((
         std::env::var("DEEP_OBSIDIAN_ALGOLIA_APP_ID").ok()?,
-        std::env::var("DEEP_OBSIDIAN_ALGOLIA_API_KEY").ok()?,
+        std::env::var("DEEP_OBSIDIAN_ALGOLIA_OWNER_KEY").ok()?,
+        std::env::var("DEEP_OBSIDIAN_ALGOLIA_SEARCH_KEY").ok()?,
         std::env::var("DEEP_OBSIDIAN_ALGOLIA_TEST_INDEX").ok()?,
     ))
 }
@@ -43,9 +48,9 @@ fn live_env() -> Option<(String, String, String)> {
 /// Builds a mount whose key is passed explicitly, so the owner and the scoped
 /// teammate can be driven side by side in one process.
 fn mount_with_key(app_id: &str, index: &str, who: &str, key: &str, writable: bool) -> SharedMountRuntime {
-    // `resolve_api_key` prefers the env var, which is how a teammate supplies a
-    // secured key without it ever touching a config file.
-    std::env::set_var("DEEP_OBSIDIAN_ALGOLIA_API_KEY", key);
+    // Built directly rather than through `connect_mount`, which resolves the key
+    // from the environment: mutating a shared env var made one test derive its
+    // key from another test's leftovers.
     let config = SharedMountConfig {
         mount_at: "_Shared/Team/".to_string(),
         app_id: app_id.to_string(),
@@ -57,8 +62,21 @@ fn mount_with_key(app_id: &str, index: &str, who: &str, key: &str, writable: boo
         cache: None,
         retention: None,
     };
-    connect_mount(&config, &SecretResolver::new(), &temp_dir("key-index"))
-        .expect("connect live mount")
+    let dir = temp_dir("key-index");
+    SharedMountRuntime {
+        client: deep_obsidian_algolia::AlgoliaClient::new(app_id, key, None),
+        history_index: deep_obsidian_server::shared::history_index_name(index),
+        cache: deep_obsidian_server::shared::cache::NoteCache::open(
+            dir.join("cache"),
+            64 * 1024 * 1024,
+            Vec::new(),
+        )
+        .expect("cache"),
+        config,
+        recall_stage: std::sync::Mutex::new("lexical".to_string()),
+        history_provisioned: std::sync::atomic::AtomicBool::new(false),
+        main_provisioned: std::sync::atomic::AtomicBool::new(false),
+    }
 }
 
 fn note(marker: &str, note_type: &str) -> String {
@@ -78,8 +96,8 @@ const PRIVATE: &str = "_Agent/Sessions/Scoped private.md";
 #[tokio::test]
 #[ignore = "requires a live Algolia account; see module docs"]
 async fn secured_key_scopes_reads_and_hides_out_of_scope_paths() {
-    let Some((app_id, owner_key, index)) = live_env() else {
-        panic!("set DEEP_OBSIDIAN_ALGOLIA_APP_ID / _API_KEY / _TEST_INDEX");
+    let Some((app_id, owner_key, search_key, index)) = live_env() else {
+        panic!("set DEEP_OBSIDIAN_ALGOLIA_APP_ID / _OWNER_KEY / _SEARCH_KEY / _TEST_INDEX");
     };
 
     // Owner seeds one note inside the shared scope and one outside it.
@@ -95,16 +113,32 @@ async fn secured_key_scopes_reads_and_hides_out_of_scope_paths() {
 
     // Mint the teammate key. The restriction string is url-encoded exactly as
     // `share key` builds it.
-    let secured = generate_secured_api_key(&owner_key, "filters=folders.lvl0%3A_Wiki");
+    let secured = generate_secured_api_key(&search_key, "filters=folders.lvl0%3A_Wiki");
     let teammate = mount_with_key(&app_id, &index, "teammate@keyscope", &secured, false);
 
-    // Listing shows only the in-scope folder.
-    let (entries, _truncated) = reads::list_children(&teammate, "").await.expect("list root");
+    // Listing a NAMED folder uses facet + search only, so it works with a
+    // search-only key. (The mount ROOT additionally needs the `browse` ACL —
+    // asserted separately below.)
+    let (entries, _truncated) = reads::list_children(&teammate, "_Wiki")
+        .await
+        .expect("list _Wiki");
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-    assert!(names.contains(&"_Wiki"), "wiki must be visible: {names:?}");
     assert!(
-        !names.contains(&"_Agent"),
-        "out-of-scope folder leaked into the listing: {names:?}"
+        names.contains(&"Decisions"),
+        "the in-scope subfolder must be visible: {names:?}"
+    );
+
+    // Nothing out of scope may surface anywhere in the wiki listing.
+    let (all_wiki, _) = reads::list_children(&teammate, "_Wiki/Decisions")
+        .await
+        .expect("list _Wiki/Decisions");
+    assert!(
+        all_wiki.iter().any(|entry| entry.name == "Scoped public.md"),
+        "the in-scope note must be listed"
+    );
+    assert!(
+        !all_wiki.iter().any(|entry| entry.name.contains("private")),
+        "out-of-scope note leaked into a listing"
     );
 
     // The in-scope note reads normally.
@@ -143,6 +177,28 @@ async fn secured_key_scopes_reads_and_hides_out_of_scope_paths() {
         "out-of-scope and nonexistent must be indistinguishable"
     );
 
+    // Documented limitation, pinned so it cannot regress silently: enumerating
+    // the mount ROOT uses `browse`, a distinct ACL from `search`. A key without
+    // it fails there while every scoped read above still works — which is why
+    // `share key` warns when the parent lacks `browse`.
+    let root = reads::list_children(&teammate, "").await;
+    let has_browse = std::env::var("DEEP_OBSIDIAN_ALGOLIA_SEARCH_KEY_HAS_BROWSE").is_ok();
+    if has_browse {
+        let (entries, _) = root.expect("root listing with a browse-capable key");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(&"_Wiki"), "wiki must be visible at root: {names:?}");
+        assert!(
+            !names.contains(&"_Agent"),
+            "out-of-scope folder leaked into the root listing: {names:?}"
+        );
+    } else {
+        assert!(
+            root.is_err(),
+            "a key without `browse` is expected to fail the root listing; if this now \
+succeeds, drop the browse warning from `share key`"
+        );
+    }
+
     // Cleanup with the owner key.
     let owner = mount_with_key(&app_id, &index, "owner@keyscope", &owner_key, true);
     let _ = versioning::retract_note(&owner, PUBLIC).await;
@@ -155,10 +211,10 @@ async fn secured_key_scopes_reads_and_hides_out_of_scope_paths() {
 #[tokio::test]
 #[ignore = "requires a live Algolia account; see module docs"]
 async fn secured_key_cannot_write() {
-    let Some((app_id, owner_key, index)) = live_env() else {
-        panic!("set DEEP_OBSIDIAN_ALGOLIA_APP_ID / _API_KEY / _TEST_INDEX");
+    let Some((app_id, owner_key, search_key, index)) = live_env() else {
+        panic!("set DEEP_OBSIDIAN_ALGOLIA_APP_ID / _OWNER_KEY / _SEARCH_KEY / _TEST_INDEX");
     };
-    let secured = generate_secured_api_key(&owner_key, "filters=folders.lvl0%3A_Wiki");
+    let secured = generate_secured_api_key(&search_key, "filters=folders.lvl0%3A_Wiki");
     // Deliberately claim writable so the request actually reaches Algolia.
     let teammate = mount_with_key(&app_id, &index, "teammate@keyscope", &secured, true);
     let path = "_Wiki/Decisions/Teammate attempt.md";
@@ -174,8 +230,9 @@ async fn secured_key_cannot_write() {
     .await
     .expect_err("a secured (search-only) key must not be able to write");
     let rendered = error.to_string();
+    let lowered = rendered.to_lowercase();
     assert!(
-        rendered.contains("403") || rendered.to_lowercase().contains("not allowed"),
+        lowered.contains("not enough rights") || lowered.contains("not allowed"),
         "expected an authorization failure, got: {rendered}"
     );
 

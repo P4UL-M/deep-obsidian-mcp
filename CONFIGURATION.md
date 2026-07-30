@@ -1,6 +1,7 @@
 # Configuring deep-obsidian-mcp
 
 - [Config file & precedence](#config-file--precedence)
+- [Shared Algolia wiki](#shared-algolia-wiki)
 - [Semantic search (embeddings)](#semantic-search-embeddings)
 - [Authentication](#authentication)
 - [Automatic reindexing](#automatic-reindexing)
@@ -24,6 +25,58 @@ Secrets (embedding API keys, the auth token) are **never** stored in the config
 file. The config only holds a reference; the value lives in the OS keyring when
 available, or an encrypted local file as a fallback. The encrypted-file fallback
 is weaker than the OS keyring because the application carries the decryption key.
+
+## Shared Algolia wiki
+
+Optional and absent by default. A `shared[]` entry mounts an Algolia index as a
+virtual folder in the vault, so a team can author one wiki through it:
+
+```json
+{
+  "vaultPath": "~/Vault",
+  "shared": [
+    {
+      "mountAt": "_Shared/Team/",
+      "appId": "XXXXXXXXXX",
+      "indexName": "team-wiki",
+      "keyRef": { "kind": "osKeyring", "service": "deep-obsidian-mcp", "account": "algolia-team" },
+      "writable": true,
+      "participantId": "you@example.com",
+      "cache": { "maxBytes": 536870912, "pin": ["_Shared/Team/_Wiki/Decisions/"] },
+      "retention": { "minVersions": 5, "maxAgeDays": 90 }
+    }
+  ]
+}
+```
+
+Store the key (never in the config file) and check it round-trips:
+
+```bash
+deep-obsidian-mcp share set-key --index team-wiki
+```
+
+Import existing local notes once, inspect first:
+
+```bash
+deep-obsidian-mcp share seed --prefix _Wiki/ --dry-run
+deep-obsidian-mcp share seed --prefix _Wiki/
+```
+
+Give a teammate read-only access scoped to part of the wiki. The parent must be a
+**search-only** key with the `browse` ACL — a secured key inherits its parent's
+rights, so deriving from a write key would hand out write access:
+
+```bash
+deep-obsidian-mcp share key --parent-key <search-only-key> --filters 'folders.lvl0:_Wiki'
+```
+
+Back the index up (it is the only copy of the shared wiki):
+
+```bash
+deep-obsidian-mcp share dump --to ~/Backups/team-wiki
+```
+
+Design, guarantees and known limits: [docs/algolia-shared-wiki.md](docs/algolia-shared-wiki.md).
 
 ## Semantic search (embeddings)
 

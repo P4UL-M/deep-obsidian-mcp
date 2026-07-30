@@ -2,6 +2,42 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## Unreleased
+
+### Added
+
+- **Shared Algolia wiki** (opt-in `shared[]` config): a team wiki that lives in
+  an Algolia index and is authored through a virtual mount in the vault. Reads
+  hydrate on demand with a bounded local cache; writes are append-only versions
+  so an overwrite never destroys the previous one.
+  See [docs/algolia-shared-wiki.md](docs/algolia-shared-wiki.md).
+- MCP tools, registered only when a mount is connected: `delete_note` (soft,
+  recoverable), `note_history`, `read_version`, `resolve_divergence`.
+- CLI: `share seed` (one-shot import, `--move` to keep a single copy),
+  `share dump` (materialize the index to disk — backup / exit strategy),
+  `share status`, `share retract` (permanent purge), `share set-key`
+  (stores the API key and verifies the round trip), `share key` (mint a
+  filter-scoped read-only teammate key).
+- `scripts/demo-shared-wiki.sh` (self-contained, mock Algolia) and
+  `scripts/try-shared-wiki.sh` (throwaway sandbox over an existing index).
+
+### Fixed
+
+- Secret storage never persisted: `keyring` was declared without platform
+  features, so every OS-keyring write silently hit the crate's in-memory mock
+  store and the value vanished with the process. Affected embedding API keys and
+  HTTP auth tokens as well as the new Algolia keys.
+- `setup-service` now backs up an existing config before overwriting it, and the
+  wizard prefills from the current config instead of discarding it.
+- The `index` crate's vault helpers were missing the symlink-traversal guard the
+  other two copies had; all three are now one implementation in
+  `deep-obsidian-core`.
+
+### Changed
+
+- `docs/behavior-contract.md`: tool availability is capability-gated rather than
+  unconditional, and shared-mount behaviour is specified.
+
 ## v0.1.0-alpha.12 — 2026-07-02
 
 ### Improved

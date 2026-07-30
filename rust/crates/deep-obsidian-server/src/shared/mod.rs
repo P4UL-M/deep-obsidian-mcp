@@ -60,25 +60,6 @@ pub fn empty_if_missing_index<T>(
     }
 }
 
-/// Maps a secured key's scope rejection onto an empty result, so a note the
-/// key may not see is INDISTINGUISHABLE from one that does not exist.
-///
-/// Algolia answers 403 `objectID not allowed` when a secured key's `filters`
-/// restriction excludes the addressed object. Surfacing that verbatim let a
-/// scoped teammate enumerate which paths exist outside their scope by telling
-/// 403 apart from not-found — a small but real probe channel. An outright
-/// invalid key reports a different message and still errors.
-pub(crate) fn empty_if_out_of_key_scope<T>(
-    result: std::result::Result<T, deep_obsidian_algolia::AlgoliaError>,
-    empty: T,
-) -> Result<T> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) if error.is_forbidden_by_key_scope() => Ok(empty),
-        Err(error) => Err(error.into()),
-    }
-}
-
 /// An empty `SearchResponse`, for [`empty_if_missing_index`] on search calls.
 pub fn empty_search_response() -> deep_obsidian_algolia::SearchResponse {
     deep_obsidian_algolia::SearchResponse {
