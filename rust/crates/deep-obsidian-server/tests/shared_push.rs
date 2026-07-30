@@ -212,14 +212,20 @@ async fn seed_never_removes_remote_notes() {
         .await
         .expect("browse main");
     assert!(leftover.is_empty(), "retraction removes note + chunks");
-    let leftover_history = mount
-        .client
-        .browse_all(
-            &mount.history_index,
-            Some("noteId:\"_Wiki/Syntheses/Product narrative.md\""),
-        )
-        .await
-        .expect("browse history");
+    // This note was never superseded, so the history index may not exist at
+    // all — which is itself "no history". Tolerated the same way production
+    // reads do.
+    let leftover_history = deep_obsidian_server::shared::empty_if_missing_index(
+        mount
+            .client
+            .browse_all(
+                &mount.history_index,
+                Some("noteId:\"_Wiki/Syntheses/Product narrative.md\""),
+            )
+            .await,
+        Vec::new(),
+    )
+    .expect("browse history");
     assert!(leftover_history.is_empty(), "retraction purges history too");
 }
 
@@ -317,4 +323,85 @@ async fn seed_move_and_dump_round_trip() {
     .expect("restored note");
     assert_eq!(restored, DECISION);
     assert!(target.join("deep-obsidian-dump.json").exists());
+}
+
+/// Regression: nothing may 404 against a VIRGIN Algolia app. An index is
+/// created by its first write, so before that every read answers
+/// `404 Index <name> does not exist` — and the `_history` index stays absent
+/// until a note is first superseded. This walks the whole surface against a
+/// brand-new index name, then proves history provisioning happens lazily on
+/// the first supersession.
+#[tokio::test]
+async fn virgin_index_never_404s_and_history_is_provisioned_lazily() {
+    std::env::set_var("DEEP_OBSIDIAN_ALGOLIA_API_KEY", "test-key");
+    let (base_url, _mock) = spawn_mock().await;
+    let vault = seed_vault();
+    let index_dir = temp_dir("virgin-index");
+    let secrets = SecretResolver::new();
+    let mut config = mount_config(&base_url, "paul@test");
+    config.index_name = "brand-new-wiki".to_string();
+    let mount = connect_mount(&config, &secrets, &index_dir).expect("connect");
+    let prefixes = vec!["_Wiki/".to_string()];
+
+    // Reads against an index that has never been written to: empty, not 404.
+    assert!(reads::list_children(&mount, "").await.expect("list root").is_empty());
+    assert!(reads::list_folders(&mount, 3).await.expect("folders").is_empty());
+    assert!(reads::find_paths(&mount, "wiki", 10).await.expect("find").is_empty());
+    assert!(reads::backlinks(&mount, "_Wiki/Any.md").await.expect("backlinks").is_empty());
+    assert!(versioning::fetch_head(&mount, "_Wiki/Any.md")
+        .await
+        .expect("head on virgin index")
+        .is_none());
+    let dump_target = temp_dir("virgin-dump");
+    assert_eq!(
+        reads::dump_all(&mount, &dump_target).await.expect("dump virgin").notes,
+        0
+    );
+
+    // First seed: plan sees an empty index as first_push, apply provisions the
+    // MAIN index only — the history index still does not exist.
+    let plan = plan_seed(&vault, &mount, &prefixes).await.expect("plan virgin");
+    assert!(plan.first_push);
+    apply_seed(&vault, &mount, &prefixes, &plan).await.expect("apply virgin");
+
+    // History reads still fine (no index yet) — this is the exact call that
+    // produced the reported `Index shared_history does not exist`.
+    let seeded = "_Wiki/Decisions/Keep retrieval architecture-agnostic.md";
+    let history = deep_obsidian_server::shared::empty_if_missing_index(
+        mount
+            .client
+            .browse_all(&mount.history_index, Some("recordType:note"))
+            .await,
+        Vec::new(),
+    )
+    .expect("history browse pre-supersession");
+    assert!(history.is_empty(), "no history before any supersession");
+
+    // Second write supersedes -> history index is created AND provisioned.
+    versioning::push_note_version(
+        &mount,
+        seeded,
+        &format!("{DECISION}\n## Consequences\n\nSecond version.\n"),
+        &[],
+        None,
+        false,
+    )
+    .await
+    .expect("supersede");
+
+    let history = mount
+        .client
+        .browse_all(&mount.history_index, Some("recordType:note"))
+        .await
+        .expect("history exists now");
+    assert_eq!(history.len(), 1, "the superseded version landed in history");
+    let settings = mount
+        .client
+        .get_settings(&mount.history_index)
+        .await
+        .expect("history settings applied lazily");
+    assert!(
+        settings.get("attributesForFaceting").is_some(),
+        "history index settings were provisioned after its first write: {settings}"
+    );
 }

@@ -474,6 +474,23 @@ for: shared mounts and the bounded cache; `grep_search` reporting
 recall stage; append-only version semantics and the three new history tools;
 explicit push consent and history-purging retraction.
 
+### 11.1 Lazy index creation
+
+An Algolia index does not exist until its first **write**; every read against a
+never-written index answers `404 Index <name> does not exist`. Two consequences
+the implementation has to honour:
+
+- **All reads treat that 404 as "no records"** (`empty_if_missing_index`), so a
+  first seed into a virgin app, a mount pointed at an empty index, and history
+  reads before the first supersession all behave as empty rather than failing.
+- **The history index is provisioned lazily.** Its settings cannot be applied
+  before it exists, and it only exists once a note is first superseded — so
+  `setSettings` runs immediately after that first history write (once per
+  process, non-fatal on failure since the index is usable with defaults).
+
+The mock mirrors this: reads against an unwritten index return the same 404.
+The permissive auto-create it used to do hid the whole bug class from the tests.
+
 ## 12. Implementation notes
 
 **No official Algolia Rust client** — the

@@ -47,21 +47,24 @@ pub async fn fetch_version_chunks(
     remote_path: &str,
     version_id: &str,
 ) -> Result<Vec<(usize, usize, String)>> {
-    let response = mount
-        .client
-        .search(
-            index,
-            &SearchRequest {
-                query: String::new(),
-                filters: Some(format!(
-                    "recordType:chunk AND noteId:\"{remote_path}\" AND versionId:\"{version_id}\""
-                )),
-                hits_per_page: Some(1000),
-                distinct: Some(false),
-                ..SearchRequest::default()
-            },
-        )
-        .await?;
+    let response = super::empty_if_missing_index(
+        mount
+            .client
+            .search(
+                index,
+                &SearchRequest {
+                    query: String::new(),
+                    filters: Some(format!(
+                        "recordType:chunk AND noteId:\"{remote_path}\" AND versionId:\"{version_id}\""
+                    )),
+                    hits_per_page: Some(1000),
+                    distinct: Some(false),
+                    ..SearchRequest::default()
+                },
+            )
+            .await,
+        super::empty_search_response(),
+    )?;
     Ok(response
         .hits
         .iter()
@@ -130,10 +133,13 @@ pub async fn list_children(
             depth - 1
         )
     };
-    let facet_hits = mount
-        .client
-        .search_facet_values(mount.index(), &facet, "", Some(&filters), 1000)
-        .await?;
+    let facet_hits = super::empty_if_missing_index(
+        mount
+            .client
+            .search_facet_values(mount.index(), &facet, "", Some(&filters), 1000)
+            .await,
+        Vec::new(),
+    )?;
     for hit in facet_hits {
         let name = hit
             .value
@@ -150,19 +156,22 @@ pub async fn list_children(
     }
 
     // Files directly in this dir.
-    let response = mount
-        .client
-        .search(
-            mount.index(),
-            &SearchRequest {
-                query: String::new(),
-                filters: Some(format!("recordType:note AND dir:\"{remote_dir}\"")),
-                hits_per_page: Some(1000),
-                distinct: Some(false),
-                ..SearchRequest::default()
-            },
-        )
-        .await?;
+    let response = super::empty_if_missing_index(
+        mount
+            .client
+            .search(
+                mount.index(),
+                &SearchRequest {
+                    query: String::new(),
+                    filters: Some(format!("recordType:note AND dir:\"{remote_dir}\"")),
+                    hits_per_page: Some(1000),
+                    distinct: Some(false),
+                    ..SearchRequest::default()
+                },
+            )
+            .await,
+        super::empty_search_response(),
+    )?;
     for hit in response.hits {
         let Some(path) = hit.get("path").and_then(Value::as_str) else {
             continue;
@@ -187,16 +196,19 @@ pub async fn list_children(
 pub async fn list_folders(mount: &SharedMountRuntime, max_depth: usize) -> Result<Vec<String>> {
     let mut folders = Vec::new();
     for level in 0..max_depth.clamp(1, 3) {
-        let hits = mount
-            .client
-            .search_facet_values(
-                mount.index(),
-                &format!("folders.lvl{level}"),
-                "",
-                Some("recordType:note"),
-                1000,
-            )
-            .await?;
+        let hits = super::empty_if_missing_index(
+            mount
+                .client
+                .search_facet_values(
+                    mount.index(),
+                    &format!("folders.lvl{level}"),
+                    "",
+                    Some("recordType:note"),
+                    1000,
+                )
+                .await,
+            Vec::new(),
+        )?;
         for hit in hits {
             folders.push(mount.mounted_path(&hit.value));
         }
@@ -212,20 +224,23 @@ pub async fn find_paths(
     query: &str,
     limit: usize,
 ) -> Result<Vec<String>> {
-    let response = mount
-        .client
-        .search(
-            mount.index(),
-            &SearchRequest {
-                query: query.to_string(),
-                filters: Some("recordType:note".to_string()),
-                restrict_searchable_attributes: vec!["path".to_string()],
-                hits_per_page: Some(limit),
-                distinct: Some(false),
-                ..SearchRequest::default()
-            },
-        )
-        .await?;
+    let response = super::empty_if_missing_index(
+        mount
+            .client
+            .search(
+                mount.index(),
+                &SearchRequest {
+                    query: query.to_string(),
+                    filters: Some("recordType:note".to_string()),
+                    restrict_searchable_attributes: vec!["path".to_string()],
+                    hits_per_page: Some(limit),
+                    distinct: Some(false),
+                    ..SearchRequest::default()
+                },
+            )
+            .await,
+        super::empty_search_response(),
+    )?;
     Ok(response
         .hits
         .iter()
@@ -237,21 +252,24 @@ pub async fn find_paths(
 /// Reverse-link lookup: one filter query (design §7 — the case where the
 /// shared index is genuinely better than the local graph walk).
 pub async fn backlinks(mount: &SharedMountRuntime, remote_path: &str) -> Result<Vec<String>> {
-    let response = mount
-        .client
-        .search(
-            mount.index(),
-            &SearchRequest {
-                query: String::new(),
-                filters: Some(format!(
-                    "recordType:note AND links:\"{remote_path}\""
-                )),
-                hits_per_page: Some(1000),
-                distinct: Some(false),
-                ..SearchRequest::default()
-            },
-        )
-        .await?;
+    let response = super::empty_if_missing_index(
+        mount
+            .client
+            .search(
+                mount.index(),
+                &SearchRequest {
+                    query: String::new(),
+                    filters: Some(format!(
+                        "recordType:note AND links:\"{remote_path}\""
+                    )),
+                    hits_per_page: Some(1000),
+                    distinct: Some(false),
+                    ..SearchRequest::default()
+                },
+            )
+            .await,
+        super::empty_search_response(),
+    )?;
     Ok(response
         .hits
         .iter()
@@ -331,10 +349,13 @@ pub async fn dump_all(
     target_dir: &std::path::Path,
 ) -> Result<DumpReport> {
     std::fs::create_dir_all(target_dir)?;
-    let records = mount
-        .client
-        .browse_all(mount.index(), Some("recordType:note"))
-        .await?;
+    let records = super::empty_if_missing_index(
+        mount
+            .client
+            .browse_all(mount.index(), Some("recordType:note"))
+            .await,
+        Vec::new(),
+    )?;
     let mut report = DumpReport {
         notes: 0,
         bytes: 0,

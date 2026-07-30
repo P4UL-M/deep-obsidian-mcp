@@ -42,6 +42,33 @@ pub enum SharedError {
 
 pub type Result<T> = std::result::Result<T, SharedError>;
 
+/// Maps Algolia's "index does not exist" 404 onto an empty result.
+///
+/// An Algolia index is created by its first write, so a shared index that has
+/// never been written to — and the `_history` index until the first note is
+/// superseded — answers 404 to every read. Semantically that is "no records",
+/// not a failure, and treating it as one broke the first seed against a real
+/// account. Every other error still propagates.
+pub fn empty_if_missing_index<T>(
+    result: std::result::Result<T, deep_obsidian_algolia::AlgoliaError>,
+    empty: T,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if error.is_index_not_found() => Ok(empty),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// An empty `SearchResponse`, for [`empty_if_missing_index`] on search calls.
+pub fn empty_search_response() -> deep_obsidian_algolia::SearchResponse {
+    deep_obsidian_algolia::SearchResponse {
+        hits: Vec::new(),
+        nb_hits: 0,
+        facets: None,
+    }
+}
+
 /// A resolved, connected shared mount.
 pub struct SharedMountRuntime {
     pub config: SharedMountConfig,
@@ -51,6 +78,11 @@ pub struct SharedMountRuntime {
     /// First stage the index supports: "neural" when NeuralSearch is enabled on
     /// the index, "lexical" otherwise. Detected from settings at startup.
     pub recall_stage: std::sync::Mutex<String>,
+    /// Set once the history index has had its settings applied. Settings can
+    /// only be applied to an index that exists, and the history index exists
+    /// only after its first record — so provisioning is lazy, right after that
+    /// first write.
+    pub history_provisioned: std::sync::atomic::AtomicBool,
 }
 
 impl SharedMountRuntime {
@@ -137,6 +169,7 @@ pub fn connect_mount(
         history_index,
         cache,
         recall_stage: std::sync::Mutex::new("lexical".to_string()),
+        history_provisioned: std::sync::atomic::AtomicBool::new(false),
     })
 }
 

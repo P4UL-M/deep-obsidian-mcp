@@ -40,19 +40,22 @@ pub async fn search_mount_with_distinct(
     limit: usize,
     distinct: Option<bool>,
 ) -> Result<Vec<RemoteSearchHit>> {
-    let response = mount
-        .client
-        .search(
-            mount.index(),
-            &SearchRequest {
-                query: query.to_string(),
-                filters: Some("recordType:chunk".to_string()),
-                hits_per_page: Some(limit),
-                distinct,
-                ..SearchRequest::default()
-            },
-        )
-        .await?;
+    let response = super::empty_if_missing_index(
+        mount
+            .client
+            .search(
+                mount.index(),
+                &SearchRequest {
+                    query: query.to_string(),
+                    filters: Some("recordType:chunk".to_string()),
+                    hits_per_page: Some(limit),
+                    distinct,
+                    ..SearchRequest::default()
+                },
+            )
+            .await,
+        super::empty_search_response(),
+    )?;
     Ok(response
         .hits
         .iter()

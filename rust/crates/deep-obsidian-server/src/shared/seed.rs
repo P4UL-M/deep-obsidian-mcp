@@ -9,7 +9,7 @@
 use super::records_build::parse_frontmatter_fields;
 use super::versioning::push_note_version;
 use super::{Result, SharedError, SharedMountRuntime};
-use deep_obsidian_algolia::records::{history_index_settings, main_index_settings};
+use deep_obsidian_algolia::records::main_index_settings;
 use serde_json::Value;
 use std::path::Path;
 
@@ -78,10 +78,13 @@ fn collect_seed_set(
 async fn remote_hash_map(
     mount: &SharedMountRuntime,
 ) -> Result<std::collections::HashMap<String, String>> {
-    let records = mount
-        .client
-        .browse_all(mount.index(), Some("recordType:note"))
-        .await?;
+    let records = super::empty_if_missing_index(
+        mount
+            .client
+            .browse_all(mount.index(), Some("recordType:note"))
+            .await,
+        Vec::new(),
+    )?;
     Ok(records
         .iter()
         .filter_map(|record| {
@@ -137,13 +140,13 @@ pub async fn apply_seed(
     plan: &SeedPlan,
 ) -> Result<SeedReport> {
     if plan.first_push {
+        // Only the MAIN index is provisioned here. The history index does not
+        // exist until a note is first superseded, and Algolia refuses settings
+        // on a nonexistent index — so its settings are applied lazily, right
+        // after that first history write (see `versioning::push_note_version`).
         mount
             .client
             .set_settings(mount.index(), main_index_settings())
-            .await?;
-        mount
-            .client
-            .set_settings(&mount.history_index, history_index_settings())
             .await?;
     }
 

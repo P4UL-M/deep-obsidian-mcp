@@ -20,6 +20,19 @@ pub enum AlgoliaError {
     InvalidResponse(String),
 }
 
+impl AlgoliaError {
+    /// True for Algolia's 404 `Index <name> does not exist`. An index springs
+    /// into existence on its first WRITE, so every read against a never-written
+    /// index answers this — callers that treat "no index" as "no records" check
+    /// it instead of failing.
+    pub fn is_index_not_found(&self) -> bool {
+        matches!(
+            self,
+            AlgoliaError::Api { status: 404, message } if message.contains("does not exist")
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, AlgoliaError>;
 
 #[derive(Debug, Clone)]

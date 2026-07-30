@@ -478,14 +478,18 @@ pub async fn note_history_payload(state: &AppState, path: &str) -> Result<Value,
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("note not found on shared mount: {path}"))?;
-    let history = mount
-        .client
-        .browse_all(
-            &mount.history_index,
-            Some(&format!("recordType:note AND noteId:\"{remote}\"")),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    // A note that was never superseded has no history index yet.
+    let history = crate::shared::empty_if_missing_index(
+        mount
+            .client
+            .browse_all(
+                &mount.history_index,
+                Some(&format!("recordType:note AND noteId:\"{remote}\"")),
+            )
+            .await,
+        Vec::new(),
+    )
+    .map_err(|error| error.to_string())?;
     let mut versions: Vec<Value> = history
         .iter()
         .map(|record| {

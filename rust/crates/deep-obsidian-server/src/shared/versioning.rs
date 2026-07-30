@@ -29,7 +29,10 @@ pub async fn fetch_head(
     remote_path: &str,
 ) -> Result<Option<NoteRecord>> {
     let ids = vec![deep_obsidian_algolia::note_object_id(remote_path)];
-    let mut results = mount.client.get_objects(mount.index(), &ids).await?;
+    let mut results = super::empty_if_missing_index(
+        mount.client.get_objects(mount.index(), &ids).await,
+        Vec::new(),
+    )?;
     Ok(results
         .pop()
         .flatten()
@@ -104,15 +107,18 @@ pub async fn push_note_version(
     // (3) copy the superseded version into history BEFORE deleting from main,
     // so a crash between the two leaves a duplicate rather than a loss.
     if let (Some(prev_note), Some(prev_version)) = (&head, &head_version) {
-        let prev_chunks = mount
-            .client
-            .browse_all(
-                mount.index(),
-                Some(&format!(
-                    "recordType:chunk AND noteId:\"{remote_path}\" AND versionId:\"{prev_version}\""
-                )),
-            )
-            .await?;
+        let prev_chunks = super::empty_if_missing_index(
+            mount
+                .client
+                .browse_all(
+                    mount.index(),
+                    Some(&format!(
+                        "recordType:chunk AND noteId:\"{remote_path}\" AND versionId:\"{prev_version}\""
+                    )),
+                )
+                .await,
+            Vec::new(),
+        )?;
         let mut history_records: Vec<Value> = prev_chunks;
         let mut prev_note_value = serde_json::to_value(prev_note).expect("note serializes");
         // History note records get a version-scoped objectID so versions coexist.
@@ -124,17 +130,41 @@ pub async fn push_note_version(
             .client
             .save_objects(&mount.history_index, history_records)
             .await?;
+        // The write above just brought the history index into existence, so
+        // settings can finally be applied. Once per process; a failure here is
+        // non-fatal (the index is usable with defaults, only ranking differs).
+        if !mount
+            .history_provisioned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Err(error) = mount
+                .client
+                .set_settings(
+                    &mount.history_index,
+                    deep_obsidian_algolia::records::history_index_settings(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    index = %mount.history_index,
+                    "history index settings not applied: {error}"
+                );
+            }
+        }
 
         // (4) delete the superseded chunks from main — explicit vPrev filter.
-        mount
-            .client
-            .delete_by_query(
-                mount.index(),
-                &format!(
-                    "recordType:chunk AND noteId:\"{remote_path}\" AND versionId:\"{prev_version}\""
-                ),
-            )
-            .await?;
+        super::empty_if_missing_index(
+            mount
+                .client
+                .delete_by_query(
+                    mount.index(),
+                    &format!(
+                        "recordType:chunk AND noteId:\"{remote_path}\" AND versionId:\"{prev_version}\""
+                    ),
+                )
+                .await,
+            Value::Null,
+        )?;
     }
 
     // (5) head pointer update.
@@ -156,13 +186,16 @@ pub async fn push_note_version(
 /// Applies the floor+ceiling retention rule to one note's history records.
 async fn purge_history(mount: &SharedMountRuntime, remote_path: &str) -> Result<()> {
     let (min_versions, max_age_days) = mount.retention();
-    let history_notes = mount
-        .client
-        .browse_all(
-            &mount.history_index,
-            Some(&format!("recordType:note AND noteId:\"{remote_path}\"")),
-        )
-        .await?;
+    let history_notes = super::empty_if_missing_index(
+        mount
+            .client
+            .browse_all(
+                &mount.history_index,
+                Some(&format!("recordType:note AND noteId:\"{remote_path}\"")),
+            )
+            .await,
+        Vec::new(),
+    )?;
     let versions: Vec<(String, u64)> = history_notes
         .iter()
         .filter_map(|record| {
@@ -175,13 +208,16 @@ async fn purge_history(mount: &SharedMountRuntime, remote_path: &str) -> Result<
     let keep = retention_keep_set(&versions, min_versions, max_age_days, now_ms());
     for (version_id, _) in versions {
         if !keep.contains(&version_id) {
-            mount
-                .client
-                .delete_by_query(
-                    &mount.history_index,
-                    &format!("noteId:\"{remote_path}\" AND versionId:\"{version_id}\""),
-                )
-                .await?;
+            super::empty_if_missing_index(
+                mount
+                    .client
+                    .delete_by_query(
+                        &mount.history_index,
+                        &format!("noteId:\"{remote_path}\" AND versionId:\"{version_id}\""),
+                    )
+                    .await,
+                Value::Null,
+            )?;
         }
     }
     Ok(())
@@ -191,13 +227,19 @@ async fn purge_history(mount: &SharedMountRuntime, remote_path: &str) -> Result<
 /// history (design §8 — retraction is the deliberate exception to
 /// non-destruction; without it a mistaken push could never be withdrawn).
 pub async fn retract_note(mount: &SharedMountRuntime, remote_path: &str) -> Result<()> {
-    mount
-        .client
-        .delete_by_query(mount.index(), &format!("noteId:\"{remote_path}\""))
-        .await?;
-    mount
-        .client
-        .delete_by_query(&mount.history_index, &format!("noteId:\"{remote_path}\""))
-        .await?;
+    super::empty_if_missing_index(
+        mount
+            .client
+            .delete_by_query(mount.index(), &format!("noteId:\"{remote_path}\""))
+            .await,
+        Value::Null,
+    )?;
+    super::empty_if_missing_index(
+        mount
+            .client
+            .delete_by_query(&mount.history_index, &format!("noteId:\"{remote_path}\""))
+            .await,
+        Value::Null,
+    )?;
     Ok(())
 }

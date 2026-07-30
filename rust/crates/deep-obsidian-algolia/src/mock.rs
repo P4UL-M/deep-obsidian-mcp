@@ -364,6 +364,8 @@ fn run_search(index: &MockIndex, params: &HashMap<String, String>) -> RankedHits
 
 type SharedState = State<MockAlgolia>;
 
+/// WRITE accessor: creates the index on first write, mirroring Algolia (an
+/// index springs into existence when you first write to it).
 fn with_index<T>(
     state: &MockAlgolia,
     index: &str,
@@ -372,6 +374,25 @@ fn with_index<T>(
     let mut indexes = state.indexes.lock().expect("mock lock");
     let entry = indexes.entry(index.to_string()).or_default();
     action(entry)
+}
+
+/// READ accessor: `None` when the index was never written to. Algolia answers
+/// 404 `Index <name> does not exist` for reads against a missing index — the
+/// permissive auto-create used to hide that whole bug class from the tests.
+fn with_existing_index<T>(
+    state: &MockAlgolia,
+    index: &str,
+    action: impl FnOnce(&MockIndex) -> T,
+) -> Option<T> {
+    let indexes = state.indexes.lock().expect("mock lock");
+    indexes.get(index).map(action)
+}
+
+fn index_missing(index: &str) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "message": format!("Index {index} does not exist") })),
+    )
 }
 
 async fn handle_batch(
@@ -420,12 +441,14 @@ async fn handle_query(
     State(state): SharedState,
     AxumPath(index): AxumPath<String>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let params = body_params(&body);
-    let (hits, facets) = with_index(&state, &index, |mock_index| {
+    let Some((hits, facets)) = with_existing_index(&state, &index, |mock_index| {
         let ranked = run_search(mock_index, &params);
         (ranked.hits, ranked.facets)
-    });
+    }) else {
+        return index_missing(&index);
+    };
     let hits_per_page: usize = params
         .get("hitsPerPage")
         .and_then(|value| value.parse().ok())
@@ -449,14 +472,14 @@ async fn handle_query(
     if let Some(facets) = facets {
         response["facets"] = facets;
     }
-    Json(response)
+    (StatusCode::OK, Json(response))
 }
 
 async fn handle_browse(
     State(state): SharedState,
     AxumPath(index): AxumPath<String>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let params = body_params(&body);
     let filters = params.get("filters").cloned().unwrap_or_default();
     let offset: usize = body
@@ -468,31 +491,38 @@ async fn handle_browse(
         .get("hitsPerPage")
         .and_then(|value| value.parse().ok())
         .unwrap_or(1000);
-    let all: Vec<Value> = with_index(&state, &index, |mock_index| {
+    let Some(all): Option<Vec<Value>> = with_existing_index(&state, &index, |mock_index| {
         mock_index
             .objects
             .values()
             .filter(|record| eval_filters(record, &filters))
             .cloned()
             .collect()
-    });
+    }) else {
+        return index_missing(&index);
+    };
     let hits: Vec<Value> = all.iter().skip(offset).take(page_size).cloned().collect();
     let next = offset + hits.len();
     let mut response = json!({ "hits": hits, "nbHits": all.len() });
     if next < all.len() {
         response["cursor"] = json!(next.to_string());
     }
-    Json(response)
+    (StatusCode::OK, Json(response))
 }
 
 async fn handle_delete_by_query(
     State(state): SharedState,
     AxumPath(index): AxumPath<String>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let params = body_params(&body);
     let filters = params.get("filters").cloned().unwrap_or_default();
-    let removed = with_index(&state, &index, |mock_index| {
+    let mut indexes = state.indexes.lock().expect("mock lock");
+    let Some(mock_index) = indexes.get_mut(&index) else {
+        drop(indexes);
+        return index_missing(&index);
+    };
+    let removed = {
         let doomed: Vec<String> = mock_index
             .objects
             .iter()
@@ -503,8 +533,12 @@ async fn handle_delete_by_query(
             mock_index.objects.remove(id);
         }
         doomed.len()
-    });
-    Json(json!({ "taskID": 1, "deletedCount": removed }))
+    };
+    drop(indexes);
+    (
+        StatusCode::OK,
+        Json(json!({ "taskID": 1, "deletedCount": removed })),
+    )
 }
 
 async fn handle_get_settings(
@@ -564,7 +598,7 @@ async fn handle_facet_query(
     State(state): SharedState,
     AxumPath((index, facet)): AxumPath<(String, String)>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let params = body_params(&body);
     let facet_query = params.get("facetQuery").cloned().unwrap_or_default();
     let filters = params.get("filters").cloned().unwrap_or_default();
@@ -573,7 +607,8 @@ async fn handle_facet_query(
         .and_then(|value| value.parse().ok())
         .unwrap_or(10);
     let needle = facet_query.to_lowercase();
-    let counts: BTreeMap<String, usize> = with_index(&state, &index, |mock_index| {
+    let Some(counts): Option<BTreeMap<String, usize>> =
+        with_existing_index(&state, &index, |mock_index| {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for record in mock_index.objects.values() {
             if !eval_filters(record, &filters) {
@@ -596,8 +631,11 @@ async fn handle_facet_query(
                 }
             }
         }
-        counts
-    });
+            counts
+        })
+    else {
+        return index_missing(&index);
+    };
     let mut hits: Vec<(String, usize)> = counts.into_iter().collect();
     hits.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     let facet_hits: Vec<Value> = hits
@@ -605,7 +643,7 @@ async fn handle_facet_query(
         .take(max_hits)
         .map(|(value, count)| json!({ "value": value, "count": count, "highlighted": value }))
         .collect();
-    Json(json!({ "facetHits": facet_hits }))
+    (StatusCode::OK, Json(json!({ "facetHits": facet_hits })))
 }
 
 #[cfg(test)]
