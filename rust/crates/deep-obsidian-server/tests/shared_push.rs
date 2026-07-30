@@ -344,8 +344,8 @@ async fn virgin_index_never_404s_and_history_is_provisioned_lazily() {
     let prefixes = vec!["_Wiki/".to_string()];
 
     // Reads against an index that has never been written to: empty, not 404.
-    assert!(reads::list_children(&mount, "").await.expect("list root").is_empty());
-    assert!(reads::list_folders(&mount, 3).await.expect("folders").is_empty());
+    assert!(reads::list_children(&mount, "").await.expect("list root").0.is_empty());
+    assert!(reads::list_folders(&mount, 3).await.expect("folders").0.is_empty());
     assert!(reads::find_paths(&mount, "wiki", 10).await.expect("find").is_empty());
     assert!(reads::backlinks(&mount, "_Wiki/Any.md").await.expect("backlinks").is_empty());
     assert!(versioning::fetch_head(&mount, "_Wiki/Any.md")

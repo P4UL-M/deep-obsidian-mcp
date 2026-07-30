@@ -491,6 +491,23 @@ the implementation has to honour:
 The mock mirrors this: reads against an unwritten index return the same 404.
 The permissive auto-create it used to do hid the whole bug class from the tests.
 
+### 11.2 Algolia request limits the mock must mirror
+
+Two real-engine rejections that a permissive mock let through, both found by
+running against a live app:
+
+- **`maxFacetHits` caps at 100** on `searchForFacetValues` — over that Algolia
+  400s rather than clamping (easy to confuse with `maxValuesPerFacet`, whose
+  ceiling is 1,000). The client clamps, and structure enumeration reports
+  `foldersTruncated` when the capped budget comes back full. Listing *paths*
+  moved off facet search onto `browse` entirely, since 100 values would have
+  silently truncated wiki-link resolution.
+- **Empty filter values are rejected** (`filters: dir:""` → 400 "Not allowed
+  empty string"). The mount root has `dir: ""` on its records, so root listing
+  browses note records and matches the empty dir locally instead.
+
+The mock now enforces both, so neither can regress unnoticed.
+
 ## 12. Implementation notes
 
 **No official Algolia Rust client** — the

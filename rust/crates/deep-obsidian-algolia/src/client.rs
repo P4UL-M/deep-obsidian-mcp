@@ -221,6 +221,14 @@ impl AlgoliaClient {
             .map_err(|error| AlgoliaError::InvalidResponse(error.to_string()))
     }
 
+    /// Algolia's hard ceiling for `maxFacetHits` on `searchForFacetValues`.
+    /// Sending more is a 400, not a clamp — and it is easy to confuse with
+    /// `maxValuesPerFacet`, whose ceiling is 1,000.
+    pub const MAX_FACET_HITS: usize = 100;
+
+    /// Facet-value search. `max_facet_hits` is clamped to [`Self::MAX_FACET_HITS`];
+    /// when the response comes back full the result may be truncated —
+    /// [`Self::search_facet_values_checked`] surfaces that.
     pub async fn search_facet_values(
         &self,
         index: &str,
@@ -229,6 +237,7 @@ impl AlgoliaClient {
         filters: Option<&str>,
         max_facet_hits: usize,
     ) -> Result<Vec<FacetHit>> {
+        let max_facet_hits = max_facet_hits.clamp(1, Self::MAX_FACET_HITS);
         let mut params = format!(
             "facetQuery={}&maxFacetHits={max_facet_hits}",
             urlencoding::encode(facet_query)
@@ -243,6 +252,23 @@ impl AlgoliaClient {
         let response: FacetSearchResponse = serde_json::from_value(payload)
             .map_err(|error| AlgoliaError::InvalidResponse(error.to_string()))?;
         Ok(response.facet_hits)
+    }
+
+    /// Like [`Self::search_facet_values`], plus `true` when the response filled
+    /// the capped budget and values may therefore have been dropped. Callers
+    /// that enumerate structure report this rather than silently under-listing.
+    pub async fn search_facet_values_checked(
+        &self,
+        index: &str,
+        facet: &str,
+        facet_query: &str,
+        filters: Option<&str>,
+    ) -> Result<(Vec<FacetHit>, bool)> {
+        let hits = self
+            .search_facet_values(index, facet, facet_query, filters, Self::MAX_FACET_HITS)
+            .await?;
+        let truncated = hits.len() >= Self::MAX_FACET_HITS;
+        Ok((hits, truncated))
     }
 
     pub async fn get_settings(&self, index: &str) -> Result<Value> {

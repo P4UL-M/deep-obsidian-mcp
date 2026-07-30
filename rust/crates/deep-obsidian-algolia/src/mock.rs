@@ -110,6 +110,23 @@ fn value_matches(value: &Value, expected: &str) -> bool {
     }
 }
 
+/// Signals a filter string Algolia would reject with a 400, so the mock does
+/// not accept queries the real engine refuses.
+fn invalid_filter(filters: &str) -> Option<String> {
+    for clause in split_top_level(filters, " AND ") {
+        let clause = clause.trim().trim_start_matches("NOT ").trim();
+        if let Some((attr, raw_value)) = clause.split_once(':') {
+            if raw_value.trim().trim_matches('"').is_empty() {
+                return Some(format!(
+                    "filters: Not allowed empty string at col {}",
+                    attr.len() + 1
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn eval_atom(record: &Value, atom: &str) -> bool {
     let atom = atom.trim();
     if let Some(rest) = atom.strip_prefix("NOT ") {
@@ -443,6 +460,9 @@ async fn handle_query(
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let params = body_params(&body);
+    if let Some(message) = params.get("filters").and_then(|f| invalid_filter(f)) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "message": message })));
+    }
     let Some((hits, facets)) = with_existing_index(&state, &index, |mock_index| {
         let ranked = run_search(mock_index, &params);
         (ranked.hits, ranked.facets)
@@ -482,6 +502,9 @@ async fn handle_browse(
 ) -> (StatusCode, Json<Value>) {
     let params = body_params(&body);
     let filters = params.get("filters").cloned().unwrap_or_default();
+    if let Some(message) = invalid_filter(&filters) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "message": message })));
+    }
     let offset: usize = body
         .get("cursor")
         .and_then(Value::as_str)
@@ -517,6 +540,9 @@ async fn handle_delete_by_query(
 ) -> (StatusCode, Json<Value>) {
     let params = body_params(&body);
     let filters = params.get("filters").cloned().unwrap_or_default();
+    if let Some(message) = invalid_filter(&filters) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "message": message })));
+    }
     let mut indexes = state.indexes.lock().expect("mock lock");
     let Some(mock_index) = indexes.get_mut(&index) else {
         drop(indexes);
@@ -606,6 +632,21 @@ async fn handle_facet_query(
         .get("maxFacetHits")
         .and_then(|value| value.parse().ok())
         .unwrap_or(10);
+    // Algolia 400s above 100 rather than clamping; mirror that so callers
+    // cannot ship a request the real engine refuses.
+    if max_hits > 100 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": format!(
+                    "Value \"{max_hits}\" outside of the range for \"maxFacetHits\" parameter, expected integer between 1 and 100"
+                )
+            })),
+        );
+    }
+    if let Some(message) = invalid_filter(&filters) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "message": message })));
+    }
     let needle = facet_query.to_lowercase();
     let Some(counts): Option<BTreeMap<String, usize>> =
         with_existing_index(&state, &index, |mock_index| {

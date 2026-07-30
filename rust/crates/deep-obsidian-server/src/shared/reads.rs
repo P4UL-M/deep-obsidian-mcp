@@ -111,10 +111,13 @@ pub struct RemoteChildEntry {
 
 /// Lists a directory on the mount: subfolders via folder-level facet values,
 /// files via note records with `dir` equal to the remote dir.
+/// Directory listing plus `folders_truncated`: Algolia caps facet-value
+/// enumeration at 100, so a directory with more than 100 subfolders cannot be
+/// listed exhaustively. Reported, never silently dropped.
 pub async fn list_children(
     mount: &SharedMountRuntime,
     remote_dir: &str,
-) -> Result<Vec<RemoteChildEntry>> {
+) -> Result<(Vec<RemoteChildEntry>, bool)> {
     let remote_dir = remote_dir.trim_matches('/');
     let mut entries: Vec<RemoteChildEntry> = Vec::new();
 
@@ -133,12 +136,12 @@ pub async fn list_children(
             depth - 1
         )
     };
-    let facet_hits = super::empty_if_missing_index(
+    let (facet_hits, folders_truncated) = super::empty_if_missing_index(
         mount
             .client
-            .search_facet_values(mount.index(), &facet, "", Some(&filters), 1000)
+            .search_facet_values_checked(mount.index(), &facet, "", Some(&filters))
             .await,
-        Vec::new(),
+        (Vec::new(), false),
     )?;
     for hit in facet_hits {
         let name = hit
@@ -155,24 +158,47 @@ pub async fn list_children(
         });
     }
 
-    // Files directly in this dir.
-    let response = super::empty_if_missing_index(
-        mount
-            .client
-            .search(
-                mount.index(),
-                &SearchRequest {
-                    query: String::new(),
-                    filters: Some(format!("recordType:note AND dir:\"{remote_dir}\"")),
-                    hits_per_page: Some(1000),
-                    distinct: Some(false),
-                    ..SearchRequest::default()
-                },
-            )
-            .await,
-        super::empty_search_response(),
-    )?;
-    for hit in response.hits {
+    // Files directly in this dir. The mount ROOT has `dir: ""` on its records,
+    // and Algolia rejects an empty filter value (`filters: dir:""` -> 400
+    // "Not allowed empty string"), so the root is enumerated by browsing note
+    // records and matching the empty dir locally.
+    let hits: Vec<Value> = if remote_dir.is_empty() {
+        super::empty_if_missing_index(
+            mount
+                .client
+                .browse_all(mount.index(), Some("recordType:note"))
+                .await,
+            Vec::new(),
+        )?
+        .into_iter()
+        .filter(|record| {
+            record
+                .get("dir")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .is_empty()
+        })
+        .collect()
+    } else {
+        super::empty_if_missing_index(
+            mount
+                .client
+                .search(
+                    mount.index(),
+                    &SearchRequest {
+                        query: String::new(),
+                        filters: Some(format!("recordType:note AND dir:\"{remote_dir}\"")),
+                        hits_per_page: Some(1000),
+                        distinct: Some(false),
+                        ..SearchRequest::default()
+                    },
+                )
+                .await,
+            super::empty_search_response(),
+        )?
+        .hits
+    };
+    for hit in hits {
         let Some(path) = hit.get("path").and_then(Value::as_str) else {
             continue;
         };
@@ -189,33 +215,37 @@ pub async fn list_children(
             .cmp(&left.is_dir)
             .then_with(|| left.path.cmp(&right.path))
     });
-    Ok(entries)
+    Ok((entries, folders_truncated))
 }
 
 /// All folder paths on the mount up to `max_depth` levels, via facet values.
-pub async fn list_folders(mount: &SharedMountRuntime, max_depth: usize) -> Result<Vec<String>> {
+pub async fn list_folders(
+    mount: &SharedMountRuntime,
+    max_depth: usize,
+) -> Result<(Vec<String>, bool)> {
     let mut folders = Vec::new();
+    let mut truncated = false;
     for level in 0..max_depth.clamp(1, 3) {
-        let hits = super::empty_if_missing_index(
+        let (hits, level_truncated) = super::empty_if_missing_index(
             mount
                 .client
-                .search_facet_values(
+                .search_facet_values_checked(
                     mount.index(),
                     &format!("folders.lvl{level}"),
                     "",
                     Some("recordType:note"),
-                    1000,
                 )
                 .await,
-            Vec::new(),
+            (Vec::new(), false),
         )?;
+        truncated |= level_truncated;
         for hit in hits {
             folders.push(mount.mounted_path(&hit.value));
         }
     }
     folders.sort();
     folders.dedup();
-    Ok(folders)
+    Ok((folders, truncated))
 }
 
 /// Path-restricted search for `find_files` on the mount.

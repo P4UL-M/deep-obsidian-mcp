@@ -97,12 +97,22 @@ preserved in history. Use resolve_divergence to reconcile."
 /// Remote note paths (for link resolution of consumer-side writes) — one
 /// facet query, capped at 1000.
 async fn known_remote_files(mount: &SharedMountRuntime) -> Vec<String> {
-    mount
-        .client
-        .search_facet_values(mount.index(), "path", "", Some("recordType:note"), 1000)
-        .await
-        .map(|hits| hits.into_iter().map(|hit| hit.value).collect())
-        .unwrap_or_default()
+    // Browse, not facet search: `maxFacetHits` caps at 100, which would
+    // silently truncate link resolution on any real corpus. Browse paginates.
+    crate::shared::empty_if_missing_index(
+        mount
+            .client
+            .browse_all(mount.index(), Some("recordType:note"))
+            .await,
+        Vec::new(),
+    )
+    .map(|records| {
+        records
+            .iter()
+            .filter_map(|record| Some(record.get("path")?.as_str()?.to_string()))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// `list_children` on a mounted directory.
@@ -114,7 +124,7 @@ pub async fn list_children_payload(
     let Some((mount, remote_dir)) = shared::route(&state.mounts, path) else {
         return Ok(None);
     };
-    let entries = reads::list_children(mount, remote_dir)
+    let (entries, folders_truncated) = reads::list_children(mount, remote_dir)
         .await
         .map_err(|error| error.to_string())?;
     let entries_json: Vec<Value> = entries
@@ -131,13 +141,21 @@ pub async fn list_children_payload(
             })
         })
         .collect();
-    Ok(Some(json!({
+    let mut payload = json!({
         "path": path,
         "shared": true,
         "indexName": mount.index(),
         "count": entries_json.len(),
         "entries": entries_json,
-    })))
+    });
+    if folders_truncated {
+        payload["foldersTruncated"] = json!(true);
+        payload["foldersTruncatedReason"] = json!(format!(
+            "more than {} subfolders here; Algolia caps facet-value enumeration",
+            deep_obsidian_algolia::AlgoliaClient::MAX_FACET_HITS
+        ));
+    }
+    Ok(Some(payload))
 }
 
 /// Synthetic directory entries for mount roots whose parent is `dir` (so
