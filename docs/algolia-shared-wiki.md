@@ -23,7 +23,8 @@ push`. The command surface is:
 | `share seed --prefix <folder/> [--move]` | One-shot import of existing local notes. Only creates/updates — **never** removes anything from the index. `--move` deletes the local copies after a per-file check that the index holds identical content, so exactly one copy exists. |
 | `share dump --to <dir>` | Materializes every head version into a directory with a manifest — backup, exit strategy, human-browsable snapshot for a corpus whose only live copy is the index. |
 | `share status` | Note count, superseded-version count, cache stats, and any diverged notes per mount. |
-| `share retract --path <note>` | The single destructive operation: removes a note, its chunks, and its whole history. |
+| `delete_note` (MCP tool) | Ordinary removal: soft-deletes on the mount. The head becomes a `deleted: true` tombstone, its chunks leave the main index (so listings and search stop finding it), and the previous version moves to history — recoverable with `read_version`, undeleted by writing the note again. Refuses local paths: MCP has never exposed local file deletion. |
+| `share retract --path <note>` | The permanent purge: removes a note, its chunks, the tombstone and the whole history. |
 | `share set-key`, `share key` | Store the mount's API key (verified round trip); mint a scoped read-only key for a teammate. |
 
 Consequence worth stating: because seed never reconciles deletions, deleting a
@@ -490,6 +491,19 @@ the implementation has to honour:
 
 The mock mirrors this: reads against an unwritten index return the same 404.
 The permissive auto-create it used to do hid the whole bug class from the tests.
+
+### 11.1.1 Tombstones must be filtered out of every read
+
+A soft-deleted note keeps its note record, so **every listing and search has to
+exclude it** or the deleted note goes on appearing. `reads::LIVE_NOTES`
+(`recordType:note AND NOT deleted:true`) is the single filter fragment used by
+`list_children`, `list_folders`, `find_paths`, `backlinks`, `dump_all`, the seed
+plan and consumer-side link resolution; `read_note` additionally treats a
+tombstoned head as not-found.
+
+Chunk queries deliberately do *not* carry the guard: chunk records have no
+`deleted` attribute and a soft delete removes them outright, so a tombstoned
+note has no chunks left to match.
 
 ### 11.2 Algolia request limits the mock must mirror
 

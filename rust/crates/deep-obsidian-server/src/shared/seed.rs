@@ -80,7 +80,7 @@ async fn remote_hash_map(
     let records = super::empty_if_missing_index(
         mount
             .client
-            .browse_all(mount.index(), Some("recordType:note"))
+            .browse_all(mount.index(), Some(super::reads::LIVE_NOTES))
             .await,
         Vec::new(),
     )?;

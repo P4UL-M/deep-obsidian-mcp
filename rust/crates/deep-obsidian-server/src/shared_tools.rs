@@ -102,7 +102,7 @@ async fn known_remote_files(mount: &SharedMountRuntime) -> Vec<String> {
     crate::shared::empty_if_missing_index(
         mount
             .client
-            .browse_all(mount.index(), Some("recordType:note"))
+            .browse_all(mount.index(), Some(reads::LIVE_NOTES))
             .await,
         Vec::new(),
     )
@@ -485,6 +485,45 @@ pub async fn vault_info_mounts(state: &AppState) -> Option<Value> {
         }));
     }
     Some(json!(mounts))
+}
+
+/// `delete_note` tool payload: soft-deletes a note on a shared mount. Refuses
+/// local paths — the MCP contract has never exposed local file deletion, and
+/// adding it here by accident would be a much bigger capability than asked for.
+pub async fn delete_note_payload(state: &AppState, path: &str) -> Result<Value, String> {
+    let Some((mount, remote)) = shared::route(&state.mounts, path) else {
+        return Err(format!(
+            "{path} is not on a shared mount; deleting local vault files is not \
+supported through MCP (remove the file yourself)"
+        ));
+    };
+    if !mount.config.writable {
+        return Err(format!(
+            "shared mount {} is read-only (writable: false)",
+            mount.mount_at()
+        ));
+    }
+    let outcome = versioning::soft_delete_note(mount, remote)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut payload = Map::new();
+    payload.insert("path".to_string(), json!(path));
+    payload.insert("shared".to_string(), json!(true));
+    payload.insert("indexName".to_string(), json!(mount.index()));
+    payload.insert("deleted".to_string(), json!(true));
+    payload.insert("alreadyDeleted".to_string(), json!(outcome.already_deleted));
+    payload.insert("versionId".to_string(), json!(outcome.version_id));
+    if let Some(recoverable) = outcome.recoverable_from {
+        payload.insert("recoverableFrom".to_string(), json!(recoverable.clone()));
+        payload.insert(
+            "howToRecover".to_string(),
+            json!(format!(
+                "read_version with versionId {recoverable} returns the removed content; \
+upsert_note it back to undelete. `share retract` purges it permanently instead."
+            )),
+        );
+    }
+    Ok(Value::Object(payload))
 }
 
 /// `note_history` tool payload.

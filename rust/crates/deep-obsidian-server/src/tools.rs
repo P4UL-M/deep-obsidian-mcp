@@ -1154,6 +1154,16 @@ fn tool_definitions(rg_available: bool, has_mounts: bool) -> Vec<ToolDefinition>
     // capability-gated availability, unchanged names/schemas otherwise.
     if has_mounts {
         definitions.push(ToolDefinition {
+            name: "delete_note".to_string(),
+            description: "Soft-delete a note on a shared mount: it stops appearing in listings and search, its previous version moves to history, and the content stays recoverable via note_history/read_version. Shared mounts only — local vault files are not deletable through MCP.".to_string(),
+            annotations: Some(tool_annotations(false, Some(false), Some(true))),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema(
+                vec![("path", json!({"type":"string","description":"Mounted vault-relative note path."}))],
+                vec!["path"],
+            ),
+        });
+        definitions.push(ToolDefinition {
             name: "note_history".to_string(),
             description: "List the version history of a note on a shared mount (append-only versions; retention keeps the 5 most recent plus anything younger than 90 days).".to_string(),
             annotations: Some(tool_annotations(true, None, None)),
@@ -2631,6 +2641,12 @@ pub async fn call_tool(
                 object.extend(fields);
             }
             Ok(json_text_result(session_payload))
+        }
+        "delete_note" => {
+            let path = string_arg(arguments, "path")?;
+            Ok(json_text_result(
+                crate::shared_tools::delete_note_payload(state, &path).await?,
+            ))
         }
         "note_history" => {
             let path = string_arg(arguments, "path")?;

@@ -323,3 +323,110 @@ async fn mounted_tools_read_search_write_and_resolve_divergence() {
     assert_eq!(mounts[0]["mountAt"], json!("_Shared/Team/"));
     assert_eq!(mounts[0]["recallStage"], json!("lexical"));
 }
+
+/// Soft delete: the note leaves every listing and search, its content stays
+/// recoverable from history, and re-writing it undeletes. A tombstone that
+/// still showed up in listings would be the whole point missed.
+#[tokio::test]
+async fn soft_delete_hides_the_note_but_keeps_it_recoverable() {
+    std::env::set_var("DEEP_OBSIDIAN_ALGOLIA_API_KEY", "test-key");
+    let (base_url, _mock) = spawn_mock().await;
+    let state = consumer_state(&base_url, "alice@test").await;
+    let mounted = "_Shared/Team/_Wiki/Decisions/Deletable.md";
+    let body = format!("{DECISION}\n## Extra\n\nDeletable body.\n");
+
+    call_tool(&state, "upsert_note", &json!({ "path": mounted, "content": body }))
+        .await
+        .expect("create");
+
+    // Visible before deletion.
+    let listed = call_tool(
+        &state,
+        "list_children",
+        &json!({ "path": "_Shared/Team/_Wiki/Decisions" }),
+    )
+    .await
+    .expect("list before");
+    assert!(
+        listed.structured_content["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == json!("Deletable.md")),
+        "note should be listed before deletion"
+    );
+
+    let deleted = call_tool(&state, "delete_note", &json!({ "path": mounted }))
+        .await
+        .expect("delete");
+    assert_eq!(deleted.structured_content["deleted"], json!(true));
+    let recoverable = deleted.structured_content["recoverableFrom"]
+        .as_str()
+        .expect("recoverableFrom")
+        .to_string();
+
+    // Gone from reads: read_file, listing, search, find_files.
+    assert!(call_tool(&state, "read_file", &json!({ "path": mounted }))
+        .await
+        .is_err());
+    let listed = call_tool(
+        &state,
+        "list_children",
+        &json!({ "path": "_Shared/Team/_Wiki/Decisions" }),
+    )
+    .await
+    .expect("list after");
+    assert!(
+        !listed.structured_content["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == json!("Deletable.md")),
+        "tombstone must not appear in listings: {:?}",
+        listed.structured_content
+    );
+    let found = call_tool(&state, "find_files", &json!({ "query": "Deletable" }))
+        .await
+        .expect("find after");
+    assert!(
+        !found.structured_content["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["path"].as_str().unwrap_or("").contains("Deletable")),
+        "tombstone must not appear in find_files"
+    );
+
+    // But recoverable, and re-writing undeletes.
+    let recovered = call_tool(
+        &state,
+        "read_version",
+        &json!({ "path": mounted, "versionId": recoverable }),
+    )
+    .await
+    .expect("read_version");
+    assert_eq!(recovered.structured_content["text"], json!(body));
+
+    call_tool(&state, "upsert_note", &json!({ "path": mounted, "content": body }))
+        .await
+        .expect("undelete");
+    let reread = call_tool(&state, "read_file", &json!({ "path": mounted }))
+        .await
+        .expect("read after undelete");
+    assert_eq!(reread.structured_content["text"], json!(body));
+}
+
+/// `delete_note` refuses local paths: MCP has never exposed local file
+/// deletion and must not gain it by side effect.
+#[tokio::test]
+async fn delete_note_refuses_local_paths() {
+    std::env::set_var("DEEP_OBSIDIAN_ALGOLIA_API_KEY", "test-key");
+    let (base_url, _mock) = spawn_mock().await;
+    let state = consumer_state(&base_url, "alice@test").await;
+    let error = call_tool(&state, "delete_note", &json!({ "path": "local-note.md" }))
+        .await
+        .expect_err("local delete must be refused");
+    assert!(error.contains("not on a shared mount"), "got: {error}");
+    // The local file is still there.
+    assert!(state.config.vault_path.join("local-note.md").exists());
+}

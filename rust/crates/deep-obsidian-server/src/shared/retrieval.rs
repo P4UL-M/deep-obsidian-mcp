@@ -47,6 +47,11 @@ pub async fn search_mount_with_distinct(
                 mount.index(),
                 &SearchRequest {
                     query: query.to_string(),
+                    // No `deleted` guard: chunk records carry no such attribute,
+                    // and a soft delete removes them from the main index
+                    // outright, so a tombstoned note has no chunks left to
+                    // match. Filtering an absent attribute would only make the
+                    // query depend on Algolia's missing-value semantics.
                     filters: Some("recordType:chunk".to_string()),
                     hits_per_page: Some(limit),
                     distinct,

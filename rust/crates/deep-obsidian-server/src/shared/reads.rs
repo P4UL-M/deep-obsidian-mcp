@@ -12,6 +12,11 @@ use deep_obsidian_algolia::records::NoteRecord;
 use deep_obsidian_algolia::SearchRequest;
 use serde_json::Value;
 
+/// Filter fragment selecting LIVE note records: a soft-deleted note keeps its
+/// record as a tombstone, so every listing/search must exclude it or a deleted
+/// note goes on showing up.
+pub const LIVE_NOTES: &str = "recordType:note AND NOT deleted:true";
+
 pub struct HydratedNote {
     pub content: String,
     pub note: NoteRecord,
@@ -83,6 +88,7 @@ pub async fn fetch_version_chunks(
 pub async fn read_note(mount: &SharedMountRuntime, remote_path: &str) -> Result<HydratedNote> {
     let note = fetch_head(mount, remote_path)
         .await?
+        .filter(|note| !note.deleted)
         .ok_or_else(|| SharedError::NoteNotFound(mount.mounted_path(remote_path)))?;
     if let Some(content) = mount.cache.get(remote_path, &note.version_id) {
         return Ok(HydratedNote { content, note });
@@ -129,12 +135,9 @@ pub async fn list_children(
     };
     let facet = format!("folders.lvl{depth}");
     let filters = if remote_dir.is_empty() {
-        "recordType:note".to_string()
+        LIVE_NOTES.to_string()
     } else {
-        format!(
-            "recordType:note AND folders.lvl{}:\"{remote_dir}\"",
-            depth - 1
-        )
+        format!("{LIVE_NOTES} AND folders.lvl{}:\"{remote_dir}\"", depth - 1)
     };
     let (facet_hits, folders_truncated) = super::empty_if_missing_index(
         mount
@@ -166,7 +169,7 @@ pub async fn list_children(
         super::empty_if_missing_index(
             mount
                 .client
-                .browse_all(mount.index(), Some("recordType:note"))
+                .browse_all(mount.index(), Some(LIVE_NOTES))
                 .await,
             Vec::new(),
         )?
@@ -187,7 +190,7 @@ pub async fn list_children(
                     mount.index(),
                     &SearchRequest {
                         query: String::new(),
-                        filters: Some(format!("recordType:note AND dir:\"{remote_dir}\"")),
+                        filters: Some(format!("{LIVE_NOTES} AND dir:\"{remote_dir}\"")),
                         hits_per_page: Some(1000),
                         distinct: Some(false),
                         ..SearchRequest::default()
@@ -233,7 +236,7 @@ pub async fn list_folders(
                     mount.index(),
                     &format!("folders.lvl{level}"),
                     "",
-                    Some("recordType:note"),
+                    Some(LIVE_NOTES),
                 )
                 .await,
             (Vec::new(), false),
@@ -261,7 +264,7 @@ pub async fn find_paths(
                 mount.index(),
                 &SearchRequest {
                     query: query.to_string(),
-                    filters: Some("recordType:note".to_string()),
+                    filters: Some(LIVE_NOTES.to_string()),
                     restrict_searchable_attributes: vec!["path".to_string()],
                     hits_per_page: Some(limit),
                     distinct: Some(false),
@@ -290,7 +293,7 @@ pub async fn backlinks(mount: &SharedMountRuntime, remote_path: &str) -> Result<
                 &SearchRequest {
                     query: String::new(),
                     filters: Some(format!(
-                        "recordType:note AND links:\"{remote_path}\""
+                        "{LIVE_NOTES} AND links:\"{remote_path}\""
                     )),
                     hits_per_page: Some(1000),
                     distinct: Some(false),
@@ -382,7 +385,7 @@ pub async fn dump_all(
     let records = super::empty_if_missing_index(
         mount
             .client
-            .browse_all(mount.index(), Some("recordType:note"))
+            .browse_all(mount.index(), Some(LIVE_NOTES))
             .await,
         Vec::new(),
     )?;

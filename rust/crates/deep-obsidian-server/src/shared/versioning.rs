@@ -11,7 +11,7 @@
 //! Then retention purge (§3.1) runs on this note's history.
 
 use super::records_build::{build_note_records, NoteVersionMeta};
-use super::{new_version_id, now_ms, retention_keep_set, Result, SharedMountRuntime};
+use super::{new_version_id, now_ms, retention_keep_set, Result, SharedError, SharedMountRuntime};
 use deep_obsidian_algolia::records::NoteRecord;
 use serde_json::{json, Value};
 
@@ -246,4 +246,114 @@ pub async fn retract_note(mount: &SharedMountRuntime, remote_path: &str) -> Resu
         Value::Null,
     )?;
     Ok(())
+}
+
+/// Soft-deletes a note: the head becomes a `deleted: true` tombstone, its
+/// chunks leave the main index (so search and hydration stop finding it), and
+/// the previous version moves to history — so the content is still recoverable
+/// via `note_history` / `read_version`, and other participants observe the
+/// removal instead of silently missing a record.
+///
+/// This is the ordinary "delete a note" operation. `retract_note` is the
+/// separate, permanent purge that also removes the tombstone and the history.
+pub async fn soft_delete_note(
+    mount: &SharedMountRuntime,
+    remote_path: &str,
+) -> Result<SoftDeleteOutcome> {
+    let head = fetch_head(mount, remote_path)
+        .await?
+        .ok_or_else(|| SharedError::NoteNotFound(mount.mounted_path(remote_path)))?;
+    if head.deleted {
+        return Ok(SoftDeleteOutcome {
+            version_id: head.version_id,
+            already_deleted: true,
+            recoverable_from: head.parent_version_id,
+        });
+    }
+
+    let participant_id = mount.participant_id();
+    let version_id = new_version_id(&participant_id);
+    let prev_version = head.version_id.clone();
+
+    // Same ordering discipline as a normal write: copy to history BEFORE
+    // removing from main, and delete by an EXPLICIT versionId so a concurrent
+    // writer's chunks are never in the delete set.
+    let prev_chunks = super::empty_if_missing_index(
+        mount
+            .client
+            .browse_all(
+                mount.index(),
+                Some(&format!(
+                    "recordType:chunk AND noteId:\"{remote_path}\" AND versionId:\"{prev_version}\""
+                )),
+            )
+            .await,
+        Vec::new(),
+    )?;
+    let mut history_records: Vec<Value> = prev_chunks;
+    let mut prev_note_value = serde_json::to_value(&head).expect("note serializes");
+    prev_note_value["objectID"] = json!(format!("note:{remote_path}@{prev_version}"));
+    prev_note_value["supersededBy"] = json!(version_id.clone());
+    history_records.push(prev_note_value);
+    mount
+        .client
+        .save_objects(&mount.history_index, history_records)
+        .await?;
+    super::ensure_index_settings(
+        &mount.client,
+        &mount.history_index,
+        &mount.history_provisioned,
+        deep_obsidian_algolia::records::history_index_settings(),
+    )
+    .await;
+
+    super::empty_if_missing_index(
+        mount
+            .client
+            .delete_by_query(
+                mount.index(),
+                &format!(
+                    "recordType:chunk AND noteId:\"{remote_path}\" AND versionId:\"{prev_version}\""
+                ),
+            )
+            .await,
+        Value::Null,
+    )?;
+
+    // The tombstone keeps the note's identity and metadata but carries no body.
+    let mut tombstone = head.clone();
+    tombstone.version_id = version_id.clone();
+    tombstone.parent_version_id = Some(prev_version.clone());
+    tombstone.deleted = true;
+    tombstone.chunk_count = 0;
+    tombstone.size_bytes = 0;
+    tombstone.content_hash = crate::tools::content_hash(b"");
+    tombstone.updated_at_ms = now_ms();
+    tombstone.participant_id = participant_id;
+    tombstone.superseded_by = None;
+    tombstone.forked_from = None;
+    mount
+        .client
+        .save_objects_awaited(
+            mount.index(),
+            vec![serde_json::to_value(&tombstone).expect("tombstone serializes")],
+        )
+        .await?;
+
+    mount.cache.remove(remote_path);
+    purge_history(mount, remote_path).await?;
+
+    Ok(SoftDeleteOutcome {
+        version_id,
+        already_deleted: false,
+        recoverable_from: Some(prev_version),
+    })
+}
+
+pub struct SoftDeleteOutcome {
+    pub version_id: String,
+    pub already_deleted: bool,
+    /// The version holding the content just removed — feed it to
+    /// `read_version` to recover, or `upsert_note` it back to undelete.
+    pub recoverable_from: Option<String>,
 }
