@@ -70,10 +70,21 @@ rights, so deriving from a write key would hand out write access:
 deep-obsidian-mcp share key --parent-key <search-only-key> --filters 'folders.lvl0:_Wiki'
 ```
 
-Back the index up (it is the only copy of the shared wiki):
+Inspect what a mount holds, and back the index up (it is the only copy of the
+shared wiki):
 
 ```bash
+deep-obsidian-mcp share status
 deep-obsidian-mcp share dump --to ~/Backups/team-wiki
+```
+
+Removing a note has two levels. `delete_note` (an MCP tool) soft-deletes: it
+leaves listings and search but stays recoverable. `share retract` is the
+permanent purge — note, chunks and entire history — and is what makes a mistaken
+publication withdrawable:
+
+```bash
+deep-obsidian-mcp share retract --path _Wiki/Oops.md
 ```
 
 Design, guarantees and known limits: [docs/algolia-shared-wiki.md](docs/algolia-shared-wiki.md).
