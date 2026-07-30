@@ -9,6 +9,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AlgoliaError {
@@ -183,6 +184,51 @@ impl AlgoliaClient {
         format!("/1/indexes/{}{}", urlencoding::encode(index), suffix)
     }
 
+    /// Extracts the `taskID` a write returns, if present.
+    pub fn task_id(payload: &Value) -> Option<u64> {
+        payload.get("taskID").and_then(Value::as_u64)
+    }
+
+    /// Blocks until an indexing task is `published`.
+    ///
+    /// Algolia writes are ASYNCHRONOUS: `batch` returns as soon as the task is
+    /// queued, and the records are not queryable until it is processed. Without
+    /// this, the universal agent pattern "write, then read back to verify"
+    /// fails against a real account. Tasks on one index are processed in order,
+    /// so waiting on the last write also guarantees every earlier one landed.
+    pub async fn wait_for_task(&self, index: &str, task_id: u64, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut delay = Duration::from_millis(20);
+        loop {
+            let payload = self
+                .request(
+                    reqwest::Method::GET,
+                    &Self::index_path(index, &format!("/task/{task_id}")),
+                    None,
+                )
+                .await?;
+            if payload.get("status").and_then(Value::as_str) == Some("published") {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(AlgoliaError::InvalidResponse(format!(
+                    "indexing task {task_id} on {index} still pending after {timeout:?}"
+                )));
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_millis(500));
+        }
+    }
+
+    /// `save_objects` that waits for the write to become queryable.
+    pub async fn save_objects_awaited(&self, index: &str, objects: Vec<Value>) -> Result<()> {
+        let payload = self.save_objects(index, objects).await?;
+        if let Some(task) = Self::task_id(&payload) {
+            self.wait_for_task(index, task, Duration::from_secs(20)).await?;
+        }
+        Ok(())
+    }
+
     /// Batch write: `addObject` upserts (with objectID), `deleteObject` removes.
     pub async fn batch(&self, index: &str, requests: Vec<Value>) -> Result<Value> {
         self.request(
@@ -287,6 +333,18 @@ impl AlgoliaClient {
             Some(settings),
         )
         .await
+    }
+
+    /// `set_settings` that waits for the change to take effect. Settings edits
+    /// are asynchronous like writes — and declaring `attributesForFaceting`
+    /// rebuilds the index, so a facet query issued before the task completes
+    /// fails with "you need to add searchable(...) to attributesForFaceting".
+    pub async fn set_settings_awaited(&self, index: &str, settings: Value) -> Result<()> {
+        let payload = self.set_settings(index, settings).await?;
+        if let Some(task) = Self::task_id(&payload) {
+            self.wait_for_task(index, task, Duration::from_secs(60)).await?;
+        }
+        Ok(())
     }
 
     pub async fn delete_by_query(&self, index: &str, filters: &str) -> Result<Value> {

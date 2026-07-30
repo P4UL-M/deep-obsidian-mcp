@@ -508,6 +508,36 @@ running against a live app:
 
 The mock now enforces both, so neither can regress unnoticed.
 
+### 11.3 Algolia writes and settings are asynchronous
+
+`batch` and `setSettings` return as soon as the task is QUEUED; the effect is
+not observable until it is processed. Two consequences, both found by driving
+the tools against a live app:
+
+- **Every write awaits its task** (`save_objects_awaited`). Without it,
+  "write, then read back to verify" — the last step of both the capture and
+  maintenance skill flows — failed with "note not found" and only succeeded a
+  few seconds later. Tasks on one index are processed in order, so awaiting the
+  final head-pointer write also guarantees the chunk writes landed.
+- **Settings edits await too** (`set_settings_awaited`). Declaring
+  `attributesForFaceting` rebuilds the index, and a facet query issued before
+  the task completed failed with "you need to add searchable(...) to
+  attributesForFaceting".
+
+Cost: roughly 3 s per mounted write against a real account. That is the price
+of read-after-write consistency; batching several notes into one task would
+amortise it and is the obvious optimisation if it starts to bite.
+
+### 11.4 Index settings are provisioned lazily, by whoever writes first
+
+Under mount-only authorship nothing runs a setup step, so **the first mount
+write creates the index with Algolia's default settings** — no faceting (folder
+listing fails outright), no `attributeForDistinct`, default searchable
+attributes. `ensure_index_settings` therefore runs after the first write to
+either index, once per process, and only when `attributesForFaceting` is absent
+so a hand-tuned index (NeuralSearch, custom ranking) is never clobbered. A
+failure is logged, not fatal: defaults still serve reads.
+
 ## 12. Implementation notes
 
 **No official Algolia Rust client** — the

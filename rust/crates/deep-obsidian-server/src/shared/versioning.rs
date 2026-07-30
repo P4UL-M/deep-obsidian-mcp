@@ -130,27 +130,15 @@ pub async fn push_note_version(
             .client
             .save_objects(&mount.history_index, history_records)
             .await?;
-        // The write above just brought the history index into existence, so
-        // settings can finally be applied. Once per process; a failure here is
-        // non-fatal (the index is usable with defaults, only ranking differs).
-        if !mount
-            .history_provisioned
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            if let Err(error) = mount
-                .client
-                .set_settings(
-                    &mount.history_index,
-                    deep_obsidian_algolia::records::history_index_settings(),
-                )
-                .await
-            {
-                tracing::warn!(
-                    index = %mount.history_index,
-                    "history index settings not applied: {error}"
-                );
-            }
-        }
+        // The write above brought the history index into existence, so its
+        // settings can finally be applied.
+        super::ensure_index_settings(
+            &mount.client,
+            &mount.history_index,
+            &mount.history_provisioned,
+            deep_obsidian_algolia::records::history_index_settings(),
+        )
+        .await;
 
         // (4) delete the superseded chunks from main — explicit vPrev filter.
         super::empty_if_missing_index(
@@ -167,9 +155,25 @@ pub async fn push_note_version(
         )?;
     }
 
-    // (5) head pointer update.
+    // (5) head pointer update — awaited, so the note is immediately readable.
+    // Algolia writes are async; without this the "write then read back to
+    // verify" pattern every capture/maintenance flow ends with would fail.
+    // Tasks on one index are processed in order, so awaiting this last write
+    // also guarantees the chunks from step (2) are queryable.
     let note_value = serde_json::to_value(&built.note).expect("note serializes");
-    mount.client.save_objects(mount.index(), vec![note_value]).await?;
+    mount
+        .client
+        .save_objects_awaited(mount.index(), vec![note_value])
+        .await?;
+    // The main index may have been created by this very write (mount-only
+    // authorship never runs `seed`), so provision its settings now.
+    super::ensure_index_settings(
+        &mount.client,
+        mount.index(),
+        &mount.main_provisioned,
+        deep_obsidian_algolia::records::main_index_settings(),
+    )
+    .await;
 
     // Retention purge (§3.1) on this note's history.
     purge_history(mount, remote_path).await?;

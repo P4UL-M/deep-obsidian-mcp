@@ -159,6 +159,14 @@ async fn mounted_tools_read_search_write_and_resolve_divergence() {
     );
     let shared_meta = &result.structured_content["shared"]["mounts"][0];
     assert_eq!(shared_meta["recallStage"], json!("lexical"));
+    // `count` must describe the FUSED list. It used to be computed from local
+    // matches only, so a purely-shared result reported count 0 alongside a
+    // non-empty `matches` — an agent reads that as "nothing found".
+    assert_eq!(
+        result.structured_content["count"].as_u64().unwrap() as usize,
+        matches.len(),
+        "count must match the fused matches list"
+    );
 
     // graph_traverse incoming on the mounted path (backlinks via filters).
     let result = call_tool(

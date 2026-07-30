@@ -83,6 +83,11 @@ pub struct SharedMountRuntime {
     /// only after its first record — so provisioning is lazy, right after that
     /// first write.
     pub history_provisioned: std::sync::atomic::AtomicBool,
+    /// Same, for the main index. Under mount-only authorship nothing else
+    /// provisions it: the index is created by the first mount write, and
+    /// without settings its facets, `distinct` and searchable attributes are
+    /// all wrong (a facet query fails outright).
+    pub main_provisioned: std::sync::atomic::AtomicBool,
 }
 
 impl SharedMountRuntime {
@@ -170,7 +175,43 @@ pub fn connect_mount(
         cache,
         recall_stage: std::sync::Mutex::new("lexical".to_string()),
         history_provisioned: std::sync::atomic::AtomicBool::new(false),
+        main_provisioned: std::sync::atomic::AtomicBool::new(false),
     })
+}
+
+/// Applies index settings once per process, and only when they look absent —
+/// so a hand-tuned index (NeuralSearch, custom ranking) is never clobbered.
+///
+/// Settings cannot be applied to an index that does not exist, and an index
+/// only exists after its first write, so every caller invokes this AFTER
+/// writing. A failure is non-fatal: the index still works with defaults, only
+/// faceting and ranking degrade, and that must not fail a user's write.
+pub async fn ensure_index_settings(
+    client: &AlgoliaClient,
+    index: &str,
+    flag: &std::sync::atomic::AtomicBool,
+    settings: serde_json::Value,
+) {
+    if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let already_configured = client
+        .get_settings(index)
+        .await
+        .map(|current| {
+            current
+                .get("attributesForFaceting")
+                .and_then(|value| value.as_array())
+                .map(|list| !list.is_empty())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if already_configured {
+        return;
+    }
+    if let Err(error) = client.set_settings_awaited(index, settings).await {
+        tracing::warn!(index = %index, "index settings not applied: {error}");
+    }
 }
 
 pub fn history_index_name(index_name: &str) -> String {

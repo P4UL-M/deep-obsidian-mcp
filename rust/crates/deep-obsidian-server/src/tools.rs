@@ -1981,7 +1981,9 @@ pub async fn call_tool(
             .await?;
             let degraded = outcome.degraded;
             let degradation_reason = outcome.degradation_reason.clone();
-            let count = outcome.matches.len();
+            // NB: computed AFTER federation below, not here — the shared-mount
+            // hits join the list later and a `count` of local-only matches
+            // would read as "no results" while `matches` was non-empty.
             let match_values = outcome
                 .matches
                 .into_iter()
@@ -2013,7 +2015,7 @@ pub async fn call_tool(
             if let Some(reason) = degradation_reason {
                 result.insert("degradationReason".to_string(), json!(reason));
             }
-            result.insert("count".to_string(), json!(count));
+            result.insert("count".to_string(), json!(match_values.len()));
             result.insert("matches".to_string(), json!(match_values));
             insert_response_truncation_flags(&mut result, response_truncated);
             Ok(json_text_result_from_arguments(

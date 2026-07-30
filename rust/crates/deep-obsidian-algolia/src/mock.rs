@@ -62,6 +62,7 @@ pub fn router(state: MockAlgolia) -> Router {
             get(handle_get_settings).put(handle_set_settings),
         )
         .route("/1/indexes/{index}/objects", post(handle_get_objects))
+        .route("/1/indexes/{index}/task/{task}", get(handle_task_status))
         .route(
             "/1/indexes/{index}/facets/{facet}/query",
             post(handle_facet_query),
@@ -565,6 +566,14 @@ async fn handle_delete_by_query(
         StatusCode::OK,
         Json(json!({ "taskID": 1, "deletedCount": removed })),
     )
+}
+
+/// Mock writes are synchronous, so a task is always already published. The
+/// endpoint exists so the production wait-for-task path is exercised by tests.
+async fn handle_task_status(
+    AxumPath((_index, _task)): AxumPath<(String, String)>,
+) -> Json<Value> {
+    Json(json!({ "status": "published", "pendingTask": false }))
 }
 
 async fn handle_get_settings(
