@@ -381,24 +381,73 @@ system is not persisting values; check the keyring backend"
             );
             Ok(())
         }
-        ShareAction::Key { index, filters } => {
+        ShareAction::Key {
+            index,
+            filters,
+            parent_key,
+        } => {
             let config = select_mount_config(resolved, index.as_deref())?;
             let secrets = SecretResolver::new();
-            let parent_key = deep_obsidian_server::shared::resolve_api_key(&config, &secrets)
-                .map_err(|error| anyhow!("{error}"))?;
+            // A secured key INHERITS its parent's ACLs; the `filters`
+            // restriction constrains search only. Deriving from the mount's
+            // write key therefore produces a key that reads a narrow slice but
+            // can write ANYWHERE in the index — verified against a live
+            // account. So the parent must be search-only, and we check it
+            // rather than trust it.
+            let parent = match parent_key.as_deref() {
+                Some(explicit) => explicit.to_string(),
+                None => deep_obsidian_server::shared::resolve_api_key(&config, &secrets)
+                    .map_err(|error| anyhow!("{error}"))?,
+            };
+            let probe = deep_obsidian_algolia::AlgoliaClient::new(
+                &config.app_id,
+                &parent,
+                config.base_url.as_deref(),
+            );
+            let acls = probe
+                .key_acls(&parent)
+                .await
+                .map_err(|error| anyhow!("cannot inspect the parent key's ACLs: {error}"))?;
+            let write_acls: Vec<&String> = acls
+                .iter()
+                .filter(|acl| deep_obsidian_algolia::WRITE_ACLS.contains(&acl.as_str()))
+                .collect();
+            if !write_acls.is_empty() {
+                return Err(anyhow!(
+                    "refusing to derive a teammate key from a parent that can write \
+(ACLs: {write_acls:?}).\n\nA secured key inherits its parent's ACLs and its `filters` \
+restriction applies to SEARCH ONLY — the result would read a narrow slice while writing \
+anywhere in the index.\n\nCreate a search-only key for this index (Algolia dashboard \
+> API Keys > New, ACL: search only), then:\n  deep-obsidian-mcp share key --parent-key \
+<that-key>{}",
+                    filters
+                        .as_deref()
+                        .map(|f| format!(" --filters '{f}'"))
+                        .unwrap_or_default()
+                ));
+            }
+            if !acls.iter().any(|acl| acl == "search") {
+                return Err(anyhow!(
+                    "the parent key cannot search (ACLs: {acls:?}); a teammate key derived \
+from it would be useless"
+                ));
+            }
             let restrictions = filters
                 .as_deref()
                 .map(|filters| format!("filters={}", urlencoding_encode(filters)))
                 .unwrap_or_default();
-            let key = deep_obsidian_algolia::generate_secured_api_key(&parent_key, &restrictions);
+            let key = deep_obsidian_algolia::generate_secured_api_key(&parent, &restrictions);
             println!(
-                "secured key (read-only{}):",
+                "secured key (parent ACLs verified search-only{}):",
                 filters
                     .as_deref()
                     .map(|filters| format!(", scoped to `{filters}`"))
                     .unwrap_or_default()
             );
             println!("{key}");
+            println!();
+            println!("The teammate supplies it via DEEP_OBSIDIAN_ALGOLIA_API_KEY, or");
+            println!("`share set-key` on their side. Writes will be refused by Algolia.");
             Ok(())
         }
     }

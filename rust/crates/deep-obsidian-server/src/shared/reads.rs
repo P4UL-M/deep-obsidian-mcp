@@ -17,6 +17,7 @@ use serde_json::Value;
 /// note goes on showing up.
 pub const LIVE_NOTES: &str = "recordType:note AND NOT deleted:true";
 
+#[derive(Debug)]
 pub struct HydratedNote {
     pub content: String,
     pub note: NoteRecord,
@@ -366,6 +367,7 @@ mod tests {
     }
 }
 
+#[derive(Debug)]
 pub struct DumpReport {
     pub notes: usize,
     pub bytes: u64,

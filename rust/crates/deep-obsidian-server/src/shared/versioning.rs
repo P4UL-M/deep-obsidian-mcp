@@ -15,6 +15,7 @@ use super::{new_version_id, now_ms, retention_keep_set, Result, SharedError, Sha
 use deep_obsidian_algolia::records::NoteRecord;
 use serde_json::{json, Value};
 
+#[derive(Debug)]
 pub struct VersionedWriteOutcome {
     pub version_id: String,
     pub parent_version_id: Option<String>,
@@ -29,10 +30,13 @@ pub async fn fetch_head(
     remote_path: &str,
 ) -> Result<Option<NoteRecord>> {
     let ids = vec![deep_obsidian_algolia::note_object_id(remote_path)];
-    let mut results = super::empty_if_missing_index(
-        mount.client.get_objects(mount.index(), &ids).await,
-        Vec::new(),
-    )?;
+    let raw = mount.client.get_objects(mount.index(), &ids).await;
+    // Either "no index yet" or "this key may not see that object" means the
+    // same thing to a reader: there is no such note here.
+    let mut results = match raw {
+        Err(error) if error.is_forbidden_by_key_scope() => Vec::new(),
+        other => super::empty_if_missing_index(other, Vec::new())?,
+    };
     Ok(results
         .pop()
         .flatten()
@@ -350,6 +354,7 @@ pub async fn soft_delete_note(
     })
 }
 
+#[derive(Debug)]
 pub struct SoftDeleteOutcome {
     pub version_id: String,
     pub already_deleted: bool,

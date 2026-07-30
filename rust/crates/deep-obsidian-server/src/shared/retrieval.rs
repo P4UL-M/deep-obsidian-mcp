@@ -121,10 +121,14 @@ async fn drop_superseded_hits(
         .iter()
         .map(|path| deep_obsidian_algolia::note_object_id(path))
         .collect();
-    let records = super::empty_if_missing_index(
-        mount.client.get_objects(mount.index(), &ids).await,
-        Vec::new(),
-    )?;
+    let raw = mount.client.get_objects(mount.index(), &ids).await;
+    // A secured key may be scoped so that chunk records are visible but note
+    // records are not. Failing the whole search there would be worse than
+    // skipping the head check, so an unresolvable head keeps its hits.
+    if raw.as_ref().err().is_some_and(|error| error.is_forbidden_by_key_scope()) {
+        return Ok(hits);
+    }
+    let records = super::empty_if_missing_index(raw, Vec::new())?;
     let mut head_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for record in records.into_iter().flatten() {
         if let (Some(path), Some(version)) = (

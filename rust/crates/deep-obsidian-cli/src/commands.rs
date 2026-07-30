@@ -43,7 +43,7 @@ Usage:
   deep-obsidian-mcp share status
   deep-obsidian-mcp share retract --path <note.md> [--index <name>] [--yes]
   deep-obsidian-mcp share set-key [--index <name>]
-  deep-obsidian-mcp share key [--index <name>] [--filters <algolia-filters>]
+  deep-obsidian-mcp share key --parent-key <search-only-key> [--filters <f>] [--index <name>]
 
 Commands:
   serve          Start the MCP server using resolved config.
@@ -562,6 +562,7 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
                 | "--to"
                 | "--prefix"
                 | "--path"
+                | "--parent-key"
         ) || token.starts_with("--config=")
             || token.starts_with("--index-dir=")
             || token.starts_with("--transport=")
@@ -637,6 +638,8 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
                 normalize_value_flag(raw_args, index, "--filters", "--filters")
             } else if token.starts_with("--to") {
                 normalize_value_flag(raw_args, index, "--to", "--to")
+            } else if token.starts_with("--parent-key") {
+                normalize_value_flag(raw_args, index, "--parent-key", "--parent-key")
             } else if token.starts_with("--prefix") {
                 normalize_value_flag(raw_args, index, "--prefix", "--prefix")
             } else if token.starts_with("--path") {

@@ -211,5 +211,10 @@ pub enum ShareAction {
         /// Algolia `filters` restriction to embed, e.g. `folders.lvl0:_Wiki`.
         #[arg(long)]
         filters: Option<String>,
+        /// SEARCH-ONLY parent key to derive from. Required: a secured key
+        /// inherits its parent's ACLs, so deriving from the mount's write key
+        /// would hand out full write access to the whole index.
+        #[arg(long = "parent-key")]
+        parent_key: Option<String>,
     },
 }

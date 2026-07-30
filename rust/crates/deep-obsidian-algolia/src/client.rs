@@ -26,6 +26,19 @@ impl AlgoliaError {
     /// into existence on its first WRITE, so every read against a never-written
     /// index answers this — callers that treat "no index" as "no records" check
     /// it instead of failing.
+    /// True for Algolia's 403 when a SECURED key's restriction excludes the
+    /// object being addressed (`Method not allowed with this API key (objectID
+    /// not allowed)`). Distinct from an outright invalid key, which reports
+    /// "Invalid Application-ID or API key" — that must still surface as an
+    /// error rather than looking like empty data.
+    pub fn is_forbidden_by_key_scope(&self) -> bool {
+        matches!(
+            self,
+            AlgoliaError::Api { status: 403, message }
+                if message.contains("not allowed with this API key")
+        )
+    }
+
     pub fn is_index_not_found(&self) -> bool {
         matches!(
             self,
@@ -413,6 +426,36 @@ impl AlgoliaClient {
             }
         }
         Ok(hits)
+    }
+}
+
+/// ACLs Algolia reports for an API key.
+pub const WRITE_ACLS: &[&str] = &[
+    "addObject",
+    "deleteObject",
+    "deleteIndex",
+    "editSettings",
+    "settings",
+];
+
+impl AlgoliaClient {
+    /// The ACLs granted to `key`. Used to refuse deriving a "read-only"
+    /// secured key from a parent that can write — a secured key INHERITS the
+    /// parent's ACLs, and its `filters` restriction constrains search only.
+    pub async fn key_acls(&self, key: &str) -> Result<Vec<String>> {
+        let payload = self
+            .request(reqwest::Method::GET, &format!("/1/keys/{key}"), None)
+            .await?;
+        Ok(payload
+            .get("acl")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 

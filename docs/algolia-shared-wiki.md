@@ -431,6 +431,21 @@ even removes the old copy. So retraction needs its own answer:
 embed a `filters` restriction validated server-side, so a participant can be
 scoped to a subset (`type:wiki-decision`, a folder facet, …).
 
+**A secured key inherits its parent's ACLs — verified the hard way.** Deriving
+one from the mount's own key (which can write) produced a key that read only
+`_Wiki/` but **successfully wrote a record into `_Agent/`** against a live
+account. The `filters` restriction constrains SEARCH ONLY; it does not constrain
+writes at all. `share key` therefore inspects the parent's ACLs and refuses any
+parent holding `addObject` / `deleteObject` / `deleteIndex` / `settings` /
+`editSettings`, pointing the owner at `--parent-key <search-only-key>`.
+
+What Algolia *does* enforce correctly, also verified live: `search` and `browse`
+honour the filter, and `getObjects` on an out-of-scope objectID is refused
+outright (403 `objectID not allowed`). That 403 used to be surfaced verbatim,
+which let a scoped teammate tell "exists but hidden" from "does not exist" and
+so enumerate paths outside their scope; it is now mapped to the same
+`NoteNotFound` as a missing note.
+
 **Write scoping is not.** Algolia write keys restrict by *index*, not by record.
 So:
 
