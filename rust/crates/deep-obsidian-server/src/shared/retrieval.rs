@@ -18,6 +18,9 @@ pub struct RemoteSearchHit {
     pub chunk_index: usize,
     pub start_line: usize,
     pub end_line: usize,
+    /// Version the chunk belongs to; compared against the note's head so a
+    /// superseded version's orphaned chunks never reach a reader.
+    pub version_id: String,
 }
 
 /// One ranked query against the mount's main index. Chunk records only (note
@@ -61,7 +64,7 @@ pub async fn search_mount_with_distinct(
             .await,
         super::empty_search_response(),
     )?;
-    Ok(response
+    let hits: Vec<RemoteSearchHit> = response
         .hits
         .iter()
         .filter_map(|hit| {
@@ -82,7 +85,66 @@ pub async fn search_mount_with_distinct(
                 chunk_index: hit.get("chunkIndex").and_then(Value::as_u64).unwrap_or(0) as usize,
                 start_line: hit.get("startLine").and_then(Value::as_u64).unwrap_or(1) as usize,
                 end_line: hit.get("endLine").and_then(Value::as_u64).unwrap_or(1) as usize,
+                version_id: hit
+                    .get("versionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             })
+        })
+        .collect();
+    drop_superseded_hits(mount, hits).await
+}
+
+/// Drops hits whose chunk belongs to a version that is no longer the note's
+/// head.
+///
+/// Two participants writing the same note simultaneously each push their own
+/// chunks; only one wins the head pointer, and the loser's chunks stay in the
+/// main index as ORPHANS. They are unreachable from the head — `read_note`
+/// reassembles by head version — but a plain chunk query still matches them, so
+/// search would show text the note no longer contains. Deleting them instead
+/// would mean re-running the destructive race the explicit `versionId:vPrev`
+/// delete filter exists to avoid, so they are filtered at query time: one
+/// batched `getObjects` over the hit paths, then keep only head-version chunks.
+async fn drop_superseded_hits(
+    mount: &SharedMountRuntime,
+    hits: Vec<RemoteSearchHit>,
+) -> Result<Vec<RemoteSearchHit>> {
+    if hits.is_empty() {
+        return Ok(hits);
+    }
+    let mut paths: Vec<String> = hits.iter().map(|hit| hit.remote_path.clone()).collect();
+    paths.sort();
+    paths.dedup();
+    let ids: Vec<String> = paths
+        .iter()
+        .map(|path| deep_obsidian_algolia::note_object_id(path))
+        .collect();
+    let records = super::empty_if_missing_index(
+        mount.client.get_objects(mount.index(), &ids).await,
+        Vec::new(),
+    )?;
+    let mut head_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for record in records.into_iter().flatten() {
+        if let (Some(path), Some(version)) = (
+            record.get("path").and_then(Value::as_str),
+            record.get("versionId").and_then(Value::as_str),
+        ) {
+            // A tombstoned note has no live content at all.
+            if record.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
+                continue;
+            }
+            head_of.insert(path.to_string(), version.to_string());
+        }
+    }
+    Ok(hits
+        .into_iter()
+        .filter(|hit| {
+            head_of
+                .get(&hit.remote_path)
+                .map(|head| *head == hit.version_id)
+                .unwrap_or(false)
         })
         .collect())
 }

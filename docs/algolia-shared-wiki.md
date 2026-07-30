@@ -505,6 +505,28 @@ Chunk queries deliberately do *not* carry the guard: chunk records have no
 `deleted` attribute and a soft delete removes them outright, so a tombstoned
 note has no chunks left to match.
 
+### 11.1.2 Orphaned chunks after a simultaneous write
+
+Verified against a live account (`tests/shared_concurrency_live.rs`): two
+participants writing the same note at the same instant both succeed, the head
+reassembles to exactly one participant's content, and the loser's content
+survives — **but as orphaned chunks in the main index**, not in history. Each
+writer only deletes the chunks of the base version it read, so neither removes
+the other's.
+
+Those orphans are unreachable from the head (`read_note` reassembles by head
+version) yet a plain chunk query still matched them, so search showed text the
+note no longer contained. They are therefore **filtered at query time**: one
+batched `getObjects` over the hit paths resolves each note's head, and hits from
+any other version are dropped. Deleting them instead would mean re-running the
+destructive race that the explicit `versionId:vPrev` delete filter exists to
+avoid — with no compare-and-swap available, a negative delete can always catch a
+concurrent writer's fresh chunks.
+
+Known consequence: orphaned chunk records accumulate in the index after each
+race (a handful of KB each) until the note is retracted. Correctness is
+unaffected; a sweep command is the obvious hygiene follow-up.
+
 ### 11.2 Algolia request limits the mock must mirror
 
 Two real-engine rejections that a permissive mock let through, both found by
