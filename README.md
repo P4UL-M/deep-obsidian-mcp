@@ -20,6 +20,10 @@ machine; semantic search works offline, and embeddings are optional.
 - **Flexible transport** — run as a stdio subprocess or a long-lived HTTP
   service, with optional bearer authentication.
 - **Packaged** — install on macOS (Homebrew) or Debian/Ubuntu (apt).
+- **Shareable (optional)** — mount an Algolia index as a virtual folder so a team
+  authors one wiki through it: versioned writes that never destroy the previous
+  version, and filter-scoped read-only keys per teammate. See
+  [docs/algolia-shared-wiki.md](./docs/algolia-shared-wiki.md).
 
 ## Install
 
@@ -66,6 +70,7 @@ Optional features and tuning live in [CONFIGURATION.md](./CONFIGURATION.md):
 
 - **Semantic search** via an OpenAI-compatible embeddings endpoint
 - **Authentication** (bearer token) for non-loopback / tunnelled deployments
+- **Shared Algolia wiki** for team-readable, team-writable project memory
 - **Automatic reindexing** behaviour
 
 ## Documentation
@@ -74,7 +79,8 @@ Optional features and tuning live in [CONFIGURATION.md](./CONFIGURATION.md):
 |---|---|
 | [INSTALL.md](./INSTALL.md) | Install on macOS, Debian/Ubuntu, or from source |
 | [USAGE.md](./USAGE.md) | Set up your vault, connect an agent, run the service, troubleshoot |
-| [CONFIGURATION.md](./CONFIGURATION.md) | Embeddings, authentication, reindexing |
+| [CONFIGURATION.md](./CONFIGURATION.md) | Embeddings, authentication, reindexing, shared Algolia wiki |
+| [docs/algolia-shared-wiki.md](./docs/algolia-shared-wiki.md) | Team-shared wiki: design, guarantees, limits |
 | [docs/mcp-reference.md](./docs/mcp-reference.md) | MCP tools, resources, and prompts |
 | [docs/architecture.md](./docs/architecture.md) | Indexing model and internals |
 | [CHANGELOG.md](./CHANGELOG.md) | Release history |
