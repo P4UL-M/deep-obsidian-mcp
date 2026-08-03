@@ -29,6 +29,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Two pre-existing grep_search tests spawn ripgrep; hosted runners
+      # don't ship it.
+      - name: install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       # `rust-toolchain.toml` declares rustfmt+clippy as required components;
       # the action installs the minimal profile by default, so request them
       # explicitly rather than letting rustup fetch them mid-build.
