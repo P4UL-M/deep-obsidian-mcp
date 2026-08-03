@@ -1,0 +1,51 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "_meta": {
+      "noteResourceCount": 3,
+      "noteResourceLimit": 200,
+      "noteResourceTotal": 3,
+      "noteUriTemplate": "obsidian://note{?path}",
+      "notesIndexUri": "obsidian://vault/notes-index",
+      "truncated": false
+    },
+    "resources": [
+      {
+        "description": "Basic metadata about the configured vault and local search index.",
+        "mimeType": "application/json",
+        "name": "vault-overview",
+        "title": "Vault Overview",
+        "uri": "obsidian://vault/info"
+      },
+      {
+        "description": "Compact path manifest for all notes in the configured vault.",
+        "mimeType": "application/json",
+        "name": "vault-notes-index",
+        "title": "Vault Notes Index",
+        "uri": "obsidian://vault/notes-index"
+      },
+      {
+        "description": "Read a full note from the configured vault.",
+        "mimeType": "text/markdown",
+        "name": "Folder/Child.md",
+        "title": "Obsidian Note",
+        "uri": "obsidian://note?path=Folder%2FChild.md"
+      },
+      {
+        "description": "Read a full note from the configured vault.",
+        "mimeType": "text/markdown",
+        "name": "Folder/Nested/Deep.md",
+        "title": "Obsidian Note",
+        "uri": "obsidian://note?path=Folder%2FNested%2FDeep.md"
+      },
+      {
+        "description": "Read a full note from the configured vault.",
+        "mimeType": "text/markdown",
+        "name": "Root.md",
+        "title": "Obsidian Note",
+        "uri": "obsidian://note?path=Root.md"
+      }
+    ]
+  }
+}

@@ -1,0 +1,71 @@
+name: ci
+
+# Minimal correctness gate for the Rust workspace. The .deb build matrix lives
+# in release-deb.yml and already exercises release compilation on PRs touching
+# `rust/**`; this workflow only runs the test suite and reports lint drift.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same PR supersedes the previous run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Blocking. The workspace manifest is at the repository root (members are
+  # `rust/crates/*`), so cargo runs from the checkout root, not from `rust/`.
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `rust-toolchain.toml` declares rustfmt+clippy as required components;
+      # the action installs the minimal profile by default, so request them
+      # explicitly rather than letting rustup fetch them mid-build.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  # Informational ONLY (`continue-on-error: true`), deliberately not a gate:
+  #
+  #   * `main` carries pre-existing clippy warnings (34 lint sites at the time
+  #     this workflow was added). Making clippy blocking would fail every PR
+  #     until that backlog is cleared, which is out of scope here.
+  #   * `cargo fmt --check` output is rustfmt-version dependent and the tree
+  #     has known formatting drift, so a hosted-runner rustfmt disagrees with
+  #     locally formatted files for reasons unrelated to the PR.
+  #
+  # The job still runs so the annotations are visible and the trend can be
+  # watched; flip `continue-on-error` off once both are clean.
+  lint:
+    name: fmt + clippy (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Both steps carry `continue-on-error` individually, not just the job:
+      # a failing step normally aborts the remaining steps, which would hide
+      # the clippy output behind the (currently guaranteed) fmt failure.
+      - name: cargo fmt --check
+        continue-on-error: true
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --all-features

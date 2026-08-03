@@ -1,0 +1,25 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"endLine\": 10,\n  \"hash\": \"fnv1a64:8f57a59c5ff19006\",\n  \"includeText\": true,\n  \"lineCount\": 4,\n  \"maxTextChars\": 20000,\n  \"path\": \"Root.md\",\n  \"resourceUri\": \"obsidian://note?path=Root.md\",\n  \"startLine\": 7,\n  \"text\": \"# Root\\n\\nRoot preamble text linking to [[Folder/Child]] and [[Missing Note]].\\n\",\n  \"textTruncated\": false,\n  \"unchanged\": false\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "endLine": 10,
+      "hash": "fnv1a64:8f57a59c5ff19006",
+      "includeText": true,
+      "lineCount": 4,
+      "maxTextChars": 20000,
+      "path": "Root.md",
+      "resourceUri": "obsidian://note?path=Root.md",
+      "startLine": 7,
+      "text": "# Root\n\nRoot preamble text linking to [[Folder/Child]] and [[Missing Note]].\n",
+      "textTruncated": false,
+      "unchanged": false
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32000,
+    "message": "upsert_note requires a vault-relative .md path."
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

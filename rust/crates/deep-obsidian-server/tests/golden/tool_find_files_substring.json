@@ -1,0 +1,34 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"count\": 3,\n  \"matches\": [\n    {\n      \"matchedOn\": \"substring\",\n      \"path\": \"Folder/Child.md\",\n      \"resourceUri\": \"obsidian://note?path=Folder%2FChild.md\"\n    },\n    {\n      \"matchedOn\": \"substring\",\n      \"path\": \"Folder/Nested/Deep.md\",\n      \"resourceUri\": \"obsidian://note?path=Folder%2FNested%2FDeep.md\"\n    },\n    {\n      \"matchedOn\": \"substring\",\n      \"path\": \"Root.md\",\n      \"resourceUri\": \"obsidian://note?path=Root.md\"\n    }\n  ],\n  \"mode\": \"substring\",\n  \"query\": \"o\"\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "count": 3,
+      "matches": [
+        {
+          "matchedOn": "substring",
+          "path": "Folder/Child.md",
+          "resourceUri": "obsidian://note?path=Folder%2FChild.md"
+        },
+        {
+          "matchedOn": "substring",
+          "path": "Folder/Nested/Deep.md",
+          "resourceUri": "obsidian://note?path=Folder%2FNested%2FDeep.md"
+        },
+        {
+          "matchedOn": "substring",
+          "path": "Root.md",
+          "resourceUri": "obsidian://note?path=Root.md"
+        }
+      ],
+      "mode": "substring",
+      "query": "o"
+    }
+  }
+}

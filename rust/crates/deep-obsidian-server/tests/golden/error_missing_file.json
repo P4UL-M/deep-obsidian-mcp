@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32000,
+    "message": "io error for <VAULT>/Nope.md: No such file or directory (os error 2)"
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

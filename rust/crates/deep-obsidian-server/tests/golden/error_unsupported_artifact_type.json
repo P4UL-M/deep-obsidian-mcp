@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32000,
+    "message": "unsupported artifact type for Root.md"
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

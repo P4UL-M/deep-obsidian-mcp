@@ -1,0 +1,23 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"action\": \"created\",\n  \"created\": true,\n  \"dryRun\": true,\n  \"newHash\": \"fnv1a64:8776213799c39cdf\",\n  \"path\": \"Folder/New Note.md\",\n  \"previousHash\": null,\n  \"resourceUri\": \"obsidian://note?path=Folder%2FNew%20Note.md\",\n  \"title\": \"New Note\",\n  \"wikiLink\": \"[[Folder/New Note|New Note]]\"\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "action": "created",
+      "created": true,
+      "dryRun": true,
+      "newHash": "fnv1a64:8776213799c39cdf",
+      "path": "Folder/New Note.md",
+      "previousHash": null,
+      "resourceUri": "obsidian://note?path=Folder%2FNew%20Note.md",
+      "title": "New Note",
+      "wikiLink": "[[Folder/New Note|New Note]]"
+    }
+  }
+}

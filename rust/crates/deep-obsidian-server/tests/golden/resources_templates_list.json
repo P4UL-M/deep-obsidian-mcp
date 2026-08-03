@@ -1,0 +1,29 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "resourceTemplates": [
+      {
+        "description": "Read a full note from the configured vault.",
+        "mimeType": "text/markdown",
+        "name": "note-resource",
+        "title": "Obsidian Note",
+        "uriTemplate": "obsidian://note{?path}"
+      },
+      {
+        "description": "Read the section corresponding to a heading slug within a note.",
+        "mimeType": "text/markdown",
+        "name": "heading-resource",
+        "title": "Obsidian Heading Section",
+        "uriTemplate": "obsidian://heading{?path,slug}"
+      },
+      {
+        "description": "Read a block identified by an Obsidian block id inside a note.",
+        "mimeType": "text/markdown",
+        "name": "block-resource",
+        "title": "Obsidian Block",
+        "uriTemplate": "obsidian://block{?path,id}"
+      }
+    ]
+  }
+}
