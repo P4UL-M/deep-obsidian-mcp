@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Component, Path};
 
 use deep_obsidian_core::text::{extract_block_sections, extract_heading_sections};
+use deep_obsidian_core::vault::VaultError;
 use serde_json::json;
 use urlencoding::decode;
 
@@ -11,7 +13,6 @@ use crate::protocol::{
     ResourceContents, ResourceDefinition, ResourceListResult, ResourceReadResult,
     ResourceTemplateDefinition, ResourceTemplateListResult,
 };
-use crate::vault::read_text;
 
 const VAULT_INFO_URI: &str = "obsidian://vault/info";
 const NOTES_INDEX_URI: &str = "obsidian://vault/notes-index";
@@ -169,6 +170,60 @@ pub fn list_resource_templates() -> ResourceTemplateListResult {
     }
 }
 
+/// Reads a vault note for the `obsidian://note|heading|block` resources.
+///
+/// The error strings surfaced by `resources/read` are public MCP behaviour, and
+/// the server-local vault helper this replaces was stricter and worded its
+/// rejections differently than `deep_obsidian_core::vault`:
+///
+/// * it validated the vault root first, so a vanished vault reported
+///   `vault path does not exist or is not a directory` rather than a per-file IO
+///   error;
+/// * it rejected *any* `..` / root / prefix component outright instead of
+///   normalizing it away, so `Notes/../Home.md` is an error here even though core
+///   would resolve it to `Home.md`;
+/// * it reported every escape (lexical or through an in-vault symlink) as
+///   `path escapes the vault` rather than `invalid vault-relative path`.
+///
+/// Those guards and that wording are preserved here so the public contract is
+/// unchanged; the read itself goes through core.
+fn read_note_text(vault_path: &Path, relative_path: &str) -> Result<String, String> {
+    if !fs::metadata(vault_path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "vault path does not exist or is not a directory: {}",
+            vault_path.display()
+        ));
+    }
+
+    let normalized = relative_path.trim_start_matches('/');
+    if normalized.is_empty() {
+        return Err(format!("invalid vault-relative path: {relative_path}"));
+    }
+    if Path::new(normalized).components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(format!("path escapes the vault: {relative_path}"));
+    }
+
+    deep_obsidian_core::vault::read_text_file(vault_path, relative_path)
+        .map(|result| result.text)
+        .map_err(|error| match error {
+            // The lexical guard above already rejected everything core reports
+            // lexically, so this can only be core's canonicalization (symlink)
+            // guard — an escape in the legacy wording.
+            VaultError::InvalidVaultRelativePath(path) => {
+                format!("path escapes the vault: {path}")
+            }
+            other => other.to_string(),
+        })
+}
+
 pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadResult, String> {
     if uri == VAULT_INFO_URI {
         let snapshot = state
@@ -228,7 +283,7 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let path = params
             .get("path")
             .ok_or_else(|| "missing note path".to_string())?;
-        let text = read_text(&state.config.vault_path, path).map_err(|error| error.to_string())?;
+        let text = read_note_text(&state.config.vault_path, path)?;
         return Ok(ResourceReadResult {
             contents: vec![ResourceContents {
                 uri: note_uri(path),
@@ -245,7 +300,7 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let slug = params
             .get("slug")
             .ok_or_else(|| "missing heading slug".to_string())?;
-        let text = read_text(&state.config.vault_path, path).map_err(|error| error.to_string())?;
+        let text = read_note_text(&state.config.vault_path, path)?;
         let heading = extract_heading_sections(&text)
             .into_iter()
             .find(|section| section.slug == *slug)
@@ -266,7 +321,7 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let id = params
             .get("id")
             .ok_or_else(|| "missing block id".to_string())?;
-        let text = read_text(&state.config.vault_path, path).map_err(|error| error.to_string())?;
+        let text = read_note_text(&state.config.vault_path, path)?;
         let block = extract_block_sections(&text)
             .into_iter()
             .find(|section| section.id == *id)
@@ -320,5 +375,77 @@ mod tests {
         assert_eq!(resource.name, "Folder/My Note.md");
         assert_eq!(resource.title.as_deref(), Some("Obsidian Note"));
         assert_eq!(resource.mime_type, "text/markdown");
+    }
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{}", std::process::id(), nanos))
+    }
+
+    /// `resources/read` error strings are public MCP behaviour; these freeze the
+    /// wording that the (now removed) server-local vault helper emitted.
+    #[test]
+    fn read_note_text_preserves_legacy_error_wording() {
+        let vault = temp_dir("resources-read-note");
+        fs::create_dir_all(vault.join("Notes")).unwrap();
+        fs::write(vault.join("Home.md"), "home").unwrap();
+
+        assert_eq!(read_note_text(&vault, "Home.md").unwrap(), "home");
+
+        assert_eq!(
+            read_note_text(&vault, "../escape.md").unwrap_err(),
+            "path escapes the vault: ../escape.md"
+        );
+        // Stricter than core, which would normalize this to `Home.md`.
+        assert_eq!(
+            read_note_text(&vault, "Notes/../Home.md").unwrap_err(),
+            "path escapes the vault: Notes/../Home.md"
+        );
+        assert_eq!(
+            read_note_text(&vault, "/").unwrap_err(),
+            "invalid vault-relative path: /"
+        );
+        // A missing note keeps the enriched IO wording from core.
+        let missing = read_note_text(&vault, "Missing.md").unwrap_err();
+        assert!(
+            missing.starts_with(&format!(
+                "io error for {}:",
+                vault.join("Missing.md").display()
+            )),
+            "missing notes keep the IO wording: {missing}"
+        );
+
+        let absent = temp_dir("resources-read-note-absent");
+        assert_eq!(
+            read_note_text(&absent, "Home.md").unwrap_err(),
+            format!(
+                "vault path does not exist or is not a directory: {}",
+                absent.display()
+            )
+        );
+
+        let _ = fs::remove_dir_all(&vault);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_note_text_reports_symlink_escapes_as_vault_escapes() {
+        let vault = temp_dir("resources-read-symlink-vault");
+        let outside = temp_dir("resources-read-symlink-outside");
+        fs::create_dir_all(&vault).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, vault.join("escape")).unwrap();
+        fs::write(outside.join("secret.md"), "secret").unwrap();
+
+        assert_eq!(
+            read_note_text(&vault, "escape/secret.md").unwrap_err(),
+            "path escapes the vault: escape/secret.md"
+        );
+
+        let _ = fs::remove_dir_all(&vault);
+        let _ = fs::remove_dir_all(&outside);
     }
 }

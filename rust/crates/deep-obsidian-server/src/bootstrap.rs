@@ -10,6 +10,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_config::{build_service_endpoints, is_loopback_host, normalize_service_config};
+use deep_obsidian_core::vault::ensure_vault_path;
 use deep_obsidian_types::{
     ResolvedServiceConfig, ServiceConfigInput, ServiceEndpoints, TransportMode,
 };
@@ -25,7 +26,6 @@ use crate::health::{build_health_payload, build_readiness_payload, readiness_sta
 use crate::mcp::{handle_request, AppState};
 use crate::protocol::JsonRpcRequest;
 use crate::runtime::{AutoReindexHandle, RuntimeState};
-use crate::vault::ensure_vault_path;
 
 /// Environment variable carrying a literal bearer token. When set and non-empty
 /// it enables authentication and overrides any configured `token_ref` — useful
@@ -308,6 +308,7 @@ pub async fn run_http_service(
         );
     }
 
+    // Startup validation gate; the normalized root it returns is not needed here.
     ensure_vault_path(&config.vault_path)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 

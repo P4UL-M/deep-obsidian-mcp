@@ -9,7 +9,6 @@ pub mod runtime;
 pub mod stdio;
 pub mod tools;
 pub mod uploads;
-pub mod vault;
 
 pub use bootstrap::{run_http_service, ServiceBootstrapContext};
 pub use deep_obsidian_config::{
