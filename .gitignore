@@ -2,3 +2,7 @@
 target/
 .DS_Store
 outputs/
+# Build output of the LiveSync sidecar. It is produced by `npm run build` and
+# packaged by the release pipeline, never committed.
+sidecar/livesync-sidecar/dist/
+node_modules/

@@ -43,6 +43,38 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
+  # Blocking, and deliberately NOT path-filtered to `sidecar/**`.
+  #
+  # The sidecar's stdio protocol is a contract the Rust supervisor codes
+  # against, so a change on either side can break it. Running unconditionally
+  # (the job takes well under a minute) means the protocol cannot rot behind a
+  # filter that only fires when the TypeScript happens to change.
+  sidecar:
+    name: livesync sidecar
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sidecar/livesync-sidecar
+    steps:
+      - uses: actions/checkout@v4
+      # Node 20 is the package's declared minimum, so CI runs the floor rather
+      # than the newest release: a Node-24-only API would otherwise slip in and
+      # break users on 20.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: sidecar/livesync-sidecar/package-lock.json
+      # `ci`, not `install`: the lockfile is the pin. `@vrtmrz/livesync-commonlib`
+      # is pre-1.0 with "not final" semantics, so an unintended float is a real
+      # risk, not a hypothetical one.
+      - run: npm ci
+      - run: npm run typecheck
+      # Build before test: the suite drives `dist/sidecar.mjs` as a child
+      # process on purpose, and fails loudly if it is missing.
+      - run: npm run build
+      - run: npm test
+
   # Informational ONLY (`continue-on-error: true`), deliberately not a gate:
   #
   #   * `main` carries pre-existing clippy warnings (34 lint sites at the time
