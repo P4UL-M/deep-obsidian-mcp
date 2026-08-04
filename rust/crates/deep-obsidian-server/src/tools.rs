@@ -6,8 +6,8 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use deep_obsidian_backend::{
-    BackendRequest, GrepContextLine, GrepMatch, RecallRequest, VaultChildEntry, VaultEntryKind,
-    RIPGREP_UNAVAILABLE_MESSAGE,
+    BackendRequest, BaseVersion, GrepContextLine, GrepMatch, RecallRequest, VaultChildEntry,
+    VaultEntryKind, RIPGREP_UNAVAILABLE_MESSAGE,
 };
 use deep_obsidian_core::text::{
     extract_block_sections, extract_heading_sections, extract_wiki_links, normalize_heading_slug,
@@ -1620,12 +1620,168 @@ fn insert_mount_capabilities(payload: &mut Value, router: &deep_obsidian_backend
     }
 }
 
+/// Cap on the conflicted paths named in a `vault_info` payload.
+///
+/// The COUNT is always exact; only the list is truncated. A vault with hundreds of
+/// conflicts has a systemic sync problem, and the right answer to it is "you have 412
+/// conflicts, here are the first few", not a payload the size of the manifest.
+const MAX_REPORTED_CONFLICTED_PATHS: usize = 20;
+
+/// Join each mount's conflicted-entry report into the `mounts` array.
+///
+/// # Why here, and why nowhere else
+///
+/// A LiveSync entry can have sibling revisions that CouchDB has not reconciled — two
+/// devices edited the same note offline. Reads serve the winning revision, which is
+/// correct but hides the fact that a losing edit exists. Somewhere has to say so.
+///
+/// It goes in `vault_info.mounts[]` and not in a read payload for two reasons. The read
+/// payloads (`read_file`, `list_children`, `resources/read`) are frozen by the
+/// single-mount goldens, and widening one would change bytes a client already depends
+/// on. And `mounts[]` is additive and multi-mount-only by construction, which is the
+/// same pattern the capability and index detail already follow — a couchdb mount cannot
+/// exist in a single-mount vault, so nothing a golden describes can gain a field.
+///
+/// It is best-effort: a mount whose remote is unreachable contributes NO field rather
+/// than an error or a zero. Reporting `conflictedCount: 0` for a vault nobody could
+/// reach would be a lie, and failing `vault_info` because of it would break the one
+/// tool a user runs to find out what is wrong.
+///
+/// The conflicted flag rides on manifest entries that a listing already collects, so on
+/// a warm mount this costs no extra round trip.
+async fn insert_mount_conflicts(payload: &mut Value, router: &deep_obsidian_backend::VaultRouter) {
+    let mut reports: HashMap<String, (usize, Vec<String>)> = HashMap::new();
+    for mount in router.mounts() {
+        match mount.backend.conflicted_paths().await {
+            // The backend's storage has no sibling-version notion, so there is nothing
+            // to report and no field to add. See `VaultBackend::conflicted_paths` for
+            // why that is distinct from "zero conflicts".
+            Ok(None) => {}
+            Ok(Some(paths)) => {
+                let total = paths.len();
+                let logical = paths
+                    .iter()
+                    .take(MAX_REPORTED_CONFLICTED_PATHS)
+                    // Rendered in the LOGICAL namespace, because that is the only
+                    // namespace a client can act on.
+                    .map(|path| mount.to_logical(path))
+                    .collect();
+                if total > 0 {
+                    tracing::warn!(
+                        "mount '{}' has {total} entr{} with unreconciled conflict revisions; \
+                         reads serve the winning revision and the losing edits are not visible \
+                         in it",
+                        mount.id,
+                        if total == 1 { "y" } else { "ies" }
+                    );
+                }
+                reports.insert(mount.id.clone(), (total, logical));
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "could not collect conflicted paths for mount '{}': {error}",
+                    mount.id
+                );
+            }
+        }
+    }
+    if reports.is_empty() {
+        return;
+    }
+
+    let Some(mounts) = payload
+        .as_object_mut()
+        .and_then(|object| object.get_mut("mounts"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in mounts.iter_mut() {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        let Some((total, paths)) = object
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| reports.get(id))
+        else {
+            continue;
+        };
+        object.insert("conflictedCount".to_string(), json!(total));
+        // Named only when there ARE any, so a healthy mount does not carry an empty
+        // array a reader has to interpret.
+        if *total > 0 {
+            object.insert("conflictedPaths".to_string(), json!(paths));
+        }
+    }
+}
+
 /// Read a note's text through the backend.
 async fn backend_read_text(state: &AppState, path: &str) -> Result<String, String> {
     backend_call(state, BackendRequest::read_text(path))
         .await?
         .into_text()
         .map_err(|error| error.to_string())
+}
+
+/// What a pre-write read of the destination found.
+struct PriorNote {
+    /// The existing content, when there is an existing note. `None` keeps the frozen
+    /// meaning "treat this as a create".
+    existing: Option<String>,
+    /// The precondition the write must carry. See [`BaseVersion`].
+    base_version: BaseVersion,
+}
+
+/// Read a note in order to overwrite it, keeping the version the read observed.
+///
+/// # Why the error is classified instead of discarded
+///
+/// The write tools have always treated a failed read as "there is no note here", via
+/// `.ok()`. On a filesystem vault that is nearly always right: the read fails because
+/// the file is absent. On a versioned remote it is dangerous, because the read can
+/// also fail because the remote is unreachable or an entry cannot be decrypted — and
+/// turning THAT into "nothing is here" would make the write a create-only one, which
+/// the storage would then refuse with a conflict against a note that was there all
+/// along. The user would be shown a conflict for what is actually an outage.
+///
+/// So only a genuine "destination absent" (`io_kind() == NotFound`, the same
+/// discriminator the upload commit path uses) becomes [`BaseVersion::Absent`].
+/// Any other failure still reports "no existing note" — preserving the frozen
+/// create-on-read-failure behaviour — but with [`BaseVersion::Unobserved`], so the
+/// backend is told the path was never reliably observed and must not conclude it is
+/// free.
+async fn backend_read_note_for_write(state: &AppState, path: &str) -> PriorNote {
+    match state.router.execute(BackendRequest::read_text(path)).await {
+        Ok(response) => match response.into_versioned_text() {
+            Ok((text, version)) => PriorNote {
+                existing: Some(text),
+                base_version: BaseVersion::from_read(version),
+            },
+            // A response-family mismatch is a backend bug, not an absent note.
+            Err(_) => PriorNote {
+                existing: None,
+                base_version: BaseVersion::Unobserved,
+            },
+        },
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => PriorNote {
+            existing: None,
+            base_version: BaseVersion::Absent,
+        },
+        Err(error) => {
+            // Not "there is no note": something went wrong reading one. The frozen
+            // behaviour is still to proceed as a create, but the write must NOT claim
+            // the path was observed to be free — see the doc comment.
+            tracing::debug!(
+                "read of {path} before a write failed for a reason other than absence ({error}); \
+                 proceeding as a create, with no observed precondition"
+            );
+            PriorNote {
+                existing: None,
+                base_version: BaseVersion::Unobserved,
+            }
+        }
+    }
 }
 
 /// Run hybrid search off the async runtime, surfacing the degradation signal. When the
@@ -1675,6 +1831,7 @@ pub async fn call_tool(
             // cover the whole logical vault and adds each mount's own numbers.
             insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
             insert_mount_capabilities(&mut payload, state.router.as_ref());
+            insert_mount_conflicts(&mut payload, state.router.as_ref()).await;
             if let Some(object) = payload.as_object_mut() {
                 match health {
                     // Sparse backend: nothing to probe, so omit the status field entirely.
@@ -2447,9 +2604,11 @@ pub async fn call_tool(
             let expected_hash = expected_hash_arg(arguments);
             let (content, compose_warning) = compose_explicit_note_content(arguments)?;
             let preserve_manual_notes = bool_arg(arguments, "preserveManualNotes", false);
-            // A read failure means "no existing note" here, exactly as before: the
-            // error is deliberately discarded so a first write still creates.
-            let existing = backend_read_text(state, &path).await.ok();
+            // A read failure still means "no existing note" here, exactly as before,
+            // so a first write creates. What is new is that the read also yields the
+            // precondition the write will carry; see `backend_read_note_for_write`.
+            let prior = backend_read_note_for_write(state, &path).await;
+            let existing = prior.existing;
             let previous_hash = existing
                 .as_deref()
                 .map(|existing| content_hash(existing.as_bytes()));
@@ -2460,8 +2619,14 @@ pub async fn call_tool(
                 .unwrap_or_else(|| finalize_written_content(&content));
             let new_hash = content_hash(final_content.as_bytes());
             let created = existing.is_none();
+            // The dry run returns above without ever reaching the write, so no
+            // backend — and therefore no remote — is touched by one.
             if !dry_run {
-                backend_call(state, BackendRequest::write_text(&path, &final_content)).await?;
+                backend_call(
+                    state,
+                    BackendRequest::write_text_guarded(&path, &final_content, prior.base_version),
+                )
+                .await?;
             }
             let title = note_title_from_content(&path, &final_content);
             let mut payload = json!({
@@ -2487,7 +2652,13 @@ pub async fn call_tool(
             let replacement = string_arg(arguments, "content")?;
             let dry_run = bool_arg(arguments, "dryRun", false);
             let expected_hash = expected_hash_arg(arguments);
-            let existing = backend_read_text(state, &path).await?;
+            // `update_note_section` REQUIRES an existing note (there is no section to
+            // update otherwise), so unlike the upserts this read propagates failures.
+            let (existing, base_version) = backend_call(state, BackendRequest::read_text(&path))
+                .await?
+                .into_versioned_text()
+                .map(|(text, version)| (text, BaseVersion::from_read(version)))
+                .map_err(|error| error.to_string())?;
             let previous_hash = content_hash(existing.as_bytes());
             validate_expected_hash(expected_hash.as_deref(), Some(&previous_hash), &path)?;
             let (final_content, action, level, heading) = match target.as_str() {
@@ -2523,7 +2694,11 @@ pub async fn call_tool(
             };
             let new_hash = content_hash(final_content.as_bytes());
             if !dry_run {
-                backend_call(state, BackendRequest::write_text(&path, &final_content)).await?;
+                backend_call(
+                    state,
+                    BackendRequest::write_text_guarded(&path, &final_content, base_version),
+                )
+                .await?;
             }
             Ok(json_text_result(json!({
                 "action": action,
@@ -2604,7 +2779,8 @@ pub async fn call_tool(
                     folder.as_deref().unwrap_or("Knowledge Capture"),
                 )
             });
-            let existing = backend_read_text(state, &target_path).await.ok();
+            let prior = backend_read_note_for_write(state, &target_path).await;
+            let existing = prior.existing;
             let previous_hash = existing
                 .as_deref()
                 .map(|existing| content_hash(existing.as_bytes()));
@@ -2620,7 +2796,11 @@ pub async fn call_tool(
             if !dry_run {
                 backend_call(
                     state,
-                    BackendRequest::write_text(&target_path, &final_content),
+                    BackendRequest::write_text_guarded(
+                        &target_path,
+                        &final_content,
+                        prior.base_version,
+                    ),
                 )
                 .await?;
             }

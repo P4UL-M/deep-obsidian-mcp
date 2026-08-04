@@ -140,7 +140,11 @@ impl VaultBackend for InMemoryVaultBackend {
                         error.to_string(),
                     ))
                 })?;
-                Ok(BackendResponse::Content(ContentResponse::Text { text }))
+                Ok(BackendResponse::Content(ContentResponse::Text {
+                    text,
+                    // No versioning here either; see the filesystem backend.
+                    version: None,
+                }))
             }
             BackendRequest::Content(ContentRequest::ReadBytes { path }) => Ok(
                 BackendResponse::Content(ContentResponse::Bytes(self.read(&path)?)),
@@ -155,7 +159,7 @@ impl VaultBackend for InMemoryVaultBackend {
                 Self::normalize(&path)?;
                 Ok(BackendResponse::Content(ContentResponse::PathAccepted))
             }
-            BackendRequest::Mutation(MutationRequest::WriteText { path, content }) => {
+            BackendRequest::Mutation(MutationRequest::WriteText { path, content, .. }) => {
                 let normalized = Self::ensure_writable(&path)?;
                 let created = self
                     .files

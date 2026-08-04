@@ -39,6 +39,8 @@ Usage:
   deep-obsidian-mcp doctor [--config <path>] [--json]
   deep-obsidian-mcp print-config [--config <path>]
   deep-obsidian-mcp probe [--config <path>] [--json]
+  deep-obsidian-mcp couchdb export --mount <id> --out <dir> [--config <path>] [--json]
+  deep-obsidian-mcp couchdb restore --mount <id> --from <dir> [--dry-run] [--force] [--json]
 
 Commands:
   serve          Start the MCP server using resolved config.
@@ -46,8 +48,20 @@ Commands:
   doctor         Diagnose config, vault access, dependencies, and health.
   print-config   Print the normalized persisted config.
   probe          Probe the configured HTTP health and MCP endpoints.
+  couchdb        Snapshot (export) and restore a CouchDB (Self-hosted LiveSync) mount.
   help           Show this help.
-  version        Print the current version.";
+  version        Print the current version.
+
+couchdb export writes every entry of one mount to a directory, plus a manifest.json
+recording each entry's revision, content hash and storage kind. Two exports of an
+unchanged vault are byte-identical, so `diff -r` (or the reported tree hash) verifies
+a round trip.
+
+couchdb restore writes such a directory back through the same revision-guarded write
+path the MCP tools use. It creates missing entries, skips identical ones, and REFUSES
+entries whose remote content differs unless --force is given -- so the default cannot
+discard an edit made after the export. --dry-run reports exactly what a real run would
+do and works on a read-only mount.";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -325,6 +339,55 @@ pub async fn run() -> Result<()> {
             let report = print_config(&resolved, !no_redact)?;
             println!("{}", report.text);
             Ok(())
+        }
+        Command::Couchdb { command } => {
+            let resolved = crate::config::resolve_runtime_config(&cli.options)?;
+            match command {
+                crate::cli::CouchdbCommand::Export { mount, out } => {
+                    let report =
+                        crate::couchdb_transfer::export(&resolved.service, &mount, &out).await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!("{}", crate::couchdb_transfer::render_export_report(&report));
+                    }
+                    Ok(())
+                }
+                crate::cli::CouchdbCommand::Restore {
+                    mount,
+                    from,
+                    dry_run: restore_dry_run,
+                    force,
+                } => {
+                    // The global `--dry-run` counts too: a user who has learned that it
+                    // makes every command harmless must not be surprised here of all
+                    // places.
+                    let report = crate::couchdb_transfer::restore(
+                        &resolved.service,
+                        &mount,
+                        &from,
+                        restore_dry_run || dry_run,
+                        force,
+                    )
+                    .await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!(
+                            "{}",
+                            crate::couchdb_transfer::render_restore_report(&report)
+                        );
+                    }
+                    if report.ok() {
+                        Ok(())
+                    } else {
+                        // A refusal is the tool working, but the operator asked for a
+                        // restore and did not fully get one, so it must not look like
+                        // success to a script.
+                        std::process::exit(1)
+                    }
+                }
+            }
         }
         Command::Probe { timeout_ms } => {
             let resolved = crate::config::resolve_runtime_config(&cli.options)?;

@@ -136,6 +136,47 @@ pub enum Command {
         #[arg(long = "timeout-ms", default_value_t = 5_000)]
         timeout_ms: u64,
     },
+    /// Snapshot and restore a CouchDB (Self-hosted LiveSync) mount.
+    Couchdb {
+        #[command(subcommand)]
+        command: CouchdbCommand,
+    },
     Help,
     Version,
+}
+
+/// Operations that only make sense against a CouchDB mount.
+///
+/// Grouped under their own `couchdb` subcommand rather than added to the top level: a
+/// filesystem vault is already a directory tree, so `export`/`restore` at the top level
+/// would read as vault-wide operations that mean something for every mount, which they
+/// do not.
+#[derive(Debug, Clone, Subcommand)]
+pub enum CouchdbCommand {
+    /// Write every entry of a couchdb mount to a directory, with a manifest.
+    Export {
+        /// The mount id, as it appears in the config's `mounts` table.
+        #[arg(long)]
+        mount: String,
+        /// Destination directory. Created if absent.
+        #[arg(long = "out")]
+        out: PathBuf,
+    },
+    /// Write a previously exported directory back into a couchdb mount.
+    Restore {
+        #[arg(long)]
+        mount: String,
+        /// A directory produced by `couchdb export`.
+        #[arg(long = "from")]
+        from: PathBuf,
+        /// Report what would happen and write nothing. Works on a read-only mount.
+        #[arg(long = "dry-run", action = clap::ArgAction::SetTrue)]
+        dry_run: bool,
+        /// Overwrite entries whose remote content differs from the snapshot.
+        ///
+        /// Without this, a differing entry is REFUSED and named, so the default can
+        /// never discard an edit made after the export.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        force: bool,
+    },
 }

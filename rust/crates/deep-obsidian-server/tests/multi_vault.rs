@@ -1005,12 +1005,33 @@ async fn template_protection_still_applies_on_a_non_root_mount() {
 ///
 /// Echoes the exact `supported` triple the supervisor enforces, so a drift in that
 /// triple fails this test too.
+///
+/// It also models the parts of the write surface this suite needs to observe through
+/// the MCP tools: `initialize.mode` (refusing `write` with `read-only`/-32009 unless
+/// `read-write` was asked for), and a real revision-guarded compare-and-swap on
+/// `write` (-32008 with `data.conflict.currentRev`). Revisions are a counter rather
+/// than CouchDB hashes -- what this suite asserts is that the REVISION THREADING is
+/// wired end to end, not how CouchDB derives a rev, which `couchdb_sidecar.rs` covers
+/// against the real thing.
 const STUB_SIDECAR: &str = r##"
 import { createInterface } from "node:readline";
 const NOTES = {
     "Charter.md": "# LiveSync Charter\n\nServed from the CouchDB mount.\n",
     "Deep/Nested.md": "# Nested\n\nA nested LiveSync note.\n",
 };
+/** Path -> revision. Bumped on every accepted write, as CouchDB would. */
+const REVS = { "Charter.md": "1-stub", "Deep/Nested.md": "1-stub" };
+/**
+ * Path -> entry kind. Modelled rather than assumed: LiveSync stores a `plain` entry as
+ * text and a `newnote` as base64 chunks, and `read` reports which it was. A stub that
+ * always answered `text` would silently corrupt every byte above 0x7f on the way back
+ * out, and the upload round-trip test would be asserting against a fiction.
+ */
+const KINDS = { "Charter.md": "markdown", "Deep/Nested.md": "markdown" };
+/** Binary bodies, kept as base64 exactly as they arrived. */
+const BINARIES = {};
+let revSeed = 1;
+let mode = "read-only";
 const rl = createInterface({ input: process.stdin });
 rl.on("line", (line) => {
     const text = line.trim();
@@ -1024,8 +1045,10 @@ rl.on("line", (line) => {
         );
     switch (message.method) {
         case "initialize":
+            mode = message.params.mode ?? "read-only";
             return reply({
                 protocolVersion: 1,
+                mode,
                 sidecarVersion: "0.1.0",
                 commonlibVersion: "0.1.2",
                 supportedSchemaVersion: 12,
@@ -1040,18 +1063,41 @@ rl.on("line", (line) => {
             });
         case "manifest":
             return reply({
-                entries: Object.entries(NOTES).map(([path, body]) => ({
-                    path,
-                    size: Buffer.byteLength(body),
+                entries: [
+                    ...Object.entries(NOTES).map(([path, body]) => ({
+                        path,
+                        size: Buffer.byteLength(body),
+                        kind: "markdown",
+                    })),
+                    ...Object.entries(BINARIES).map(([path, base64]) => ({
+                        path,
+                        size: Buffer.from(base64, "base64").length,
+                        kind: "binary",
+                    })),
+                ].map((entry) => ({
+                    ...entry,
                     mtimeMs: 1700000000000,
                     ctimeMs: 1700000000000,
                     deleted: false,
                     conflicted: false,
-                    kind: "markdown",
                 })),
                 exhausted: true,
             });
         case "read": {
+            if (KINDS[message.params.path] === "binary") {
+                const base64 = BINARIES[message.params.path];
+                return reply({
+                    kind: "binary",
+                    base64,
+                    path: message.params.path,
+                    size: Buffer.from(base64, "base64").length,
+                    mtimeMs: 1700000000000,
+                    ctimeMs: 1700000000000,
+                    deleted: false,
+                    conflicted: false,
+                    rev: REVS[message.params.path],
+                });
+            }
             const body = NOTES[message.params.path];
             if (body === undefined) return fail(-32004, "not-found", "no entry at that path");
             return reply({
@@ -1063,10 +1109,23 @@ rl.on("line", (line) => {
                 ctimeMs: 1700000000000,
                 deleted: false,
                 conflicted: false,
-                rev: "1-stub",
+                rev: REVS[message.params.path],
             });
         }
         case "stat": {
+            if (KINDS[message.params.path] === "binary") {
+                const base64 = BINARIES[message.params.path];
+                return reply({
+                    kind: "binary",
+                    path: message.params.path,
+                    size: Buffer.from(base64, "base64").length,
+                    mtimeMs: 1700000000000,
+                    ctimeMs: 1700000000000,
+                    deleted: false,
+                    conflicted: false,
+                    rev: REVS[message.params.path],
+                });
+            }
             const body = NOTES[message.params.path];
             if (body === undefined) return fail(-32004, "not-found", "no entry at that path");
             return reply({
@@ -1077,7 +1136,74 @@ rl.on("line", (line) => {
                 ctimeMs: 1700000000000,
                 deleted: false,
                 conflicted: false,
-                rev: "1-stub",
+                rev: REVS[message.params.path],
+            });
+        }
+        case "write": {
+            // A config-level refusal, before anything reaches a remote.
+            if (mode !== "read-write") {
+                return fail(-32009, "read-only", "this sidecar was initialized read-only");
+            }
+            const path = message.params.path;
+            const current = REVS[path];
+            const hasBaseRev = Object.prototype.hasOwnProperty.call(message.params, "baseRev");
+            const baseRev = message.params.baseRev;
+            const conflict = (expected) =>
+                process.stdout.write(
+                    JSON.stringify({
+                        jsonrpc: "2.0",
+                        id: message.id,
+                        error: {
+                            code: -32008,
+                            message: "conflict",
+                            data: {
+                                kind: "conflict",
+                                detail: "the revision guard did not hold",
+                                conflict: {
+                                    ...(current !== undefined ? { currentRev: current } : {}),
+                                    expected,
+                                    deleted: false,
+                                    conflicted: false,
+                                },
+                            },
+                        },
+                    }) + "\n"
+                );
+            // The three CAS modes, exactly as the protocol defines them.
+            if (hasBaseRev && baseRev === null) {
+                // create-only
+                if (current !== undefined) return conflict(null);
+            } else if (hasBaseRev) {
+                // guarded update
+                if (current !== baseRev) return conflict(baseRev);
+            }
+            const created = current === undefined;
+            revSeed += 1;
+            REVS[path] = `${revSeed}-stub`;
+            const isText = message.params.content.kind === "text";
+            KINDS[path] = isText ? "markdown" : "binary";
+            let size;
+            if (isText) {
+                NOTES[path] = message.params.content.text;
+                delete BINARIES[path];
+                size = Buffer.byteLength(NOTES[path]);
+            } else {
+                // Kept as base64 verbatim, so the bytes survive: decoding to a JS string
+                // would mangle everything above 0x7f.
+                BINARIES[path] = message.params.content.base64;
+                delete NOTES[path];
+                size = Buffer.from(BINARIES[path], "base64").length;
+            }
+            return reply({
+                path,
+                rev: REVS[path],
+                conflicted: false,
+                size,
+                mtimeMs: 1700000000000,
+                ctimeMs: 1700000000000,
+                kind: message.params.content.kind === "text" ? "markdown" : "binary",
+                created,
+                resurrected: false,
             });
         }
         case "changesSince":
@@ -1087,7 +1213,7 @@ rl.on("line", (line) => {
         case "unwatch":
             return reply({ watching: false });
         case "health":
-            return reply({ status: "ok", compatibility: { status: "ok" }, watching: false, uptimeMs: 1 });
+            return reply({ status: "ok", mode, compatibility: { status: "ok" }, watching: false, uptimeMs: 1 });
         case "shutdown":
             reply({ ok: true });
             return process.exit(0);
@@ -1133,8 +1259,14 @@ impl CouchdbFixture {
         }
     }
 
-    /// The two-mount config, with the couchdb mount pointed at the stub.
+    /// The two-mount config, with the couchdb mount pointed at the stub. READ-ONLY,
+    /// which is what `writable` defaults to in the config schema.
     fn config(&self) -> ResolvedServiceConfig {
+        self.config_writable(false)
+    }
+
+    /// The same table with the couchdb mount opted in to writes.
+    fn config_writable(&self, writable: bool) -> ResolvedServiceConfig {
         let mut config = self.inner.config();
         config.experimental = ExperimentalConfig {
             multi_vault: true,
@@ -1157,6 +1289,7 @@ impl CouchdbFixture {
                 sidecar_path: Some(self.stub.clone()),
                 index_dir: None,
                 options: None,
+                writable,
             },
         };
         config
@@ -1167,6 +1300,11 @@ impl CouchdbFixture {
     /// A temp store rather than `XDG_CONFIG_HOME`: that variable is process-global and
     /// mutating it races every other test that reads the default secrets path.
     async fn state(&self) -> AppState {
+        self.state_writable(false).await
+    }
+
+    /// The same state with the couchdb mount opted in to writes.
+    async fn state_writable(&self, writable: bool) -> AppState {
         let resolver = SecretResolver::with_encrypted_file_path(self.secrets.clone());
         resolver
             .put(
@@ -1177,7 +1315,7 @@ impl CouchdbFixture {
             )
             .expect("store the fixture password");
 
-        let config = self.config();
+        let config = self.config_writable(writable);
         let backends = MountBackends::build_with_resolver(&config, &resolver);
         let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
             .await
@@ -1346,6 +1484,423 @@ async fn writes_on_a_couchdb_prefix_are_refused_but_the_root_stays_writable() {
         written.get("result").is_some(),
         "the filesystem root must stay writable: {written}"
     );
+}
+
+/// The write tools work end to end on a WRITABLE couchdb mount: create, overwrite,
+/// section update, and session note.
+///
+/// The point is not that a write returns success — it is that every one of these tools
+/// composes its content above the boundary and then lands it through the couchdb write
+/// path, and that a read afterwards serves the composed content back.
+#[tokio::test]
+async fn the_write_tools_work_end_to_end_on_a_writable_couchdb_mount() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-writable");
+    let state = fixture.state_writable(true).await;
+
+    // A create on a path the stub does not have.
+    let created = tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": "LiveSync/Fresh.md", "content": "# Fresh\n\nWritten by the agent.\n"}),
+    )
+    .await;
+    let payload = structured(&created);
+    assert_eq!(payload["created"], json!(true), "{payload}");
+    assert_eq!(payload["action"], json!("created"), "{payload}");
+
+    let read_back = tool_call(&state, "read_file", json!({"path": "LiveSync/Fresh.md"})).await;
+    assert!(
+        structured(&read_back)["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Written by the agent."),
+        "{read_back}"
+    );
+
+    // An overwrite of an existing note, which is where the revision threading matters:
+    // the tool read the note (getting its rev), and the write must be accepted under
+    // exactly that rev.
+    let updated = tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": "LiveSync/Charter.md", "content": "# Charter\n\nRevised.\n"}),
+    )
+    .await;
+    let payload = structured(&updated);
+    assert_eq!(payload["created"], json!(false), "{payload}");
+    assert_eq!(payload["action"], json!("updated"), "{payload}");
+
+    // A section update, which reads-composes-writes in one tool call.
+    let sectioned = tool_call(
+        &state,
+        "update_note_section",
+        json!({
+            "path": "LiveSync/Charter.md",
+            "heading": "Status",
+            "content": "Green.",
+            "createIfMissing": true
+        }),
+    )
+    .await;
+    assert!(
+        sectioned.get("result").is_some(),
+        "a section update must land on a writable couchdb mount: {sectioned}"
+    );
+    let read_back = tool_call(&state, "read_file", json!({"path": "LiveSync/Charter.md"})).await;
+    let text = structured(&read_back)["text"].as_str().unwrap_or_default();
+    assert!(text.contains("## Status"), "{text}");
+    assert!(text.contains("Green."), "{text}");
+
+    // A session note, whose path is derived rather than given.
+    let session = tool_call(
+        &state,
+        "upsert_session_note",
+        json!({"path": "LiveSync/Sessions/Today.md", "content": "Session body.\n"}),
+    )
+    .await;
+    assert!(
+        session.get("result").is_some(),
+        "a session note must land on a writable couchdb mount: {session}"
+    );
+
+    // The filesystem root is unaffected by any of this.
+    let root = tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": "RootStillWritable.md", "content": "# Root\n\nbody\n"}),
+    )
+    .await;
+    assert!(root.get("result").is_some(), "{root}");
+}
+
+/// A stale `expectedHash` on a couchdb mount is refused with the SAME error taxonomy a
+/// filesystem mount produces, and nothing is written.
+///
+/// The check itself happens above the boundary, which is exactly why the wording is
+/// identical: there is one implementation of it, not one per backend.
+#[tokio::test]
+async fn an_expected_hash_conflict_on_a_couchdb_mount_matches_the_filesystem_taxonomy() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-hash-conflict");
+    let state = fixture.state_writable(true).await;
+
+    let stale = json!("fnv1a64:0000000000000000");
+    let couchdb = tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "LiveSync/Charter.md",
+            "content": "# Charter\n\nclobbered\n",
+            "expectedHash": stale
+        }),
+    )
+    .await;
+    let filesystem = tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "Root.md",
+            "content": "# Root\n\nclobbered\n",
+            "expectedHash": stale
+        }),
+    )
+    .await;
+
+    for (label, response) in [("couchdb", &couchdb), ("filesystem", &filesystem)] {
+        let message = error_message(response);
+        assert!(
+            message.starts_with("hash conflict for "),
+            "[{label}] {message}"
+        );
+        assert!(
+            message.contains("expected fnv1a64:0000000000000000"),
+            "[{label}] {message}"
+        );
+    }
+
+    // Neither note was touched.
+    let charter = tool_call(&state, "read_file", json!({"path": "LiveSync/Charter.md"})).await;
+    assert!(
+        !structured(&charter)["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("clobbered"),
+        "{charter}"
+    );
+    assert!(
+        !fs::read_to_string(fixture.inner.root_vault.join("Root.md"))
+            .expect("read Root.md")
+            .contains("clobbered")
+    );
+}
+
+/// A dry run on a couchdb mount never reaches the write path.
+///
+/// Composition and the hash comparison both happen above the boundary, so a dry run is
+/// structurally incapable of touching the remote — this pins that, because a future
+/// refactor that moved composition down would break it silently.
+#[tokio::test]
+async fn a_dry_run_on_a_couchdb_mount_never_writes() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-dry-run");
+    let state = fixture.state_writable(true).await;
+
+    let before = tool_call(&state, "read_file", json!({"path": "LiveSync/Charter.md"})).await;
+    let before = structured(&before)["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let dry = tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "LiveSync/Charter.md",
+            "content": "# Charter\n\nDRY RUN CONTENT\n",
+            "dryRun": true
+        }),
+    )
+    .await;
+    let payload = structured(&dry);
+    assert_eq!(payload["dryRun"], json!(true), "{payload}");
+    // It still reports what it WOULD write, which is the whole value of a dry run.
+    assert!(payload["newHash"].is_string(), "{payload}");
+
+    let after = tool_call(&state, "read_file", json!({"path": "LiveSync/Charter.md"})).await;
+    assert_eq!(
+        structured(&after)["text"].as_str().unwrap_or_default(),
+        before,
+        "a dry run must leave the remote untouched"
+    );
+
+    // A dry run against a path that does not exist must also not create it.
+    let dry_create = tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": "LiveSync/NeverWritten.md", "content": "body", "dryRun": true}),
+    )
+    .await;
+    assert!(dry_create.get("result").is_some(), "{dry_create}");
+    let missing = tool_call(
+        &state,
+        "read_file",
+        json!({"path": "LiveSync/NeverWritten.md"}),
+    )
+    .await;
+    assert!(missing.get("error").is_some(), "{missing}");
+}
+
+/// `request_vault_upload` → commit → `read_artifact`, all on a writable couchdb prefix.
+///
+/// The backend suite covers `CommitUploadStream` against the real sidecar. What this adds
+/// is the surface above it, which is couchdb-specific in ways the backend tests cannot
+/// see: the mint validates the destination through the ROUTER's `ResolvePath` (and
+/// couchdb's path rules are stricter than the filesystem's), enforces the protected-path
+/// policy, and fans the staging sweep across every mount including the couchdb no-op —
+/// and then `read_artifact` has to serve the bytes back from the same logical path the
+/// token was bound to.
+///
+/// Driven through the upload store and `commit_stream_via_backend`, which is the exact
+/// path `upload_handler` drives; the HTTP layer itself is not reachable from this harness
+/// and adds no couchdb-specific behaviour.
+#[tokio::test]
+async fn an_upload_round_trips_through_the_mcp_surface_on_a_couchdb_mount() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-upload");
+    let state = fixture
+        .state_writable(true)
+        .await
+        .with_upload_base("http://127.0.0.1:4100".to_string());
+
+    // `.png`, not `.bin`: `read_artifact` is gated on a supported artifact extension
+    // (`is_supported_artifact_path`), which is a pre-existing, backend-independent policy
+    // and not something a couchdb mount changes.
+    let logical = "LiveSync/assets/uploaded.png";
+
+    // 1. Mint. The destination is validated through the router, so a couchdb path has to
+    //    be accepted here rather than refused as escaping the vault.
+    let minted = tool_call(&state, "request_vault_upload", json!({"path": logical})).await;
+    let payload = structured(&minted);
+    assert_eq!(payload["path"], json!(logical), "{payload}");
+    let upload_url = payload["uploadUrl"]
+        .as_str()
+        .expect("uploadUrl")
+        .to_string();
+    assert!(upload_url.contains("/upload/"), "{upload_url}");
+    let token = upload_url
+        .rsplit('/')
+        .next()
+        .expect("a token at the end of the url")
+        .to_string();
+
+    // 2. Commit, through the same function the HTTP handler drives. The token is claimed
+    //    exactly as a real PUT would claim it, so its single-use binding is exercised.
+    let pending = state.uploads.claim(&token).expect("the token must claim");
+    assert_eq!(pending.dest_path, logical, "the token is bound to the path");
+    let bytes: Vec<u8> = vec![0x00, 0x01, 0xfe, 0xff, 0x42, 0x7f, 0x80];
+    let backend = state
+        .router
+        .backend_for(&pending.dest_path)
+        .expect("the couchdb mount must own this path");
+    let relative = state
+        .router
+        .resolve(&pending.dest_path)
+        .expect("resolve")
+        .backend_relative_path;
+    let outcome = deep_obsidian_server::uploads::commit_stream_via_backend(
+        backend,
+        relative,
+        pending.expected_hash.clone(),
+        pending.max_bytes,
+        deep_obsidian_backend::UploadChunks::new(std::iter::once(Ok(bytes.clone()))),
+    )
+    .await
+    .expect("the commit must land on a writable couchdb mount");
+    assert!(outcome.created);
+    assert_eq!(outcome.bytes_written, bytes.len());
+    state.uploads.consume(&token);
+
+    // 3. `read_artifact` serves it back, base64, from the LOGICAL path. Base64 is opt-in
+    //    (`includeBase64`) and bounded by `maxBytes`, so both are asked for explicitly.
+    let artifact = tool_call(
+        &state,
+        "read_artifact",
+        json!({"path": logical, "includeBase64": true, "maxBytes": 1024}),
+    )
+    .await;
+    let payload = structured(&artifact);
+    // The size comes from `stat` on the couchdb backend, independently of the bytes.
+    assert_eq!(payload["size"], json!(bytes.len()), "{payload}");
+    assert_eq!(payload["mimeType"], json!("image/png"), "{payload}");
+    let encoded = payload["base64"]
+        .as_str()
+        .unwrap_or_else(|| panic!("read_artifact must return base64: {payload}"));
+    // Decoded rather than compared as a string, so this asserts the BYTES round-tripped
+    // and not merely that some base64 came back.
+    let decoded = base64_decode(encoded);
+    assert_eq!(
+        decoded, bytes,
+        "the uploaded bytes must round-trip through the couchdb mount"
+    );
+
+    // A protected destination is still refused at mint on a couchdb mount, before any
+    // capability token exists.
+    let protected = tool_call(
+        &state,
+        "request_vault_upload",
+        json!({"path": "LiveSync/Templates/sneaky.png"}),
+    )
+    .await;
+    assert!(
+        error_message(&protected).contains("protected write path"),
+        "{protected}"
+    );
+}
+
+/// Decode standard base64, for asserting on `read_artifact`'s payload.
+fn base64_decode(input: &str) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut accumulator = 0u32;
+    let mut bits = 0u32;
+    for byte in input.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        if byte == b'=' {
+            break;
+        }
+        let value = ALPHABET
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .unwrap_or_else(|| panic!("invalid base64 character {byte:?}"))
+            as u32;
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((accumulator >> bits) & 0xff) as u8);
+        }
+    }
+    out
+}
+
+/// `vault_info` reports the writable mount's capabilities, so a client can tell which
+/// mounts it may write to without trying one.
+#[tokio::test]
+async fn vault_info_reports_write_capabilities_per_mount() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-capabilities");
+
+    for writable in [false, true] {
+        let state = fixture.state_writable(writable).await;
+        let info = tool_call(&state, "vault_info", json!({})).await;
+        let mounts = structured(&info)["mounts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let live = mounts
+            .iter()
+            .find(|mount| mount["id"] == json!("live"))
+            .unwrap_or_else(|| panic!("the couchdb mount must be listed: {info}"));
+        let capabilities = live["capabilities"].as_array().cloned().unwrap_or_default();
+        assert!(
+            capabilities.contains(&json!("binary-read")),
+            "reads are advertised in both modes: {live}"
+        );
+        assert_eq!(
+            capabilities.contains(&json!("binary-write")),
+            writable,
+            "binary-write must be advertised iff the mount is writable: {live}"
+        );
+        assert_eq!(
+            capabilities.contains(&json!("upload")),
+            writable,
+            "upload must be advertised iff the mount is writable: {live}"
+        );
+
+        // Conflict surfacing rides on the same per-mount detail. The couchdb mount CAN
+        // hold sibling revisions, so it reports a count even when that count is zero —
+        // "checked, none" is information.
+        assert_eq!(
+            live["conflictedCount"],
+            json!(0),
+            "a couchdb mount must report its conflicted count: {live}"
+        );
+        // ...and reports no PATHS when there are none, rather than an empty array a
+        // reader has to interpret.
+        assert!(
+            live.get("conflictedPaths").is_none(),
+            "a healthy mount must not carry an empty conflictedPaths: {live}"
+        );
+
+        // The filesystem mount carries NO such field, because the question does not apply
+        // to it: a file has exactly one version by construction, so reporting "zero
+        // conflicts" would imply a check that was never possible. This is the `Option`
+        // distinction in `VaultBackend::conflicted_paths`, observed through MCP.
+        let root = mounts
+            .iter()
+            .find(|mount| mount["id"] == json!("vault"))
+            .unwrap_or_else(|| panic!("the root mount must be listed: {info}"));
+        assert!(
+            root.get("conflictedCount").is_none(),
+            "a filesystem mount must not report a conflicted count at all: {root}"
+        );
+        assert!(root.get("conflictedPaths").is_none(), "{root}");
+    }
 }
 
 /// `grep_search` scoped to a CouchDB mount is refused, and the refusal says the vault

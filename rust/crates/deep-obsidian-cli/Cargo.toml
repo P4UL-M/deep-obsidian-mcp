@@ -19,6 +19,7 @@ anyhow.workspace = true
 clap.workspace = true
 deep-obsidian-backend = { path = "../deep-obsidian-backend" }
 deep-obsidian-config = { path = "../deep-obsidian-config" }
+deep-obsidian-core = { path = "../deep-obsidian-core" }
 deep-obsidian-server = { path = "../deep-obsidian-server" }
 deep-obsidian-types = { path = "../deep-obsidian-types" }
 reqwest.workspace = true

@@ -227,6 +227,26 @@ pub enum MountBackendConfig {
         /// `initialize.options`. These must match how the vault was written.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         options: Option<CouchdbOptions>,
+        /// Whether this mount accepts writes. **Defaults to `false`.**
+        ///
+        /// # Why this is per-mount and not another experimental flag
+        ///
+        /// `experimental.couchdbVaults` answers "may this build talk to CouchDB at
+        /// all", which is a question about the backend's maturity and is the same
+        /// answer for every mount. Writability answers "may the agent edit THIS
+        /// vault", which is a question about one vault's role — a user may well want
+        /// a writable scratch vault and a read-only archive in the same table, and a
+        /// single global flag could not express that.
+        ///
+        /// The two therefore compose rather than duplicate: `couchdbVaults` gates
+        /// the mount existing, `writable` gates it being written. A writable mount
+        /// needs both, and `false` by default means every existing config keeps
+        /// exactly the read-only behaviour it has today.
+        ///
+        /// Setting it is what makes the mount's sidecar initialize `read-write`;
+        /// nothing else in the process can unlock a write.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        writable: bool,
     },
 }
 

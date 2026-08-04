@@ -40,15 +40,16 @@ mod memory;
 mod contract;
 
 pub use couchdb::{
-    CouchDbVaultBackend, COUCHDB_GREP_UNSUPPORTED_MESSAGE, COUCHDB_READ_ONLY_MESSAGE,
+    CouchDbVaultBackend, EntryContent, COUCHDB_GREP_UNSUPPORTED_MESSAGE, COUCHDB_READ_ONLY_MESSAGE,
+    UPLOAD_COLLECT_ADVISORY_BYTES,
 };
 pub use deep_obsidian_core::vault::{VaultChildEntry, VaultEntryKind, VaultError};
 pub use filesystem::FilesystemVaultBackend;
 pub use grep::{resolve_ripgrep, RIPGREP_UNAVAILABLE_MESSAGE};
 pub use router::{Mount, Resolved, RouterError, VaultRouter};
 pub use sidecar::{
-    CompatibilityStatus, SidecarConfig, SidecarCredentials, SidecarError, SidecarSupervisor,
-    SupervisorHealth,
+    CompatibilityStatus, SidecarConfig, SidecarCredentials, SidecarError, SidecarMode,
+    SidecarSupervisor, SupervisorHealth,
 };
 pub use watch::{should_ignore_watch_path, watch_reason, ChangeEvent, ChangeStream};
 
@@ -188,6 +189,31 @@ pub enum BackendError {
     /// Optimistic-concurrency check failed.
     #[error("hash conflict: expected {expected}, found {found}")]
     HashConflict { expected: String, found: String },
+    /// A storage-level compare-and-swap lost: the destination changed between the
+    /// caller's precondition check and the write, so NOTHING was written.
+    ///
+    /// This failure mode cannot arise on the filesystem backend, whose write is a
+    /// rename that always wins. It exists because a versioned backend can detect
+    /// what the filesystem silently tolerates, and detecting it and then writing
+    /// anyway would be the one thing this boundary must never do.
+    ///
+    /// `Display` opens with `hash conflict for {path}:` so it lands in the same
+    /// taxonomy a caller already handles for a stale `expectedHash` — the cause
+    /// (the note changed under a concurrent writer) and the remedy (re-read, retry)
+    /// are the same. It then says what a hash comparison cannot: that the change
+    /// arrived AFTER the caller's own check.
+    #[error(
+        "hash conflict for {path}: the destination changed between this write's precondition \
+         check and the write itself, so nothing was written (precondition: {expected}; the \
+         destination is now at {found}). Re-read the note and retry."
+    )]
+    VersionConflict {
+        path: String,
+        /// The precondition that was not met, rendered for a human.
+        expected: String,
+        /// Where the destination actually is now, rendered for a human.
+        found: String,
+    },
     /// The request is not supported by this backend (capability absent).
     #[error("{0}")]
     Unsupported(String),
@@ -258,12 +284,76 @@ pub enum ContentRequest {
     ResolvePath { path: String },
 }
 
+/// What the caller observed about a write destination before composing the write.
+///
+/// # Why this exists
+///
+/// The MCP layer's `expectedHash` guard is a read, a comparison, and then a write
+/// (see the write tools in the server's `tools` module). On a filesystem vault the
+/// gap between the comparison and the write is a tolerated race: the write is a
+/// `rename` that cannot fail, so a concurrent editor is simply overwritten. That is
+/// frozen behaviour and this type does not change it.
+///
+/// On a backend that versions its documents the gap is closable, and refusing to
+/// close it would mean the `expectedHash` contract is weaker than the storage
+/// underneath it allows. So a read may hand back an OPAQUE version token, the caller
+/// carries it to the write, and the backend turns it into a storage-level
+/// precondition. The token is never parsed, compared or logged as content by any
+/// caller — it is only ever handed back.
+///
+/// The three variants are distinct on purpose: `Unobserved` and `Absent` would
+/// collapse into one `None` and a caller whose read merely FAILED would silently get
+/// create-only semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BaseVersion {
+    /// The caller states no precondition — it did not read, or its read failed for a
+    /// reason other than "nothing is there". The backend may still guard against its
+    /// own most recent observation, but it must not infer that the path is free.
+    #[default]
+    Unobserved,
+    /// The caller read the destination and found NOTHING there. A backend that can
+    /// express it should make this a create-only write, so a concurrent create is
+    /// reported rather than clobbered.
+    Absent,
+    /// The caller read the destination at this opaque version.
+    Version(String),
+}
+
+impl BaseVersion {
+    /// The observed version, if the caller observed one.
+    pub fn as_version(&self) -> Option<&str> {
+        match self {
+            BaseVersion::Version(version) => Some(version),
+            _ => None,
+        }
+    }
+
+    /// Build from a read's optional version token: an empty or absent token is
+    /// `Unobserved`, never `Absent`. A backend that mints no versions therefore
+    /// keeps exactly its old semantics.
+    pub fn from_read(version: Option<String>) -> Self {
+        match version {
+            Some(version) if !version.is_empty() => BaseVersion::Version(version),
+            _ => BaseVersion::Unobserved,
+        }
+    }
+}
+
 /// Writes.
 #[derive(Debug)]
 pub enum MutationRequest {
     /// Create or overwrite a text file, creating parent directories as needed and
     /// refusing protected template folders.
-    WriteText { path: String, content: String },
+    ///
+    /// `content` is the COMPLETE new content: composition (section replacement,
+    /// manual-note preservation, frontmatter) happens above this boundary, as does
+    /// the `expectedHash` check. `base_version` carries what that check observed;
+    /// see [`BaseVersion`]. A backend with no version concept ignores it.
+    WriteText {
+        path: String,
+        content: String,
+        base_version: BaseVersion,
+    },
     /// Land a byte stream at `path` atomically.
     ///
     /// The backend owns the entire mechanic — staging location, incremental hashing,
@@ -362,9 +452,20 @@ pub enum ManifestResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentResponse {
-    Text { text: String },
+    Text {
+        text: String,
+        /// The opaque version this text was read at, for a backend that versions
+        /// its documents. `None` on a backend that does not — which is what keeps
+        /// the filesystem's read-then-write race exactly as it was.
+        ///
+        /// A caller that is about to write the note back should carry this into
+        /// [`MutationRequest::WriteText`]; see [`BaseVersion`].
+        version: Option<String>,
+    },
     Bytes(Vec<u8>),
-    Stat { size_bytes: u64 },
+    Stat {
+        size_bytes: u64,
+    },
     PathAccepted,
 }
 
@@ -440,6 +541,43 @@ pub trait VaultBackend: Send + Sync {
     /// replay; backends without replay ignore it and deliver only changes observed
     /// from subscription onward.
     fn changes(&self, after: Option<OpaqueCursor>) -> ChangeStream;
+
+    /// Vault-relative paths whose stored content has unreconciled sibling versions,
+    /// sorted; or `None` when this backend's storage has no such notion.
+    ///
+    /// # Why `Option` rather than an empty list
+    ///
+    /// `None` and `Some(vec![])` are different facts and a caller needs to tell them
+    /// apart. `Some(vec![])` means "this vault CAN hold conflicting versions and holds
+    /// none right now" — worth reporting. `None` means the question does not apply: a
+    /// filesystem has exactly one version of a file by construction, so answering
+    /// "zero conflicts" would invite a reader to conclude a check was performed when
+    /// none was possible.
+    ///
+    /// The default is therefore `None`, and it is a statement about the storage model
+    /// rather than an unimplemented stub. A backend whose writes are last-writer-wins
+    /// never has a losing version to report.
+    async fn conflicted_paths(&self) -> Result<Option<Vec<String>>, BackendError> {
+        Ok(None)
+    }
+
+    /// This backend as a CouchDB vault, when it is one.
+    ///
+    /// # Why this exists rather than more trait methods
+    ///
+    /// The `couchdb export` / `couchdb restore` commands are provider-specific by
+    /// definition — they exist because a LiveSync vault is the one vault a user cannot
+    /// back up with `cp -r`, and they speak in revisions and entry kinds. Expressing
+    /// them as `VaultBackend` methods would put "export yourself to a directory" on the
+    /// filesystem backend, where it means nothing.
+    ///
+    /// A narrow, explicitly-named accessor is the honest shape: everything the SERVER
+    /// does stays provider-agnostic through `execute`, and exactly one CLI command pair
+    /// admits that it is talking to CouchDB. The default is `None`, so a new backend
+    /// gets the right answer without writing anything.
+    fn as_couchdb(&self) -> Option<&couchdb::CouchDbVaultBackend> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -462,10 +600,18 @@ fn mismatch(expected: &str, got: &BackendResponse) -> BackendError {
 }
 
 impl BackendResponse {
-    /// Text from a [`ContentRequest::ReadText`].
+    /// Text from a [`ContentRequest::ReadText`], discarding any version token.
     pub fn into_text(self) -> Result<String, BackendError> {
+        self.into_versioned_text().map(|(text, _)| text)
+    }
+
+    /// Text from a [`ContentRequest::ReadText`] together with the opaque version it
+    /// was read at. The pair a caller needs to write the note back safely.
+    pub fn into_versioned_text(self) -> Result<(String, Option<String>), BackendError> {
         match self {
-            BackendResponse::Content(ContentResponse::Text { text }) => Ok(text),
+            BackendResponse::Content(ContentResponse::Text { text, version }) => {
+                Ok((text, version))
+            }
             other => Err(mismatch("read-text", &other)),
         }
     }
@@ -564,10 +710,23 @@ impl BackendRequest {
         BackendRequest::Content(ContentRequest::ResolvePath { path: path.into() })
     }
 
+    /// A write with no observed precondition. The shape every pre-existing call site
+    /// wants, and the shape a filesystem-only caller will always want.
     pub fn write_text(path: impl Into<String>, content: impl Into<String>) -> Self {
+        BackendRequest::write_text_guarded(path, content, BaseVersion::Unobserved)
+    }
+
+    /// A write carrying what the caller observed at the destination. See
+    /// [`BaseVersion`].
+    pub fn write_text_guarded(
+        path: impl Into<String>,
+        content: impl Into<String>,
+        base_version: BaseVersion,
+    ) -> Self {
         BackendRequest::Mutation(MutationRequest::WriteText {
             path: path.into(),
             content: content.into(),
+            base_version,
         })
     }
 

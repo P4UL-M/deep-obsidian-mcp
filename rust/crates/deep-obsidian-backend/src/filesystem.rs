@@ -103,6 +103,12 @@ impl FilesystemVaultBackend {
             // permission errors, the remediation. Frozen by `error_missing_file`.
             ContentRequest::ReadText { path } => Ok(ContentResponse::Text {
                 text: vault::read_text_file(&self.vault_path, &path)?.text,
+                // The filesystem mints no version token. A caller therefore gets
+                // `BaseVersion::Unobserved` back and the read-then-write window
+                // stays exactly as wide as it has always been, which is frozen
+                // behaviour rather than an omission: closing it would mean an
+                // `mtime`/`ino` precondition this backend has never enforced.
+                version: None,
             }),
             // Io-flavoured (bare): `read_artifact` has always reported the raw IO
             // error here, with no path prefix. Frozen public behaviour.
@@ -228,7 +234,10 @@ impl VaultBackend for FilesystemVaultBackend {
                 .map_err(|error| BackendError::Message(error.to_string()))?
                 .map(BackendResponse::Mutation)
             }
-            BackendRequest::Mutation(MutationRequest::WriteText { path, content }) => self
+            // `base_version` is deliberately ignored: this backend mints no version
+            // tokens, so it never receives one, and its write is an atomic rename
+            // that has no precondition to attach. See `BaseVersion`.
+            BackendRequest::Mutation(MutationRequest::WriteText { path, content, .. }) => self
                 .write_text(&path, &content)
                 .map(BackendResponse::Mutation),
             BackendRequest::Mutation(MutationRequest::SweepOrphanStagingFiles) => {

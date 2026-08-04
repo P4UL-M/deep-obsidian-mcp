@@ -28,33 +28,42 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::sidecar::{
-    EntryKind, ManifestEntry, ReadPayload, SidecarConfig, SidecarCredentials, SidecarError,
-    SidecarSupervisor,
+    ConflictDetail, ConflictsResult, EntryKind, ManifestEntry, ReadPayload, SidecarConfig,
+    SidecarCredentials, SidecarError, SidecarErrorKind, SidecarMode, SidecarSupervisor, StatResult,
+    WriteGuard, WritePayload, WriteResult,
 };
 use crate::watch::ChangeStream;
 use crate::{
-    BackendDescriptor, BackendError, BackendKind, BackendRequest, BackendResponse, Capability,
-    ContentRequest, ContentResponse, HealthRequest, HealthResponse, ManifestRequest,
-    ManifestResponse, MutationRequest, OpaqueCursor, RecallRequest, VaultBackend, VaultChildEntry,
-    VaultEntryKind,
+    BackendDescriptor, BackendError, BackendKind, BackendRequest, BackendResponse, BaseVersion,
+    Capability, ContentRequest, ContentResponse, HealthRequest, HealthResponse, ManifestRequest,
+    ManifestResponse, MutationRequest, MutationResponse, OpaqueCursor, RecallRequest, VaultBackend,
+    VaultChildEntry, VaultEntryKind,
 };
 
-/// Refusal for every write against a CouchDB mount.
+/// Refusal for every write against a READ-ONLY CouchDB mount.
 ///
 /// Deliberately long and specific. A user reaching this has configured a mount and
 /// then tried to save a note into it; "unsupported operation" would leave them
 /// guessing whether it is a bug, a permission problem, or a missing capability.
-/// The three facts they need are that the backend is experimental, that it is
-/// read-only *by construction* rather than by configuration, and where writes DO
-/// work.
+///
+/// The facts they need are that the backend is experimental, that the refusal comes
+/// from THIS MOUNT'S CONFIGURATION rather than from a missing implementation, exactly
+/// which setting changes it, and what to do instead if they would rather not.
+///
+/// Note what this message must not claim. Until writes existed it said they were
+/// refused "by construction" and that "no write path exists yet"; both became false
+/// the moment `writable` did anything, and a refusal that misstates its own cause
+/// sends the reader looking in the wrong place.
 pub const COUCHDB_READ_ONLY_MESSAGE: &str = "this mount is an EXPERIMENTAL, READ-ONLY \
-CouchDB (Self-hosted LiveSync) vault: writes are refused by construction, not by configuration. \
-The sidecar that reads it overrides CouchDB's put/delete so it cannot mutate your vault, and no \
-write path exists yet. Edit the note in Obsidian and let LiveSync replicate it, or write to a \
-filesystem mount instead.";
+CouchDB (Self-hosted LiveSync) vault: it is read-only because its mount configuration does not \
+set 'writable', and the sidecar serving it was started read-only as a result, so no write can \
+reach your vault. To allow writes, set \"writable\": true on this mount (it additionally requires \
+experimental.couchdbVaults, which is already on if this mount loaded) and restart the service; \
+guarded writes are then compare-and-swapped against the revision each read observed. Otherwise \
+edit the note in Obsidian and let LiveSync replicate it, or write to a filesystem mount instead.";
 
 /// Refusal for `grep_search` against a CouchDB mount.
 pub const COUCHDB_GREP_UNSUPPORTED_MESSAGE: &str = "grep_search is unavailable on this mount: it \
@@ -85,10 +94,19 @@ struct CachedManifest {
     collected_at: std::time::Instant,
 }
 
-/// A read-only LiveSync vault reached through a supervised sidecar.
+/// A LiveSync vault reached through a supervised sidecar. Read-only unless the
+/// supervisor was configured `read-write`.
 pub struct CouchDbVaultBackend {
     supervisor: Arc<SidecarSupervisor>,
     manifest: std::sync::Mutex<Option<CachedManifest>>,
+    /// Derived from the supervisor's mode, never configured separately.
+    ///
+    /// A second flag could disagree with the sidecar it talks to, and the disagreement
+    /// would be silent in one direction: a backend advertising `BinaryWrite` over a
+    /// read-only sidecar would advertise a capability, accept the request, and only
+    /// then be refused at the far end — a capability lie. Deriving it makes the two
+    /// unable to differ.
+    writable: bool,
 }
 
 impl std::fmt::Debug for CouchDbVaultBackend {
@@ -106,11 +124,17 @@ impl CouchDbVaultBackend {
     /// index source SHARE a single child process. Two supervisors for one mount
     /// would mean two CouchDB connections, two handshakes, two change feeds, and
     /// two irreconcilable health answers.
-    pub fn new(supervisor: Arc<SidecarSupervisor>) -> Self {
+    pub fn from_supervisor(supervisor: Arc<SidecarSupervisor>) -> Self {
         Self {
+            writable: supervisor.mode().is_writable(),
             supervisor,
             manifest: std::sync::Mutex::new(None),
         }
+    }
+
+    /// True when this mount accepts writes.
+    pub fn is_writable(&self) -> bool {
+        self.writable
     }
 
     /// Build a supervisor and a backend over it, resolving the bundle location.
@@ -121,12 +145,14 @@ impl CouchDbVaultBackend {
     pub fn spawn(
         sidecar_path: Option<&Path>,
         credentials: SidecarCredentials,
+        mode: SidecarMode,
         options: Option<Value>,
         request_timeout: Option<Duration>,
     ) -> Result<(Arc<SidecarSupervisor>, Self), SidecarError> {
-        let config = SidecarConfig::resolve(sidecar_path, credentials, options, request_timeout)?;
+        let config =
+            SidecarConfig::resolve(sidecar_path, credentials, mode, options, request_timeout)?;
         let supervisor = SidecarSupervisor::new(config);
-        Ok((supervisor.clone(), Self::new(supervisor)))
+        Ok((supervisor.clone(), Self::from_supervisor(supervisor)))
     }
 
     pub fn supervisor(&self) -> &Arc<SidecarSupervisor> {
@@ -188,8 +214,13 @@ impl CouchDbVaultBackend {
                 ensure_vault_relative(&path)?;
                 let result = map_sidecar(self.supervisor.read(&path).await)?;
                 note_conflict(&path, result.conflicted);
+                let version = (!result.rev.is_empty()).then(|| result.rev.clone());
                 match result.payload {
-                    ReadPayload::Text(text) => Ok(ContentResponse::Text { text }),
+                    // The revision travels out with the text. That is what lets a
+                    // caller that is about to write this note back turn its own
+                    // `expectedHash` check into a storage-level precondition instead
+                    // of a hope. See `BaseVersion`.
+                    ReadPayload::Text(text) => Ok(ContentResponse::Text { text, version }),
                     // A `newnote` entry read as text. Refused rather than
                     // lossily decoded: the caller asked for a note.
                     ReadPayload::Bytes(_) => Err(BackendError::Message(format!(
@@ -229,6 +260,313 @@ impl CouchDbVaultBackend {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Writes
+    // -----------------------------------------------------------------------
+
+    /// Refuse every mutation on a read-only mount, with the message that names why.
+    fn ensure_writable(&self) -> Result<(), BackendError> {
+        if self.writable {
+            return Ok(());
+        }
+        Err(BackendError::Unsupported(
+            COUCHDB_READ_ONLY_MESSAGE.to_string(),
+        ))
+    }
+
+    /// `WriteText`, guarded by whatever the caller observed.
+    ///
+    /// # The guard, and why it is not a retry
+    ///
+    /// The MCP layer above has already read this note, hashed it, compared the hash
+    /// to the caller's `expectedHash`, and composed `content`. `base_version` is the
+    /// revision that read saw. Handing it to the sidecar as `baseRev` makes CouchDB
+    /// itself adjudicate the window between that comparison and this write — the
+    /// window a filesystem mount cannot close and therefore silently loses.
+    ///
+    /// So a `conflict` here means something specific: the note changed AFTER the
+    /// caller's precondition was checked. Retrying with the fresh revision would
+    /// write anyway, which is precisely the last-writer-wins behaviour the caller
+    /// asked to be protected from. It is reported instead. The single exception is
+    /// spelled out in [`Self::resolve_write_conflict`].
+    async fn write_text(
+        &self,
+        path: &str,
+        content: &str,
+        base_version: BaseVersion,
+    ) -> Result<MutationResponse, BackendError> {
+        self.ensure_writable()?;
+        ensure_writable_path(path)?;
+        let guard = write_guard_for(&base_version);
+        let result = self
+            .guarded_write(
+                path,
+                WritePayload::Text(content.to_string()),
+                guard,
+                content.as_bytes(),
+            )
+            .await?;
+        Ok(MutationResponse::Written {
+            created: result.created,
+        })
+    }
+
+    /// `CommitUploadStream`: collect the body, verify `expected_hash`, write binary.
+    ///
+    /// The filesystem backend's staging file and atomic rename have no analogue here
+    /// and need none: the sidecar's write is already all-or-nothing at the entry root
+    /// (chunks first, root last), so there is nothing to stage. What IS shared is the
+    /// contract: `max_bytes` enforced *during* collection so an oversize body never
+    /// reaches the remote, `expected_hash` verified against the destination as it is
+    /// at commit time, and the canonical content hash reported back.
+    async fn commit_upload(
+        &self,
+        path: &str,
+        expected_hash: Option<&str>,
+        max_bytes: usize,
+        chunks: crate::UploadChunks,
+    ) -> Result<MutationResponse, BackendError> {
+        self.ensure_writable()?;
+        ensure_writable_path(path)?;
+
+        // The chunk iterator is fed by the caller's async body pump, so pulling it on
+        // a reactor thread would deadlock against that pump — the same reason the
+        // filesystem backend spawns here.
+        let collected = tokio::task::spawn_blocking(move || collect_upload(max_bytes, chunks))
+            .await
+            .map_err(|error| BackendError::Message(error.to_string()))??;
+
+        // One read serves both the precondition and the guard: re-reading for the
+        // revision separately would open a second window between them.
+        let existing = self.read_for_write(path).await?;
+        if let Some(expected) = expected_hash {
+            let found = existing
+                .as_ref()
+                .map(|existing| deep_obsidian_core::content_hash(&existing.bytes));
+            if found.as_deref() != Some(expected) {
+                // Byte-identical to the filesystem backend's own wording and shape,
+                // because the upload endpoint's 409 body is frozen public behaviour.
+                return Err(BackendError::HashConflict {
+                    expected: expected.to_string(),
+                    found: found.unwrap_or_else(|| "null".to_string()),
+                });
+            }
+        }
+        let guard = match &existing {
+            Some(existing) => WriteGuard::Revision(existing.rev.clone()),
+            None => WriteGuard::CreateOnly,
+        };
+
+        let result = self
+            .guarded_write(
+                path,
+                WritePayload::Base64(encode_base64(&collected.bytes)),
+                guard,
+                &collected.bytes,
+            )
+            .await?;
+        Ok(MutationResponse::UploadCommitted {
+            created: result.created,
+            bytes_written: collected.bytes.len(),
+            hash: collected.hash,
+        })
+    }
+
+    /// Issue one guarded write and decide what a lost compare-and-swap means.
+    ///
+    /// `desired` is the exact bytes this write is trying to land. It is needed only on
+    /// the conflict path, and only for the ambiguous case; see
+    /// [`Self::resolve_write_conflict`].
+    async fn guarded_write(
+        &self,
+        path: &str,
+        payload: WritePayload,
+        guard: WriteGuard,
+        desired: &[u8],
+    ) -> Result<WriteResult, BackendError> {
+        let attempt = self.supervisor.write(path, &payload, &guard).await;
+        match attempt.outcome {
+            Ok(result) => {
+                if result.conflicted {
+                    warn!(
+                        "wrote {path} on a livesync entry that has conflicting revisions; the \
+                         write extended the WINNING revision only and neither created nor \
+                         resolved a conflict branch"
+                    );
+                }
+                if result.resurrected {
+                    debug!("write of {path} brought a soft-deleted livesync entry back");
+                }
+                Ok(result)
+            }
+            Err(error) if error.rpc_kind() == Some(SidecarErrorKind::Conflict) => {
+                self.resolve_write_conflict(path, &guard, &error, desired, attempt.outcome_unknown)
+                    .await
+            }
+            Err(error) => Err(map_sidecar_error(error)),
+        }
+    }
+
+    /// What to do about a `conflict`.
+    ///
+    /// The answer is almost always "report it". A compare-and-swap that lost means
+    /// another writer got there first, and the whole point of threading the revision
+    /// was to find that out instead of overwriting them.
+    ///
+    /// There is exactly one exception, and it is not a conflict being mapped to
+    /// success. When an earlier attempt of THIS call was issued and its outcome was
+    /// never observed (`outcome_unknown`), the winning revision may be that attempt's
+    /// own. A revision cannot distinguish the two — but the content can: if the
+    /// destination already holds exactly the bytes this write was asked to land, then
+    /// the requested state is the state, and reporting a failure would send the caller
+    /// off to retry a write that already happened. The check is byte-equality, never a
+    /// merge, and it is gated strictly on the ambiguity actually having arisen.
+    async fn resolve_write_conflict(
+        &self,
+        path: &str,
+        guard: &WriteGuard,
+        error: &SidecarError,
+        desired: &[u8],
+        outcome_unknown: bool,
+    ) -> Result<WriteResult, BackendError> {
+        let detail = error.conflict().cloned().unwrap_or_default();
+        if outcome_unknown {
+            if let Ok(Some(current)) = self.read_for_write(path).await {
+                if current.bytes == desired {
+                    warn!(
+                        "livesync write of {path} was retried after an unobserved outcome and then \
+                         lost the compare-and-swap, but the entry already holds exactly the \
+                         requested content at revision {}; treating the write as the no-op it is \
+                         rather than reporting a failure for a write that landed",
+                        current.rev
+                    );
+                    return Ok(WriteResult {
+                        path: path.to_string(),
+                        rev: current.rev,
+                        conflicted: current.conflicted,
+                        size: current.bytes.len() as u64,
+                        mtime_ms: 0,
+                        ctime_ms: 0,
+                        // Unknowable on this path: the write that landed was not
+                        // observed. Reported as false rather than guessed. No MCP
+                        // payload is served from this flag — the tool layer derives
+                        // `created` from its own read.
+                        created: false,
+                        resurrected: false,
+                    });
+                }
+            }
+        }
+        warn!(
+            "livesync write of {path} lost its compare-and-swap ({}); nothing was written",
+            describe_conflict(&detail)
+        );
+        Err(BackendError::VersionConflict {
+            path: path.to_string(),
+            expected: guard.describe(),
+            found: describe_conflict(&detail),
+        })
+    }
+
+    /// Read a destination for the purpose of writing it: its bytes and its revision.
+    ///
+    /// `Ok(None)` means nothing is there. Every other failure is propagated, which is
+    /// what keeps an unreachable remote or an undecryptable entry from being mistaken
+    /// for a free path.
+    async fn read_for_write(&self, path: &str) -> Result<Option<ExistingEntry>, BackendError> {
+        match self.supervisor.read(path).await {
+            Ok(result) => Ok(Some(ExistingEntry {
+                bytes: match result.payload {
+                    ReadPayload::Bytes(bytes) => bytes,
+                    ReadPayload::Text(text) => text.into_bytes(),
+                },
+                rev: result.rev,
+                conflicted: result.conflicted,
+            })),
+            Err(SidecarError::Rpc {
+                kind: SidecarErrorKind::NotFound,
+                ..
+            }) => Ok(None),
+            Err(error) => Err(map_sidecar_error(error)),
+        }
+    }
+
+    /// Every conflicted path in the vault, off the cached manifest.
+    ///
+    /// Free: `conflicted` is already on every manifest entry and the manifest is
+    /// already collected for listings, so this costs no extra round trip. Sorted, so a
+    /// report is stable.
+    pub async fn collect_conflicted_paths(&self) -> Result<Vec<String>, BackendError> {
+        let entries = self.manifest_entries().await?;
+        let mut paths: Vec<String> = entries
+            .iter()
+            .filter(|entry| is_listable(entry) && entry.conflicted)
+            .map(|entry| entry.path.clone())
+            .collect();
+        paths.sort();
+        Ok(paths)
+    }
+
+    /// The winning revision and every sibling revision for one path.
+    ///
+    /// Available on a read-only mount too, which is the point: that is exactly where a
+    /// caller most needs to know the content it was served has a losing sibling.
+    pub async fn conflicts(&self, path: &str) -> Result<ConflictsResult, BackendError> {
+        ensure_vault_relative(path)?;
+        map_sidecar(self.supervisor.conflicts(path).await)
+    }
+
+    /// One entry's full metadata, including its revision and conflicted flag.
+    ///
+    /// The boundary's `Stat` carries only `size_bytes` (widening it would change a
+    /// frozen MCP payload), so this exists for the export path, which needs the
+    /// revision it is recording to be the one that produced the bytes it wrote.
+    pub async fn stat_entry(&self, path: &str) -> Result<StatResult, BackendError> {
+        ensure_vault_relative(path)?;
+        map_sidecar(self.supervisor.stat(path).await)
+    }
+
+    /// An entry's raw bytes and revision, or `None` when nothing is there.
+    ///
+    /// The pair a restore needs: the bytes to compare against the snapshot, and the
+    /// revision to guard the write with — from ONE read, so no window opens between the
+    /// comparison and the write.
+    pub async fn read_bytes_and_version(
+        &self,
+        path: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, BackendError> {
+        ensure_vault_relative(path)?;
+        Ok(self
+            .read_for_write(path)
+            .await?
+            .map(|existing| (existing.bytes, existing.rev)))
+    }
+
+    /// Write one entry's exact content, choosing its storage kind explicitly.
+    ///
+    /// Used by `couchdb restore`. The kind is a PARAMETER rather than inferred from the
+    /// bytes because it decides whether the entry becomes a LiveSync `plain` or
+    /// `newnote` document, and a wrong choice is not visible afterwards. The caller
+    /// establishes it from the export manifest; see the CLI's `resolve_kind`.
+    ///
+    /// Goes through the same guarded write every other caller uses, so a restore cannot
+    /// overwrite an edit that landed between its own read and its write either.
+    pub async fn write_entry(
+        &self,
+        path: &str,
+        content: EntryContent<'_>,
+        base_version: BaseVersion,
+    ) -> Result<WriteResult, BackendError> {
+        self.ensure_writable()?;
+        ensure_writable_path(path)?;
+        let (payload, desired) = match content {
+            EntryContent::Text(text) => (WritePayload::Text(text.to_string()), text.as_bytes()),
+            EntryContent::Binary(bytes) => (WritePayload::Base64(encode_base64(bytes)), bytes),
+        };
+        self.guarded_write(path, payload, write_guard_for(&base_version), desired)
+            .await
+    }
+
     async fn health(&self, request: HealthRequest) -> Result<HealthResponse, BackendError> {
         match request {
             // NOT a hard startup gate: a CouchDB mount whose remote is unreachable
@@ -254,13 +592,17 @@ impl VaultBackend for CouchDbVaultBackend {
     /// * `Watch` — the sidecar's live change feed.
     /// * NO `GrepSearch` — ripgrep needs files on disk. See
     ///   [`COUCHDB_GREP_UNSUPPORTED_MESSAGE`].
-    /// * NO `BinaryWrite`, NO `Upload` — read-only. See
-    ///   [`COUCHDB_READ_ONLY_MESSAGE`].
+    /// * `BinaryWrite`, `Upload` — only on a `writable` mount, i.e. only when the
+    ///   sidecar behind it was initialized `read-write`. A read-only mount advertises
+    ///   neither and refuses both with [`COUCHDB_READ_ONLY_MESSAGE`], exactly as
+    ///   before.
     fn descriptor(&self) -> BackendDescriptor {
-        BackendDescriptor::new(
-            BackendKind::Couchdb,
-            [Capability::BinaryRead, Capability::Watch],
-        )
+        let mut capabilities = vec![Capability::BinaryRead, Capability::Watch];
+        if self.writable {
+            capabilities.push(Capability::BinaryWrite);
+            capabilities.push(Capability::Upload);
+        }
+        BackendDescriptor::new(BackendKind::Couchdb, capabilities)
     }
 
     async fn execute(&self, request: BackendRequest) -> Result<BackendResponse, BackendError> {
@@ -272,17 +614,31 @@ impl VaultBackend for CouchDbVaultBackend {
             BackendRequest::Content(request) => {
                 self.content(request).await.map(BackendResponse::Content)
             }
-            // Every write, refused with the same explicit message. `SweepOrphanStagingFiles`
-            // is the one exception: it is documented as best-effort housekeeping that
-            // never fails, and there is no staging area here, so it is a no-op rather
-            // than a refusal — failing it would make a caller's cleanup pass report a
-            // spurious error.
+            // Housekeeping, and a no-op in BOTH modes: it is documented as
+            // best-effort and never-failing, and there is no staging area here to
+            // sweep — the sidecar's write is all-or-nothing at the entry root, so no
+            // partial artifact ever exists for a killed process to leave behind.
+            // Failing it would make a caller's cleanup pass report a spurious error.
             BackendRequest::Mutation(MutationRequest::SweepOrphanStagingFiles) => {
                 Ok(BackendResponse::Mutation(crate::MutationResponse::Swept))
             }
-            BackendRequest::Mutation(_) => Err(BackendError::Unsupported(
-                COUCHDB_READ_ONLY_MESSAGE.to_string(),
-            )),
+            BackendRequest::Mutation(MutationRequest::WriteText {
+                path,
+                content,
+                base_version,
+            }) => self
+                .write_text(&path, &content, base_version)
+                .await
+                .map(BackendResponse::Mutation),
+            BackendRequest::Mutation(MutationRequest::CommitUploadStream {
+                path,
+                expected_hash,
+                max_bytes,
+                chunks,
+            }) => self
+                .commit_upload(&path, expected_hash.as_deref(), max_bytes, chunks)
+                .await
+                .map(BackendResponse::Mutation),
             BackendRequest::Recall(RecallRequest::Grep { .. }) => Err(BackendError::Unsupported(
                 COUCHDB_GREP_UNSUPPORTED_MESSAGE.to_string(),
             )),
@@ -298,6 +654,16 @@ impl VaultBackend for CouchDbVaultBackend {
     /// handed back verbatim. The supervisor replays `changesSince` from it before
     /// arming the live feed, so a resumed subscription does not miss the edits made
     /// while nothing was subscribed.
+    /// `Some`, always: a LiveSync vault genuinely can hold sibling revisions, so even
+    /// an empty list is a real answer here rather than an inapplicable one.
+    async fn conflicted_paths(&self) -> Result<Option<Vec<String>>, BackendError> {
+        self.collect_conflicted_paths().await.map(Some)
+    }
+
+    fn as_couchdb(&self) -> Option<&CouchDbVaultBackend> {
+        Some(self)
+    }
+
     fn changes(&self, after: Option<OpaqueCursor>) -> ChangeStream {
         let receiver = self
             .supervisor
@@ -307,6 +673,169 @@ impl VaultBackend for CouchDbVaultBackend {
         // backend, whose stream owns its `notify` watcher).
         ChangeStream::new(receiver, ())
     }
+}
+
+/// Content to store, with its storage kind stated rather than inferred.
+///
+/// `Text` becomes a LiveSync `plain` entry and `Binary` a `newnote`; the distinction is
+/// permanent once written and invisible afterwards, which is why it is a type the caller
+/// must choose rather than something derived from the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryContent<'a> {
+    Text(&'a str),
+    Binary(&'a [u8]),
+}
+
+/// A destination as it exists right now, for a write's precondition.
+struct ExistingEntry {
+    bytes: Vec<u8>,
+    rev: String,
+    conflicted: bool,
+}
+
+/// A fully collected upload body.
+struct CollectedUpload {
+    bytes: Vec<u8>,
+    hash: String,
+}
+
+/// The largest upload this backend has actually been exercised with, end to end.
+///
+/// **Advisory, not a cap.** The enforced limit is the caller's `max_bytes` (the upload
+/// endpoint's own 100 MiB budget), and lowering it here would silently change a
+/// documented contract for one mount kind. But a CouchDB upload is not a stream — the
+/// sidecar needs whole content to chunk it, so the bytes are held once by the collector
+/// and again as base64 in a single JSON-RPC line, roughly 2.3x the payload across two
+/// processes. So the real ceiling is memory and Node's line handling rather than the
+/// configured number, and a body above this one is served on a path no test has walked.
+/// Crossing it is logged rather than refused, and this constant is what the round-trip
+/// test uses, so the documented figure is a measured one.
+pub const UPLOAD_COLLECT_ADVISORY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Pull the whole upload body into memory, enforcing the byte budget as it arrives.
+///
+/// # Why the body is buffered here, unlike on the filesystem
+///
+/// A LiveSync write is not a stream: the sidecar takes the complete content, runs
+/// upstream's content-defined chunker over it, and publishes the chunks. There is no
+/// partial-write representation to hand it, so the bytes must be whole before the
+/// write starts. `max_bytes` is checked DURING collection anyway, so an oversize body
+/// is refused at exactly the same byte as it would be on a filesystem mount and with
+/// the same `PayloadTooLarge` (413) taxonomy — it just never reaches the remote.
+///
+/// The practical ceiling is therefore memory, not the configured cap: the bytes are
+/// held once here and again as base64 in the request line. See the module docs.
+fn collect_upload(
+    max_bytes: usize,
+    chunks: crate::UploadChunks,
+) -> Result<CollectedUpload, BackendError> {
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut hasher = deep_obsidian_core::ContentHasher::new();
+    for chunk in chunks.into_inner() {
+        let chunk = chunk.map_err(BackendError::Message)?;
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(BackendError::PayloadTooLarge);
+        }
+        hasher.update(&chunk);
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() > UPLOAD_COLLECT_ADVISORY_BYTES {
+        warn!(
+            "collecting a {} byte upload for a CouchDB mount, above the {} byte size this path \
+             has been tested to; it is held in memory here and again as base64 in the sidecar \
+             request, so expect roughly 2.3x that in peak memory across the two processes",
+            bytes.len(),
+            UPLOAD_COLLECT_ADVISORY_BYTES
+        );
+    }
+    Ok(CollectedUpload {
+        hash: hasher.finish(),
+        bytes,
+    })
+}
+
+/// The compare-and-swap precondition a caller's observation implies.
+///
+/// The mapping is the whole design in four lines:
+///
+/// * observed a revision → guard on it, so an edit that arrived after the caller's
+///   `expectedHash` check loses instead of being overwritten;
+/// * observed nothing → create-only, so a concurrent CREATE is reported rather than
+///   clobbered (and a soft-deleted entry occupying the path is reported too, which is
+///   information the caller genuinely wants);
+/// * observed nothing reliably → unguarded. The sidecar still guards against the
+///   revision IT read a moment earlier, so this can never fork the revision tree; it
+///   just does not carry a precondition the caller never established.
+fn write_guard_for(base_version: &BaseVersion) -> WriteGuard {
+    match base_version {
+        BaseVersion::Version(rev) => WriteGuard::Revision(rev.clone()),
+        BaseVersion::Absent => WriteGuard::CreateOnly,
+        BaseVersion::Unobserved => WriteGuard::Unguarded,
+    }
+}
+
+/// Reject a path no write may target.
+///
+/// Two rules, both borrowed rather than reinvented: the sidecar's own path rules (via
+/// [`ensure_vault_relative`]), and core's protected-template policy — reported with
+/// [`deep_obsidian_core::vault::VaultError::ProtectedWritePath`] so the wording is
+/// byte-identical to a filesystem mount's refusal. A mount kind must not decide
+/// whether `Templates/` is writable.
+fn ensure_writable_path(path: &str) -> Result<(), BackendError> {
+    ensure_vault_relative(path)?;
+    if path.split('/').any(|segment| {
+        segment.eq_ignore_ascii_case("template") || segment.eq_ignore_ascii_case("templates")
+    }) {
+        return Err(BackendError::Vault(
+            deep_obsidian_core::vault::VaultError::ProtectedWritePath(path.to_string()),
+        ));
+    }
+    Ok(())
+}
+
+/// Render a conflict detail for a human, without inventing certainty.
+fn describe_conflict(detail: &ConflictDetail) -> String {
+    let mut rendered = match &detail.current_rev {
+        Some(rev) => format!("revision {rev}"),
+        // The guarded entry is gone entirely, which a rev cannot express.
+        None => "no revision at all (the entry does not exist)".to_string(),
+    };
+    if detail.deleted {
+        rendered.push_str(", soft-deleted");
+    }
+    if detail.conflicted {
+        rendered.push_str(", itself conflicted");
+    }
+    rendered
+}
+
+/// Encode bytes as standard base64.
+///
+/// The mirror of the decoder in `sidecar.rs`, and here for the same reason: this crate
+/// has no base64 dependency and these two call sites are the only ones that need one.
+fn encode_base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for group in input.chunks(3) {
+        let bits = (u32::from(group[0]) << 16)
+            | (group.get(1).map_or(0, |byte| u32::from(*byte)) << 8)
+            | group.get(2).map_or(0, |byte| u32::from(*byte));
+        out.push(ALPHABET[(bits >> 18) as usize & 0x3f] as char);
+        out.push(ALPHABET[(bits >> 12) as usize & 0x3f] as char);
+        // Padding is length-driven, so a 1- or 2-byte tail emits exactly the `=`
+        // count CouchDB (and the sidecar's own decoder) expects.
+        out.push(if group.len() > 1 {
+            ALPHABET[(bits >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if group.len() > 2 {
+            ALPHABET[bits as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Log a conflicted read at debug.
@@ -331,9 +860,14 @@ fn note_conflict(path: &str, conflicted: bool) {
 /// keeps the sidecar's already-redacted wording, prefixed with the mount kind so a
 /// user can tell a CouchDB failure from a filesystem one.
 fn map_sidecar<T>(result: Result<T, SidecarError>) -> Result<T, BackendError> {
-    result.map_err(|error| match &error {
+    result.map_err(map_sidecar_error)
+}
+
+/// [`map_sidecar`] for one error, where the caller has already unwrapped the result.
+fn map_sidecar_error(error: SidecarError) -> BackendError {
+    match &error {
         SidecarError::Rpc {
-            kind: crate::sidecar::SidecarErrorKind::NotFound,
+            kind: SidecarErrorKind::NotFound,
             detail,
             ..
         } => BackendError::io(std::io::Error::new(
@@ -341,7 +875,7 @@ fn map_sidecar<T>(result: Result<T, SidecarError>) -> Result<T, BackendError> {
             detail.clone(),
         )),
         _ => BackendError::Message(error.to_string()),
-    })
+    }
 }
 
 /// Reject a path that is not usable as a vault-relative path.
@@ -681,6 +1215,7 @@ mod tests {
             kind: crate::sidecar::SidecarErrorKind::NotFound,
             detail: "no entry at that path".to_string(),
             status: None,
+            conflict: None,
         }))
         .expect_err("not-found must map to an error");
         assert_eq!(error.io_kind(), Some(std::io::ErrorKind::NotFound));
@@ -693,6 +1228,7 @@ mod tests {
             kind: crate::sidecar::SidecarErrorKind::DecryptFailed,
             detail: "chunk could not be decrypted".to_string(),
             status: None,
+            conflict: None,
         }))
         .expect_err("decrypt-failed must map to an error");
         let message = error.to_string();
@@ -715,5 +1251,32 @@ mod tests {
         // ...and each points at what DOES work.
         assert!(COUCHDB_READ_ONLY_MESSAGE.contains("filesystem mount"));
         assert!(COUCHDB_GREP_UNSUPPORTED_MESSAGE.contains("hybrid_search"));
+    }
+
+    /// The write refusal must name its ACTUAL cause and the setting that changes it.
+    ///
+    /// This exists because the previous wording — "refused by construction, not by
+    /// configuration" and "no write path exists yet" — became false the moment
+    /// `writable` did anything, and the test above could not tell: it only greps for
+    /// EXPERIMENTAL and READ-ONLY, which a wrong-but-alarming message also contains.
+    /// A refusal that misstates its own cause is worse than a generic one, because it
+    /// actively sends the reader somewhere there is nothing to find.
+    #[test]
+    fn the_write_refusal_names_the_setting_that_lifts_it() {
+        assert!(
+            COUCHDB_READ_ONLY_MESSAGE.contains("\"writable\": true"),
+            "the refusal must name the exact setting: {COUCHDB_READ_ONLY_MESSAGE}"
+        );
+        assert!(
+            COUCHDB_READ_ONLY_MESSAGE.contains("mount configuration"),
+            "the refusal must attribute itself to configuration: {COUCHDB_READ_ONLY_MESSAGE}"
+        );
+        // And must NOT claim the capability is unimplemented, which it no longer is.
+        for false_claim in ["by construction", "no write path exists"] {
+            assert!(
+                !COUCHDB_READ_ONLY_MESSAGE.contains(false_claim),
+                "the refusal must not claim {false_claim:?}: {COUCHDB_READ_ONLY_MESSAGE}"
+            );
+        }
     }
 }

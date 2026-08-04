@@ -43,13 +43,19 @@ const VAULTS = {
 
 function usage() {
     process.stderr.write(
-        `usage: node test/mock-couch-server.mjs [--vault ${Object.keys(VAULTS).join("|")}] [--auth-status <code>]\n`
+        `usage: node test/mock-couch-server.mjs [--vault ${Object.keys(VAULTS).join("|")}] [--auth-status <code>] [--writable]\n`
     );
 }
 
 const args = process.argv.slice(2);
 let vaultName = "small";
 let authStatus;
+/**
+ * Opt-in, exactly as it is on `MockCouch` itself. The default stays non-writable so
+ * the read-only proofs keep asserting against a fixture that would refuse a write
+ * even if the sidecar tried one.
+ */
+let writable = false;
 for (let index = 0; index < args.length; index += 1) {
     if (args[index] === "--vault") {
         vaultName = args[index + 1];
@@ -57,6 +63,8 @@ for (let index = 0; index < args.length; index += 1) {
     } else if (args[index] === "--auth-status") {
         authStatus = Number(args[index + 1]);
         index += 1;
+    } else if (args[index] === "--writable") {
+        writable = true;
     } else {
         usage();
         process.exit(2);
@@ -75,6 +83,7 @@ const couch = new MockCouch({
     localDocs: vault.localDocs ?? {},
     conflicts: vault.conflicts ?? {},
     ...(authStatus !== undefined ? { authStatus } : {}),
+    ...(writable ? { writable: true } : {}),
 });
 const url = await couch.listen();
 
@@ -102,12 +111,33 @@ const COMMANDS = {
         return { pushed: path };
     },
     /**
-     * Every request that would have MUTATED the remote. Must stay empty: the
-     * sidecar is structurally read-only and this is the transport-level proof.
+     * Every request that would have MUTATED the remote. On a non-writable fixture
+     * this must stay EMPTY: that is the transport-level proof that a read-only mount
+     * never even attempts a write. On a writable one it is the write ledger.
      */
     writes: () => ({ writes: couch.writes }),
     /** Requests this mock does not model; a non-empty list means upstream moved. */
     unhandled: () => ({ unhandled: couch.unhandled }),
+    /** Every document write actually APPLIED, as `{method, id, type}` rows. */
+    mutations: () => ({ mutations: couch.mutations }),
+    /**
+     * Answer the next N mutating requests 500 WITHOUT applying them, so the Rust
+     * side can drive the supervisor's retry-on-`remote-error` path.
+     */
+    "fail-next-writes": ({ count }) => {
+        couch.failNextWrites = Number(count ?? 1);
+        return { failNextWrites: couch.failNextWrites };
+    },
+    /**
+     * Apply the next N entry-root PUTs and then answer 500 — the LOST RESPONSE case.
+     * The write lands, the client never hears, and its retry meets a revision that
+     * is its own. This is the only way to reach the ambiguity carve-out in the Rust
+     * conflict resolver from outside.
+     */
+    "drop-next-entry-put-responses": ({ count }) => {
+        couch.dropNextEntryPutResponses = Number(count ?? 1);
+        return { dropNextEntryPutResponses: couch.dropNextEntryPutResponses };
+    },
 };
 
 // The handshake line. Written before any command is read so the parent can wait
