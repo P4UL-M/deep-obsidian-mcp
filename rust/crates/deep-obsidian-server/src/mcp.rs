@@ -1,12 +1,12 @@
-use std::path::Path;
 use std::sync::Arc;
 
-use deep_obsidian_backend::{Capability, FilesystemVaultBackend, Mount, VaultBackend, VaultRouter};
-use deep_obsidian_types::{MountBackendConfig, ResolvedServiceConfig};
+use deep_obsidian_backend::{Capability, VaultBackend, VaultRouter};
+use deep_obsidian_types::ResolvedServiceConfig;
 use serde_json::{json, Value};
 
 use crate::auth::AuthState;
 use crate::health::MountIndexSummary;
+use crate::mounts::MountBackends;
 use crate::protocol::{
     InitializeResult, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
     PromptGetResult, PromptListResult, ResourceListResult, ResourceReadResult,
@@ -65,67 +65,28 @@ pub struct AppState {
     pub upload_base: Option<String>,
 }
 
-/// Instantiate the backend a mount's config describes.
-///
-/// `index_dir_override` wins over the mount's own declared index dir. It carries
-/// the resolved server index dir for the ROOT mount, which already folds in both
-/// the top-level `indexDir` setting and the root mount's declared one (top-level
-/// winning), so consulting the mount field again there would invert that
-/// precedence.
-fn build_mount_backend(
-    backend: &MountBackendConfig,
-    index_dir_override: Option<&Path>,
-) -> Arc<dyn VaultBackend> {
-    match backend {
-        MountBackendConfig::Filesystem {
-            vault_path,
-            index_dir,
-        } => {
-            let backend = FilesystemVaultBackend::new(vault_path.clone());
-            // The index dir is declared so a vault-internal one cannot leak into
-            // `grep_search` results as phantom vault paths.
-            match index_dir_override.or(index_dir.as_deref()) {
-                Some(index_dir) => Arc::new(backend.with_index_dir(index_dir)),
-                None => Arc::new(backend),
-            }
-        }
-    }
-}
-
-/// Build the router from a resolved config's mount table.
-///
-/// A legacy `vaultPath` config yields exactly one root mount, which the router
-/// then serves through its pass-through fast path -- so single-mount behaviour is
-/// unchanged by construction, not by convention.
-fn build_router(config: &ResolvedServiceConfig) -> VaultRouter {
-    let mounts = config
-        .mount_table()
-        .into_iter()
-        .map(|mount| {
-            // Only the ROOT mount's vault can hold the server's resolved index dir
-            // (that is where it defaults to), so it is the one that inherits it.
-            let index_dir_override = mount
-                .mount_at
-                .is_empty()
-                .then(|| config.index_dir.as_path());
-            let backend = build_mount_backend(&mount.backend, index_dir_override);
-            Mount::new(mount.id, mount.mount_at, backend)
-        })
-        .collect();
-    // Infallible in practice: `deep_obsidian_config::normalize_service_config` is
-    // the validation gate and already rejects duplicate ids and duplicate prefixes
-    // with user-facing messages. A failure here therefore means a
-    // `ResolvedServiceConfig` was hand-built with an invalid table, which is a
-    // programming error rather than a runtime condition.
-    VaultRouter::new(mounts).expect("resolved config to carry a valid mount table")
-}
-
 impl AppState {
     /// Build state with no upload base (used by the stdio transport).
     ///
-    /// Constructs one backend per configured mount and wires them into the router.
+    /// Builds the mount backends itself, which is right for a caller that has no
+    /// other use for them. A caller that ALSO needs the backends (to build the index
+    /// runtimes over the same sidecar supervisors) must use
+    /// [`AppState::with_backends`] instead — building them twice would give a couchdb
+    /// mount two child processes.
+    ///
+    /// Must be called from inside a tokio runtime.
     pub fn new(config: ResolvedServiceConfig, runtimes: Arc<MountRuntimes>) -> Self {
-        let router = build_router(&config);
+        let backends = MountBackends::build(&config);
+        Self::with_backends(config, runtimes, &backends)
+    }
+
+    /// Build state over already-built mount backends.
+    pub fn with_backends(
+        config: ResolvedServiceConfig,
+        runtimes: Arc<MountRuntimes>,
+        backends: &MountBackends,
+    ) -> Self {
+        let router = backends.router();
         let root = router
             .root()
             .expect("resolved config to declare a root mount");

@@ -15,15 +15,17 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_server::health::{
     build_readiness_payload, insert_mount_index_detail, readiness_status_code,
 };
 use deep_obsidian_server::mcp::{handle_request, AppState};
+use deep_obsidian_server::mounts::MountBackends;
 use deep_obsidian_server::protocol::JsonRpcRequest;
 use deep_obsidian_server::runtime::MountRuntimes;
 use deep_obsidian_types::{
     AuthConfig, AutoReindexConfig, EmbeddingConfig, ExperimentalConfig, HttpConfig,
-    MountBackendConfig, MountConfig, ResolvedServiceConfig, StdioMode, TransportMode,
+    MountBackendConfig, MountConfig, ResolvedServiceConfig, SecretRef, StdioMode, TransportMode,
 };
 use serde_json::{json, Value};
 
@@ -124,7 +126,10 @@ impl Fixture {
                     },
                 },
             ],
-            experimental: ExperimentalConfig { multi_vault: true },
+            experimental: ExperimentalConfig {
+                multi_vault: true,
+                ..ExperimentalConfig::default()
+            },
             index_dir: self.index_dir.clone(),
             transport: TransportMode::Http,
             stdio_mode: StdioMode::Auto,
@@ -151,10 +156,14 @@ impl Fixture {
     }
 
     async fn state_for(&self, config: ResolvedServiceConfig) -> AppState {
-        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
+        let backends = MountBackends::build(&config);
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
             .await
             .expect("bootstrap runtime");
-        AppState::new(config, runtimes)
+        // `with_backends`, not `new`: `new` would build a SECOND MountBackends, and
+        // for a couchdb mount the router's backend would then not be the one the index
+        // reads through -- two child processes for one mount.
+        AppState::with_backends(config, runtimes, &backends)
     }
 
     /// State with an upload base, so `request_vault_upload` can mint.
@@ -387,7 +396,22 @@ async fn an_unscoped_grep_is_refused_rather_than_answered_from_one_mount() {
     .await;
     let matches = structured(&scoped)["matches"].as_array().expect("matches");
     assert!(!matches.is_empty());
-    assert_eq!(matches[0]["path"], json!("Team/Charter.md"));
+    // Membership, not `matches[0]`: BOTH team notes contain "charter" (Roster.md says
+    // "who signs the charter"), the search is case-insensitive by default, and
+    // ripgrep walks the tree in parallel — so which hit lands first is genuinely
+    // nondeterministic. This assertion was observed to flake on the ordering. What the
+    // test is actually about is that scoping reaches the team mount and reports
+    // LOGICAL paths, and both of those are checked here.
+    let paths: Vec<&str> = matches
+        .iter()
+        .map(|item| item["path"].as_str().expect("path"))
+        .collect();
+    assert!(paths.contains(&"Team/Charter.md"), "{paths:?}");
+    // Every path is mount-prefixed, i.e. logical rather than mount-relative.
+    assert!(
+        paths.iter().all(|path| path.starts_with("Team/")),
+        "{paths:?}"
+    );
 }
 
 #[tokio::test]
@@ -959,4 +983,432 @@ async fn template_protection_still_applies_on_a_non_root_mount() {
     .await;
     assert!(!error_message(&written).is_empty());
     assert!(!fixture.team_vault.join("Templates/Note.md").exists());
+}
+
+// ---------------------------------------------------------------------------
+// A couchdb mount, end to end through the MCP surface
+// ---------------------------------------------------------------------------
+//
+// A couchdb mount is multi-mount BY DEFINITION (it cannot be the root mount), so it
+// belongs in this suite rather than in `mcp_contract.rs`, whose goldens describe a
+// single-mount vault and must not move.
+//
+// A stub sidecar stands in for the real one. That is the right level here: the real
+// sidecar against the real fixture CouchDB is already covered end to end in
+// `deep-obsidian-backend`'s `couchdb_sidecar.rs`, and what this suite adds is the
+// part that suite cannot see -- that the ROUTER sends a path on the couchdb prefix to
+// the couchdb backend, that a read comes back through the MCP tool surface, and that
+// a write on that prefix is refused with the experimental read-only message while the
+// filesystem root stays writable.
+
+/// A node script that speaks protocol v1 and serves two notes from memory.
+///
+/// Echoes the exact `supported` triple the supervisor enforces, so a drift in that
+/// triple fails this test too.
+const STUB_SIDECAR: &str = r##"
+import { createInterface } from "node:readline";
+const NOTES = {
+    "Charter.md": "# LiveSync Charter\n\nServed from the CouchDB mount.\n",
+    "Deep/Nested.md": "# Nested\n\nA nested LiveSync note.\n",
+};
+const rl = createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+    const text = line.trim();
+    if (!text) return;
+    const message = JSON.parse(text);
+    const reply = (result) =>
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\n");
+    const fail = (code, kind, detail) =>
+        process.stdout.write(
+            JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code, message: detail, data: { kind, detail } } }) + "\n"
+        );
+    switch (message.method) {
+        case "initialize":
+            return reply({
+                protocolVersion: 1,
+                sidecarVersion: "0.1.0",
+                commonlibVersion: "0.1.2",
+                supportedSchemaVersion: 12,
+                supported: {
+                    protocolVersion: 1,
+                    commonlibVersion: "0.1.2",
+                    maxSchemaVersion: 12,
+                    pluginVersionTested: "1.0.3",
+                },
+                compatibility: { status: "ok" },
+                remote: { schemaVersion: 12, encrypted: false, pathObfuscation: false },
+            });
+        case "manifest":
+            return reply({
+                entries: Object.entries(NOTES).map(([path, body]) => ({
+                    path,
+                    size: Buffer.byteLength(body),
+                    mtimeMs: 1700000000000,
+                    ctimeMs: 1700000000000,
+                    deleted: false,
+                    conflicted: false,
+                    kind: "markdown",
+                })),
+                exhausted: true,
+            });
+        case "read": {
+            const body = NOTES[message.params.path];
+            if (body === undefined) return fail(-32004, "not-found", "no entry at that path");
+            return reply({
+                kind: "text",
+                text: body,
+                path: message.params.path,
+                size: Buffer.byteLength(body),
+                mtimeMs: 1700000000000,
+                ctimeMs: 1700000000000,
+                deleted: false,
+                conflicted: false,
+                rev: "1-stub",
+            });
+        }
+        case "stat": {
+            const body = NOTES[message.params.path];
+            if (body === undefined) return fail(-32004, "not-found", "no entry at that path");
+            return reply({
+                kind: "markdown",
+                path: message.params.path,
+                size: Buffer.byteLength(body),
+                mtimeMs: 1700000000000,
+                ctimeMs: 1700000000000,
+                deleted: false,
+                conflicted: false,
+                rev: "1-stub",
+            });
+        }
+        case "changesSince":
+            return reply({ changes: [], nextCursor: "c1", exhausted: true });
+        case "watch":
+            return reply({ watching: true, cursor: "c1" });
+        case "unwatch":
+            return reply({ watching: false });
+        case "health":
+            return reply({ status: "ok", compatibility: { status: "ok" }, watching: false, uptimeMs: 1 });
+        case "shutdown":
+            reply({ ok: true });
+            return process.exit(0);
+        default:
+            return fail(-32601, "method-not-found", message.method);
+    }
+});
+"##;
+
+/// True when `node` can run. The stub is a node script, so this suite's couchdb tests
+/// gate on the same prerequisite the real backend does.
+fn node_available() -> bool {
+    std::process::Command::new("node")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// A filesystem root mount plus a couchdb mount at `LiveSync`, backed by the stub.
+struct CouchdbFixture {
+    inner: Fixture,
+    stub: PathBuf,
+    secrets: PathBuf,
+}
+
+impl CouchdbFixture {
+    fn new(name: &str) -> Self {
+        let inner = Fixture::new(name);
+        let base = inner
+            .index_dir
+            .parent()
+            .expect("fixture base")
+            .to_path_buf();
+        let stub = base.join("stub-sidecar.mjs");
+        fs::write(&stub, STUB_SIDECAR).expect("write the stub sidecar");
+        Self {
+            inner,
+            stub,
+            secrets: base.join("secrets.json"),
+        }
+    }
+
+    /// The two-mount config, with the couchdb mount pointed at the stub.
+    fn config(&self) -> ResolvedServiceConfig {
+        let mut config = self.inner.config();
+        config.experimental = ExperimentalConfig {
+            multi_vault: true,
+            couchdb_vaults: true,
+        };
+        // Replace the `team` filesystem mount with a couchdb one at the same prefix,
+        // so the routing assertions below are about the BACKEND KIND rather than about
+        // a different prefix.
+        config.mounts[1] = MountConfig {
+            id: "live".to_string(),
+            mount_at: "LiveSync".to_string(),
+            backend: MountBackendConfig::Couchdb {
+                url: "http://couch.invalid".to_string(),
+                database: "vault".to_string(),
+                username: Some("vaultuser".to_string()),
+                password_ref: SecretRef::EncryptedFile {
+                    id: "livesync-password".to_string(),
+                },
+                e2ee: None,
+                sidecar_path: Some(self.stub.clone()),
+                index_dir: None,
+                options: None,
+            },
+        };
+        config
+    }
+
+    /// State over the couchdb config, with the password stored in a TEMP secrets file.
+    ///
+    /// A temp store rather than `XDG_CONFIG_HOME`: that variable is process-global and
+    /// mutating it races every other test that reads the default secrets path.
+    async fn state(&self) -> AppState {
+        let resolver = SecretResolver::with_encrypted_file_path(self.secrets.clone());
+        resolver
+            .put(
+                &SecretRef::EncryptedFile {
+                    id: "livesync-password".to_string(),
+                },
+                secrecy::SecretString::new("s3cr3t-password-value".to_string()),
+            )
+            .expect("store the fixture password");
+
+        let config = self.config();
+        let backends = MountBackends::build_with_resolver(&config, &resolver);
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
+            .await
+            .expect("a couchdb mount must not fail the bootstrap");
+        AppState::with_backends(config, runtimes, &backends)
+    }
+}
+
+/// The config the gate rejects, and the one it accepts.
+#[test]
+fn a_couchdb_mount_requires_the_couchdb_vaults_flag() {
+    let fixture = CouchdbFixture::new("gate");
+    let config = fixture.config();
+
+    // The resolved config used above already has both flags; assert the gate through
+    // the normalizer, which is what a real config file goes through.
+    let input = deep_obsidian_types::ServiceConfigInput {
+        mounts: Some(config.mounts.clone()),
+        experimental: Some(ExperimentalConfig {
+            multi_vault: true,
+            couchdb_vaults: false,
+        }),
+        ..Default::default()
+    };
+    let error = deep_obsidian_server::normalize_service_config(input)
+        .expect_err("an ungated couchdb mount must be refused");
+    assert!(error.to_string().contains("couchdbVaults"), "{error}");
+
+    let input = deep_obsidian_types::ServiceConfigInput {
+        mounts: Some(config.mounts.clone()),
+        experimental: Some(ExperimentalConfig {
+            multi_vault: true,
+            couchdb_vaults: true,
+        }),
+        ..Default::default()
+    };
+    assert!(deep_obsidian_server::normalize_service_config(input).is_ok());
+}
+
+/// A read on the couchdb prefix is served BY THE COUCHDB BACKEND, and a read on the
+/// root is still served by the filesystem one.
+#[tokio::test]
+async fn reads_on_a_couchdb_prefix_are_served_by_the_couchdb_backend() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-read");
+    let state = fixture.state().await;
+
+    // The stub's content, reached through the MCP tool surface at the MOUNTED path.
+    let live = tool_call(&state, "read_file", json!({"path": "LiveSync/Charter.md"})).await;
+    let text = structured(&live)["text"]
+        .as_str()
+        .expect("text payload")
+        .to_string();
+    assert!(text.contains("Served from the CouchDB mount"), "{text}");
+
+    // ...and the filesystem root is untouched by any of this.
+    let root = tool_call(&state, "read_file", json!({"path": "Root.md"})).await;
+    let root_text = structured(&root)["text"].as_str().expect("text payload");
+    assert!(
+        root_text.contains("Root note in the root mount"),
+        "{root_text}"
+    );
+
+    // The couchdb mount's index lands in ITS OWN directory, keyed by mount id under
+    // the root's. A collision here would be two `RuntimeState`s writing one SQLite
+    // file, and `IndexTarget::from_factory` derives the path from `index_dir` alone
+    // (a couchdb mount has no vault path to derive it from), so this is worth pinning
+    // -- it is what `every_mount_indexes_into_its_own_directory` covers for
+    // filesystem mounts.
+    let live_index = fixture.inner.index_dir.join("mounts").join("live");
+    assert!(
+        live_index.join("index.sqlite").is_file(),
+        "the couchdb mount's index must land at {}",
+        live_index.display()
+    );
+    // ...and it is a DIFFERENT file from the root mount's.
+    assert!(fixture.inner.index_dir.join("index.sqlite").is_file());
+
+    // `vault_info` names the backend kind per mount, which is how an operator sees
+    // which mount is the experimental one.
+    let info = tool_call(&state, "vault_info", json!({})).await;
+    let mounts = structured(&info)["mounts"]
+        .as_array()
+        .expect("per-mount detail");
+    let live_mount = mounts
+        .iter()
+        .find(|mount| mount["id"] == json!("live"))
+        .expect("the couchdb mount is reported");
+    assert_eq!(live_mount["backendKind"], json!("couchdb"));
+}
+
+/// A listing on the couchdb prefix synthesizes folders from path prefixes: a LiveSync
+/// vault is a flat map with no directories of its own.
+#[tokio::test]
+async fn listings_on_a_couchdb_prefix_synthesize_folders() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-list");
+    let state = fixture.state().await;
+
+    let listing = tool_call(&state, "list_children", json!({"path": "LiveSync"})).await;
+    let entries = structured(&listing)["children"]
+        .as_array()
+        .expect("children")
+        .iter()
+        .map(|entry| {
+            (
+                entry["path"].as_str().unwrap_or_default().to_string(),
+                entry["kind"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // `Deep` exists only as a path prefix of `Deep/Nested.md`, and is reported as a
+    // directory; directories come first, exactly as for a filesystem mount.
+    assert_eq!(
+        entries,
+        vec![
+            ("LiveSync/Deep".to_string(), "directory".to_string()),
+            ("LiveSync/Charter.md".to_string(), "file".to_string()),
+        ],
+        "{entries:?}"
+    );
+}
+
+/// A write on the couchdb prefix is refused with the experimental read-only message,
+/// while the SAME tool still writes to the filesystem root.
+#[tokio::test]
+async fn writes_on_a_couchdb_prefix_are_refused_but_the_root_stays_writable() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-write");
+    let state = fixture.state().await;
+
+    let refused = tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": "LiveSync/New.md", "content": "# New\n\nbody\n"}),
+    )
+    .await;
+    let message = error_message(&refused);
+    assert!(message.contains("EXPERIMENTAL"), "{message}");
+    assert!(message.contains("READ-ONLY"), "{message}");
+    // The refusal points at what DOES work rather than stopping at "unsupported".
+    assert!(message.contains("filesystem mount"), "{message}");
+
+    // Nothing was written anywhere.
+    let missing = tool_call(&state, "read_file", json!({"path": "LiveSync/New.md"})).await;
+    assert!(missing.get("error").is_some(), "{missing}");
+
+    // ...and the root mount is unaffected: the refusal is per-mount, not global.
+    let written = tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": "RootWritten.md", "content": "# Root Written\n\nbody\n"}),
+    )
+    .await;
+    assert!(
+        written.get("result").is_some(),
+        "the filesystem root must stay writable: {written}"
+    );
+}
+
+/// `grep_search` scoped to a CouchDB mount is refused, and the refusal says the vault
+/// has no local files rather than blaming a missing ripgrep.
+///
+/// # Which guard actually fires, verified rather than assumed
+///
+/// `AppState::rg_available` is derived from the ROOT mount only, so with a filesystem
+/// root it stays true and `grep_search` stays advertised. `VaultRouter::grep` does NOT
+/// check `Capability::GrepSearch`; it scopes by the caller's `glob` and delegates to
+/// that one mount's backend. So a glob that narrows to the couchdb prefix DOES reach
+/// `CouchDbVaultBackend`'s `Recall::Grep` arm, and its message is what the caller sees
+/// — the arm is genuinely reachable through MCP, not dead defence-in-depth.
+///
+/// An UNSCOPED grep is refused earlier, by the router's federation guard, which is
+/// already covered by `an_unscoped_grep_is_refused_rather_than_answered_from_one_mount`.
+#[tokio::test]
+async fn grep_scoped_to_a_couchdb_mount_is_refused_honestly() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-grep");
+    let state = fixture.state().await;
+    if !state.rg_available {
+        eprintln!("skipping: ripgrep is not available, so grep_search is not advertised");
+        return;
+    }
+
+    let response = tool_call(
+        &state,
+        "grep_search",
+        json!({"query": "Charter", "glob": "LiveSync/**/*.md"}),
+    )
+    .await;
+    let message = error_message(&response);
+    // The couchdb backend's own refusal, reached through the router.
+    assert!(message.contains("EXPERIMENTAL"), "{message}");
+    assert!(message.contains("READ-ONLY"), "{message}");
+    assert!(
+        message.contains("do not exist for a CouchDB vault"),
+        "the refusal must name the real reason: {message}"
+    );
+    // ...and it must NOT blame a missing binary, which is the honest-error point.
+    assert!(
+        !message.contains("ripgrep is not installed"),
+        "the refusal must not blame a missing binary: {message}"
+    );
+    // It points at what DOES work on this mount.
+    assert!(message.contains("hybrid_search"), "{message}");
+
+    // Sanity: grep on the FILESYSTEM root still works, so the refusal is per-mount and
+    // not a global loss of the tool. The glob names `Notes/` rather than `*.md`
+    // because a root-scoped glob would span the LiveSync mount too, which the
+    // router refuses for the unrelated federation reason.
+    let root = tool_call(
+        &state,
+        "grep_search",
+        json!({"query": "nested", "glob": "Notes/**/*.md"}),
+    )
+    .await;
+    assert!(
+        root.get("result").is_some(),
+        "grep on the filesystem root must still work: {root}"
+    );
 }

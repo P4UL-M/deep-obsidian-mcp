@@ -88,6 +88,36 @@ pub enum ConfigError {
     /// More than a single root mount without the opt-in flag.
     #[error("multi-vault mounts are experimental: set {{\"experimental\": {{\"multiVault\": true}}}} in the config to resolve a table of {count} mounts")]
     MultiVaultNotEnabled { count: usize },
+    /// A `couchdb` mount without the opt-in flag.
+    ///
+    /// Checked BEFORE [`Self::MultiVaultNotEnabled`]: a couchdb mount is
+    /// non-root-only, so it always makes the table multi-mount and both gates
+    /// would fire. The couchdb message is the more specific and more actionable
+    /// of the two, and it names the flag the user has actually not set yet for
+    /// the feature they were trying to use.
+    #[error("couchdb (Self-hosted LiveSync) vaults are EXPERIMENTAL and READ-ONLY: set {{\"experimental\": {{\"couchdbVaults\": true}}}} in the config to resolve mount {id:?}")]
+    CouchdbVaultsNotEnabled { id: String },
+    /// A `couchdb` mount at the vault root.
+    ///
+    /// `ResolvedServiceConfig::vault_path` is the ROOT mount's local directory and
+    /// still feeds `doctor`, the packaged index-dir derivation and the vault
+    /// overview. A CouchDB vault has no local directory, so a couchdb root mount
+    /// would leave it undefined. Lifting this needs those consumers to stop
+    /// requiring a root vault path first.
+    #[error("mount {id:?} is a couchdb backend at the vault root, which is not supported: a CouchDB vault has no local directory to serve as 'vaultPath'. Mount it at a non-root mountAt (e.g. \"LiveSync\") alongside a filesystem root mount.")]
+    CouchdbRootMountUnsupported { id: String },
+    /// A CouchDB URL carrying `user:password@` userinfo.
+    ///
+    /// Rejected at validation rather than stripped at render time: the URL is
+    /// printed verbatim by `doctor` and `print-config`, and a password that
+    /// reached the config file at all has already been written to disk in
+    /// plaintext. Failing loudly is the only answer that tells the user to move
+    /// it into `passwordRef`.
+    #[error("mount {id:?} has a couchdb url containing embedded credentials; remove the 'user:password@' userinfo from the url and store the password as a secret reference in 'passwordRef' instead (the url is printed verbatim by 'doctor' and 'print-config')")]
+    CouchdbUrlHasUserinfo { id: String },
+    /// A `couchdb` mount with an empty `url` or `database`.
+    #[error("mount {id:?} has an invalid couchdb backend: {reason}")]
+    InvalidCouchdbBackend { id: String, reason: &'static str },
 }
 
 fn home_dir() -> PathBuf {
@@ -295,7 +325,76 @@ fn expand_mount_backend_paths(backend: MountBackendConfig) -> MountBackendConfig
             vault_path: expand_home_path(vault_path),
             index_dir: index_dir.map(expand_home_path),
         },
+        // `url` and `database` are not paths. `sidecarPath` and `indexDir` are, and
+        // both are plausible `~`-relative values (a checked-out sidecar bundle, an
+        // index outside the vault), so both are expanded.
+        MountBackendConfig::Couchdb {
+            url,
+            database,
+            username,
+            password_ref,
+            e2ee,
+            sidecar_path,
+            index_dir,
+            options,
+        } => MountBackendConfig::Couchdb {
+            url,
+            database,
+            username,
+            password_ref,
+            e2ee,
+            sidecar_path: sidecar_path.map(expand_home_path),
+            index_dir: index_dir.map(expand_home_path),
+            options,
+        },
     }
+}
+
+/// True when `url`'s authority carries `user[:password]@` userinfo.
+///
+/// Deliberately string-based rather than URL-parser-based: this crate has no URL
+/// dependency, and the question is narrow. The authority is everything between
+/// `//` and the next `/`, `?` or `#`; userinfo is an `@` inside it. An `@` later in
+/// the path (legal, and not a credential) must not trip the check.
+fn url_authority_has_userinfo(url: &str) -> bool {
+    let Some(after_scheme) = url.split_once("//").map(|(_, rest)| rest) else {
+        return false;
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    after_scheme[..authority_end].contains('@')
+}
+
+/// Validate the parts of a couchdb backend that are checkable without connecting.
+///
+/// Reachability, credentials and remote compatibility are all deliberately NOT
+/// checked here: they are the sidecar's `initialize` compatibility status, which is
+/// a runtime readiness fact rather than a config error (a config must still load
+/// while the CouchDB server is down).
+fn validate_couchdb_backend(mount: &MountConfig) -> Result<(), ConfigError> {
+    let MountBackendConfig::Couchdb { url, database, .. } = &mount.backend else {
+        return Ok(());
+    };
+    if url.trim().is_empty() {
+        return Err(ConfigError::InvalidCouchdbBackend {
+            id: mount.id.clone(),
+            reason:
+                "'url' is empty; give the CouchDB server origin, e.g. \"https://couch.example\"",
+        });
+    }
+    if database.trim().is_empty() {
+        return Err(ConfigError::InvalidCouchdbBackend {
+            id: mount.id.clone(),
+            reason: "'database' is empty; give the LiveSync database name",
+        });
+    }
+    if url_authority_has_userinfo(url) {
+        return Err(ConfigError::CouchdbUrlHasUserinfo {
+            id: mount.id.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Validate and canonicalize a declared mount table.
@@ -352,6 +451,26 @@ pub fn normalize_service_config(
                 return Err(ConfigError::VaultPathAndMountsBothSet);
             }
             let (mounts, root) = normalize_mounts(mounts)?;
+            // Couchdb gates first: a couchdb mount is non-root-only, so it always
+            // makes the table multi-mount and BOTH gates would fire. The couchdb
+            // errors are the specific ones, so they win — see
+            // `ConfigError::CouchdbVaultsNotEnabled`.
+            for mount in &mounts {
+                if !matches!(mount.backend, MountBackendConfig::Couchdb { .. }) {
+                    continue;
+                }
+                if !experimental.couchdb_vaults {
+                    return Err(ConfigError::CouchdbVaultsNotEnabled {
+                        id: mount.id.clone(),
+                    });
+                }
+                if mount.mount_at.is_empty() {
+                    return Err(ConfigError::CouchdbRootMountUnsupported {
+                        id: mount.id.clone(),
+                    });
+                }
+                validate_couchdb_backend(mount)?;
+            }
             // A single explicit root mount is exactly the legacy shape spelled out
             // longhand, so it needs no flag. Anything else does.
             if mounts.len() > 1 && !experimental.multi_vault {
@@ -364,6 +483,13 @@ pub fn normalize_service_config(
                     vault_path,
                     index_dir,
                 } => (vault_path.clone(), index_dir.clone()),
+                // Unreachable: `CouchdbRootMountUnsupported` above rejects exactly
+                // this shape, which is what keeps `vault_path` well-defined.
+                MountBackendConfig::Couchdb { .. } => {
+                    return Err(ConfigError::CouchdbRootMountUnsupported {
+                        id: mounts[root].id.clone(),
+                    });
+                }
             };
             (mounts, vault_path, mount_index_dir)
         }
@@ -708,8 +834,8 @@ mod tests {
         DEFAULT_CONFIG_APP_DIR,
     };
     use deep_obsidian_types::{
-        AuthConfigInput, ExperimentalConfig, MountBackendConfig, MountConfig,
-        PersistedServiceConfig, SecretRef, ServiceConfigInput,
+        AuthConfigInput, CouchdbE2eeConfig, CouchdbOptions, ExperimentalConfig, MountBackendConfig,
+        MountConfig, PersistedServiceConfig, SecretRef, ServiceConfigInput,
     };
     use std::path::PathBuf;
 
@@ -731,7 +857,10 @@ mod tests {
     fn mounts_input(mounts: Vec<MountConfig>, multi_vault: bool) -> ServiceConfigInput {
         ServiceConfigInput {
             mounts: Some(mounts),
-            experimental: Some(ExperimentalConfig { multi_vault }),
+            experimental: Some(ExperimentalConfig {
+                multi_vault,
+                ..ExperimentalConfig::default()
+            }),
             ..ServiceConfigInput::default()
         }
     }
@@ -1042,7 +1171,10 @@ mod tests {
         assert_eq!(mounts[1].mount_at, "Team");
         assert_eq!(
             persisted.experimental,
-            Some(ExperimentalConfig { multi_vault: true })
+            Some(ExperimentalConfig {
+                multi_vault: true,
+                ..ExperimentalConfig::default()
+            })
         );
         let serialized = serde_json::to_string(&persisted).expect("serialize");
         assert!(serialized.contains("\"mountAt\""));
@@ -1207,5 +1339,304 @@ mod tests {
         let mount = default_mount_index_dir(&packaged_root, "team");
         assert!(mount.starts_with(&packaged_root));
         assert!(mount.to_string_lossy().contains(DEFAULT_CONFIG_APP_DIR));
+    }
+
+    // -----------------------------------------------------------------------
+    // couchdb mounts
+    // -----------------------------------------------------------------------
+
+    fn couchdb_mount(id: &str, mount_at: &str) -> MountConfig {
+        MountConfig {
+            id: id.to_string(),
+            mount_at: mount_at.to_string(),
+            backend: MountBackendConfig::Couchdb {
+                url: "https://couch.example".to_string(),
+                database: "vault".to_string(),
+                username: Some("vaultuser".to_string()),
+                password_ref: SecretRef::EncryptedFile {
+                    id: "livesync-password".to_string(),
+                },
+                e2ee: None,
+                sidecar_path: None,
+                index_dir: None,
+                options: None,
+            },
+        }
+    }
+
+    /// The input a working couchdb config needs: a filesystem root plus the mount,
+    /// with BOTH experimental flags set.
+    fn couchdb_input(
+        mount: MountConfig,
+        multi_vault: bool,
+        couchdb_vaults: bool,
+    ) -> ServiceConfigInput {
+        ServiceConfigInput {
+            mounts: Some(vec![
+                filesystem_mount("vault", "", "/tmp/root-vault"),
+                mount,
+            ]),
+            experimental: Some(ExperimentalConfig {
+                multi_vault,
+                couchdb_vaults,
+            }),
+            ..ServiceConfigInput::default()
+        }
+    }
+
+    /// The happy path: both flags set, non-root mount, and the ROOT mount still
+    /// supplies `vault_path`.
+    #[test]
+    fn a_gated_non_root_couchdb_mount_resolves() {
+        let resolved =
+            normalize_service_config(couchdb_input(couchdb_mount("live", "LiveSync"), true, true))
+                .expect("a gated couchdb mount resolves");
+
+        assert_eq!(resolved.vault_path, PathBuf::from("/tmp/root-vault"));
+        assert_eq!(resolved.mounts.len(), 2);
+        assert_eq!(resolved.mounts[1].backend.kind_name(), "couchdb");
+        assert!(resolved.experimental.couchdb_vaults);
+    }
+
+    /// Without `couchdbVaults` the mount is refused — and the COUCHDB error wins over
+    /// `MultiVaultNotEnabled`, even though a couchdb mount always makes the table
+    /// multi-mount and so trips both gates. The couchdb message names the flag the
+    /// user has actually not set for the feature they were using.
+    #[test]
+    fn the_couchdb_gate_is_required_and_wins_over_the_multi_vault_gate() {
+        let error = normalize_service_config(couchdb_input(
+            couchdb_mount("live", "LiveSync"),
+            true,
+            false,
+        ))
+        .expect_err("an ungated couchdb mount must be refused");
+        assert!(matches!(
+            error,
+            ConfigError::CouchdbVaultsNotEnabled { ref id } if id == "live"
+        ));
+        assert!(error.to_string().contains("couchdbVaults"));
+        assert!(error.to_string().contains("EXPERIMENTAL"));
+        assert!(error.to_string().contains("READ-ONLY"));
+
+        // Neither flag set: still the couchdb error, not the multi-vault one.
+        let error = normalize_service_config(couchdb_input(
+            couchdb_mount("live", "LiveSync"),
+            false,
+            false,
+        ))
+        .expect_err("an ungated couchdb mount must be refused");
+        assert!(matches!(error, ConfigError::CouchdbVaultsNotEnabled { .. }));
+
+        // ...and with `couchdbVaults` alone, the multi-vault gate is what fires,
+        // because the table really is multi-mount.
+        let error = normalize_service_config(couchdb_input(
+            couchdb_mount("live", "LiveSync"),
+            false,
+            true,
+        ))
+        .expect_err("a multi-mount table still needs multiVault");
+        assert!(matches!(
+            error,
+            ConfigError::MultiVaultNotEnabled { count: 2 }
+        ));
+    }
+
+    /// A couchdb mount cannot be the ROOT mount: `vault_path` would have nothing to
+    /// point at.
+    #[test]
+    fn a_couchdb_root_mount_is_refused() {
+        let input = ServiceConfigInput {
+            mounts: Some(vec![couchdb_mount("live", "")]),
+            experimental: Some(ExperimentalConfig {
+                multi_vault: true,
+                couchdb_vaults: true,
+            }),
+            ..ServiceConfigInput::default()
+        };
+        let error = normalize_service_config(input).expect_err("a couchdb root must be refused");
+        assert!(matches!(
+            error,
+            ConfigError::CouchdbRootMountUnsupported { ref id } if id == "live"
+        ));
+        // The message says WHY, and what to do instead.
+        assert!(error.to_string().contains("no local directory"));
+        assert!(error.to_string().contains("non-root mountAt"));
+    }
+
+    /// Embedded `user:password@` credentials in the url are refused, because the url
+    /// is printed verbatim by `doctor` and `print-config`.
+    #[test]
+    fn a_couchdb_url_with_userinfo_is_refused() {
+        for url in [
+            "https://admin:hunter2@couch.example",
+            "http://admin@couch.example:5984",
+        ] {
+            let mut mount = couchdb_mount("live", "LiveSync");
+            if let MountBackendConfig::Couchdb { url: slot, .. } = &mut mount.backend {
+                *slot = url.to_string();
+            }
+            let error = normalize_service_config(couchdb_input(mount, true, true))
+                .expect_err("userinfo must be refused");
+            assert!(
+                matches!(error, ConfigError::CouchdbUrlHasUserinfo { .. }),
+                "{url} produced {error}"
+            );
+            assert!(error.to_string().contains("passwordRef"));
+        }
+
+        // An `@` in the PATH is legal and must not trip the check.
+        let mut mount = couchdb_mount("live", "LiveSync");
+        if let MountBackendConfig::Couchdb { url: slot, .. } = &mut mount.backend {
+            *slot = "https://couch.example/prefix@v1".to_string();
+        }
+        assert!(normalize_service_config(couchdb_input(mount, true, true)).is_ok());
+    }
+
+    #[test]
+    fn an_empty_couchdb_url_or_database_is_refused() {
+        for (url, database) in [("", "vault"), ("https://couch.example", "")] {
+            let mut mount = couchdb_mount("live", "LiveSync");
+            if let MountBackendConfig::Couchdb {
+                url: url_slot,
+                database: database_slot,
+                ..
+            } = &mut mount.backend
+            {
+                *url_slot = url.to_string();
+                *database_slot = database.to_string();
+            }
+            let error = normalize_service_config(couchdb_input(mount, true, true))
+                .expect_err("an empty url/database must be refused");
+            assert!(matches!(error, ConfigError::InvalidCouchdbBackend { .. }));
+        }
+    }
+
+    /// `~` is expanded in `sidecarPath` and `indexDir` (both are real paths) and NOT
+    /// in `url`/`database` (neither is).
+    #[test]
+    fn couchdb_paths_are_home_expanded_and_the_url_is_not() {
+        let mut mount = couchdb_mount("live", "LiveSync");
+        if let MountBackendConfig::Couchdb {
+            sidecar_path,
+            index_dir,
+            ..
+        } = &mut mount.backend
+        {
+            *sidecar_path = Some(PathBuf::from("~/sidecar/dist/sidecar.mjs"));
+            *index_dir = Some(PathBuf::from("~/indexes/live"));
+        }
+        let resolved =
+            normalize_service_config(couchdb_input(mount, true, true)).expect("resolves");
+        let MountBackendConfig::Couchdb {
+            url,
+            sidecar_path,
+            index_dir,
+            ..
+        } = &resolved.mounts[1].backend
+        else {
+            panic!("expected a couchdb mount");
+        };
+        assert_eq!(url, "https://couch.example");
+        assert!(!sidecar_path
+            .as_ref()
+            .expect("sidecar path")
+            .to_string_lossy()
+            .starts_with('~'));
+        assert!(!index_dir
+            .as_ref()
+            .expect("index dir")
+            .to_string_lossy()
+            .starts_with('~'));
+    }
+
+    /// A couchdb mount round-trips through `to_persisted_config` unchanged, and the
+    /// persisted JSON carries only secret REFERENCES — there is no plaintext password
+    /// field for `redact_config` to have to strip.
+    #[test]
+    fn a_couchdb_mount_round_trips_and_persists_only_secret_references() {
+        let mut mount = couchdb_mount("live", "LiveSync");
+        if let MountBackendConfig::Couchdb { e2ee, options, .. } = &mut mount.backend {
+            *e2ee = Some(CouchdbE2eeConfig {
+                passphrase_ref: SecretRef::OsKeyring {
+                    service: "deep-obsidian-mcp".to_string(),
+                    account: "livesync-e2ee".to_string(),
+                },
+                obfuscate_passphrase_ref: Some(SecretRef::EncryptedFile {
+                    id: "livesync-obfuscate".to_string(),
+                }),
+            });
+            *options = Some(CouchdbOptions {
+                request_timeout_ms: Some(45_000),
+                ..CouchdbOptions::default()
+            });
+        }
+        let resolved =
+            normalize_service_config(couchdb_input(mount, true, true)).expect("resolves");
+        let persisted = to_persisted_config(&resolved);
+
+        // Round trip: re-normalizing the persisted form yields the same mount table.
+        let reresolved = normalize_service_config(ServiceConfigInput {
+            mounts: persisted.mounts.clone(),
+            experimental: persisted.experimental.clone(),
+            ..ServiceConfigInput::default()
+        })
+        .expect("the persisted form re-resolves");
+        assert_eq!(reresolved.mounts, resolved.mounts);
+
+        let json = serde_json::to_string(&persisted).expect("serialize");
+        // References are present...
+        assert!(json.contains("passwordRef"), "{json}");
+        assert!(json.contains("passphraseRef"), "{json}");
+        assert!(json.contains("obfuscatePassphraseRef"), "{json}");
+        assert!(json.contains("livesync-password"), "{json}");
+        // ...and there is no plaintext secret FIELD at all, which is what makes
+        // `redact_config` an identity function rather than a stripper.
+        for forbidden in ["\"password\"", "\"passphrase\"", "\"obfuscatePassphrase\""] {
+            assert!(!json.contains(forbidden), "{forbidden} present in {json}");
+        }
+        // camelCase throughout: the per-variant `rename_all` is required on a tagged
+        // enum, because the container attribute renames VARIANTS, not their fields.
+        assert!(
+            json.contains("sidecarPath") || !json.contains("sidecar_path"),
+            "{json}"
+        );
+        assert!(json.contains("requestTimeoutMs"), "{json}");
+        assert!(!json.contains("request_timeout_ms"), "{json}");
+    }
+
+    /// A plaintext `password` in the config is rejected rather than silently ignored:
+    /// `MountBackendConfig` has no such field, so serde reports an unknown one only
+    /// if the variant denies them. It does not — so this asserts the honest thing
+    /// instead: the field is DROPPED and never reaches the sidecar.
+    #[test]
+    fn a_plaintext_password_in_a_couchdb_mount_is_not_a_field() {
+        let json = r#"{
+            "kind": "couchdb",
+            "url": "https://couch.example",
+            "database": "vault",
+            "username": "vaultuser",
+            "passwordRef": {"kind": "encryptedFile", "id": "livesync-password"},
+            "password": "hunter2"
+        }"#;
+        let parsed: MountBackendConfig = serde_json::from_str(json).expect("parse");
+        let reserialized = serde_json::to_string(&parsed).expect("serialize");
+        assert!(!reserialized.contains("hunter2"), "{reserialized}");
+        assert!(reserialized.contains("passwordRef"), "{reserialized}");
+    }
+
+    /// The serde tag is `couchdb`, matching `kind_name`, and an unknown provider is
+    /// an "unknown variant" error rather than a silent mis-parse.
+    #[test]
+    fn the_couchdb_variant_is_tagged_and_unknown_providers_are_refused() {
+        let mount = couchdb_mount("live", "LiveSync");
+        let json = serde_json::to_string(&mount.backend).expect("serialize");
+        assert!(json.contains("\"kind\":\"couchdb\""), "{json}");
+        assert_eq!(mount.backend.kind_name(), "couchdb");
+
+        let error = serde_json::from_str::<MountBackendConfig>(
+            r#"{"kind": "postgres", "url": "x", "database": "y"}"#,
+        )
+        .expect_err("an unknown provider must be refused");
+        assert!(error.to_string().contains("unknown variant"), "{error}");
     }
 }

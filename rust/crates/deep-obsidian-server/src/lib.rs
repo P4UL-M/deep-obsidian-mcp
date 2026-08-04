@@ -1,7 +1,9 @@
 pub mod auth;
 pub mod bootstrap;
+pub mod couchdb_source;
 pub mod health;
 pub mod mcp;
+pub mod mounts;
 pub mod prompts;
 pub mod protocol;
 pub mod resources;

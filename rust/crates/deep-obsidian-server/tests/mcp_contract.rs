@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use deep_obsidian_server::mcp::{handle_request, initialize_response, AppState};
+use deep_obsidian_server::mounts::MountBackends;
 use deep_obsidian_server::protocol::JsonRpcRequest;
 use deep_obsidian_server::runtime::MountRuntimes;
 use deep_obsidian_types::{
@@ -136,10 +137,11 @@ impl Fixture {
 
     async fn state(&self) -> AppState {
         let config = self.config();
-        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
+        let backends = MountBackends::build(&config);
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
             .await
             .expect("bootstrap runtime");
-        let mut state = AppState::new(config, runtimes);
+        let mut state = AppState::with_backends(config, runtimes, &backends);
         // Pin the one environment-dependent input to the tool list.
         state.rg_available = false;
         state

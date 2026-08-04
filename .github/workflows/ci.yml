@@ -40,6 +40,20 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The couchdb backend's integration suite drives the REAL sidecar bundle
+      # against the mock CouchDB fixture. Those tests are deliberately not
+      # `#[ignore]` (they are hermetic: a local HTTP server on an ephemeral port),
+      # but they skip when `node` or `dist/sidecar.mjs` is absent -- and a silent
+      # skip in CI is worse than an explicit ignore, because it is invisible. So the
+      # bundle is built here, before the Rust suite runs.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: sidecar/livesync-sidecar/package-lock.json
+      - name: build the livesync sidecar bundle
+        working-directory: sidecar/livesync-sidecar
+        run: npm ci && npm run build
       - name: cargo test --workspace
         run: cargo test --workspace
 
