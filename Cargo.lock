@@ -581,6 +581,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "deep-obsidian-algolia"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
 name = "deep-obsidian-backend"
 version = "0.1.0"
 dependencies = [

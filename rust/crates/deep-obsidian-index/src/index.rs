@@ -710,6 +710,55 @@ fn render_heading_path(path: &[String]) -> String {
     path.join(" › ")
 }
 
+/// A planned chunk: the raw source slice with its 1-based inclusive line range.
+/// Section-planned chunks tile the note without overlap (`text` equals the
+/// exact source slice); the line-based fallback for heading-less notes carries
+/// a 12-line overlap, so consumers reassembling a note MUST de-duplicate by
+/// line range rather than concatenating blindly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedChunk {
+    pub chunk_index: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text: String,
+}
+
+/// Plans a note's chunk tiling exactly as the indexer does (section-aware with
+/// the line-based fallback). Public so a remote backend's push path produces
+/// chunk records with boundaries identical to the local index.
+pub fn plan_note_chunks(content: &str, title: &str) -> Vec<PlannedChunk> {
+    let planned: Vec<(usize, usize, String)> = match section_chunks(
+        content,
+        title,
+        SECTION_CHUNK_TARGET_TOKENS,
+        SECTION_CHUNK_MIN_TOKENS,
+    ) {
+        Some(sections) => sections
+            .into_iter()
+            .map(|section| (section.start_line, section.end_line, section.text))
+            .collect(),
+        None => chunk_lines(
+            content,
+            DEFAULT_CHUNK_SIZE_LINES,
+            DEFAULT_CHUNK_OVERLAP_LINES,
+            DEFAULT_CHUNK_MAX_CHARS,
+        )
+        .into_iter()
+        .map(|(_, start_line, end_line, text)| (start_line, end_line, text))
+        .collect(),
+    };
+    planned
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_index, (start_line, end_line, text))| PlannedChunk {
+            chunk_index,
+            start_line,
+            end_line,
+            text,
+        })
+        .collect()
+}
+
 /// Section-aware chunker. Tiles the note into NON-overlapping segments at heading
 /// boundaries (each heading owns `[heading_line, next_heading_line)` regardless of the
 /// next heading's level, plus a leading preamble segment), carrying the ancestor
