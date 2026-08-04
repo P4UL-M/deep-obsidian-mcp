@@ -2938,6 +2938,29 @@ fn render_mount_line(mount: &MountConfig, root_index_dir: Option<&Path>) -> Stri
             index_dir,
             ..
         } => (format!("{url}/{database} (read-only)"), index_dir.clone()),
+        // `appId`, `indexName` and — when set — `baseUrl`. No key, and no `apiKeyRef`
+        // identifier either. `baseUrl` is validated at config load to carry no userinfo
+        // (`ConfigError::AlgoliaBaseUrlHasUserinfo`), which is what makes printing it
+        // verbatim safe; the default endpoint is derived from `appId` and named as such
+        // rather than invented here, so this line never implies a url nobody configured.
+        MountBackendConfig::Algolia {
+            app_id,
+            index_name,
+            base_url,
+            writable,
+            index_dir,
+            ..
+        } => (
+            format!(
+                "{app_id}/{index_name}{}{}",
+                match base_url {
+                    Some(base_url) => format!(" via {base_url}"),
+                    None => String::new(),
+                },
+                if *writable { "" } else { " (read-only)" }
+            ),
+            index_dir.clone(),
+        ),
     };
     let index_dir = if mount.mount_at.is_empty() {
         root_index_dir.map(Path::to_path_buf)
@@ -2979,10 +3002,13 @@ fn render_doctor_report(report: &DoctorReport) -> String {
                     MountBackendConfig::Filesystem { vault_path, .. } => {
                         vault_path.display().to_string()
                     }
-                    // Unreachable: a couchdb mount cannot be the root mount
-                    // (`ConfigError::CouchdbRootMountUnsupported`), which is
-                    // precisely what keeps this line able to name a directory.
-                    MountBackendConfig::Couchdb { .. } => "(missing)".to_string(),
+                    // Unreachable: neither a couchdb nor an algolia mount can be the
+                    // root mount (`ConfigError::CouchdbRootMountUnsupported`,
+                    // `ConfigError::AlgoliaRootMountUnsupported`), which is precisely
+                    // what keeps this line able to name a directory.
+                    MountBackendConfig::Couchdb { .. } | MountBackendConfig::Algolia { .. } => {
+                        "(missing)".to_string()
+                    }
                 })
         })
         .unwrap_or_else(|| "(missing)".to_string());

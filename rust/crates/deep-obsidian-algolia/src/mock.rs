@@ -25,17 +25,40 @@ struct MockIndex {
 #[derive(Clone, Default)]
 pub struct MockAlgolia {
     indexes: Arc<Mutex<HashMap<String, MockIndex>>>,
+    /// objectIDs this mock answers with Algolia's 403 `objectID not allowed`.
+    ///
+    /// Mimics a SECURED key whose `filters` restriction excludes an object: the real
+    /// engine does NOT answer "not found" there, it answers 403 with that message, and
+    /// a caller that surfaces the difference lets a scoped participant enumerate paths
+    /// outside their scope. Without this the anti-enumeration mapping could only be
+    /// verified against a live account.
+    forbidden_object_ids: Arc<Vec<String>>,
+}
+
+impl MockAlgolia {
+    /// A mock that refuses `object_ids` with the secured-key 403.
+    pub fn with_forbidden_object_ids(object_ids: Vec<String>) -> Self {
+        Self {
+            indexes: Arc::new(Mutex::new(HashMap::new())),
+            forbidden_object_ids: Arc::new(object_ids),
+        }
+    }
 }
 
 /// Binds to an ephemeral loopback port and serves the mock; returns the base
 /// URL to pass as the client's `base_url` override.
 pub async fn spawn_mock() -> (String, tokio::task::JoinHandle<()>) {
+    spawn_mock_with(MockAlgolia::default()).await
+}
+
+/// [`spawn_mock`] over a pre-configured mock, e.g. one that refuses some objectIDs.
+pub async fn spawn_mock_with(state: MockAlgolia) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock listener");
     let addr = listener.local_addr().expect("mock local addr");
     let handle = tokio::spawn(async move {
-        axum::serve(listener, router(MockAlgolia::default()))
+        axum::serve(listener, router(state))
             .await
             .expect("mock server");
     });
@@ -604,12 +627,28 @@ async fn handle_get_objects(
     State(state): SharedState,
     AxumPath(_index): AxumPath<String>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let requests = body
         .get("requests")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // A secured key's restriction is evaluated per request, and the whole call fails —
+    // not just the offending entry. Mirrored, because a caller that only checked
+    // individual results would never see the 403 at all.
+    if requests.iter().any(|request| {
+        request
+            .get("objectID")
+            .and_then(Value::as_str)
+            .is_some_and(|id| state.forbidden_object_ids.iter().any(|entry| entry == id))
+    }) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "message": "Method not allowed with this API key (objectID not allowed)"
+            })),
+        );
+    }
     let mut results = Vec::new();
     for request in requests {
         let index_name = request
@@ -625,7 +664,7 @@ async fn handle_get_objects(
         });
         results.push(found.unwrap_or(Value::Null));
     }
-    Json(json!({ "results": results }))
+    (StatusCode::OK, Json(json!({ "results": results })))
 }
 
 async fn handle_facet_query(

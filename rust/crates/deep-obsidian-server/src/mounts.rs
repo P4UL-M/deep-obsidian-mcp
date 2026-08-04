@@ -22,11 +22,22 @@
 //! # Where secrets are resolved
 //!
 //! Here, and only here. [`MountBackends::build`] resolves each couchdb mount's
-//! `passwordRef` and E2EE passphrase refs through the shared [`SecretResolver`] and
-//! hands the plaintext straight into the backend's credential struct, which keeps it
-//! in a `SecretString` and passes it to the sidecar exclusively through
-//! `initialize`. Nothing between here and there writes it to argv, the environment,
-//! or a log.
+//! `passwordRef` and E2EE passphrase refs, and each algolia mount's `apiKeyRef`,
+//! through the shared [`SecretResolver`] and hands the plaintext straight into the
+//! backend's credential struct, which keeps it in a `SecretString`. Nothing between
+//! here and there writes it to argv, the environment, or a log: the couchdb password
+//! reaches the sidecar only through `initialize`, and the Algolia key only as an
+//! `X-Algolia-API-Key` request header.
+//!
+//! An algolia mount additionally honours the [`ALGOLIA_API_KEY_ENV`] override; see
+//! [`resolve_algolia_api_key`] for the precedence and why the shadowing is announced.
+//!
+//! # An algolia mount has no supervisor and no index
+//!
+//! It needs neither: it speaks HTTP directly (so nothing to supervise), and the remote
+//! index IS its corpus (so nothing to index locally). That is why its
+//! [`MountBackendEntry::supervisor`] is `None` and why `MountRuntimes` skips it
+//! entirely — see [`crate::runtime::mount_has_local_index`].
 
 use std::sync::Arc;
 
@@ -95,6 +106,25 @@ could not be initialized, so it has no index",
                     })
                 })
             }
+            // An Algolia mount has no local index BY DESIGN: the remote index is the
+            // corpus. Nothing asks for this target — `MountRuntimes::new` filters such
+            // mounts out entirely (see `runtime::mount_has_local_index`) — so this is
+            // belt and braces against a future caller that builds a runtime anyway. Its
+            // message states the DESIGN rather than a failure, because that is what it
+            // is; `UnavailableSource` is reused for the mechanism, not the diagnosis.
+            (MountBackendConfig::Algolia { .. }, _) => {
+                let message = format!(
+                    "mount '{}' is an EXPERIMENTAL Algolia-backed shared corpus, which has no \
+local search index by design: the shared index IS the corpus, and materializing a local copy would \
+duplicate it on every participant's disk and then serve one participant's stale snapshot",
+                    self.mount.id
+                );
+                IndexTarget::from_factory("algolia-no-local-index", &self.index_dir, move || {
+                    Arc::new(UnavailableSource {
+                        message: message.clone(),
+                    })
+                })
+            }
             _ => IndexTarget::filesystem(self.vault_path(), &self.index_dir),
         }
     }
@@ -103,8 +133,10 @@ could not be initialized, so it has no index",
     fn vault_path(&self) -> &std::path::Path {
         match &self.mount.backend {
             MountBackendConfig::Filesystem { vault_path, .. } => vault_path,
-            // Unreachable: both couchdb arms are handled above.
-            MountBackendConfig::Couchdb { .. } => std::path::Path::new(""),
+            // Unreachable: every couchdb and algolia arm is handled above.
+            MountBackendConfig::Couchdb { .. } | MountBackendConfig::Algolia { .. } => {
+                std::path::Path::new("")
+            }
         }
     }
 
@@ -186,6 +218,10 @@ fn mount_index_dir(config: &ResolvedServiceConfig, mount: &MountConfig) -> std::
     let declared = match &mount.backend {
         MountBackendConfig::Filesystem { index_dir, .. } => index_dir.clone(),
         MountBackendConfig::Couchdb { index_dir, .. } => index_dir.clone(),
+        // For an algolia mount this directory holds no index — there is none — only
+        // the hydrated-note cache. Same derivation regardless, so an operator has one
+        // rule to remember rather than one per backend.
+        MountBackendConfig::Algolia { index_dir, .. } => index_dir.clone(),
     };
     declared.unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id))
 }
@@ -214,6 +250,101 @@ fn build_entry(
             index_dir,
             mount,
         },
+        MountBackendConfig::Algolia {
+            app_id,
+            index_name,
+            api_key_ref,
+            base_url,
+            writable,
+            participant_id,
+            cache,
+            retention,
+            ..
+        } => {
+            let api_key = match resolve_algolia_api_key(&mount.id, api_key_ref, resolver) {
+                Ok(api_key) => api_key,
+                Err(error) => {
+                    // Degraded, not fatal: an algolia mount is non-root-only, so the
+                    // vault root keeps serving. Same shape as the couchdb missing-secret
+                    // path, deliberately reusing that failure mode rather than inventing
+                    // one.
+                    warn!(
+                        "mount '{}' cannot be served: {error}; the vault root keeps serving and \
+readiness reports the server as degraded",
+                        mount.id
+                    );
+                    return MountBackendEntry {
+                        backend: Arc::new(UnavailableBackend::of_kind(
+                            deep_obsidian_backend::BackendKind::Algolia,
+                            format!(
+                                "mount '{}' is an EXPERIMENTAL Algolia-backed shared corpus that \
+could not be initialized: {error}",
+                                mount.id
+                            ),
+                        )),
+                        supervisor: None,
+                        index_dir,
+                        mount,
+                    };
+                }
+            };
+            if *writable {
+                warn!(
+                    "mount '{}' is a WRITABLE Algolia-backed SHARED corpus: the agent can edit it, \
+and its writes are immediately visible to every other participant mounting the same index",
+                    mount.id
+                );
+            }
+            let cache = cache.clone().unwrap_or_default();
+            let retention = retention.clone().unwrap_or_default();
+            let credentials = deep_obsidian_backend::AlgoliaCredentials {
+                app_id: app_id.clone(),
+                index_name: index_name.clone(),
+                api_key,
+                base_url: base_url.clone(),
+            };
+            let options = deep_obsidian_backend::AlgoliaOptions {
+                writable: *writable,
+                participant_id: participant_id.clone(),
+                cache_max_bytes: cache.max_bytes,
+                cache_pinned_prefixes: cache.pinned_prefixes.clone(),
+                retention_min_versions: retention.min_versions,
+                retention_max_age_days: retention.max_age_days,
+            };
+            match deep_obsidian_backend::AlgoliaVaultBackend::connect(
+                credentials,
+                options,
+                &index_dir,
+            ) {
+                Ok(backend) => MountBackendEntry {
+                    backend: Arc::new(backend),
+                    // No child process: the backend speaks HTTP directly.
+                    supervisor: None,
+                    index_dir,
+                    mount,
+                },
+                Err(error) => {
+                    warn!(
+                        "mount '{}' cannot be served: {error}; the vault root keeps serving and \
+readiness reports the server as degraded",
+                        mount.id
+                    );
+                    MountBackendEntry {
+                        backend: Arc::new(UnavailableBackend::of_kind(
+                            deep_obsidian_backend::BackendKind::Algolia,
+                            format!(
+                                "mount '{}' is an EXPERIMENTAL Algolia-backed shared corpus that \
+could not be started: {error}",
+                                mount.id
+                            ),
+                        )),
+                        supervisor: None,
+                        index_dir,
+                        mount,
+                    }
+                }
+            }
+        }
         MountBackendConfig::Couchdb {
             url,
             database,
@@ -365,6 +496,40 @@ fn resolve_credentials(
     })
 }
 
+/// Resolve an algolia mount's API key: the environment override first, then the
+/// configured `apiKeyRef`.
+///
+/// # Why the environment wins, and why that is announced
+///
+/// [`ALGOLIA_API_KEY_ENV`] takes precedence, carried over from the shared-wiki
+/// prototype so container and demo setups with no keyring keep working. That ordering
+/// is a genuine footgun: a stray environment variable silently repoints a possibly
+/// WRITABLE shared corpus at a different credential, and nothing in the config would
+/// hint at it. So the shadowing is logged at `warn` — the override still wins (a
+/// deployment that sets it means it), but it can never be invisible.
+///
+/// A missing key is a configuration failure, and a mount that cannot authenticate
+/// cannot serve, so it degrades to [`UnavailableBackend`] through the caller rather
+/// than being dropped from the router.
+fn resolve_algolia_api_key(
+    mount_id: &str,
+    api_key_ref: &SecretRef,
+    resolver: &SecretResolver,
+) -> Result<SecretString, String> {
+    if let Ok(from_env) = std::env::var(deep_obsidian_backend::ALGOLIA_API_KEY_ENV) {
+        let from_env = from_env.trim().to_string();
+        if !from_env.is_empty() {
+            warn!(
+                "mount '{mount_id}' is using the Algolia API key from ${}, which SHADOWS the \
+key its 'apiKeyRef' points at; unset the variable to use the configured secret",
+                deep_obsidian_backend::ALGOLIA_API_KEY_ENV
+            );
+            return Ok(SecretString::new(from_env));
+        }
+    }
+    require_secret(resolver, api_key_ref, "apiKeyRef")
+}
+
 /// Fetch a required secret, naming the FIELD rather than the secret when it is
 /// missing. The reference itself (a keyring service/account or a file id) is
 /// deliberately not echoed: it is not secret, but it is noise in an error a user
@@ -395,12 +560,26 @@ fn require_secret(
 /// under the configured prefix. Refusing loudly is the only honest answer.
 pub struct UnavailableBackend {
     message: String,
+    /// The kind the mount WAS configured as.
+    ///
+    /// Reported rather than assumed: `vault_info.mounts[].backendKind` is how an
+    /// operator finds the mount they are debugging, and a stub that claimed every
+    /// broken mount was a couchdb one would point them at the wrong configuration
+    /// block — which is exactly when they can least afford it.
+    kind: deep_obsidian_backend::BackendKind,
 }
 
 impl UnavailableBackend {
+    /// A stub for a couchdb mount. Kept as the bare constructor because that is what
+    /// every pre-existing call site means.
     pub fn new(message: impl Into<String>) -> Self {
+        Self::of_kind(deep_obsidian_backend::BackendKind::Couchdb, message)
+    }
+
+    pub fn of_kind(kind: deep_obsidian_backend::BackendKind, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind,
         }
     }
 }
@@ -409,10 +588,7 @@ impl UnavailableBackend {
 impl VaultBackend for UnavailableBackend {
     /// No capabilities at all, so nothing is advertised for this mount.
     fn descriptor(&self) -> deep_obsidian_backend::BackendDescriptor {
-        deep_obsidian_backend::BackendDescriptor::new(
-            deep_obsidian_backend::BackendKind::Couchdb,
-            [],
-        )
+        deep_obsidian_backend::BackendDescriptor::new(self.kind, [])
     }
 
     async fn execute(
@@ -493,6 +669,7 @@ mod tests {
             experimental: ExperimentalConfig {
                 multi_vault: true,
                 couchdb_vaults: true,
+                algolia_vaults: true,
             },
             index_dir,
             transport: TransportMode::Http,

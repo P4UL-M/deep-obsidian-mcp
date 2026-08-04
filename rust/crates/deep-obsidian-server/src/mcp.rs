@@ -12,7 +12,7 @@ use crate::protocol::{
     PromptGetResult, PromptListResult, ResourceListResult, ResourceReadResult,
     ResourceTemplateListResult, ServerInfo, ToolCallResult, ToolListResult,
 };
-use crate::runtime::{MountRuntimes, RuntimeDiagnostics, RuntimeReadiness, RuntimeState};
+use crate::runtime::{MountRuntimes, RuntimeState};
 use crate::uploads::UploadStore;
 use crate::{prompts, resources, tools};
 
@@ -128,19 +128,15 @@ impl AppState {
                 id: mount.id.clone(),
                 mount_at: mount.mount_at.clone(),
                 backend_kind: mount.backend.descriptor().kind.as_str(),
+                // `None` when the mount has no runtime of its own — which is a mount
+                // with no LOCAL index, not a broken one. See
+                // `MountIndexSummary::diagnostics` for why the two must not be
+                // conflated, and `runtime::mount_has_local_index` for which mounts
+                // these are.
                 diagnostics: self
                     .runtimes
                     .for_mount(&mount.id)
-                    .map(|runtime| runtime.diagnostics())
-                    // A mount with no runtime of its own has no index to report on.
-                    // Unreachable while every backend is a filesystem vault.
-                    .unwrap_or_else(|| RuntimeDiagnostics {
-                        status: RuntimeReadiness::Degraded,
-                        refresh_in_flight: false,
-                        snapshot: None,
-                        last_success: None,
-                        last_error: None,
-                    }),
+                    .map(|runtime| runtime.diagnostics()),
             })
             .collect()
     }

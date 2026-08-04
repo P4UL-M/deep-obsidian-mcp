@@ -602,9 +602,12 @@ name = "deep-obsidian-backend"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "deep-obsidian-algolia",
  "deep-obsidian-core",
+ "deep-obsidian-index",
  "notify",
  "rand 0.8.6",
+ "regex",
  "secrecy",
  "serde",
  "serde_json",
@@ -684,6 +687,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "deep-obsidian-algolia",
  "deep-obsidian-backend",
  "deep-obsidian-config",
  "deep-obsidian-core",
