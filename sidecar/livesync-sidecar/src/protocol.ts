@@ -9,6 +9,27 @@
  * This file is the contract. The Rust supervisor codes against these shapes,
  * so every change here is a protocol change: bump `PROTOCOL_VERSION` for
  * anything a v1 host could not tolerate, and keep additive fields optional.
+ *
+ * ## Versioning rule: additive methods do NOT bump the version
+ *
+ * `PROTOCOL_VERSION` describes what a host must *tolerate*, not what the
+ * sidecar happens to offer. The supervisor pins the `SUPPORTED` triple exactly
+ * and refuses any drift in it, so the version number is load-bearing in one
+ * direction only: it must change when an existing shape changes meaning.
+ *
+ * Adding a *method* cannot break a v1 host -- a host that does not know `write`
+ * never sends it, and one that does gets `method-not-found` from an older
+ * sidecar, which is already a modelled failure. Adding an *optional request
+ * field* with a backwards-compatible default (`initialize.mode`, which defaults
+ * to `"read-only"`, i.e. exactly v1 behaviour) is likewise invisible to a host
+ * that omits it. Adding a *response field* is safe because neither side
+ * deserialises strictly.
+ *
+ * So the write surface below is additive on protocol version 1. What WOULD
+ * require a bump: changing `SUPPORTED`'s shape, changing an existing method's
+ * params or result, changing an error code's meaning, or flipping
+ * `initialize.mode`'s default. Under no circumstances edit `SUPPORTED` to
+ * advertise a capability -- the supervisor asserts that object field by field.
  */
 
 /** Wire version of this protocol. Bumped on any breaking change. */
@@ -82,6 +103,30 @@ export type JsonRpcErrorData = {
     detail?: string;
     /** Present when the failure is a compatibility refusal. */
     status?: CompatibilityStatus;
+    /**
+     * Present iff `kind` is `"conflict"`. Everything a host needs to retry a
+     * compare-and-swap without a second round trip.
+     */
+    conflict?: ConflictDetail;
+};
+
+/**
+ * Why a guarded write lost, and what the remote looks like now.
+ *
+ * `currentRev` is the winning revision at the moment the conflict was detected;
+ * it is absent only when the document does not exist at all (a guarded write
+ * against a path that has since been purged). `expected` echoes what the caller
+ * asked for so a log line is self-contained: `null` means create-only.
+ */
+export type ConflictDetail = {
+    currentRev?: string;
+    expected?: string | null;
+    /** The remote entry is soft-deleted (`deleted: true`), not absent. */
+    deleted?: boolean;
+    /** The remote entry already has sibling conflict revisions. */
+    conflicted?: boolean;
+    mtimeMs?: number;
+    size?: number;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -112,6 +157,10 @@ export const ErrorCodes = {
     decryptFailed: -32006,
     /** The entry exists but one or more of its chunks could not be assembled. */
     corruptedDocument: -32007,
+    /** A guarded write lost: the remote revision is not the one the caller expected. */
+    conflict: -32008,
+    /** A write method was called on a sidecar initialized `mode: "read-only"`. */
+    readOnly: -32009,
 } as const;
 
 export type ErrorKind =
@@ -127,7 +176,9 @@ export type ErrorKind =
     | "not-found"
     | "remote-error"
     | "decrypt-failed"
-    | "corrupted-document";
+    | "corrupted-document"
+    | "conflict"
+    | "read-only";
 
 export const ERROR_CODE_BY_KIND: Record<ErrorKind, number> = {
     "parse-error": ErrorCodes.parseError,
@@ -143,6 +194,8 @@ export const ERROR_CODE_BY_KIND: Record<ErrorKind, number> = {
     "remote-error": ErrorCodes.remoteError,
     "decrypt-failed": ErrorCodes.decryptFailed,
     "corrupted-document": ErrorCodes.corruptedDocument,
+    conflict: ErrorCodes.conflict,
+    "read-only": ErrorCodes.readOnly,
 };
 
 /* -------------------------------------------------------------------------- */
@@ -211,12 +264,27 @@ export type InitializeOptions = {
 };
 
 /**
+ * What the sidecar is allowed to do to the remote.
+ *
+ * `"read-only"` is the default and the only value a v1 host ever sends, so an
+ * omitted `mode` is exactly v1 behaviour. `"read-write"` unlocks `write` and
+ * `delete` and nothing else: the milestone document, the version document and
+ * the sync-parameters document stay unwritten in BOTH modes (see
+ * `manipulator.ts`). A writer is still not a LiveSync peer.
+ */
+export type SidecarMode = "read-only" | "read-write";
+
+export const SIDECAR_MODES: readonly SidecarMode[] = ["read-only", "read-write"];
+
+/**
  * `initialize` is the ONLY place secrets cross the process boundary: never
  * argv (visible in `ps`), never the environment (inherited by children and
  * often captured by crash reporters).
  */
 export type InitializeParams = {
     protocolVersion: number;
+    /** Defaults to `"read-only"`. */
+    mode?: SidecarMode;
     couchdb: {
         /** Server origin, without the database path. E.g. `https://couch.example`. */
         url: string;
@@ -234,6 +302,8 @@ export type InitializeParams = {
 
 export type InitializeResult = {
     protocolVersion: number;
+    /** Echoed back so a host never has to remember what it asked for. */
+    mode: SidecarMode;
     sidecarVersion: string;
     commonlibVersion: string;
     supportedSchemaVersion: number;
@@ -334,6 +404,118 @@ export type StatParams = { path: string };
 export type StatResult = ReadCommon & { kind: EntryKind };
 
 /* -------------------------------------------------------------------------- */
+/* write / delete / conflicts  (read-write mode only for the first two)        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Content to store. Mirrors `ReadResult`'s discriminator so a read result can be
+ * fed back into a write without reshaping.
+ *
+ * `"text"` becomes a LiveSync `plain` entry, `"binary"` a `newnote` entry whose
+ * chunks are base64 fragments. The choice is not the caller's to override: it is
+ * derived from the blob type, exactly as upstream's `put` derives it, so a
+ * sidecar-written entry is indistinguishable from a plugin-written one.
+ */
+export type WriteContent = { kind: "text"; text: string } | { kind: "binary"; base64: string };
+
+/**
+ * Compare-and-swap write.
+ *
+ * `baseRev` selects the CAS mode, and the three cases are deliberately distinct
+ * values rather than a flag:
+ *
+ *   * `null` -- **create-only**. Fails `conflict` if any document exists at the
+ *     path, *including* a soft-deleted one (LiveSync's `deleted: true` entry is
+ *     a live document with a revision; the conflict detail carries
+ *     `deleted: true` so a host can decide to resurrect instead).
+ *   * `"<rev>"` -- **guarded update**. Fails `conflict` unless the remote's
+ *     winning revision is exactly this. The failure carries the current rev.
+ *   * absent -- **unguarded upsert**. Writes over whatever is there. Supported
+ *     because tooling (import, export, repair) legitimately needs it; the Rust
+ *     side may still refuse to expose it.
+ *
+ * `mtimeMs` defaults to now, `ctimeMs` to the existing entry's ctime (or
+ * `mtimeMs` for a create), which is what the plugin does when it writes a file
+ * it did not create.
+ */
+export type WriteParams = {
+    path: string;
+    content: WriteContent;
+    baseRev?: string | null;
+    mtimeMs?: number;
+    ctimeMs?: number;
+};
+
+export type WriteResult = {
+    path: string;
+    /** Revision of the entry document this write produced. */
+    rev: string;
+    /**
+     * The entry still has sibling conflict revisions.
+     *
+     * A guarded write neither creates nor resolves conflicts -- it targets the
+     * winning revision -- so this reports a *pre-existing* conflict the host
+     * should surface. It is never set by the write itself.
+     */
+    conflicted: boolean;
+    size: number;
+    mtimeMs: number;
+    ctimeMs: number;
+    kind: EntryKind;
+    /** No document existed at this path before the write. */
+    created: boolean;
+    /** The write replaced a soft-deleted entry, bringing it back. */
+    resurrected: boolean;
+};
+
+/**
+ * Soft delete, matching the plugin's default.
+ *
+ * Sets `deleted: true` and bumps `mtime` on the entry document; the chunks and
+ * the `children` list are left alone. It is NOT a CouchDB tombstone: this slice
+ * never sends `_deleted: true`, because that would make the entry invisible to
+ * `_all_docs` and unrecoverable, and because upstream only does it when the
+ * user opted into `deleteMetadataOfDeletedFiles` (default off).
+ *
+ * `baseRev` guards the delete exactly as it guards a write. `null` and absent
+ * both mean unguarded (create-only is meaningless for a delete). A path with no
+ * document at all fails `not-found`.
+ */
+export type DeleteParams = { path: string; baseRev?: string | null };
+
+export type DeleteResult = { path: string; rev: string; deleted: true };
+
+export type ConflictRevision = {
+    rev: string;
+    mtimeMs: number;
+    size: number;
+    /** This revision is itself a soft delete. */
+    deleted: boolean;
+    /** Set when the revision's body could not be fetched; the other fields are 0. */
+    unavailable?: boolean;
+};
+
+/**
+ * Enumerates CouchDB's `_conflicts` for one path so a host can surface or
+ * preserve the losing revisions.
+ *
+ * Read-only, and therefore available in BOTH modes -- refusing it on a
+ * read-only mount would hide exactly the information a read-only host most
+ * needs. Resolution (picking a winner, deleting the losers) is deliberately not
+ * in this slice: it is destructive and needs a merge policy the sidecar has no
+ * business choosing.
+ */
+export type ConflictsParams = { path: string };
+
+export type ConflictsResult = {
+    path: string;
+    /** The revision `read`/`stat` serve. */
+    winning: string;
+    /** Sibling revisions, empty when the entry is not conflicted. */
+    conflicts: ConflictRevision[];
+};
+
+/* -------------------------------------------------------------------------- */
 /* changesSince                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -403,6 +585,17 @@ export type HealthResult = {
      */
     status: "ok" | "degraded" | "uninitialized";
     compatibility: Compatibility;
+    /**
+     * The mode this process was initialized in (`"read-only"` before
+     * `initialize`).
+     *
+     * There is deliberately no orphan-chunk counter here. See the README: a
+     * chunk is orphaned only relative to *every* entry's `children` list, so
+     * "did my last write orphan anything" is not cheaply knowable -- it needs a
+     * full-database refcount, which is what upstream's own maintenance report
+     * does and what its (commented-out) GC would have needed.
+     */
+    mode: SidecarMode;
     watching: boolean;
     /** Redacted message of the most recent failure, if any. */
     lastError?: string;
@@ -424,9 +617,12 @@ export const Methods = {
     manifest: "manifest",
     read: "read",
     stat: "stat",
+    conflicts: "conflicts",
     changesSince: "changesSince",
     watch: "watch",
     unwatch: "unwatch",
+    write: "write",
+    delete: "delete",
     health: "health",
     shutdown: "shutdown",
 } as const;
@@ -438,15 +634,22 @@ export const DATA_METHODS: readonly MethodName[] = [
     Methods.manifest,
     Methods.read,
     Methods.stat,
+    Methods.conflicts,
     Methods.changesSince,
     Methods.watch,
     Methods.unwatch,
+    Methods.write,
+    Methods.delete,
 ];
+
+/** Methods refused unless `initialize` was given `mode: "read-write"`. */
+export const WRITE_METHODS: readonly MethodName[] = [Methods.write, Methods.delete];
 
 /** A typed error the dispatcher converts into a JSON-RPC failure. */
 export class SidecarError extends Error {
     readonly kind: ErrorKind;
     readonly status?: CompatibilityStatus;
+    readonly conflict?: ConflictDetail;
 
     constructor(kind: ErrorKind, message: string, status?: CompatibilityStatus) {
         super(message);
@@ -457,6 +660,13 @@ export class SidecarError extends Error {
         }
     }
 
+    /** Builds the `conflict` failure, the only error carrying structured data. */
+    static conflict(message: string, detail: ConflictDetail): SidecarError {
+        const error = new SidecarError("conflict", message);
+        (error as { conflict?: ConflictDetail }).conflict = detail;
+        return error;
+    }
+
     toErrorBody(): JsonRpcErrorBody {
         const data: JsonRpcErrorData = { kind: this.kind };
         if (this.message) {
@@ -464,6 +674,9 @@ export class SidecarError extends Error {
         }
         if (this.status !== undefined) {
             data.status = this.status;
+        }
+        if (this.conflict !== undefined) {
+            data.conflict = this.conflict;
         }
         return {
             code: ERROR_CODE_BY_KIND[this.kind],

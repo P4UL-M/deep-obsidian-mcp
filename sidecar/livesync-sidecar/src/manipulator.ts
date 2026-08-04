@@ -5,22 +5,53 @@
  * whole surface is quarantined here: `main.ts` sees only the protocol types.
  * When commonlib moves, this file is the blast radius.
  *
- * Read-only posture, enforced structurally rather than by convention:
+ * Write posture, enforced structurally rather than by convention:
  *
- *   * `ReadOnlyManipulator` overrides every writing method commonlib exposes --
- *     `put`, `delete`, and critically `putSyncParameters`, which upstream's
- *     `getReplicationPBKDF2Salt` will happily call to *create* the remote's
- *     `_local/obsidian_livesync_sync_parameters` document when it is missing.
- *     A read-only client must never do that.
+ *   * `GuardedManipulator` overrides every writing method commonlib exposes.
+ *     `putSyncParameters` is refused **unconditionally, in both modes**:
+ *     upstream's `getReplicationPBKDF2Salt` will happily call it to *create* the
+ *     remote's `_local/obsidian_livesync_sync_parameters` document when it is
+ *     missing, and neither a reader nor a writer gets to establish another
+ *     vault's replication salt. `put` is refused unless the sidecar was
+ *     initialized `mode: "read-write"`; `delete` is refused always, because
+ *     upstream's own `delete` cannot express compare-and-swap (see below).
  *   * The compatibility gate reimplements the milestone checks from
  *     `ensureRemoteIsCompatible` instead of calling it, because that function
  *     writes the milestone document (node registration, tweak values,
- *     `last_connected`) as a side effect of *checking* it.
+ *     `last_connected`) as a side effect of *checking* it. This stays true in
+ *     read-write mode: a writer client is still not a LiveSync peer and must
+ *     never appear in `accepted_nodes`.
  *   * The version check reimplements `checkRemoteVersion` for the same reason:
  *     upstream's version misses fall through to `bumpRemoteVersion`, which
  *     PUTs `obsydian_livesync_version`.
  *
  * Documented drift from the public `DirectFileManipulator` API, and why:
+ *
+ *   * **`put` has no compare-and-swap, and cannot be given one.** Upstream's
+ *     `putDBEntry` writes the entry root with `localDatabase.put(doc, {force:
+ *     true})`. PouchDB turns `force` into `new_edits: false` plus a *fabricated*
+ *     child revision (`pouchdb-core/lib/index.js`,
+ *     `transformForceOptionToNewEditsOption`), so a stale base revision never
+ *     produces a 409 -- it silently grafts a second leaf onto the revision tree,
+ *     i.e. creates a conflict. That is the right behaviour for a replicating
+ *     peer and the wrong behaviour for an MCP tool whose contract is
+ *     `expectedHash`. Its `conflictBaseRev` parameter does not help either: it
+ *     only chooses *which* revision the forced write chains from.
+ *
+ *     So `write` keeps all of `putDBEntry` (target-file filtering, blob typing,
+ *     the splitter, chunk batching, Eden, and above all chunk id derivation and
+ *     the encryption transform) and replaces exactly one operation: the final
+ *     root `put`. A one-shot interceptor on `localDatabase.put` re-issues the
+ *     entry-root write *without* `force` and with the revision the CAS
+ *     precondition validated, so CouchDB itself adjudicates the race. The
+ *     interceptor asserts it fired exactly once: if upstream ever stops routing
+ *     the root write through `localDatabase.put`, the write fails loudly instead
+ *     of silently reverting to force-write semantics.
+ *   * **`delete` is not used.** `deleteDBEntryByPath` also force-puts, for the
+ *     same reason. `delete` re-implements it: read the entry, set `deleted:
+ *     true` and bump `mtime`, put it back under a revision guard. It never sets
+ *     `_deleted` -- upstream only does that when `deleteMetadataOfDeletedFiles`
+ *     is on, and it is off by default.
  *
  *   * `enumerateAllNormalDocs` is unusable for `manifest`: it is a generator
  *     with no exposed position (no resumable cursor) and it hardcodes
@@ -47,11 +78,18 @@ import type {
     ChangeEntry,
     Compatibility,
     CompatibilityStatus,
+    ConflictDetail,
+    ConflictsResult,
+    ConflictRevision,
+    DeleteResult,
     EntryKind,
     InitializeOptions,
     ManifestEntry,
     ReadResult,
+    SidecarMode,
     StatResult,
+    WriteParams,
+    WriteResult,
 } from "./protocol.js";
 import { SidecarError, SUPPORTED } from "./protocol.js";
 import { logStderr, registerSecrets, setSuppressPaths } from "./logging.js";
@@ -131,10 +169,23 @@ type AllDocsResponse = { total_rows?: number; offset?: number; rows: AllDocsRow[
 type ChangesRow = { id: string; seq: string | number; deleted?: boolean; doc?: RawDoc | null };
 type ChangesResponse = { results: ChangesRow[]; last_seq: string | number };
 
+type PutResponse = { ok?: boolean; id?: string; rev?: string };
+
+/**
+ * The pieces of the PouchDB handle this file touches.
+ *
+ * Note this is the handle *after* `transform-pouch` has wrapped it (commonlib
+ * installs the encryption transform while initialising the database), so every
+ * method here is the transforming one: a `put` through this type encrypts, a
+ * `get` decrypts. Bypassing it -- e.g. issuing raw HTTP -- would write plaintext
+ * into an E2EE vault.
+ */
 type LocalDatabase = {
     allDocs(options: Record<string, unknown>): Promise<AllDocsResponse>;
     changes(options: Record<string, unknown>): Promise<ChangesResponse>;
     info(): Promise<{ update_seq?: string | number; doc_count?: number }>;
+    get(id: string, options?: Record<string, unknown>): Promise<RawDoc>;
+    put(doc: RawDoc, options?: Record<string, unknown>): Promise<PutResponse>;
 };
 
 type MilestoneDoc = {
@@ -146,31 +197,50 @@ type MilestoneDoc = {
 };
 
 /* -------------------------------------------------------------------------- */
-/* Read-only subclass                                                          */
+/* Guarded subclass                                                            */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * A write the sidecar structurally forbids, in any mode.
+ *
+ * Deliberately `internal-error` rather than `read-only`: reaching one of these
+ * means an upstream code path tried to write a control document behind our back,
+ * which is a bug or an upstream change, not a caller asking for something the
+ * configuration disallows. `read-only` is reserved for the latter.
+ */
 function refuseWrite(operation: string): never {
     throw new SidecarError(
         "internal-error",
-        `read-only sidecar refused a write attempt (${operation})`
+        `sidecar refused a forbidden write attempt (${operation})`
     );
 }
 
 /**
- * `DirectFileManipulator` with every write path fused open.
+ * `DirectFileManipulator` with every write path fused, then selectively opened.
  *
  * `putSyncParameters` is the important one: it is reachable from
- * `getReplicationPBKDF2Salt`, which commonlib wires into the decryption path
- * as a lazily-invoked callback, so an E2EE read of a vault whose
- * sync-parameters document lacks a salt would otherwise write to the remote
- * mid-read.
+ * `getReplicationPBKDF2Salt`, which commonlib wires into the *encryption and
+ * decryption* path as a lazily-invoked callback, so an E2EE read (or write) of a
+ * vault whose sync-parameters document lacks a salt would otherwise write to the
+ * remote mid-operation. That stays refused in read-write mode: establishing
+ * another client's replication salt is not this process's business.
+ *
+ * `put` is gated on `writesAllowed`, which the vault sets after a successful
+ * `initialize` in read-write mode. `delete` stays refused unconditionally
+ * because it force-writes; `LiveSyncVault.remove` replaces it.
  */
-class ReadOnlyManipulator extends DirectFileManipulator {
+class GuardedManipulator extends DirectFileManipulator {
+    /** Set by the owning vault once the mode is known. */
+    writesAllowed = false;
+
     override putSyncParameters(): Promise<boolean> {
         return refuseWrite("putSyncParameters");
     }
-    override put(): Promise<boolean> {
-        return refuseWrite("put");
+    override put(...args: Parameters<DirectFileManipulator["put"]>): Promise<boolean> {
+        if (!this.writesAllowed) {
+            return refuseWrite("put");
+        }
+        return super.put(...args);
     }
     override delete(): Promise<boolean> {
         return refuseWrite("delete");
@@ -274,6 +344,8 @@ export type ConnectParams = {
     passphrase?: string;
     obfuscatePassphrase?: string;
     options?: InitializeOptions;
+    /** Defaults to `"read-only"`. */
+    mode?: SidecarMode;
 };
 
 export type ConnectOutcome = {
@@ -282,12 +354,13 @@ export type ConnectOutcome = {
 };
 
 export class LiveSyncVault {
-    private manipulator: ReadOnlyManipulator | undefined;
+    private manipulator: GuardedManipulator | undefined;
     private compatibility: Compatibility = { status: "unknown" };
     private encrypted = false;
     private pathObfuscation = false;
     private watchCallback: ((change: ChangeEntry & { cursor: string }) => void) | undefined;
     private watching = false;
+    private mode: SidecarMode = "read-only";
 
     get isServeable(): boolean {
         return this.manipulator !== undefined && this.compatibility.status === "ok";
@@ -301,6 +374,10 @@ export class LiveSyncVault {
         return this.watching;
     }
 
+    get currentMode(): SidecarMode {
+        return this.mode;
+    }
+
     private db(): LocalDatabase {
         const manipulator = this.manipulator;
         if (!manipulator) {
@@ -309,7 +386,7 @@ export class LiveSyncVault {
         return manipulator.liveSyncLocalDB.localDatabase as unknown as LocalDatabase;
     }
 
-    private requireServeable(): ReadOnlyManipulator {
+    private requireServeable(): GuardedManipulator {
         const manipulator = this.manipulator;
         if (!manipulator) {
             throw new SidecarError("not-initialized", "initialize has not been called");
@@ -325,6 +402,24 @@ export class LiveSyncVault {
     }
 
     /**
+     * The write gate.
+     *
+     * The mode is checked *before* serveability on purpose: "this sidecar was
+     * started read-only" is a configuration fact the host can act on
+     * immediately, and reporting it as `incompatible-remote` would send a host
+     * chasing the vault instead of its own config.
+     */
+    private requireWritable(): GuardedManipulator {
+        if (this.mode !== "read-write") {
+            throw new SidecarError(
+                "read-only",
+                'this sidecar was initialized with mode "read-only"; write methods are refused'
+            );
+        }
+        return this.requireServeable();
+    }
+
+    /**
      * Connects, runs the compatibility gate, and reports the outcome.
      *
      * Never throws for a remote-side problem: transport, credential, schema,
@@ -335,6 +430,7 @@ export class LiveSyncVault {
     async connect(params: ConnectParams): Promise<ConnectOutcome> {
         registerSecrets([params.password, params.passphrase, params.obfuscatePassphrase, params.url]);
         setSuppressPaths(Boolean(params.obfuscatePassphrase));
+        this.mode = params.mode ?? "read-only";
 
         const options = params.options ?? {};
         const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -369,7 +465,7 @@ export class LiveSyncVault {
                 : {}),
         };
 
-        const manipulator = new ReadOnlyManipulator(manipulatorOptions, {
+        const manipulator = new GuardedManipulator(manipulatorOptions, {
             fetch: makeTimeoutFetch(timeoutMs),
         });
         this.manipulator = manipulator;
@@ -401,6 +497,11 @@ export class LiveSyncVault {
 
         const gate = await this.runCompatibilityGate(params);
         this.compatibility = gate;
+        // Writes are unlocked only once the gate says "ok": a vault we do not
+        // fully understand must not be written to even in read-write mode. This
+        // is what makes the live "unknown-schema still refuses writes" test
+        // fail-closed rather than fail-friendly.
+        manipulator.writesAllowed = this.mode === "read-write" && gate.status === "ok";
         return this.outcome();
     }
 
@@ -600,6 +701,13 @@ export class LiveSyncVault {
      * *create* it, so its absence is reported as `e2ee-invalid` rather than
      * letting the decryption path reach the write. Given a salt, one real chunk
      * read is the only honest test of the passphrase.
+     *
+     * A *writer* needs the salt even when the remote holds no encrypted chunk
+     * yet: the encryption transform derives the key lazily on the first chunk it
+     * encrypts, and the handler's miss path is `create` then `put`, which
+     * `GuardedManipulator` refuses. Without this check an encrypting write into a
+     * freshly-created vault would fail deep inside the write with an opaque
+     * internal error instead of being refused up front.
      */
     private async verifyE2EE(encryptedChunkId: string | undefined): Promise<Compatibility | undefined> {
         let syncParams: RawDoc | false;
@@ -609,13 +717,20 @@ export class LiveSyncVault {
             const { status, detail } = statusFromTransportError(error);
             return { status, detail };
         }
+        const hasSalt = syncParams !== false && typeof syncParams["pbkdf2salt"] === "string";
         if (encryptedChunkId === undefined) {
+            if (!hasSalt && this.mode === "read-write") {
+                return {
+                    status: "e2ee-invalid",
+                    detail: `remote has no usable ${SYNC_PARAMETERS_DOCID} document, so the replication salt an encrypted write would need cannot be derived; a LiveSync client must connect once to establish it (this sidecar will not write it)`,
+                };
+            }
             // A passphrase for a vault with no encrypted chunks: harmless, and
             // possibly just an empty vault. Say so on stderr and continue.
             logStderr("compat", "a passphrase was supplied but the remote holds no encrypted chunks");
             return undefined;
         }
-        if (syncParams === false || typeof syncParams["pbkdf2salt"] !== "string") {
+        if (!hasSalt) {
             return {
                 status: "e2ee-invalid",
                 detail: `remote has no usable ${SYNC_PARAMETERS_DOCID} document, so the replication salt cannot be derived; a LiveSync client must connect once to establish it (this sidecar will not write it)`,
@@ -765,11 +880,20 @@ export class LiveSyncVault {
      * Assembles an entry's content from its chunks.
      *
      * `plain` (and legacy `notes`) chunks are text fragments and concatenate
-     * directly. `newnote` chunks are base64 fragments of the original bytes:
-     * they are concatenated *then* decoded, because a fragment boundary can
-     * land mid-quantum and decoding each piece separately would corrupt the
-     * result. The re-encoded output is therefore canonical base64, not
-     * necessarily byte-identical to the stored fragments.
+     * directly.
+     *
+     * `newnote` chunks are base64 and must be decoded **one fragment at a time**,
+     * then concatenated as bytes. Upstream's splitter cuts binary content at an
+     * arbitrary *byte* offset and base64-encodes each piece independently
+     * (`splitPiecesRabinKarp` -> `arrayBufferToBase64Single(subarray)`), so a
+     * fragment whose byte length is not a multiple of three ends in `=` padding
+     * *in the middle of the stream*. Concatenating the base64 first and decoding
+     * once therefore truncates at the first interior `=`. Upstream's own reader
+     * (`decodeBinary` -> `base64ToArrayBuffer(string[])`) decodes per fragment
+     * and joins the buffers, and this mirrors it.
+     *
+     * The re-encoded output is canonical base64 of the whole content, so it is
+     * not necessarily a concatenation of the stored fragments.
      */
     async read(path: string): Promise<ReadResult> {
         const manipulator = this.requireServeable();
@@ -814,11 +938,11 @@ export class LiveSyncVault {
             throw remoteError(error);
         }
 
-        const joined = Array.isArray(loaded.data) ? loaded.data.join("") : String(loaded.data ?? "");
+        const fragments = Array.isArray(loaded.data) ? loaded.data : [String(loaded.data ?? "")];
         if (meta.type === "newnote") {
-            return { ...common, kind: "binary", base64: Buffer.from(joined, "base64").toString("base64") };
+            return { ...common, kind: "binary", base64: decodeChunkedBinary(fragments).toString("base64") };
         }
-        return { ...common, kind: "text", text: joined };
+        return { ...common, kind: "text", text: fragments.join("") };
     }
 
     /**
@@ -867,6 +991,335 @@ export class LiveSyncVault {
             throw new SidecarError("not-found", "no entry at this path");
         }
         return meta as RawDoc;
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Write methods                                                          */
+    /* ---------------------------------------------------------------------- */
+
+    /**
+     * Compare-and-swap write of one entry.
+     *
+     * Publication order is upstream's, and it matters: every leaf chunk is
+     * written (`POST /{db}/_bulk_docs`) before the entry root
+     * (`PUT /{db}/{id}`). An interrupted write therefore leaves *orphan chunks*,
+     * never a root pointing at chunks that do not exist. Orphans are inert --
+     * chunk ids are content-addressed, so a retry re-derives the same ids and the
+     * duplicate writes come back 409 and are counted as "duplicated" by
+     * upstream's own write layer. See the README for the orphan policy.
+     *
+     * The CAS precondition is evaluated against a fresh read *and* enforced by
+     * CouchDB: the pre-read produces a good error message, the rev-guarded PUT is
+     * what actually makes concurrent writers safe.
+     */
+    async write(params: WriteParams): Promise<WriteResult> {
+        const manipulator = this.requireWritable();
+        const path = params.path;
+        if (!isVisiblePath(path)) {
+            throw new SidecarError(
+                "invalid-params",
+                "this path is not writable through the sidecar (paths containing ':' and dot-paths are excluded, matching commonlib's isTargetFile)"
+            );
+        }
+
+        let id: string;
+        try {
+            id = String(await manipulator.path2id(path as never));
+        } catch (error) {
+            throw remoteError(error);
+        }
+
+        const current = await this.currentState(id);
+
+        // The CAS precondition. `baseRev === null` is create-only, a string is a
+        // guarded update, absent is an unguarded upsert.
+        let guardRev: string | undefined;
+        if (params.baseRev === null) {
+            if (current) {
+                throw SidecarError.conflict(
+                    current.deleted
+                        ? "create-only write refused: a soft-deleted entry still occupies this path (write with its rev, or unguarded, to resurrect it)"
+                        : "create-only write refused: an entry already exists at this path",
+                    conflictDetailOf(current, null)
+                );
+            }
+            guardRev = undefined;
+        } else if (typeof params.baseRev === "string") {
+            if (!current) {
+                throw SidecarError.conflict(
+                    "guarded write refused: no entry exists at this path any more",
+                    { expected: params.baseRev }
+                );
+            }
+            if (current.rev !== params.baseRev) {
+                throw SidecarError.conflict(
+                    "guarded write refused: the remote revision moved",
+                    conflictDetailOf(current, params.baseRev)
+                );
+            }
+            guardRev = current.rev;
+        } else {
+            guardRev = current?.rev;
+        }
+
+        const mtime = params.mtimeMs ?? Date.now();
+        const ctime = params.ctimeMs ?? current?.ctimeMs ?? mtime;
+        const payload =
+            params.content.kind === "text"
+                ? [params.content.text]
+                : // `application/octet-stream` is what makes upstream classify the
+                  // entry as `newnote` and base64 its chunks; `text/plain` would
+                  // silently store binary as `plain`. Mirrors `createBinaryBlob`.
+                  new Blob([decodeBase64(params.content.base64)], { type: "application/octet-stream" });
+        const size =
+            params.content.kind === "text"
+                ? Buffer.byteLength(params.content.text, "utf8")
+                : decodeBase64(params.content.base64).byteLength;
+
+        const outcome = await this.withGuardedRootPut(guardRev, () =>
+            manipulator.put(path as never, payload as never, { ctime, mtime, size })
+        );
+
+        if (outcome.conflicted) {
+            const now = await this.currentState(id).catch(() => undefined);
+            throw SidecarError.conflict(
+                "write refused: CouchDB rejected the entry revision (a concurrent writer won)",
+                now ? conflictDetailOf(now, params.baseRev) : { expected: params.baseRev }
+            );
+        }
+        if (outcome.error !== undefined) {
+            throw remoteError(outcome.error);
+        }
+        if (outcome.accepted === false) {
+            // `putDBEntry` reports a refusal or a chunk-write failure as `false`
+            // without an exception. Nothing has been rooted, so the vault is
+            // unchanged apart from possibly-orphaned chunks.
+            throw new SidecarError(
+                "remote-error",
+                "the remote refused the write: chunks could not be stored, or commonlib declined the path"
+            );
+        }
+        if (outcome.rootPuts !== 1) {
+            // The interceptor is the only thing standing between this method and
+            // upstream's unconditional force-write. If it did not fire exactly
+            // once, compare-and-swap was NOT enforced, and pretending otherwise
+            // would be the worst possible failure.
+            throw new SidecarError(
+                "internal-error",
+                `upstream no longer routes the entry root write through localDatabase.put (observed ${outcome.rootPuts} guarded puts); compare-and-swap could not be enforced, so this write is reported as failed`
+            );
+        }
+        const rev = outcome.rev;
+        if (rev === undefined || rev === "") {
+            throw new SidecarError("internal-error", "the entry write returned no revision");
+        }
+
+        return {
+            path,
+            rev,
+            // A rev-guarded write targets the winning revision, so it neither
+            // creates nor resolves conflicts: the pre-read verdict still holds
+            // and reporting it costs no extra round trip.
+            conflicted: current?.conflicted ?? false,
+            size,
+            mtimeMs: mtime,
+            ctimeMs: ctime,
+            kind: params.content.kind === "binary" ? "binary" : "markdown",
+            created: current === undefined,
+            resurrected: current?.deleted ?? false,
+        };
+    }
+
+    /**
+     * Soft delete, matching the plugin's default.
+     *
+     * Re-implemented rather than delegated to `DirectFileManipulator.delete`,
+     * which force-puts. The document is read back and edited in place, so an
+     * obfuscated entry survives the round trip: the outgoing transform decrypts
+     * `path`/`children`/`mtime`/`size` on the way in and the incoming transform
+     * re-encrypts them on the way out. Chunks are deliberately left behind --
+     * LiveSync deletions are recoverable.
+     */
+    async remove(path: string, baseRev?: string | null): Promise<DeleteResult> {
+        this.requireWritable();
+        if (!isVisiblePath(path)) {
+            throw new SidecarError("invalid-params", "this path is not writable through the sidecar");
+        }
+        const manipulator = this.requireServeable();
+        let id: string;
+        try {
+            id = String(await manipulator.path2id(path as never));
+        } catch (error) {
+            throw remoteError(error);
+        }
+
+        let doc: RawDoc;
+        try {
+            doc = await this.db().get(id, { conflicts: true });
+        } catch (error) {
+            if (isMissingDocError(error)) {
+                throw new SidecarError("not-found", "no entry at this path");
+            }
+            throw remoteError(error);
+        }
+        if (doc.type === "leaf") {
+            throw new SidecarError("not-found", "no entry at this path");
+        }
+        const state = stateOf(doc);
+        if (typeof baseRev === "string" && state.rev !== baseRev) {
+            throw SidecarError.conflict(
+                "guarded delete refused: the remote revision moved",
+                conflictDetailOf(state, baseRev)
+            );
+        }
+
+        const next = stripReadOnlyMeta(doc);
+        next.deleted = true;
+        // Upstream bumps mtime on delete so replicas order the deletion after
+        // the last edit. It also sets `_deleted` when
+        // `deleteMetadataOfDeletedFiles` is on; the sidecar never does, in any
+        // mode: a CouchDB tombstone leaves `_all_docs` and cannot be listed or
+        // recovered.
+        next.mtime = Date.now();
+
+        let response: PutResponse;
+        try {
+            response = await this.db().put(next);
+        } catch (error) {
+            if (isConflictError(error)) {
+                const now = await this.currentState(id).catch(() => undefined);
+                throw SidecarError.conflict(
+                    "delete refused: CouchDB rejected the entry revision (a concurrent writer won)",
+                    now ? conflictDetailOf(now, baseRev) : { expected: baseRev }
+                );
+            }
+            throw remoteError(error);
+        }
+        return { path, rev: String(response.rev ?? ""), deleted: true };
+    }
+
+    /**
+     * Enumerates the entry's conflict revisions.
+     *
+     * Read-only, hence available in both modes. Each losing revision is fetched
+     * by `rev` for its metadata; a revision CouchDB has already compacted away is
+     * reported with `unavailable: true` rather than dropped, so a host never
+     * silently under-reports a conflict.
+     */
+    async conflicts(path: string): Promise<ConflictsResult> {
+        const meta = await this.metaOf(path);
+        const revs = meta._conflicts ?? [];
+        const conflicts: ConflictRevision[] = [];
+        for (const rev of revs) {
+            let doc: RawDoc | undefined;
+            try {
+                doc = await this.db().get(meta._id, { rev });
+            } catch (error) {
+                logStderr("conflicts", `conflict revision could not be read: ${describe(error)}`);
+            }
+            if (!doc) {
+                conflicts.push({ rev, mtimeMs: 0, size: 0, deleted: false, unavailable: true });
+                continue;
+            }
+            conflicts.push({
+                rev,
+                mtimeMs: doc.mtime ?? 0,
+                size: doc.size ?? 0,
+                deleted: Boolean(doc.deleted ?? doc._deleted),
+            });
+        }
+        return { path, winning: meta._rev ?? "", conflicts };
+    }
+
+    /**
+     * Current state of an entry document, or `undefined` when there is none.
+     *
+     * Goes through `localDatabase.get`, i.e. through the decryption transform, so
+     * an obfuscated entry reports its real `mtime`/`size` rather than the zeros
+     * the remote physically stores.
+     */
+    private async currentState(id: string): Promise<EntryState | undefined> {
+        try {
+            return stateOf(await this.db().get(id, { conflicts: true }));
+        } catch (error) {
+            if (isMissingDocError(error)) return undefined;
+            throw remoteError(error);
+        }
+    }
+
+    /**
+     * Runs `body` with the entry-root write intercepted and re-issued under a
+     * revision guard.
+     *
+     * This is the whole compare-and-swap mechanism. Upstream calls
+     * `localDatabase.put(rootDoc, {force: true})`, which PouchDB rewrites into a
+     * `new_edits: false` graft that can never conflict. The interceptor drops
+     * `force`, substitutes the revision the precondition validated, and lets
+     * CouchDB answer. Everything that is not an entry root -- chunk `bulkDocs`
+     * never comes through `put` at all, but `_local` control documents would --
+     * keeps upstream's own semantics untouched.
+     *
+     * Safe to install per-call because `main.ts` serialises every request, so
+     * exactly one write is ever in flight. Restored in `finally` regardless.
+     *
+     * The 409 is captured *here* rather than being caught after `body` rejects:
+     * it has to cross `chunkManager.transaction` and `serialized` frames, both of
+     * which are free to change how they propagate, and losing the discriminator
+     * would turn a conflict into a generic remote error.
+     */
+    private async withGuardedRootPut(
+        guardRev: string | undefined,
+        body: () => Promise<boolean>
+    ): Promise<{
+        accepted: boolean | undefined;
+        rev: string | undefined;
+        rootPuts: number;
+        conflicted: boolean;
+        error: unknown;
+    }> {
+        const db = this.db();
+        const originalPut = db.put;
+        let rootPuts = 0;
+        let rev: string | undefined;
+        let conflicted = false;
+
+        db.put = async (doc: RawDoc, options?: Record<string, unknown>): Promise<PutResponse> => {
+            if (!isEntryRoot(doc)) {
+                return await originalPut.call(db, doc, options);
+            }
+            rootPuts += 1;
+            const guarded: RawDoc = { ...doc };
+            if (guardRev === undefined) {
+                delete guarded._rev;
+            } else {
+                guarded._rev = guardRev;
+            }
+            try {
+                const response = await originalPut.call(db, guarded, {});
+                rev = response.rev;
+                return response;
+            } catch (error) {
+                if (isConflictError(error)) {
+                    conflicted = true;
+                }
+                throw error;
+            }
+        };
+
+        let accepted: boolean | undefined;
+        let error: unknown;
+        try {
+            accepted = await body();
+        } catch (caught) {
+            error = caught;
+        } finally {
+            db.put = originalPut;
+        }
+        // A captured 409 outranks whatever the upstream frames turned it into.
+        if (conflicted) {
+            return { accepted, rev, rootPuts, conflicted: true, error: undefined };
+        }
+        return { accepted, rev, rootPuts, conflicted: false, error };
     }
 
     /**
@@ -979,7 +1432,7 @@ export class LiveSyncVault {
      * Bounded: if the feed never reports completion the caller gets a typed
      * refusal from `beginWatch` rather than a hang.
      */
-    private async awaitWatchSettled(manipulator: ReadOnlyManipulator): Promise<void> {
+    private async awaitWatchSettled(manipulator: GuardedManipulator): Promise<void> {
         const deadline = Date.now() + 3_000;
         while (manipulator.watching && Date.now() < deadline) {
             await new Promise((resolve) => {
@@ -1040,6 +1493,127 @@ function remoteError(error: unknown): SidecarError {
     if (error instanceof SidecarError) return error;
     const { detail } = statusFromTransportError(error);
     return new SidecarError("remote-error", detail);
+}
+
+function describe(error: unknown): string {
+    return (error as Error)?.message ?? String(error);
+}
+
+/**
+ * Bytes behind a `newnote` entry's base64 fragments.
+ *
+ * Per-fragment decoding, matching upstream's `decodeBinary`. See `read`.
+ *
+ * The `%` prefix is upstream's pre-base64 encoding (`_decodeToArrayBuffer`, a
+ * UTF-16 packing). Upstream still reads it for old documents but states it
+ * "always uses base64" now, and this sidecar does not implement it: refusing is
+ * the only honest option, because guessing would hand a caller silently wrong
+ * bytes. (Encrypted chunks also start with `%`, but the decryption transform has
+ * already run by the time content reaches here.)
+ */
+function decodeChunkedBinary(fragments: readonly string[]): Buffer {
+    if (fragments[0]?.startsWith("%")) {
+        throw new SidecarError(
+            "corrupted-document",
+            "this attachment uses upstream's pre-base64 chunk encoding, which the sidecar does not decode"
+        );
+    }
+    return Buffer.concat(fragments.map((fragment) => Buffer.from(fragment, "base64")));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Write-path helpers                                                          */
+/* -------------------------------------------------------------------------- */
+
+/** The subset of an entry document a CAS precondition needs. */
+type EntryState = {
+    rev: string;
+    deleted: boolean;
+    conflicted: boolean;
+    mtimeMs: number;
+    ctimeMs: number;
+    size: number;
+};
+
+function stateOf(doc: RawDoc): EntryState {
+    return {
+        rev: doc._rev ?? "",
+        deleted: Boolean(doc.deleted ?? doc._deleted),
+        conflicted: (doc._conflicts?.length ?? 0) > 0,
+        mtimeMs: doc.mtime ?? 0,
+        ctimeMs: doc.ctime ?? 0,
+        size: doc.size ?? 0,
+    };
+}
+
+function conflictDetailOf(state: EntryState, expected: string | null | undefined): ConflictDetail {
+    return {
+        currentRev: state.rev,
+        ...(expected !== undefined ? { expected } : {}),
+        deleted: state.deleted,
+        conflicted: state.conflicted,
+        mtimeMs: state.mtimeMs,
+        size: state.size,
+    };
+}
+
+/**
+ * Is this the document that roots an entry (as opposed to a chunk or a control
+ * document)?
+ *
+ * `leaf` chunks reach CouchDB through `bulkDocs`, never `put`, so in practice the
+ * only other traffic on `put` is `_local/` control documents -- which must keep
+ * upstream's semantics, and which `GuardedManipulator` refuses anyway.
+ */
+function isEntryRoot(doc: RawDoc): boolean {
+    if (typeof doc._id !== "string" || doc._id.startsWith("_local/")) return false;
+    return doc.type === "plain" || doc.type === "newnote" || doc.type === "notes";
+}
+
+/**
+ * CouchDB rejects a document body carrying unknown underscore-prefixed fields,
+ * and `_conflicts` / `_revs_info` / `_revisions` are exactly the ones a `get`
+ * with options adds. Stripping them is what makes read-modify-write legal.
+ */
+function stripReadOnlyMeta(doc: RawDoc): RawDoc {
+    const copy: RawDoc = { ...doc };
+    delete copy._conflicts;
+    delete copy["_revs_info"];
+    delete copy["_revisions"];
+    return copy;
+}
+
+function isConflictError(error: unknown): boolean {
+    const anyError = error as { status?: number; name?: string; error?: string; message?: string };
+    if (anyError?.status === 409) return true;
+    return anyError?.name === "conflict" || anyError?.error === "conflict";
+}
+
+function isMissingDocError(error: unknown): boolean {
+    const anyError = error as { status?: number; name?: string; reason?: string };
+    if (anyError?.status === 404) return true;
+    return anyError?.name === "not_found";
+}
+
+/**
+ * Base64 to bytes, strictly.
+ *
+ * `Buffer.from(x, "base64")` silently ignores anything it cannot parse, so a
+ * caller's typo would be stored as truncated content. Round-tripping the decode
+ * catches that at the boundary instead.
+ */
+function decodeBase64(base64: string): Buffer {
+    const bytes = Buffer.from(base64, "base64");
+    if (bytes.toString("base64") !== normaliseBase64(base64)) {
+        throw new SidecarError("invalid-params", "content.base64 is not valid base64");
+    }
+    return bytes;
+}
+
+function normaliseBase64(base64: string): string {
+    const compact = base64.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+    const padding = compact.length % 4 === 0 ? "" : "=".repeat(4 - (compact.length % 4));
+    return `${compact}${padding}`;
 }
 
 /**

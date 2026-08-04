@@ -17,6 +17,22 @@
  * `handleFilenameCaseSensitive` is set), `h:`-prefixed `leaf` chunk documents,
  * the `obsydian_livesync_version` schema document, and `_local/` control
  * documents.
+ *
+ * ## Writes
+ *
+ * Non-writable is the DEFAULT and stays the read-only proof: every mutating
+ * request is recorded and answered 403, which is how `test/vault.test.mjs` and
+ * the Rust suite assert the read-only posture at the transport.
+ *
+ * `writable: true` opts into a real update-conflict model, because that is the
+ * only way to test compare-and-swap honestly: `PUT /{db}/{id}` compares the
+ * body's `_rev` against the stored one and answers 409 on a mismatch, exactly as
+ * CouchDB does, and `POST /{db}/_bulk_docs` reports per-document 409s (which is
+ * how upstream's chunk writer learns a content-addressed chunk already exists).
+ * `new_edits: false` -- the shape PouchDB's `{force: true}` produces -- is
+ * deliberately NOT modelled: it lands in `unhandled` as a 501, so a regression
+ * that reverts the sidecar to force-writes fails loudly here instead of
+ * appearing to pass.
  */
 import http from "node:http";
 
@@ -53,6 +69,7 @@ export class MockCouch {
      * @param {Record<string, object>} [options.localDocs] id (with `_local/`) -> body
      * @param {Record<string, string[]>} [options.conflicts] id -> extra conflict revs
      * @param {number} [options.authStatus] when set, every request answers with it
+     * @param {boolean} [options.writable] accept PUT/_bulk_docs with real 409 semantics
      */
     constructor(options = {}) {
         this.dbName = options.dbName ?? "vault";
@@ -60,18 +77,34 @@ export class MockCouch {
         this.localDocs = new Map();
         this.conflicts = new Map(Object.entries(options.conflicts ?? {}));
         this.authStatus = options.authStatus;
+        this.writable = options.writable === true;
         this.changes = [];
         this.seq = 0;
         /** Every request, for assertions (e.g. `GET /vault/_all_docs?...`). */
         this.requests = [];
-        /** Requests that would modify the remote. Must stay empty. */
+        /** Requests that would modify the remote. Empty unless `writable`. */
         this.writes = [];
+        /** Every document write actually applied: `{method, id, type}`. */
+        this.mutations = [];
         /** Requests answered with 501 because this mock does not know them. */
         this.unhandled = [];
         this.debug = process.env.DEBUG_REQUESTS === "1";
         /** Pending longpoll/continuous releases, triggered by `pushChange`. */
         this.waiters = [];
         this.lastStreamed = "0";
+        /** Bodies by `id@rev`, so `?rev=` and conflict revisions can be read. */
+        this.revisions = new Map();
+        this.revSeed = 0;
+        /** Answer the next N mutating requests 500 WITHOUT applying them. */
+        this.failNextWrites = 0;
+        /**
+         * Apply the next N *entry root* PUTs, then answer 500.
+         *
+         * Targeted at the root PUT rather than any write because that is the only
+         * interesting dropped response: the write landed, the client does not know
+         * it, and a naive retry would use a base revision that no longer exists.
+         */
+        this.dropNextEntryPutResponses = 0;
 
         for (const [id, body] of Object.entries(options.docs ?? {})) {
             this.putDoc(id, body);
@@ -85,6 +118,7 @@ export class MockCouch {
         const rev = body._rev ?? `1-${Buffer.from(id).toString("hex").slice(0, 8).padEnd(8, "0")}`;
         const doc = { ...body, _id: id, _rev: rev };
         this.docs.set(id, doc);
+        this.revisions.set(`${id}@${rev}`, doc);
         this.seq += 1;
         this.changes.push({ seq: this.seq, id, rev, deleted: Boolean(body._deleted) });
         return doc;
@@ -93,10 +127,62 @@ export class MockCouch {
     /** Adds a document and releases any held feed, as a live edit would. */
     pushChange(id, body) {
         const doc = this.putDoc(id, body);
+        this.release();
+        return doc;
+    }
+
+    release() {
         const waiters = this.waiters;
         this.waiters = [];
         for (const release of waiters) release();
-        return doc;
+    }
+
+    nextRev(previousRev) {
+        const generation = previousRev ? Number(String(previousRev).split("-")[0]) + 1 : 1;
+        this.revSeed += 1;
+        return `${generation}-${this.revSeed.toString(16).padStart(32, "0")}`;
+    }
+
+    /**
+     * Grafts a sibling revision onto a document, the way replication does.
+     *
+     * A genuine CouchDB conflict cannot be produced through the write API -- that
+     * is the whole point of compare-and-swap -- so a replication-style conflict is
+     * injected directly: the stored document stays the winner and the extra
+     * revision is listed in `_conflicts` and readable by `?rev=`.
+     */
+    injectConflict(id, body) {
+        const winner = this.docs.get(id);
+        if (!winner) throw new Error(`cannot inject a conflict into a missing document: ${id}`);
+        const rev = this.nextRev(winner._rev);
+        const doc = { ...body, _id: id, _rev: rev };
+        this.revisions.set(`${id}@${rev}`, doc);
+        this.conflicts.set(id, [...(this.conflicts.get(id) ?? []), rev]);
+        return rev;
+    }
+
+    /**
+     * The update-conflict check, i.e. what makes this mock useful for CAS.
+     *
+     * Matches CouchDB: a body without `_rev` may only create, a body with `_rev`
+     * must match the current winner exactly, and everything else is a 409.
+     */
+    applyPut(id, body, method) {
+        const existing = this.docs.get(id);
+        const givenRev = body._rev;
+        if (existing ? givenRev !== existing._rev : Boolean(givenRev)) {
+            return [409, { error: "conflict", reason: "Document update conflict.", id }];
+        }
+        const rev = this.nextRev(existing?._rev);
+        const doc = { ...body, _id: id, _rev: rev };
+        delete doc._revisions;
+        delete doc._conflicts;
+        this.docs.set(id, doc);
+        this.revisions.set(`${id}@${rev}`, doc);
+        this.seq += 1;
+        this.changes.push({ seq: this.seq, id, rev, deleted: Boolean(doc._deleted) });
+        this.mutations.push({ method, id, type: doc.type });
+        return [201, { ok: true, id, rev }];
     }
 
     async listen() {
@@ -152,19 +238,42 @@ export class MockCouch {
             return send(res, 404, { error: "not_found", reason: "no_db_file" });
         }
 
-        // Anything that is not a read is a bug in the sidecar, not a gap in the
-        // mock: record it so a test can assert the read-only posture, and answer
-        // 403 so the attempt visibly fails.
-        if (req.method !== "GET" && req.method !== "POST" && req.method !== "HEAD") {
+        // Anything that is not a read is recorded, always: `writes` is the
+        // transport-level ledger both the read-only proof and the read-write
+        // "only entry and leaf documents were touched" assertion read.
+        const isBulk = req.method === "POST" && segments[1] === "_bulk_docs";
+        const isDocPut = req.method === "PUT" && segments.length > 1 && !segments[1].startsWith("_");
+        const isDestructive =
+            req.method === "POST" &&
+            (segments[1] === "_revs_diff" || segments[1] === "_compact" || segments[1] === "_purge");
+        const isMutating = isBulk || isDocPut || isDestructive || (req.method !== "GET" && req.method !== "POST" && req.method !== "HEAD");
+
+        if (isMutating) {
             this.writes.push(record);
-            return send(res, 403, { error: "forbidden", reason: "read-only mock" });
-        }
-        if (req.method === "POST" && segments.length > 1) {
-            const name = segments[1];
-            if (name === "_bulk_docs" || name === "_revs_diff" || name === "_compact" || name === "_purge") {
-                this.writes.push(record);
+            // Compaction and purging stay forbidden even when writable: this
+            // slice must never destroy revision history.
+            if (!this.writable || isDestructive || (!isBulk && !isDocPut)) {
                 return send(res, 403, { error: "forbidden", reason: "read-only mock" });
             }
+            if (this.failNextWrites > 0) {
+                this.failNextWrites -= 1;
+                return send(res, 500, { error: "internal_server_error", reason: "injected failure" });
+            }
+            const outcome = isBulk
+                ? this.bulkWrite(parsedBody, url.searchParams)
+                : this.singleWrite(decodeURIComponent(segments.slice(1).join("/")), parsedBody, url.searchParams);
+            if (outcome === undefined) {
+                // `new_edits: false` is the shape PouchDB's `{force: true}`
+                // produces. Not modelled on purpose -- see the header.
+                this.unhandled.push(record);
+                return send(res, 501, { error: "not_implemented", reason: "mock does not model new_edits=false" });
+            }
+            this.release();
+            if (isDocPut && this.dropNextEntryPutResponses > 0) {
+                this.dropNextEntryPutResponses -= 1;
+                return send(res, 500, { error: "internal_server_error", reason: "injected dropped response" });
+            }
+            return send(res, outcome[0], outcome[1]);
         }
 
         // GET /{db} -- database info.
@@ -219,7 +328,41 @@ export class MockCouch {
         return send(res, status, payload);
     }
 
+    /** `PUT /{db}/{id}`. Returns `undefined` for a shape the mock refuses to model. */
+    singleWrite(id, body, params) {
+        if (params.get("new_edits") === "false" || body?.new_edits === false) return undefined;
+        const doc = { ...(body ?? {}) };
+        const revParam = params.get("rev");
+        if (revParam) doc._rev = revParam;
+        return this.applyPut(id, doc, "PUT");
+    }
+
+    /**
+     * `POST /{db}/_bulk_docs`. One row per document, 409s reported inline.
+     *
+     * Content-addressed chunks make the inline 409 load-bearing: re-writing a
+     * chunk that already exists is how a retried write behaves, and upstream's
+     * write layer counts those as "duplicated" rather than failing.
+     */
+    bulkWrite(body, params) {
+        if (params.get("new_edits") === "false" || body?.new_edits === false) return undefined;
+        const docs = body?.docs ?? [];
+        const rows = docs.map((doc) => {
+            const id = doc._id;
+            const [status, payload] = this.applyPut(id, doc, "BULK");
+            if (status === 201) return { ok: true, id, rev: payload.rev };
+            return { id, error: payload.error, reason: payload.reason, status };
+        });
+        return [201, rows];
+    }
+
     getDoc(id, params) {
+        const requestedRev = params.get("rev");
+        if (requestedRev) {
+            const revision = this.revisions.get(`${id}@${requestedRev}`);
+            if (!revision) return [404, { error: "not_found", reason: "missing" }];
+            return [200, { ...revision }];
+        }
         const doc = this.docs.get(id);
         if (!doc) return [404, { error: "not_found", reason: "missing" }];
         const out = { ...doc };

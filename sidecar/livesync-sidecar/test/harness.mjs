@@ -169,48 +169,80 @@ export class Sidecar {
 }
 
 /**
- * Boots a mock CouchDB plus a sidecar, runs `body`, and tears both down even if
- * the body throws.
+ * Boots a mock CouchDB and lets the body open as many sidecars against it as it
+ * likes, tearing all of them down even if the body throws.
+ *
+ * Multiple sidecars matter for two things this slice must prove: a read-back
+ * through a *second* process (no shared cache, so the bytes really came from the
+ * remote) and two writers racing for the same revision.
  *
  * @param {object} options
- * @param {object} options.vault fixture bundle: {docs, localDocs, conflicts}
+ * @param {object} [options.vault] fixture bundle: {docs, localDocs, conflicts}
  * @param {number} [options.authStatus]
- * @param {object} [options.e2ee]
- * @param {object} [options.initOptions]
- * @param {boolean} [options.skipInitialize]
+ * @param {boolean} [options.writable] let the mock accept writes
+ * @param {object} [options.e2ee] default e2ee block for `open`
+ * @param {object} [options.initOptions] default `options` block for `open`
+ * @param {string} [options.mode] default mode for `open`
  * @param {string} [options.password]
  */
-export async function withSidecar(options, body) {
+export async function withCouch(options, body) {
     const couch = new MockCouch({
         docs: options.vault?.docs ?? {},
         localDocs: options.vault?.localDocs ?? {},
         conflicts: options.vault?.conflicts ?? {},
         ...(options.authStatus !== undefined ? { authStatus: options.authStatus } : {}),
+        ...(options.writable ? { writable: true } : {}),
     });
     const url = await couch.listen();
-    const sidecar = new Sidecar();
-    let initializeResult;
-    try {
-        if (!options.skipInitialize) {
+    const started = [];
+
+    /** Spawns a sidecar and (unless told not to) initializes it. */
+    const open = async (overrides = {}) => {
+        const sidecar = new Sidecar();
+        started.push(sidecar);
+        const e2ee = "e2ee" in overrides ? overrides.e2ee : options.e2ee;
+        const initOptions = "initOptions" in overrides ? overrides.initOptions : options.initOptions;
+        const mode = "mode" in overrides ? overrides.mode : options.mode;
+        let initializeResult;
+        if (!(overrides.skipInitialize ?? options.skipInitialize)) {
             initializeResult = await sidecar.call("initialize", {
                 protocolVersion: PROTOCOL_VERSION,
+                ...(mode !== undefined ? { mode } : {}),
                 couchdb: {
                     url,
                     database: "vault",
                     username: "vaultuser",
-                    password: options.password ?? "s3cr3t-password-value",
+                    password: overrides.password ?? options.password ?? "s3cr3t-password-value",
                 },
-                ...(options.e2ee ? { e2ee: options.e2ee } : {}),
-                ...(options.initOptions ? { options: options.initOptions } : {}),
+                ...(e2ee ? { e2ee } : {}),
+                ...(initOptions ? { options: initOptions } : {}),
             });
         }
-        await body({ sidecar, couch, url, initializeResult });
+        return { sidecar, initializeResult };
+    };
+
+    try {
+        await body({ couch, url, open });
     } finally {
-        try {
-            await sidecar.shutdown();
-        } catch {
-            await sidecar.kill();
+        for (const sidecar of started) {
+            try {
+                await sidecar.shutdown();
+            } catch {
+                await sidecar.kill();
+            }
         }
         await couch.close();
     }
+}
+
+/**
+ * The single-sidecar shorthand: `withCouch` plus one `open()`.
+ *
+ * @param {object} options see {@link withCouch}
+ */
+export async function withSidecar(options, body) {
+    await withCouch(options, async ({ couch, url, open }) => {
+        const { sidecar, initializeResult } = await open();
+        await body({ sidecar, couch, url, initializeResult, open });
+    });
 }
