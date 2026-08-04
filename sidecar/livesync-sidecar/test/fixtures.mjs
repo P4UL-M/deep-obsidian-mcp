@@ -49,11 +49,17 @@ export const CONFLICTED_TEXT = "Winning revision content.\n";
 /** Raw bytes behind the binary fixture, base64-chunked below. */
 export const BINARY_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02, 0x03]);
 
-const BINARY_BASE64 = BINARY_BYTES.toString("base64");
-// Split mid-quantum on purpose: it proves the reader concatenates fragments
-// before decoding rather than decoding each one.
-const BINARY_CHUNK_A = BINARY_BASE64.slice(0, 5);
-const BINARY_CHUNK_B = BINARY_BASE64.slice(5);
+// Upstream's splitter cuts binary content at an arbitrary BYTE offset and
+// base64-encodes each piece independently (`splitPiecesRabinKarp` calls
+// `arrayBufferToBase64Single` on each `subarray`). So a fragment is always valid
+// base64 on its own -- and, when its byte length is not a multiple of three, it
+// carries `=` padding in the middle of the stream.
+//
+// 5 + 7 bytes is chosen for exactly that: both fragments are padded. A reader
+// that concatenates the base64 and decodes once truncates at the first interior
+// `=` and silently returns 5 of the 12 bytes.
+const BINARY_CHUNK_A = BINARY_BYTES.subarray(0, 5).toString("base64");
+const BINARY_CHUNK_B = BINARY_BYTES.subarray(5).toString("base64");
 
 export const CONFLICT_REV = "2-conflictingrevision";
 
@@ -242,6 +248,30 @@ export function encryptedVault({ withSalt = false } = {}) {
         };
     }
     return { ...vault, docs, localDocs };
+}
+
+/**
+ * The replication salt every E2EE fixture and every E2EE write shares.
+ *
+ * It has to be a *fixed* value, not a random one: the HKDF key schedule derives
+ * the content key from passphrase + salt, so a sidecar that reads back what
+ * another wrote must see the same salt. `_local/obsidian_livesync_sync_parameters`
+ * is where LiveSync keeps it, and the sidecar refuses to create it in either
+ * mode -- so a writable E2EE fixture must ship it.
+ */
+export const PBKDF2_SALT = Buffer.alloc(32, 7).toString("base64");
+
+/**
+ * The standard fixture, plus everything a *writer* needs: a milestone (so the
+ * compatibility gate has tweak values to check) and a replication salt (so an
+ * encrypting write can derive its key without writing the sync-parameters doc).
+ *
+ * The existing notes are plaintext on purpose. A vault can hold both -- upstream
+ * classifies a chunk by its `h:+` prefix and `e_` marker, not by a vault-wide
+ * flag -- so this doubles as the "first encrypted chunk appears mid-life" case.
+ */
+export function writableVault(overrides = {}) {
+    return smallVault({ milestone: {}, syncParameters: { pbkdf2salt: PBKDF2_SALT }, ...overrides });
 }
 
 /**

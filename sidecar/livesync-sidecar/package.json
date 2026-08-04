@@ -2,7 +2,7 @@
   "name": "@deep-obsidian/livesync-sidecar",
   "version": "0.1.0",
   "private": true,
-  "description": "Read-only JSON-RPC-over-stdio sidecar exposing a Self-hosted LiveSync CouchDB vault to the deep-obsidian MCP server.",
+  "description": "JSON-RPC-over-stdio sidecar exposing a Self-hosted LiveSync CouchDB vault to the deep-obsidian MCP server. Read-only by default; guarded writes are opt-in per process.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -12,6 +12,7 @@
     "build": "node scripts/build.mjs",
     "test": "node --test test/*.test.mjs",
     "mock-couch": "node test/mock-couch-server.mjs",
+    "fixtures:e2ee": "npm run build && node test/generate-e2ee-fixture.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

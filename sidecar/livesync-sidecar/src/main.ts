@@ -13,12 +13,15 @@ import {
     DATA_METHODS,
     Methods,
     PROTOCOL_VERSION,
+    SIDECAR_MODES,
     SIDECAR_VERSION,
     SUPPORTED,
     SidecarError,
 } from "./protocol.js";
 import type {
     ChangesSinceParams,
+    ConflictsResult,
+    DeleteResult,
     ErrorKind,
     ChangesSinceResult,
     HealthResult,
@@ -34,10 +37,13 @@ import type {
     ReadParams,
     ReadResult,
     ShutdownResult,
+    SidecarMode,
     StatParams,
     StatResult,
     UnwatchResult,
     WatchResult,
+    WriteContent,
+    WriteResult,
 } from "./protocol.js";
 import { installLogging, logStderr, redact, writeFrame } from "./logging.js";
 import { LiveSyncVault } from "./manipulator.js";
@@ -114,6 +120,53 @@ function optionalCursor(value: unknown, name: string): string | null {
     return value;
 }
 
+/**
+ * `baseRev` is tri-state, so the three JSON values must stay distinguishable:
+ * absent (unguarded), `null` (create-only), a string (guarded). `undefined`
+ * cannot be expressed in JSON, so "absent" is detected by key presence.
+ */
+function optionalBaseRev(object: Record<string, unknown>): string | null | undefined {
+    if (!("baseRev" in object)) return undefined;
+    const value = object["baseRev"];
+    if (value === null) return null;
+    if (value === undefined) return undefined;
+    if (typeof value !== "string" || value === "") {
+        throw new SidecarError(
+            "invalid-params",
+            "baseRev must be a non-empty string, null (create-only), or omitted (unguarded)"
+        );
+    }
+    return value;
+}
+
+function optionalTimestamp(value: unknown, name: string): number | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+        throw new SidecarError("invalid-params", `${name} must be a non-negative number when present`);
+    }
+    return value;
+}
+
+function writeContent(value: unknown): WriteContent {
+    const content = asObject(value, "write.content");
+    const kind = content["kind"];
+    if (kind === "text") {
+        const text = content["text"];
+        if (typeof text !== "string") {
+            throw new SidecarError("invalid-params", "content.text must be a string");
+        }
+        return { kind: "text", text };
+    }
+    if (kind === "binary") {
+        const base64 = content["base64"];
+        if (typeof base64 !== "string") {
+            throw new SidecarError("invalid-params", "content.base64 must be a string");
+        }
+        return { kind: "binary", base64 };
+    }
+    throw new SidecarError("invalid-params", 'content.kind must be "text" or "binary"');
+}
+
 function pageLimit(value: unknown): number {
     if (value === undefined || value === null) return DEFAULT_PAGE_LIMIT;
     if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
@@ -143,6 +196,20 @@ async function handleInitialize(params: unknown): Promise<InitializeResult> {
         throw new SidecarError("already-initialized", "initialize has already been called on this process");
     }
 
+    // Absent means read-only. That is what keeps `mode` an additive field: a v1
+    // host that never heard of it gets exactly v1 behaviour.
+    const modeRaw = object["mode"];
+    let mode: SidecarMode = "read-only";
+    if (modeRaw !== undefined && modeRaw !== null) {
+        if (typeof modeRaw !== "string" || !SIDECAR_MODES.includes(modeRaw as SidecarMode)) {
+            throw new SidecarError(
+                "invalid-params",
+                `mode must be one of ${SIDECAR_MODES.map((value) => JSON.stringify(value)).join(", ")}`
+            );
+        }
+        mode = modeRaw as SidecarMode;
+    }
+
     const couchdb = asObject(object["couchdb"], "initialize.couchdb");
     const url = requireString(couchdb["url"], "couchdb.url");
     const database = requireString(couchdb["database"], "couchdb.database");
@@ -170,6 +237,7 @@ async function handleInitialize(params: unknown): Promise<InitializeResult> {
         database,
         username,
         password,
+        mode,
         ...(passphrase !== undefined ? { passphrase } : {}),
         ...(obfuscatePassphrase !== undefined ? { obfuscatePassphrase } : {}),
         ...(options !== undefined ? { options } : {}),
@@ -182,6 +250,7 @@ async function handleInitialize(params: unknown): Promise<InitializeResult> {
 
     return {
         protocolVersion: PROTOCOL_VERSION,
+        mode,
         sidecarVersion: SIDECAR_VERSION,
         commonlibVersion: SUPPORTED.commonlibVersion,
         supportedSchemaVersion: SUPPORTED.maxSchemaVersion,
@@ -214,6 +283,35 @@ async function handleStat(params: unknown): Promise<StatResult> {
     const object = asObject(params, Methods.stat);
     const path = requireString(object["path"], "path") as StatParams["path"];
     return await state.vault.stat(path);
+}
+
+async function handleConflicts(params: unknown): Promise<ConflictsResult> {
+    const object = asObject(params, Methods.conflicts);
+    return await state.vault.conflicts(requireString(object["path"], "path"));
+}
+
+async function handleWrite(params: unknown): Promise<WriteResult> {
+    const object = asObject(params, Methods.write);
+    const baseRev = optionalBaseRev(object);
+    const mtimeMs = optionalTimestamp(object["mtimeMs"], "mtimeMs");
+    const ctimeMs = optionalTimestamp(object["ctimeMs"], "ctimeMs");
+    return await state.vault.write({
+        path: requireString(object["path"], "path"),
+        content: writeContent(object["content"]),
+        ...(baseRev !== undefined ? { baseRev } : {}),
+        ...(mtimeMs !== undefined ? { mtimeMs } : {}),
+        ...(ctimeMs !== undefined ? { ctimeMs } : {}),
+    });
+}
+
+async function handleDelete(params: unknown): Promise<DeleteResult> {
+    const object = asObject(params, Methods.delete);
+    const path = requireString(object["path"], "path");
+    const baseRev = optionalBaseRev(object);
+    // `null` and absent both mean unguarded here: create-only has no meaning for
+    // a delete, and refusing `null` would only trip hosts that serialise their
+    // optional fields eagerly.
+    return await state.vault.remove(path, baseRev ?? undefined);
 }
 
 async function handleChangesSince(params: unknown): Promise<ChangesSinceResult> {
@@ -254,6 +352,7 @@ function handleHealth(params: unknown): HealthResult {
     return {
         status,
         compatibility,
+        mode: state.vault.currentMode,
         watching: state.vault.isWatching,
         ...(state.lastError !== undefined ? { lastError: redact(state.lastError) } : {}),
         pendingChanges: state.vault.isWatching ? state.changeCount : 0,
@@ -280,6 +379,12 @@ const CALLER_FAULT_KINDS: ReadonlySet<ErrorKind> = new Set<ErrorKind>([
     "not-initialized",
     "already-initialized",
     "unsupported-protocol-version",
+    // A lost compare-and-swap is the *expected* outcome of concurrent editing and
+    // a read-only refusal is a configuration fact, not a sick remote. Latching
+    // either into `lastError` would make a perfectly healthy vault look broken
+    // forever, and the supervisor surfaces that field.
+    "conflict",
+    "read-only",
 ]);
 
 async function dispatch(method: string, params: unknown): Promise<unknown> {
@@ -305,6 +410,12 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
             return await handleRead(params);
         case Methods.stat:
             return await handleStat(params);
+        case Methods.conflicts:
+            return await handleConflicts(params);
+        case Methods.write:
+            return await handleWrite(params);
+        case Methods.delete:
+            return await handleDelete(params);
         case Methods.changesSince:
             return await handleChangesSince(params);
         case Methods.watch:

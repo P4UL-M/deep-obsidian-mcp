@@ -1,8 +1,12 @@
 # `@deep-obsidian/livesync-sidecar`
 
-A read-only Node process that exposes a [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync)
+A Node process that exposes a [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync)
 CouchDB vault to the `deep-obsidian` MCP server over a versioned JSON-RPC-over-stdio
 protocol.
+
+**Read-only by default.** Writing is opt-in per process via
+`initialize.mode: "read-write"`, and even then only entry and chunk documents are
+ever written — see [Writing](#writing) and [Security posture](#security-posture).
 
 ## Why a sidecar and not Rust
 
@@ -18,9 +22,6 @@ Rust server supervises it as a child process. The cost is a Node runtime
 dependency for this one backend; the benefit is that format changes are an
 upstream bump plus a fixture regeneration, not a reverse-engineering project.
 
-The sidecar **only reads**. It never writes to the remote database — see
-[Security posture](#security-posture).
-
 ## Protocol
 
 Newline-delimited JSON-RPC 2.0 over stdin/stdout, UTF-8, one message per line.
@@ -35,19 +36,39 @@ summary below is for orientation.
 
 | Method | Purpose |
 | --- | --- |
-| `initialize` | Handshake, credentials, compatibility gate. The only method that receives secrets. |
+| `initialize` | Handshake, credentials, mode, compatibility gate. The only method that receives secrets. |
 | `manifest` | Paginated vault metadata listing. |
 | `read` | Full content of one entry, assembled from its chunks. |
 | `stat` | Metadata for one entry, no chunk fetch. |
+| `conflicts` | The entry's sibling conflict revisions. Read-only, available in both modes. |
 | `changesSince` | One-shot change feed from an opaque cursor. |
 | `watch` / `unwatch` | Subscribe to / unsubscribe from live `change` notifications. |
-| `health` | Liveness, compatibility status, watch state, last error. |
+| `write` | Compare-and-swap write of one entry. **`read-write` mode only.** |
+| `delete` | Soft delete of one entry. **`read-write` mode only.** |
+| `health` | Liveness, compatibility status, mode, watch state, last error. |
 | `shutdown` | Graceful exit 0. |
 
-`initialize` must come first. Every data method (`manifest`, `read`, `stat`,
-`changesSince`, `watch`, `unwatch`) **fails closed** until `initialize` has
-returned `compatibility.status: "ok"`. `health` and `shutdown` are always
-available — the supervisor needs them exactly when something is wrong.
+`initialize` must come first. Every data method **fails closed** until
+`initialize` has returned `compatibility.status: "ok"`. `health` and `shutdown`
+are always available — the supervisor needs them exactly when something is wrong.
+
+### Versioning rule: additive methods do not bump the version
+
+`PROTOCOL_VERSION` describes what a host must *tolerate*. Adding a method cannot
+break a v1 host: a host that does not know `write` never sends it, and one that
+does gets `method-not-found` from an older sidecar, which is already a modelled
+failure. Adding an optional request field with a backwards-compatible default
+(`initialize.mode`, which defaults to `"read-only"`, i.e. exactly v1 behaviour) is
+invisible to a host that omits it, and neither side deserialises strictly, so new
+response fields are safe too.
+
+So the whole write surface is **additive on protocol version 1**. What *would*
+require a bump: changing `SUPPORTED`'s shape, changing an existing method's params
+or result, changing an error code's meaning, or flipping `mode`'s default.
+
+**Never edit `SUPPORTED` to advertise a capability.** The Rust supervisor asserts
+that object field by field on every handshake, so a new key there is a hard
+version mismatch, not a feature flag.
 
 ### `initialize`
 
@@ -56,6 +77,7 @@ available — the supervisor needs them exactly when something is wrong.
   "jsonrpc": "2.0", "id": 1, "method": "initialize",
   "params": {
     "protocolVersion": 1,
+    "mode": "read-only",
     "couchdb": { "url": "https://couch.example", "database": "vault",
                  "username": "user", "password": "..." },
     "e2ee": { "passphrase": "...", "obfuscatePassphrase": "..." },
@@ -69,6 +91,7 @@ The result echoes the pinning triple and reports what the remote is:
 ```json
 {
   "protocolVersion": 1,
+  "mode": "read-only",
   "sidecarVersion": "0.1.0",
   "commonlibVersion": "0.1.2",
   "supportedSchemaVersion": 12,
@@ -100,7 +123,7 @@ carrying the same status.
 | `auth-failed` | CouchDB answered 401/403. |
 | `unreachable` | DNS/refused/timeout/TLS/5xx. |
 | `e2ee-required` | Encrypted chunks or obfuscated ids present, passphrase missing. |
-| `e2ee-invalid` | Passphrase supplied but unusable (see below). |
+| `e2ee-invalid` | Passphrase supplied but unusable (see below). In `read-write` mode, also reported when a passphrase is supplied and the remote has no replication salt for an encrypted write to use. |
 | `unknown` | Unclassified. |
 
 ### Entry shapes
@@ -118,8 +141,8 @@ plus `nextCursor` / `exhausted`. `read` yields
 - **Soft deletes** are LiveSync's default: the entry document carries
   `deleted: true` and is still listed and readable, with `deleted: true` set.
   It is not a CouchDB tombstone.
-- **Conflicts**: the winning revision is served and `conflicted: true` is set.
-  Conflict revisions are not exposed in v1.
+- **Conflicts**: the winning revision is served and `conflicted: true` is set. The
+  losing revisions are enumerable with [`conflicts`](#conflicts).
 - **Cursors** (`manifest`, `changesSince`, `change.cursor`) are **opaque**. Pass
   them back verbatim; do not parse, compare, or persist assumptions about them.
 - **An empty page does not mean the end.** Both `manifest` and `changesSince` can
@@ -140,7 +163,177 @@ The sidecar copies those ranges verbatim, so it excludes:
 
 It additionally hides paths containing `:` and paths beginning with `.`, which
 mirrors what commonlib's `isTargetFile` refuses on read. Without that, `manifest`
-would advertise entries `read` then reports as missing.
+would advertise entries `read` then reports as missing. The same rule gates
+`write` and `delete`, which refuse such paths with `invalid-params`.
+
+## Writing
+
+`write` and `delete` exist only when `initialize` was given
+`mode: "read-write"`. Otherwise they refuse with `read-only` (`-32009`) before any
+request reaches the remote. Writes are additionally refused whenever the
+compatibility gate reported anything other than `ok`: a vault the sidecar cannot
+fully classify must not be written to, however the host asked.
+
+### Compare-and-swap
+
+`baseRev` selects the CAS mode, and the three cases are distinct JSON values
+rather than a flag:
+
+| `baseRev` | Meaning | Failure |
+| --- | --- | --- |
+| `null` | **create-only** | `conflict` if any document exists at the path, *including a soft-deleted one* |
+| `"<rev>"` | **guarded update** | `conflict` unless the remote's winning revision is exactly this |
+| absent | **unguarded upsert** | `conflict` only if another writer landed between this one's read and its write |
+
+The last row is not a contradiction: "unguarded" means the *caller* states no
+precondition, but the write itself is still revision-guarded against the revision
+observed a moment earlier, so it can never create a conflict branch. Losing that
+narrow race is reported with `currentRev`, and retrying is a one-liner.
+
+`conflict` (`-32008`) carries `error.data.conflict`:
+
+```json
+{ "currentRev": "3-abc…", "expected": "2-def…",
+  "deleted": false, "conflicted": false, "mtimeMs": 1700000000000, "size": 4096 }
+```
+
+`currentRev` is absent only when the document does not exist at all.
+`deleted: true` on a create-only refusal is the signal that the path *looks* free
+but a soft-deleted entry still occupies it, so the right move is a resurrect
+rather than a create.
+
+`delete` takes the same `baseRev` guard, except that `null` and absent both mean
+unguarded — create-only has no meaning for a delete. A path with no document at
+all is `not-found`, never a silent success.
+
+`write` returns `{path, rev, conflicted, size, mtimeMs, ctimeMs, kind, created,
+resurrected}`. `conflicted` reports a *pre-existing* conflict: a rev-guarded write
+extends the winning branch only, so it neither creates nor resolves conflict
+branches. That is asserted against a real CouchDB with a real replication-style
+sibling revision, not only against the mock — grafting a sibling needs
+`new_edits: false`, which is precisely the request shape the mock refuses to
+model.
+
+**Resurrection is structural, not a special case.** Upstream's `putDBEntry`
+rebuilds the entry root from scratch, so the `deleted` flag is simply not carried
+over — any successful write over a soft-deleted entry brings it back, and
+`resurrected: true` reports that it happened.
+
+**Writing over a hard CouchDB tombstone (`_deleted: true`) fails with
+`conflict`.** So does upstream's own `put`, for the same reason: a rev-less PUT
+against a deleted document is a 409 in CouchDB, and neither upstream nor this
+sidecar goes looking for the tombstone's revision. It does not arise in practice
+because LiveSync's delete is soft unless the user turns on
+`deleteMetadataOfDeletedFiles` (off by default).
+
+#### Why the CAS is implemented around upstream rather than by it
+
+`DirectFileManipulator.put` cannot express CAS and cannot be made to. Upstream's
+`putDBEntry` writes the entry root with `localDatabase.put(doc, {force: true})`,
+and PouchDB turns `force` into `new_edits: false` plus a *fabricated* child
+revision — so a stale base revision never produces a 409, it silently grafts a
+second leaf onto the revision tree. That is correct for a replicating peer and
+wrong for a tool whose contract is `expectedHash`. Its `conflictBaseRev` parameter
+only chooses which revision the forced write chains from.
+
+So `write` keeps all of `putDBEntry` — target-file filtering, blob typing, the
+splitter, chunk batching, Eden, chunk id derivation, the encryption transform —
+and replaces exactly one operation: the final root `put`, re-issued without
+`force` under the revision the precondition validated, so CouchDB adjudicates. The
+interceptor asserts it fired exactly once; if upstream ever stops routing the root
+write through `localDatabase.put`, the write fails loudly with `internal-error`
+instead of silently reverting to force-write semantics.
+
+`delete` is likewise re-implemented (read, set `deleted: true`, bump `mtime`, put
+under a revision guard) because `deleteDBEntryByPath` force-puts too.
+
+### Publication order, and what an interrupted write leaves behind
+
+Chunks first, entry root **last** — upstream's order, and the one the plugin
+relies on. Every leaf goes out in `POST /{db}/_bulk_docs` before the root's
+`PUT /{db}/{id}`.
+
+The invariant that matters: **an interrupted write can leave orphan chunks, never
+a root pointing at chunks that do not exist.** A dangling root would be
+unreadable and unrepairable; an orphan chunk is inert.
+
+### Retry safety
+
+The sidecar performs no retries of its own — retry policy belongs to the Rust
+supervisor, which knows about backoff and user intent. What the sidecar guarantees
+is that retrying is *safe*, and it is deterministic in both directions:
+
+- **Chunks are content-addressed** (hash of content, salted by the passphrase when
+  E2EE is on), so re-publishing identical content re-derives identical ids. The
+  duplicate writes come back 409 and upstream's own write layer counts them as
+  "duplicated". Republishing is idempotent.
+- **A retry with the same `baseRev` either succeeds or fails `conflict`, never
+  double-writes.** If the first attempt died before the root, the retry succeeds.
+  If the first attempt's root landed but the response was lost, the retry loses
+  the CAS and comes back with `currentRev` — which is exactly the information
+  needed to decide whether the lost write was in fact the caller's own.
+
+### Orphan chunks: deliberately not collected
+
+Nothing in this sidecar reclaims orphan chunks, and `health` deliberately has no
+orphan counter. Two reasons.
+
+It is not cheaply knowable. A chunk is orphaned only relative to *every* entry's
+`children` list, including every conflict revision, so "did my last write orphan
+anything" needs a full-database refcount — not a per-write fact.
+
+And it is upstream's own stance. The plugin's maintenance command computes exactly
+that refcount and *reports* orphans as an `__orphan` row in a CSV dump
+(`CmdLocalDatabaseMainte.ts`), but its "Remove all orphaned chunks" UI is
+**commented out** under the heading "Garbage Collection (Old and Experimental)"
+(`PaneMaintenance.ts`). Upstream's real reclamation path is a rebuild — which is
+what the `locked` / `locked+cleaned` milestone states signal, and which this
+sidecar already refuses to read through. A sidecar-side GC would be a destructive
+operation with no upstream contract behind it; deferred to a later slice, if ever.
+
+Orphans arise from ordinary editing anyway, not only from failed writes: every
+edit that changes a chunk's content leaves the old chunk referenced by nothing
+once the previous revision is compacted away.
+
+### `conflicts`
+
+`conflicts {path}` → `{path, winning, conflicts: [{rev, mtimeMs, size, deleted}]}`.
+
+Read-only, and therefore available in **both** modes — refusing it on a read-only
+mount would hide exactly the information a read-only host most needs. A revision
+CouchDB has already compacted away is reported with `unavailable: true` rather
+than dropped, so a host never silently under-reports a conflict.
+
+Resolution — picking a winner, deleting the losers — is deliberately not here. It
+is destructive and needs a merge policy the sidecar has no business choosing.
+
+### E2EE and obfuscated writes
+
+Both come free from routing the root write through the *transformed* PouchDB
+handle: commonlib installs `transform-pouch` with an `incoming` hook that encrypts
+and an `outgoing` hook that decrypts, so the CAS interceptor sits above the
+transform and never sees or bypasses it. Issuing raw HTTP instead would write
+plaintext into an encrypted vault.
+
+- **Chunks**: with a passphrase configured, chunk ids gain the `+` marker (`h:+…`)
+  and each chunk is stored as `{e_: true, data: "%=<HKDF ciphertext>"}`.
+- **Obfuscated paths**: the entry id becomes `f:<hash>` and the *metadata* is
+  encrypted too — the stored document's `path` is a `/\:`-prefixed envelope and
+  `mtime`, `ctime`, `size` are zeroed with the real values inside it, `children`
+  emptied. Reading restores all of it.
+- **An encrypting writer needs the replication salt to already exist.** The
+  key is derived from passphrase + the `pbkdf2salt` in
+  `_local/obsidian_livesync_sync_parameters`, and the sidecar refuses to create
+  that document in *either* mode. A read-write handshake with a passphrase and no
+  salt is refused up front with `e2ee-invalid` rather than failing deep inside the
+  first write. A read-only handshake against the same vault is unaffected.
+- **Obfuscation is all-or-nothing.** `path2id` obfuscates unconditionally once the
+  passphrase is set, so a client with obfuscation on can only address `f:` entries
+  by path and one with it off can only address plaintext ids. That matches the
+  plugin, which requires a rebuild to switch modes.
+
+This is also what finally proves the E2EE **success** path — see
+[Tests](#tests).
 
 ## Version pinning policy
 
@@ -189,24 +382,33 @@ radius, on purpose.
 - **With path obfuscation enabled, paths are also suppressed from stderr.** The
   point of that mode is that the server never sees plaintext paths; the log must
   not either.
-- **Read-only, structurally.** `put`, `delete`, and `putSyncParameters` are
-  overridden to throw. `putSyncParameters` matters most: upstream's
-  `getReplicationPBKDF2Salt` will *create* the remote's
-  `_local/obsidian_livesync_sync_parameters` document when it is missing, and it
-  is wired into the decryption path as a lazy callback — so an E2EE read could
-  otherwise write to someone's vault mid-read. The sidecar checks for the salt up
-  front and reports `e2ee-invalid` instead.
-- **The milestone document is never written.** Upstream's
+- **Read-only unless asked, structurally.** `put` is refused unless the process
+  was initialized `mode: "read-write"` *and* the compatibility gate said `ok`;
+  commonlib's `delete` is refused unconditionally (it force-writes, so `delete` is
+  re-implemented instead); `putSyncParameters` is refused **in both modes**.
+  `putSyncParameters` matters most: upstream's `getReplicationPBKDF2Salt` will
+  *create* the remote's `_local/obsidian_livesync_sync_parameters` document when
+  it is missing, and it is wired into the encryption *and* decryption paths as a
+  lazy callback — so an E2EE operation could otherwise write to someone's vault
+  mid-read. The sidecar checks for the salt up front and reports `e2ee-invalid`
+  instead.
+- **The milestone document is never written, in either mode.** Upstream's
   `ensureDatabaseIsCompatible` registers the calling node and updates
   `last_connected`/tweak values as a side effect of *checking* compatibility. The
-  sidecar reimplements the checks read-only: it is a reader, not a peer, so it
-  never appears in `accepted_nodes`.
-- **The version document is never written.** Upstream's `checkRemoteVersion`
-  falls through to `bumpRemoteVersion` on a miss, which PUTs
+  sidecar reimplements the checks read-only: a writer client is still not a
+  LiveSync peer and must never appear in `accepted_nodes`.
+- **The version document is never written, in either mode.** Upstream's
+  `checkRemoteVersion` falls through to `bumpRemoteVersion` on a miss, which PUTs
   `obsydian_livesync_version`.
-- `test/vault.test.mjs` asserts this at the transport: the mock CouchDB records
-  every `PUT`/`DELETE` and every mutating `POST`, and the test requires that list
-  to be empty.
+- **No CouchDB tombstones, no compaction, no purge.** Deletion is soft; revision
+  history is never destroyed.
+- Asserted at the transport, not by inspection. The mock CouchDB records every
+  mutating request plus every document write it applies (`{method, id, type}`).
+  `test/vault.test.mjs` requires the ledger to be **empty** for a read-only
+  sidecar; `test/write.test.mjs` requires that in read-write mode it contains
+  **only** `leaf`, `plain` and `newnote` documents and no `_local/` or
+  `obsydian_livesync_version` id. The live CouchDB test re-checks the same thing
+  against a real server by diffing `_all_docs`.
 
 ## How the Rust server runs this
 
@@ -282,6 +484,12 @@ with bounded exponential backoff (capped at 30s), replays `changesSince` from th
 opaque cursor, then re-arms `watch`; the catch-up is what stops a restart from silently
 dropping edits made while it was down.
 
+**The supervisor currently sends no `mode`, so every supervised sidecar is
+read-only.** Nothing in the Rust crates calls `write`, `delete` or `conflicts` yet;
+exposing them through the MCP `upsert_note` family is the next slice. Until then
+the write plane is reachable only by driving the bundle directly, and a CouchDB
+mount is read-only end to end.
+
 ## Tests
 
 ```sh
@@ -290,6 +498,65 @@ npm run typecheck
 npm run build      # required: the suite drives dist/sidecar.mjs
 npm test
 ```
+
+| File | Covers |
+| --- | --- |
+| `test/protocol.test.mjs` | Framing, handshake, malformed input, shutdown. |
+| `test/compat.test.mjs` | The compatibility gate, status by status. |
+| `test/vault.test.mjs` | Read plane, and the read-only ledger assertion. |
+| `test/write.test.mjs` | CAS matrix, soft delete, chunk order, retry safety, concurrent writers, mode gating. |
+| `test/e2ee.test.mjs` | Real encrypt/decrypt round trips, obfuscation, and the committed fixture regression. |
+| `test/redaction.test.mjs` | Secrets and paths never reach stderr. |
+| `test/upstream-constants.test.mjs` | Restated upstream ids/prefixes still match the installed library. |
+| `test/live-couch.test.mjs` | Opt-in, against a real CouchDB. Skipped without `DEEP_OBSIDIAN_COUCHDB_URL`. |
+
+### Committed E2EE fixtures
+
+`npm run fixtures:e2ee` regenerates:
+
+- `test/fixtures/e2ee-written-vault.json` — encrypted chunks under plaintext ids
+- `test/fixtures/e2ee-obfuscated-vault.json` — encrypted chunks under `f:` ids
+
+These are the closest thing to plugin-generated fixtures obtainable without
+installing Obsidian: the ciphertext, chunk ids, encrypted metadata envelope and
+obfuscated document ids are all produced by `octagonal-wheels` and
+`livesync-commonlib` through the real sidecar. Only the *database* is a mock — and
+CouchDB does not participate in the codec, it stores what it is given.
+
+Both shapes of proof are needed, and they are different:
+
+- a **round trip** (write, then read back through a second sidecar process; a third
+  with the wrong passphrase must fail) proves the encrypt and decrypt halves agree;
+- the **committed fixtures**, read back by a fresh sidecar with no writing
+  involved, prove the codec has not *drifted*. A round trip alone would happily
+  write and read a new, mutually consistent, wrong format after a commonlib bump.
+
+Regenerate only on a deliberate commonlib bump, and treat the diff as the signal to
+review `maxSchemaVersion`. **Never hand-edit them**: a fixture edited to make a
+test pass proves nothing about the format. The passphrases and the `pbkdf2salt` are
+part of the data — HKDF derives the content key from passphrase + salt — so they
+live in `test/e2ee-fixture.mjs` and changing either without regenerating makes the
+dumps unreadable.
+
+### Against a real CouchDB
+
+```sh
+docker run -d --name couch -p 5984:5984 \
+  -e COUCHDB_USER=admin -e COUCHDB_PASSWORD=pw couchdb:3
+curl -X PUT http://admin:pw@127.0.0.1:5984/livevault
+DEEP_OBSIDIAN_COUCHDB_URL=http://127.0.0.1:5984 \
+DEEP_OBSIDIAN_COUCHDB_DB=livevault \
+DEEP_OBSIDIAN_COUCHDB_USER=admin \
+DEEP_OBSIDIAN_COUCHDB_PASSWORD=pw npm test
+```
+
+Skipped, not failed, when the variable is absent: the hermetic suite is the
+contract and CI must not require a container. Two things only a real server can
+prove — that a database the sidecar cannot classify is refused for writing even in
+`read-write` mode with valid credentials, and that `MockCouch`'s 409 semantics are
+CouchDB's, by replaying the CAS matrix against the real conflict adjudicator. The
+write test creates and drops its own scratch database and never touches the one
+named in the environment; point it at a throwaway container regardless.
 
 `npm run mock-couch` starts `test/mock-couch.mjs` over a real socket
 (`test/mock-couch-server.mjs`), so a non-Node parent can drive the same fixture vaults.
@@ -309,53 +576,67 @@ The mock's endpoint set was discovered empirically (`DEBUG_REQUESTS=1` logs ever
 request), and anything it does not model answers `501` and is recorded, so a new
 upstream request shape fails loudly instead of silently degrading.
 
-### Still deferred: real plugin-generated fixtures
+Non-writable is the mock's **default**, and that is what keeps the read-only proof
+honest. `writable: true` opts into a real update-conflict model — `PUT` compares
+`_rev` and answers 409 exactly as CouchDB does, `_bulk_docs` reports per-document
+409s (which is how upstream's chunk writer learns a content-addressed chunk already
+exists). `new_edits: false`, the shape PouchDB's `{force: true}` produces, is
+deliberately **not** modelled: it lands in `unhandled` as a 501, so a regression
+that reverts the sidecar to force-writes fails loudly here instead of appearing to
+pass. Failure injection (`failNextWrites`, `dropNextEntryPutResponses`) and
+`injectConflict` (a replication-style sibling revision, which cannot be produced
+through the write API — that is the point of CAS) are what make the retry-safety and
+`conflicts` tests possible.
 
-Slice 3c (the Rust backend) closed the *supervision* half of this list: the real
-bundle is now driven end to end against the fixture CouchDB from Rust, and an
-env-gated test (`DEEP_OBSIDIAN_COUCHDB_URL`) points the real sidecar at a real
-CouchDB and asserts it **classifies** it rather than crashing — verified against
-`couchdb:3`, which reports `unknown-schema` for an empty database.
+### Closed by the write plane: E2EE and obfuscation
 
-What that test deliberately does **not** do is seed a vault. Writing LiveSync
-documents by hand would produce a fixture that satisfies a test while proving nothing
-about the format, which is the exact trap this file warns about below. Closing the
-remaining gaps needs the real plugin:
+Earlier slices could only prove *classification* — `e2ee-required` and
+`e2ee-invalid` against synthetic ciphertext, so a **successful** decrypt was never
+exercised and wrong-passphrase detection rested on an AEAD failure that was never
+demonstrated. Writing closed that hermetically, because the sidecar can now
+generate real ciphertext with the plugin's own library (see
+[Committed E2EE fixtures](#committed-e2ee-fixtures)). Covered now: a successful
+E2EE round trip through two processes, a wrong-passphrase refusal against real
+ciphertext, obfuscated-id resolution in both directions, and drift detection
+against committed dumps.
+
+One marker detail is still worth knowing when reading fixtures: the `h:+` id
+prefix is what *selects* a chunk for the decryption transform, but `e_: true` plus
+a `%=`/`%` header on `data` is what makes upstream actually attempt a decrypt. An
+`h:+` chunk without `e_` is classified UNENCRYPTED and passed through verbatim.
+The sidecar reads `h:+` presence as "this vault is configured for E2EE" (which is
+what `e2ee-required` needs) and relies on a real chunk read for `e2ee-invalid`.
+
+A **plugin-generated** fixture would still be worth having, because it would prove
+the sidecar agrees with Obsidian and not merely with itself:
 
 1. install Self-hosted LiveSync in a scratch vault, point it at a throwaway CouchDB,
    and replicate a few notes, one attachment, one deletion and one deliberate conflict;
 2. dump the database (`_all_docs?include_docs=true`) and commit it, recording the
    plugin version in the fixture;
-3. repeat with E2EE enabled, and again with path obfuscation — that is what would
-   finally exercise a *successful* decrypt and obfuscated-id resolution;
+3. repeat with E2EE enabled, and again with path obfuscation;
 4. re-run on every `commonlibVersion` bump; a diff in the dump is the signal that
    `maxSchemaVersion` needs review.
 
-Until then these have no hermetic coverage and are **not** faked green:
+### Still deferred
 
-- **Real E2EE round-trip.** Fixture ciphertext would need the plugin's HKDF key
-  schedule to be trustworthy. `test/compat.test.mjs` covers the
-  `e2ee-required` / `e2ee-invalid` *classification*, including a chunk whose
-  decryption is genuinely attempted and fails — but the ciphertext is synthetic,
-  so a **successful** decrypt is never exercised. Two consequences: correct-vault
-  reads through the E2EE path are unproven here, and wrong-passphrase detection
-  is only as strong as the underlying AEAD's failure (reliable for real
-  ciphertext, but not demonstrated against it).
+These have no hermetic coverage and are **not** faked green:
 
-  Note the marker semantics, which are easy to get wrong when building fixtures:
-  the `h:+` id prefix is what *selects* a chunk for the decryption transform, but
-  `e_: true` plus a `%=`/`%` header on `data` is what makes upstream actually
-  attempt a decrypt. An `h:+` chunk without `e_` is classified UNENCRYPTED and
-  passed through verbatim. The sidecar reads `h:+` presence as "this vault is
-  configured for E2EE" (which is what `e2ee-required` needs) and relies on a real
-  chunk read for `e2ee-invalid`.
-- **Real path obfuscation.** Same reason: `f:` ids are salted hashes. The
-  detection path and the stderr path-suppression behaviour are covered; resolving
-  an obfuscated id back to a path is not.
 - **Compression** (`enableCompression`) and **Eden** inline chunks.
 - **Chunk-splitter variants** and non-default `hashAlg`, which change how content
   is fragmented on write and therefore what a reader must reassemble.
+- **The pre-base64 binary chunk encoding.** Upstream still reads `%`-prefixed
+  UTF-16-packed attachment chunks for old documents but states it always writes
+  base64 now. The sidecar refuses them with `corrupted-document` rather than
+  guessing, because guessing would hand a caller silently wrong bytes.
+- **Conflict resolution.** `conflicts` enumerates; nothing merges or deletes.
+- **Orphan-chunk collection**, deliberately — see
+  [Orphan chunks](#orphan-chunks-deliberately-not-collected).
 - **Live-feed reconnection.** Upstream's `beginWatch` retries after 10s on error;
   the tests cover the happy path and cancellation, not a mid-stream drop.
 - **Large vaults**: manifest pagination is covered at `limit=2` over six entries,
   not at a scale where CouchDB's own paging behaviour matters.
+- **Genuinely interleaved concurrent writers.** Two sidecars racing is covered as a
+  strict sequence (A wins, B's stale-base write is refused with A's revision),
+  which is what CAS guarantees; mock-side response gating to interleave the two
+  round trips would add flake surface without adding coverage.

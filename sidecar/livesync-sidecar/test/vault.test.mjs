@@ -94,12 +94,13 @@ test("read assembles text from multiple chunks", async () => {
     });
 });
 
-test("read decodes binary entries after joining base64 fragments", async () => {
+test("read decodes each base64 fragment of a binary entry separately", async () => {
     await withSidecar({ vault: vault() }, async ({ sidecar }) => {
         const result = await sidecar.call("read", { path: "assets/logo.png" });
         assert.equal(result.kind, "binary");
-        // The fixture splits base64 mid-quantum, so per-fragment decoding would
-        // corrupt this.
+        // Both fragments carry `=` padding (5 and 7 bytes), which is what upstream's
+        // byte-offset splitting produces. Joining the base64 and decoding once
+        // stops at the first interior `=` and returns 5 of the 12 bytes.
         assert.deepEqual(Buffer.from(result.base64, "base64"), BINARY_BYTES);
     });
 });
