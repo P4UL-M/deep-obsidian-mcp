@@ -1,18 +1,16 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use deep_obsidian_backend::{
+    BackendRequest, GrepContextLine, GrepMatch, RecallRequest, VaultChildEntry, VaultEntryKind,
+    RIPGREP_UNAVAILABLE_MESSAGE,
+};
 use deep_obsidian_core::text::{
     extract_block_sections, extract_heading_sections, extract_wiki_links, normalize_heading_slug,
     note_title, tokenize,
-};
-use deep_obsidian_core::vault::{
-    ensure_inside_vault, list_children as vault_list_children, list_markdown_files,
-    list_top_level_folders, read_text_file, write_text_file, VaultChildEntry, VaultEntryKind,
 };
 use deep_obsidian_index::graph as index_graph;
 use deep_obsidian_index::index::{artifact_kind, artifact_mime_type, IndexError};
@@ -39,73 +37,10 @@ const RESPONSE_TEXT_BUDGET_CHARS: usize = 24_000;
 const TRUNCATION_NOTE: &str =
     "Response text truncated to fit the aggregate budget; later matches' text was omitted. Lower `limit` or call read_file for full text.";
 
-/// Clear, actionable error surfaced when `grep_search` is invoked but ripgrep
-/// could not be resolved at startup (or a spawn unexpectedly fails with
-/// `NotFound`). Never surface the raw `os error 2` for this case.
-const RIPGREP_UNAVAILABLE_MESSAGE: &str = "grep_search is unavailable: ripgrep (rg) not found on PATH. Install ripgrep or fix the service PATH, then restart.";
-
 /// Clear, actionable message for `search_artifacts` when the artifact embedding backend is
 /// unreachable at query time. Artifacts have no lexical (BM25) fallback, so the tool errors
 /// — but with this message instead of the raw upstream 400/connection error.
 const ARTIFACT_EMBEDDING_BACKEND_UNAVAILABLE_MESSAGE: &str = "artifact embedding backend unavailable — check the artifact embedding service (it may be down or restarting), then retry.";
-
-/// Resolve the absolute path to the `rg` (ripgrep) binary.
-///
-/// The MCP server runs under launchd as a Homebrew service, whose `PATH` is the
-/// minimal `/usr/bin:/bin:/usr/sbin:/sbin` — it does NOT include Homebrew's bin
-/// dir, so spawning bare `rg` fails with `ENOENT`. We resolve an absolute path
-/// instead: an explicit env override, then `PATH`, then known install locations,
-/// finally falling back to bare `rg` (preserving old behavior when it is on PATH).
-pub fn resolve_ripgrep() -> PathBuf {
-    resolve_ripgrep_env(|key| std::env::var(key).ok())
-}
-
-fn resolve_ripgrep_env(get_env: impl Fn(&str) -> Option<String>) -> PathBuf {
-    // 1. Explicit override.
-    for key in ["DEEP_OBSIDIAN_RIPGREP", "RIPGREP_PATH"] {
-        if let Some(value) = get_env(key) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                let candidate = PathBuf::from(trimmed);
-                if candidate.is_file() {
-                    return candidate;
-                }
-            }
-        }
-    }
-    // 2. Search PATH.
-    if let Some(path) = get_env("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("rg");
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    // 3. Known install locations (Homebrew prefix first, then common paths).
-    let mut known: Vec<PathBuf> = Vec::new();
-    if let Some(prefix) = get_env("HOMEBREW_PREFIX") {
-        let trimmed = prefix.trim();
-        if !trimmed.is_empty() {
-            known.push(PathBuf::from(trimmed).join("bin").join("rg"));
-        }
-    }
-    for path in [
-        "/opt/homebrew/bin/rg",
-        "/usr/local/bin/rg",
-        "/usr/bin/rg",
-        "/bin/rg",
-    ] {
-        known.push(PathBuf::from(path));
-    }
-    for candidate in known {
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    // 4. Fallback: bare name (works when rg is on PATH).
-    PathBuf::from("rg")
-}
 
 #[derive(Debug, Clone)]
 struct KnowledgeNote {
@@ -350,14 +285,10 @@ fn insert_optional_text(
     object.insert(format!("{key}Truncated"), json!(truncated));
 }
 
-pub(crate) fn content_hash(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("fnv1a64:{hash:016x}")
-}
+/// The canonical content hash. Re-exported from core so the tool layer's one-shot
+/// hashing and the backend's incremental (streaming upload) hashing are the same
+/// function rather than two copies that must be kept in sync.
+pub(crate) use deep_obsidian_core::content_hash;
 
 /// True when `path` targets a protected Template(s) folder. Mirrors the policy
 /// in core's `ensure_writable_vault_relative_path` (which is private), so the
@@ -1193,22 +1124,6 @@ fn file_path_match_json(match_item: &index_search::FilePathMatch) -> Value {
     Value::Object(object)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GrepContextLine {
-    line_number: usize,
-    line_text: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct LiveGrepMatch {
-    path: String,
-    line_number: usize,
-    submatches: Vec<index_search::GrepSubmatch>,
-    line_text: String,
-    context_before: Vec<GrepContextLine>,
-    context_after: Vec<GrepContextLine>,
-}
-
 fn grep_context_line_json(line: &GrepContextLine) -> Value {
     json!({
         "lineNumber": line.line_number,
@@ -1216,7 +1131,7 @@ fn grep_context_line_json(line: &GrepContextLine) -> Value {
     })
 }
 
-fn grep_match_json(match_item: &LiveGrepMatch, options: TextPayloadOptions) -> Value {
+fn grep_match_json(match_item: &GrepMatch, options: TextPayloadOptions) -> Value {
     let mut object = Map::from_iter([
         ("path".to_string(), json!(match_item.path.clone())),
         ("resourceUri".to_string(), json!(note_uri(&match_item.path))),
@@ -1318,25 +1233,13 @@ fn outline_payload(path: &str, content: &str, options: TextPayloadOptions) -> Va
     })
 }
 
-fn relative_vault_path(vault_path: &Path, absolute_path: &str) -> String {
-    let path = Path::new(absolute_path);
-    match path.strip_prefix(vault_path) {
-        Ok(relative) => relative
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/"),
-        Err(_) => absolute_path.to_string(),
-    }
-}
-
+/// Match `query` against a note-path list already fetched from the backend.
 fn live_find_file_matches(
-    vault_path: &Path,
+    files: Vec<String>,
     query: &str,
     mode: &str,
     limit: usize,
 ) -> Result<Vec<index_search::FilePathMatch>, String> {
-    let files = list_markdown_files(vault_path).map_err(|error| error.to_string())?;
     let limit = limit.max(1);
     if mode == "regex" {
         let matcher = RegexBuilder::new(query)
@@ -1366,210 +1269,29 @@ fn live_find_file_matches(
         .collect())
 }
 
-async fn live_grep_matches(
-    ripgrep_path: std::path::PathBuf,
-    vault_path: std::path::PathBuf,
-    index_dir: Option<std::path::PathBuf>,
-    query: String,
-    regex_mode: bool,
-    case_sensitive: bool,
-    glob: Option<String>,
-    context_lines: usize,
-    limit: usize,
-) -> Result<Vec<LiveGrepMatch>, String> {
-    // A custom index dir INSIDE the vault (holding the SQLite index and its
-    // sidecar files) must never leak into grep results as phantom vault paths.
-    // This is filtered on the emitted path rather than with a `--glob`: ripgrep
-    // matches globs containing a separator against paths relative to the process
-    // working directory (not to the searched root), so the only glob form that
-    // fires here is the unanchored `!**/<name>/**` — which would also hide a
-    // real note under any same-named directory elsewhere in the vault. An index
-    // dir equal to the vault root strips to an empty prefix; skip that
-    // degenerate case rather than hiding the whole vault.
-    let index_dir_prefix = index_dir
-        .and_then(|dir| dir.strip_prefix(&vault_path).ok().map(|p| p.to_path_buf()))
-        .filter(|relative| relative.components().next().is_some());
-    tokio::task::spawn_blocking(move || {
-        let mut args = vec![
-            "--json".to_string(),
-            "--line-number".to_string(),
-            "--with-filename".to_string(),
-            "--hidden".to_string(),
-            "--glob".to_string(),
-            "!.obsidian/**".to_string(),
-            "--glob".to_string(),
-            "!.git/**".to_string(),
-            "--glob".to_string(),
-            "!.deep-obsidian-mcp/**".to_string(),
-        ];
-        if !regex_mode {
-            args.push("--fixed-strings".to_string());
-        }
-        if !case_sensitive {
-            args.push("--ignore-case".to_string());
-        }
-        if let Some(glob) = glob.as_ref() {
-            args.push("--glob".to_string());
-            args.push(glob.clone());
-        } else {
-            args.push("--glob".to_string());
-            args.push("*.md".to_string());
-        }
-        // End-of-options separator: everything after `--` is treated by ripgrep
-        // strictly as positionals, so a user `query` (or path) beginning with `-`
-        // cannot be parsed as a flag (e.g. `--pre=<interpreter>` argv injection).
-        args.push("--".to_string());
-        args.push(query);
-        args.push(vault_path.to_string_lossy().into_owned());
-
-        let output = ProcessCommand::new(&ripgrep_path)
-            .args(&args)
-            .output()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    RIPGREP_UNAVAILABLE_MESSAGE.to_string()
-                } else {
-                    error.to_string()
-                }
-            })?;
-
-        if !output.status.success() && output.status.code() != Some(1) {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(if stderr.is_empty() {
-                format!("rg failed with status {}", output.status)
-            } else {
-                stderr
-            });
-        }
-
-        let stdout = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
-        let mut matches = Vec::new();
-        for line in stdout.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let parsed: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
-            if parsed.get("type").and_then(Value::as_str) != Some("match") {
-                continue;
-            }
-            let data = parsed
-                .get("data")
-                .ok_or_else(|| "rg match payload missing data".to_string())?;
-            let absolute_path = data
-                .get("path")
-                .and_then(|value| value.get("text"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| "rg match payload missing path".to_string())?;
-            // Drop hits under a vault-internal index dir before they count
-            // towards `limit`, so a phantom path never displaces a real note.
-            if let Some(prefix) = index_dir_prefix.as_ref() {
-                if Path::new(absolute_path)
-                    .strip_prefix(&vault_path)
-                    .is_ok_and(|relative| relative.starts_with(prefix))
-                {
-                    continue;
-                }
-            }
-            let line_number = data
-                .get("line_number")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| "rg match payload missing line number".to_string())?
-                as usize;
-            let line_text = data
-                .get("lines")
-                .and_then(|value| value.get("text"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| "rg match payload missing line text".to_string())?
-                .trim_end_matches('\n')
-                .to_string();
-            let submatches = data
-                .get("submatches")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "rg match payload missing submatches".to_string())?
-                .iter()
-                .map(|submatch| {
-                    Ok(index_search::GrepSubmatch {
-                        start: submatch
-                            .get("start")
-                            .and_then(Value::as_u64)
-                            .ok_or_else(|| "rg submatch missing start".to_string())?
-                            as usize,
-                        end: submatch
-                            .get("end")
-                            .and_then(Value::as_u64)
-                            .ok_or_else(|| "rg submatch missing end".to_string())?
-                            as usize,
-                        text: submatch
-                            .get("match")
-                            .and_then(|value| value.get("text"))
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| "rg submatch missing text".to_string())?
-                            .to_string(),
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-
-            matches.push(LiveGrepMatch {
-                path: relative_vault_path(&vault_path, absolute_path),
-                line_number,
-                submatches,
-                line_text,
-                context_before: Vec::new(),
-                context_after: Vec::new(),
-            });
-            if matches.len() >= limit.max(1) {
-                break;
-            }
-        }
-
-        if context_lines > 0 {
-            populate_grep_context(&vault_path, &mut matches, context_lines)?;
-        }
-
-        Ok(matches)
-    })
-    .await
-    .map_err(|error| error.to_string())?
+/// Issue a backend request, rendering any failure as the tool layer's `String` error.
+///
+/// The rendering is [`BackendError`](deep_obsidian_backend::BackendError)'s `Display`,
+/// which delegates to the underlying source — so a vault error keeps core's enriched
+/// wording and a bare IO error keeps its unadorned one. That is what makes these
+/// call sites byte-identical to the direct `fs`/`vault` calls they replaced.
+async fn backend_call(
+    state: &AppState,
+    request: BackendRequest,
+) -> Result<deep_obsidian_backend::BackendResponse, String> {
+    state
+        .backend
+        .execute(request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
-fn populate_grep_context(
-    vault_path: &Path,
-    matches: &mut [LiveGrepMatch],
-    context_lines: usize,
-) -> Result<(), String> {
-    let mut cache = HashMap::<String, Vec<String>>::new();
-    for match_item in matches {
-        let lines = if let Some(lines) = cache.get(&match_item.path) {
-            lines
-        } else {
-            let absolute_path = ensure_inside_vault(vault_path, &match_item.path)
-                .map_err(|error| error.to_string())?;
-            let text = fs::read_to_string(&absolute_path).map_err(|error| error.to_string())?;
-            cache.insert(match_item.path.clone(), split_note_lines(&text));
-            cache.get(&match_item.path).expect("cached grep context")
-        };
-        let line_index = match_item.line_number.saturating_sub(1);
-        let before_start = line_index.saturating_sub(context_lines);
-        match_item.context_before = lines[before_start..line_index.min(lines.len())]
-            .iter()
-            .enumerate()
-            .map(|(offset, line)| GrepContextLine {
-                line_number: before_start + offset + 1,
-                line_text: line.clone(),
-            })
-            .collect();
-        let after_start = (line_index + 1).min(lines.len());
-        let after_end = (after_start + context_lines).min(lines.len());
-        match_item.context_after = lines[after_start..after_end]
-            .iter()
-            .enumerate()
-            .map(|(offset, line)| GrepContextLine {
-                line_number: after_start + offset + 1,
-                line_text: line.clone(),
-            })
-            .collect();
-    }
-    Ok(())
+/// Read a note's text through the backend.
+async fn backend_read_text(state: &AppState, path: &str) -> Result<String, String> {
+    backend_call(state, BackendRequest::read_text(path))
+        .await?
+        .into_text()
+        .map_err(|error| error.to_string())
 }
 
 /// Run hybrid search off the async runtime, surfacing the degradation signal. When the
@@ -1635,12 +1357,12 @@ pub async fn call_tool(
             let folders_only = bool_arg(arguments, "foldersOnly", false);
             let include_hidden = bool_arg(arguments, "includeHidden", false);
             let include_ignored = bool_arg(arguments, "includeIgnored", false);
-            let entries = vault_list_children(
-                &config.vault_path,
-                path.as_deref(),
-                include_hidden,
-                include_ignored,
+            let entries = backend_call(
+                state,
+                BackendRequest::list_children(path.clone(), include_hidden, include_ignored),
             )
+            .await?
+            .into_children()
             .map_err(|error| error.to_string())?;
             if folders_only {
                 let folders = entries
@@ -1667,12 +1389,11 @@ pub async fn call_tool(
             let path = string_arg(arguments, "path")?;
             validate_format_arg(arguments)?;
             let text_options = TextPayloadOptions::from_arguments(arguments, true);
-            let file =
-                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            let text = backend_read_text(state, &path).await?;
             // Full-file content hash, computed with the same helper the write tools use so a
             // write's `newHash` can be fed straight back into a read's `knownHash`. Always the
             // full-file hash regardless of any startLine/endLine slice.
-            let hash = content_hash(file.text.as_bytes());
+            let hash = content_hash(text.as_bytes());
             let known_hash = optional_string_arg(arguments, "knownHash");
             if known_hash.as_deref() == Some(hash.as_str()) {
                 let result = Map::from_iter([
@@ -1695,12 +1416,12 @@ pub async fn call_tool(
                 .map(|value| value as usize);
             let text = if start_line.is_some() || end_line.is_some() {
                 deep_obsidian_core::vault::slice_lines(
-                    &file.text,
+                    &text,
                     start_line.unwrap_or(1),
                     end_line.or(start_line).unwrap_or(1),
                 )
             } else {
-                file.text
+                text
             };
             let line_count = text.split('\n').count();
             let mut result = Map::from_iter([
@@ -1724,13 +1445,19 @@ pub async fn call_tool(
             let mime_type = artifact_mime_type(&path)
                 .ok_or_else(|| format!("unsupported artifact type for {}", path))?;
             let kind = artifact_kind(&path).unwrap_or("artifact");
-            let absolute_path = ensure_inside_vault(&config.vault_path, &path)
+            // Stat and byte reads keep the BARE IO error wording this tool has always
+            // reported (no path prefix, no remediation) -- see `BackendError`.
+            let size_bytes = backend_call(state, BackendRequest::stat(&path))
+                .await?
+                .into_size_bytes()
                 .map_err(|error| error.to_string())?;
-            let metadata = fs::metadata(&absolute_path).map_err(|error| error.to_string())?;
             let include_base64 = bool_arg(arguments, "includeBase64", false);
             let max_bytes = clamped_usize_arg(arguments, "maxBytes", 0, 0, 1_048_576);
             let bytes = if include_base64 || max_bytes > 0 {
-                fs::read(&absolute_path).map_err(|error| error.to_string())?
+                backend_call(state, BackendRequest::read_bytes(&path))
+                    .await?
+                    .into_bytes()
+                    .map_err(|error| error.to_string())?
             } else {
                 Vec::new()
             };
@@ -1739,7 +1466,7 @@ pub async fn call_tool(
                 ("resourceUri".to_string(), json!(artifact_uri(&path))),
                 ("kind".to_string(), json!(kind)),
                 ("mimeType".to_string(), json!(mime_type)),
-                ("size".to_string(), json!(metadata.len())),
+                ("size".to_string(), json!(size_bytes)),
                 ("includeBase64".to_string(), json!(include_base64)),
                 ("maxBytes".to_string(), json!(max_bytes)),
             ]);
@@ -1767,7 +1494,11 @@ pub async fn call_tool(
             let mode = optional_enum_string_arg(arguments, "mode", &["substring", "regex"])?
                 .unwrap_or_else(|| "substring".to_string());
             let limit = clamped_usize_arg(arguments, "limit", 20, 1, 200);
-            let matches = live_find_file_matches(&config.vault_path, &query, &mode, limit)?
+            let files = backend_call(state, BackendRequest::walk_markdown())
+                .await?
+                .into_markdown_files()
+                .map_err(|error| error.to_string())?;
+            let matches = live_find_file_matches(files, &query, &mode, limit)?
                 .into_iter()
                 .map(|item| file_path_match_json(&item))
                 .collect::<Vec<_>>();
@@ -1790,18 +1521,20 @@ pub async fn call_tool(
             let context_lines = clamped_usize_arg(arguments, "contextLines", 0, 0, 20);
             let limit = clamped_usize_arg(arguments, "limit", 50, 1, 500);
             let text_options = TextPayloadOptions::from_arguments(arguments, true);
-            let matches = live_grep_matches(
-                (*state.ripgrep_path).clone(),
-                config.vault_path.clone(),
-                Some(config.index_dir.clone()),
-                query.clone(),
-                regex_mode,
-                case_sensitive,
-                glob.clone(),
-                context_lines,
-                limit,
+            let matches = backend_call(
+                state,
+                BackendRequest::Recall(RecallRequest::Grep {
+                    query: query.clone(),
+                    regex: regex_mode,
+                    case_sensitive,
+                    glob: glob.clone(),
+                    context_lines,
+                    limit,
+                }),
             )
             .await?
+            .into_grep_matches()
+            .map_err(|error| error.to_string())?
             .into_iter()
             .map(|item| grep_match_json(&item, text_options))
             .collect::<Vec<_>>();
@@ -1825,11 +1558,10 @@ pub async fn call_tool(
             if arguments.get("maxTextChars").is_none() {
                 text_options.max_text_chars = 4_000;
             }
-            let file =
-                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            let text = backend_read_text(state, &path).await?;
             Ok(json_text_result_from_arguments(
                 arguments,
-                outline_payload(&path, &file.text, text_options),
+                outline_payload(&path, &text, text_options),
             ))
         }
         "build_index" => {
@@ -2187,8 +1919,10 @@ pub async fn call_tool(
         "recommend_folder" => {
             let topic = string_arg(arguments, "topic")?;
             let project = optional_string_arg(arguments, "project");
-            let folders =
-                list_top_level_folders(&config.vault_path).map_err(|error| error.to_string())?;
+            let folders = backend_call(state, BackendRequest::top_level_folders())
+                .await?
+                .into_folders()
+                .map_err(|error| error.to_string())?;
             if folders.is_empty() {
                 return Ok(json_text_result(json!({
                     "folder": "Knowledge Capture",
@@ -2280,22 +2014,21 @@ pub async fn call_tool(
             let expected_hash = expected_hash_arg(arguments);
             let (content, compose_warning) = compose_explicit_note_content(arguments)?;
             let preserve_manual_notes = bool_arg(arguments, "preserveManualNotes", false);
-            let existing = read_text_file(&config.vault_path, &path).ok();
+            // A read failure means "no existing note" here, exactly as before: the
+            // error is deliberately discarded so a first write still creates.
+            let existing = backend_read_text(state, &path).await.ok();
             let previous_hash = existing
-                .as_ref()
-                .map(|existing| content_hash(existing.text.as_bytes()));
+                .as_deref()
+                .map(|existing| content_hash(existing.as_bytes()));
             validate_expected_hash(expected_hash.as_deref(), previous_hash.as_deref(), &path)?;
             let final_content = existing
-                .as_ref()
-                .map(|existing| {
-                    merge_with_manual_notes(&content, &existing.text, preserve_manual_notes)
-                })
+                .as_deref()
+                .map(|existing| merge_with_manual_notes(&content, existing, preserve_manual_notes))
                 .unwrap_or_else(|| finalize_written_content(&content));
             let new_hash = content_hash(final_content.as_bytes());
             let created = existing.is_none();
             if !dry_run {
-                write_text_file(&config.vault_path, &path, &final_content)
-                    .map_err(|error| error.to_string())?;
+                backend_call(state, BackendRequest::write_text(&path, &final_content)).await?;
             }
             let title = note_title_from_content(&path, &final_content);
             let mut payload = json!({
@@ -2321,13 +2054,12 @@ pub async fn call_tool(
             let replacement = string_arg(arguments, "content")?;
             let dry_run = bool_arg(arguments, "dryRun", false);
             let expected_hash = expected_hash_arg(arguments);
-            let existing =
-                read_text_file(&config.vault_path, &path).map_err(|error| error.to_string())?;
-            let previous_hash = content_hash(existing.text.as_bytes());
+            let existing = backend_read_text(state, &path).await?;
+            let previous_hash = content_hash(existing.as_bytes());
             validate_expected_hash(expected_hash.as_deref(), Some(&previous_hash), &path)?;
             let (final_content, action, level, heading) = match target.as_str() {
                 "preamble" => (
-                    replace_note_preamble(&existing.text, &replacement),
+                    replace_note_preamble(&existing, &replacement),
                     "updated".to_string(),
                     None,
                     None,
@@ -2339,7 +2071,7 @@ pub async fn call_tool(
                     let level = clamped_usize_arg(arguments, "level", 2, 1, 6);
                     let create_if_missing = bool_arg(arguments, "createIfMissing", true);
                     let (updated, action, actual_level) = update_or_create_note_section(
-                        &existing.text,
+                        &existing,
                         &heading,
                         &replacement,
                         level,
@@ -2358,8 +2090,7 @@ pub async fn call_tool(
             };
             let new_hash = content_hash(final_content.as_bytes());
             if !dry_run {
-                write_text_file(&config.vault_path, &path, &final_content)
-                    .map_err(|error| error.to_string())?;
+                backend_call(state, BackendRequest::write_text(&path, &final_content)).await?;
             }
             Ok(json_text_result(json!({
                 "action": action,
@@ -2379,7 +2110,7 @@ pub async fn call_tool(
             let expected_hash = expected_hash_arg(arguments);
             let mime_type = optional_string_arg(arguments, "mimeType");
             // Reject traversal NOW, at mint, before issuing any capability.
-            ensure_inside_vault(&config.vault_path, &path).map_err(|error| error.to_string())?;
+            backend_call(state, BackendRequest::resolve_path(&path)).await?;
             // Enforce the vault's protected-path policy: never let an
             // upload land inside Template(s)/ folders. Checked at mint so the
             // capability is never even issued for a protected destination.
@@ -2389,10 +2120,14 @@ pub async fn call_tool(
             let Some(base) = state.upload_base.as_ref() else {
                 return Err("request_vault_upload requires the HTTP service transport".to_string());
             };
-            // Best-effort cleanup of temp files orphaned by a crashed upload.
-            crate::uploads::sweep_orphan_temp_files(&config.vault_path);
-            let expires_at =
-                std::time::SystemTime::now() + crate::uploads::TOKEN_TTL;
+            // Best-effort cleanup of staging files orphaned by a crashed upload. The
+            // backend owns the staging mechanics, so it owns the sweep; failures are
+            // ignored exactly as before.
+            let _ = state
+                .backend
+                .execute(BackendRequest::sweep_orphan_staging_files())
+                .await;
+            let expires_at = std::time::SystemTime::now() + crate::uploads::TOKEN_TTL;
             let token = state.uploads.mint(crate::uploads::PendingUpload {
                 dest_path: path.clone(),
                 expected_hash: expected_hash.clone(),
@@ -2434,25 +2169,25 @@ pub async fn call_tool(
                     folder.as_deref().unwrap_or("Knowledge Capture"),
                 )
             });
-            let existing = read_text_file(&config.vault_path, &target_path).ok();
+            let existing = backend_read_text(state, &target_path).await.ok();
             let previous_hash = existing
-                .as_ref()
-                .map(|existing| content_hash(existing.text.as_bytes()));
+                .as_deref()
+                .map(|existing| content_hash(existing.as_bytes()));
             validate_expected_hash(
                 expected_hash.as_deref(),
                 previous_hash.as_deref(),
                 &target_path,
             )?;
-            let final_content = finalize_session_note_content(
-                &content,
-                existing.as_ref().map(|existing| existing.text.as_str()),
-                preserve_manual_notes,
-            );
+            let final_content =
+                finalize_session_note_content(&content, existing.as_deref(), preserve_manual_notes);
             let new_hash = content_hash(final_content.as_bytes());
             let created = existing.is_none();
             if !dry_run {
-                write_text_file(&config.vault_path, &target_path, &final_content)
-                    .map_err(|error| error.to_string())?;
+                backend_call(
+                    state,
+                    BackendRequest::write_text(&target_path, &final_content),
+                )
+                .await?;
             }
             Ok(json_text_result(json!({
                 "action": if existing.is_some() { "updated" } else { "created" },
@@ -2473,9 +2208,9 @@ pub async fn call_tool(
 mod tests {
     use super::{
         call_tool, clamped_usize_arg, compose_explicit_note_content, content_hash,
-        finalize_session_note_content, json_text_result_from_arguments, live_grep_matches,
-        merge_with_manual_notes, optional_enum_string_arg, outline_payload, replace_note_preamble,
-        string_arg, tool_definitions, update_or_create_note_section, TextPayloadOptions,
+        finalize_session_note_content, json_text_result_from_arguments, merge_with_manual_notes,
+        optional_enum_string_arg, outline_payload, replace_note_preamble, string_arg,
+        tool_definitions, update_or_create_note_section, TextPayloadOptions,
     };
     use crate::mcp::AppState;
     use crate::runtime::RuntimeState;
@@ -3110,162 +2845,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grep_search_populates_context_lines() {
-        let vault_path = temp_dir("grep-context");
-        fs::write(
-            vault_path.join("Context.md"),
-            "alpha\nbefore\nneedle here\nafter\nomega\n",
-        )
-        .expect("write note");
-
-        let matches = live_grep_matches(
-            super::resolve_ripgrep(),
-            vault_path,
-            None,
-            "needle".to_string(),
-            false,
-            true,
-            None,
-            1,
-            10,
-        )
-        .await
-        .expect("grep matches");
-
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].line_number, 3);
-        assert_eq!(matches[0].context_before[0].line_text, "before");
-        assert_eq!(matches[0].context_after[0].line_text, "after");
-    }
-
-    #[tokio::test]
-    async fn grep_search_treats_flaglike_query_as_literal_pattern() {
-        // A query beginning with `-`/`--` must be searched as a literal pattern,
-        // not parsed by ripgrep as a flag (argv injection guard via `--`).
-        let vault_path = temp_dir("grep-flaglike");
-        fs::write(
-            vault_path.join("Flags.md"),
-            "ordinary line\ncontains --pre=/bin/echo here\ntrailing line\n",
-        )
-        .expect("write note");
-
-        let matches = live_grep_matches(
-            super::resolve_ripgrep(),
-            vault_path,
-            None,
-            "--pre=/bin/echo".to_string(),
-            false,
-            true,
-            None,
-            0,
-            10,
-        )
-        .await
-        .expect("flag-like query must be a literal search, not an rg flag error");
-
-        assert_eq!(matches.len(), 1, "literal flag-like string should match once");
-        assert_eq!(matches[0].line_number, 2);
-        assert!(matches[0].line_text.contains("--pre=/bin/echo"));
-    }
-
-    #[tokio::test]
-    async fn grep_search_excludes_a_custom_index_dir_inside_the_vault() {
-        // An index dir configured INSIDE the vault holds the SQLite index and
-        // its sidecars. With a caller-supplied glob those files are reachable by
-        // rg and would surface as phantom vault paths.
-        let vault_path = temp_dir("grep-index-dir");
-        let index_dir = vault_path.join("Index Cache");
-        fs::create_dir_all(&index_dir).expect("create index dir");
-        fs::write(vault_path.join("Real.md"), "needle in a real note\n").expect("write note");
-        fs::write(index_dir.join("index.sqlite"), "needle in the index\n").expect("write index");
-        fs::write(index_dir.join("cached.md"), "needle in a cache file\n").expect("write cache");
-        // A real note under a SAME-NAMED directory elsewhere must survive: the
-        // exclusion is the index dir itself, not every path segment like it.
-        let namesake = vault_path.join("Projets/Index Cache");
-        fs::create_dir_all(&namesake).expect("create namesake dir");
-        fs::write(namesake.join("Notes.md"), "needle in a real note\n").expect("write namesake");
-
-        let paths = |matches: &[super::LiveGrepMatch]| {
-            let mut paths: Vec<String> = matches.iter().map(|item| item.path.clone()).collect();
-            paths.sort();
-            paths
-        };
-
-        // Without the exclusion the index dir leaks into the results — this is
-        // the bug, asserted so the fix below cannot pass vacuously.
-        let leaked = live_grep_matches(
-            super::resolve_ripgrep(),
-            vault_path.clone(),
-            None,
-            "needle".to_string(),
-            false,
-            true,
-            Some("**/*".to_string()),
-            0,
-            10,
-        )
-        .await
-        .expect("grep matches");
-        assert_eq!(
-            paths(&leaked),
-            vec![
-                "Index Cache/cached.md".to_string(),
-                "Index Cache/index.sqlite".to_string(),
-                "Projets/Index Cache/Notes.md".to_string(),
-                "Real.md".to_string()
-            ]
-        );
-
-        // With the resolved index dir the phantom paths are gone — and only
-        // those: the same-named directory deeper in the vault is untouched.
-        let filtered = live_grep_matches(
-            super::resolve_ripgrep(),
-            vault_path.clone(),
-            Some(index_dir),
-            "needle".to_string(),
-            false,
-            true,
-            Some("**/*".to_string()),
-            0,
-            10,
-        )
-        .await
-        .expect("grep matches");
-        assert_eq!(
-            paths(&filtered),
-            vec![
-                "Projets/Index Cache/Notes.md".to_string(),
-                "Real.md".to_string()
-            ]
-        );
-
-        // An index dir outside the vault yields no exclusion and no false
-        // negatives.
-        let outside = live_grep_matches(
-            super::resolve_ripgrep(),
-            vault_path.clone(),
-            Some(temp_dir("grep-index-dir-outside")),
-            "needle".to_string(),
-            false,
-            true,
-            None,
-            0,
-            10,
-        )
-        .await
-        .expect("grep matches");
-        assert_eq!(
-            paths(&outside),
-            vec![
-                "Index Cache/cached.md".to_string(),
-                "Projets/Index Cache/Notes.md".to_string(),
-                "Real.md".to_string()
-            ],
-            "the default *.md glob still sees every markdown file"
-        );
-    }
-
-    #[tokio::test]
     async fn request_vault_upload_requires_http_transport_under_stdio() {
         let vault_path = temp_dir("upload-stdio");
         // `test_state` builds an AppState with upload_base = None (stdio default).
@@ -3512,12 +3091,18 @@ mod tests {
         let (runtime, _auto_reindex) = RuntimeState::bootstrap(config.clone())
             .await
             .expect("bootstrap runtime");
-        // Force the unavailable state regardless of the host environment.
+        // Force the unavailable state regardless of the host environment: a backend
+        // whose `rg` path does not exist reports no grep capability.
         let state = AppState {
+            backend: std::sync::Arc::new(
+                deep_obsidian_backend::FilesystemVaultBackend::with_ripgrep(
+                    config.vault_path.clone(),
+                    vault_path.join("definitely-missing-rg"),
+                ),
+            ),
             config: std::sync::Arc::new(config),
             runtime,
             auth: std::sync::Arc::new(crate::auth::AuthState::disabled()),
-            ripgrep_path: std::sync::Arc::new(PathBuf::from("rg")),
             rg_available: false,
             uploads: crate::uploads::UploadStore::new(),
             upload_base: None,
@@ -3535,35 +3120,6 @@ mod tests {
             "error must not surface the raw spawn error, got: {error}"
         );
         assert_eq!(error, super::RIPGREP_UNAVAILABLE_MESSAGE);
-    }
-
-    #[tokio::test]
-    async fn live_grep_spawn_not_found_yields_clear_message() {
-        let vault_path = temp_dir("grep-spawn-missing");
-        // An absolute path that does not exist makes the spawn fail with
-        // `ErrorKind::NotFound`, exercising the spawn-failure branch directly.
-        let missing_rg = vault_path.join("definitely-missing-rg");
-        let result = live_grep_matches(
-            missing_rg,
-            vault_path,
-            None,
-            "needle".to_string(),
-            false,
-            true,
-            None,
-            0,
-            10,
-        )
-        .await;
-        let error = result.expect_err("spawn of a missing binary must fail");
-        assert!(
-            error.contains("ripgrep"),
-            "spawn NotFound should yield the clear message, got: {error}"
-        );
-        assert!(
-            !error.contains("os error 2"),
-            "spawn NotFound must not surface the raw os error, got: {error}"
-        );
     }
 
     #[test]
@@ -3739,32 +3295,5 @@ mod tests {
         // Full text present and not omitted for a small response.
         assert!(matches[0].get("text").and_then(serde_json::Value::as_str).is_some());
         assert!(matches[0].get("textOmitted").is_none());
-    }
-
-    #[test]
-    fn resolve_ripgrep_honors_existing_override() {
-        // `/bin/sh` exists on macOS and Linux — stand-in for an existing rg path.
-        let resolved = super::resolve_ripgrep_env(|key| {
-            if key == "DEEP_OBSIDIAN_RIPGREP" {
-                Some("/bin/sh".to_string())
-            } else {
-                None
-            }
-        });
-        assert_eq!(resolved, std::path::PathBuf::from("/bin/sh"));
-    }
-
-    #[test]
-    fn resolve_ripgrep_ignores_missing_override_and_resolves_rg() {
-        // A non-existent override and a bogus PATH dir must never be returned.
-        // The result is always a path named `rg` — either a real known location
-        // (when ripgrep is installed) or the bare fallback name.
-        let resolved = super::resolve_ripgrep_env(|key| match key {
-            "DEEP_OBSIDIAN_RIPGREP" => Some("/no/such/rg".to_string()),
-            "PATH" => Some("/no/such/dir".to_string()),
-            _ => None,
-        });
-        assert_ne!(resolved, std::path::PathBuf::from("/no/such/rg"));
-        assert_eq!(resolved.file_name().and_then(|n| n.to_str()), Some("rg"));
     }
 }

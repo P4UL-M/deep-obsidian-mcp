@@ -2597,7 +2597,7 @@ fn check_index_dir(config: &ResolvedServiceConfig) -> CheckReport {
 }
 
 fn check_rg() -> CheckReport {
-    let rg = deep_obsidian_server::tools::resolve_ripgrep();
+    let rg = deep_obsidian_backend::resolve_ripgrep();
     match ProcessCommand::new(&rg).arg("--version").output() {
         Ok(output) if output.status.success() => CheckReport {
             name: "rg".into(),

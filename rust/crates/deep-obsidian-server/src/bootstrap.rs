@@ -10,7 +10,6 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_config::{build_service_endpoints, is_loopback_host, normalize_service_config};
-use deep_obsidian_core::vault::ensure_vault_path;
 use deep_obsidian_types::{
     ResolvedServiceConfig, ServiceConfigInput, ServiceEndpoints, TransportMode,
 };
@@ -185,7 +184,7 @@ pub(crate) async fn upload_handler(
     AxumPath(token): AxumPath<String>,
     body: Body,
 ) -> impl IntoResponse {
-    use crate::uploads::{commit_stream, ClaimError, CommitError};
+    use crate::uploads::{commit_stream_via_backend, ClaimError, CommitError};
 
     // Atomically claim the token (or reject). Generic errors only: never leak
     // whether a vault path exists.
@@ -199,23 +198,22 @@ pub(crate) async fn upload_handler(
         }
     };
 
-    // Bridge the async body stream into a synchronous, bounded commit on a
-    // blocking thread. The lock is NOT held during streaming.
+    // Bridge the async body stream into the backend's bounded commit, which pulls
+    // the chunks synchronously on its own blocking thread. The lock is NOT held
+    // during streaming, and the commit runs concurrently with the pump below.
     let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(4);
-    let vault_path = state.config.vault_path.clone();
+    let backend = state.backend.clone();
     let dest_path = pending.dest_path.clone();
     let expected_hash = pending.expected_hash.clone();
     let max_bytes = pending.max_bytes;
 
-    let commit = tokio::task::spawn_blocking(move || {
-        commit_stream(
-            &vault_path,
-            &dest_path,
-            expected_hash.as_deref(),
-            max_bytes,
-            chunk_rx.into_iter(),
-        )
-    });
+    let commit = tokio::spawn(commit_stream_via_backend(
+        backend,
+        dest_path,
+        expected_hash,
+        max_bytes,
+        deep_obsidian_backend::UploadChunks::new(chunk_rx.into_iter()),
+    ));
 
     let mut stream = body.into_data_stream();
     let mut stream_error: Option<String> = None;
@@ -308,18 +306,26 @@ pub async fn run_http_service(
         );
     }
 
-    // Startup validation gate; the normalized root it returns is not needed here.
-    ensure_vault_path(&config.vault_path)
+    // Build state first so the startup gate can run through the backend. Both
+    // `RuntimeState::new` and `AppState::new` are pure construction, so this does
+    // not change what happens before the gate — only where the gate asks.
+    let runtime = RuntimeState::new(config.clone());
+    let state =
+        AppState::new(config.clone(), runtime.clone()).with_upload_base(upload_base_url(&config));
+
+    // Startup validation gate. The backend reports unreachability with core's
+    // wording, so the failure a user sees is unchanged.
+    state
+        .backend
+        .execute(deep_obsidian_backend::BackendRequest::health_overview())
+        .await
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
     let auth_state = resolve_auth_state(&config)?;
     enforce_auth_exposure(&config, auth_state.enabled)?;
 
     let endpoints = build_service_endpoints(&config);
-    let runtime = RuntimeState::new(config.clone());
-    let state = AppState::new(config.clone(), runtime.clone())
-        .with_upload_base(upload_base_url(&config))
-        .with_auth(auth_state);
+    let state = state.with_auth(auth_state);
 
     // Protected routes share an auth/origin middleware layer; health and
     // readiness are intentionally left open for liveness probes.

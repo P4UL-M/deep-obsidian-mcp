@@ -1,6 +1,10 @@
 //! Out-of-band binary upload support: capability tokens and the streaming
 //! commit path used by the `PUT /upload/{token}` endpoint.
 //!
+//! The bytes themselves are landed by the vault backend; what lives here is the
+//! capability-token store and the error taxonomy the HTTP endpoint maps to status
+//! codes.
+//!
 //! A token is minted by the `request_vault_upload` MCP tool. It is bound at mint
 //! time to a validated, vault-relative destination path and carries a short TTL.
 //! Bytes travel out-of-band (e.g. via `curl --data-binary`) and the endpoint has
@@ -8,15 +12,21 @@
 //! before the token expires.
 
 use std::collections::HashMap;
-use std::fs;
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use deep_obsidian_backend::{
+    BackendError, BackendRequest, MutationRequest, UploadChunks, VaultBackend,
+};
 
 /// Maximum bytes a single upload may carry (100 MiB).
 pub const DEFAULT_MAX_UPLOAD_BYTES: usize = 104_857_600;
 /// Time-to-live for a minted upload token.
+///
+/// Must stay >= the backend's staging-file TTL (`filesystem::STAGING_TTL`), which
+/// decides when an abandoned staging file is old enough to delete. If this grew
+/// past it, the sweep could unlink a staging file belonging to an upload that is
+/// still legitimately in flight.
 pub const TOKEN_TTL: Duration = Duration::from_secs(300);
 /// Maximum number of outstanding (unconsumed) tokens.
 pub const MAX_OUTSTANDING_TOKENS: usize = 64;
@@ -101,7 +111,7 @@ impl UploadStore {
         // Lazily purge OTHER expired entries. The requested token is handled
         // explicitly so an expired-but-present token reports `Expired` (410)
         // rather than `Unknown` (403). Orphan temp files (from a crashed
-        // mid-stream process) are swept separately via `sweep_orphan_temp_files`.
+        // mid-stream process) are swept separately by the backend's staging sweep.
         map.retain(|key, pending| {
             key == token || pending.in_flight || !pending.is_expired(now)
         });
@@ -144,69 +154,6 @@ impl UploadStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
-    }
-}
-
-/// Prefix used for in-progress upload temp files.
-const TEMP_PREFIX: &str = ".upload-";
-
-/// Sweep the vault for orphan `.upload-*.tmp` files older than the token TTL and
-/// unlink them. These are left behind only if a process is killed mid-stream
-/// (the normal failure path always removes its own temp file). Called lazily on
-/// mint so a crashed upload does not leak disk indefinitely. Errors are ignored:
-/// this is best-effort housekeeping, never a hard failure.
-pub fn sweep_orphan_temp_files(vault_path: &Path) {
-    sweep_orphan_temp_files_at(vault_path, SystemTime::now());
-}
-
-/// Testable core of [`sweep_orphan_temp_files`] with an injectable reference time.
-/// A `.upload-*.tmp` file is removed only when `now - mtime > TOKEN_TTL`.
-fn sweep_orphan_temp_files_at(vault_path: &Path, now: SystemTime) {
-    sweep_dir(vault_path, now, 0);
-}
-
-fn sweep_dir(dir: &Path, now: SystemTime, depth: usize) {
-    // Bound recursion to avoid pathological deep trees.
-    if depth > 24 {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            // Skip hidden/system dirs except we still descend normal folders.
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name == ".git" || name == ".obsidian" {
-                continue;
-            }
-            sweep_dir(&path, now, depth + 1);
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with(TEMP_PREFIX) || !name.ends_with(".tmp") {
-            continue;
-        }
-        // Only remove temp files older than the TTL, so a concurrent in-flight
-        // upload's temp file is never deleted out from under it.
-        let stale = entry
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .map(|modified| {
-                now.duration_since(modified)
-                    .map(|age| age > TOKEN_TTL)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        if stale {
-            let _ = fs::remove_file(&path);
-        }
     }
 }
 
@@ -257,6 +204,26 @@ impl std::fmt::Display for CommitError {
     }
 }
 
+/// Normalize a backend failure into the endpoint's error taxonomy.
+///
+/// Every arm is a 1:1 mapping, so the HTTP status codes and the strings the endpoint
+/// returns are unchanged: a byte-budget overrun is still `TooLarge`, an escape is
+/// still `EscapesVault`, and anything else renders through `BackendError`'s
+/// `Display` — which for a bare IO error is the raw `io::Error` string, exactly what
+/// `CommitError::Io` used to carry.
+impl From<BackendError> for CommitError {
+    fn from(error: BackendError) -> Self {
+        match error {
+            BackendError::PayloadTooLarge => CommitError::TooLarge,
+            BackendError::PathEscapesVault => CommitError::EscapesVault,
+            BackendError::HashConflict { expected, found } => {
+                CommitError::HashConflict { expected, found }
+            }
+            other => CommitError::Io(other.to_string()),
+        }
+    }
+}
+
 /// Result of a successful commit.
 #[derive(Debug)]
 pub struct CommitOutcome {
@@ -265,125 +232,38 @@ pub struct CommitOutcome {
     pub hash: String,
 }
 
-/// Compute and return the absolute destination path, ensuring the canonical
-/// parent directory stays within the canonical vault root.
+/// Land an upload's bytes at its bound destination, through the backend.
 ///
-/// `ensure_inside_vault` is lexical only; this adds the runtime symlink guard.
-/// Directories are created within the vault as needed before canonicalization.
-fn resolve_guarded_destination(
-    vault_path: &Path,
-    dest_path: &str,
-) -> Result<PathBuf, CommitError> {
-    let absolute = deep_obsidian_core::vault::ensure_inside_vault(vault_path, dest_path)
-        .map_err(|_| CommitError::EscapesVault)?;
-    let parent = absolute
-        .parent()
-        .ok_or_else(|| CommitError::Io("destination has no parent directory".to_string()))?;
-    fs::create_dir_all(parent).map_err(|error| CommitError::Io(error.to_string()))?;
-
-    let canonical_parent = parent
-        .canonicalize()
-        .map_err(|error| CommitError::Io(error.to_string()))?;
-    let canonical_vault = vault_path
-        .canonicalize()
-        .map_err(|error| CommitError::Io(error.to_string()))?;
-    if !canonical_parent.starts_with(&canonical_vault) {
-        return Err(CommitError::EscapesVault);
-    }
-    Ok(absolute)
-}
-
-/// Stream `chunks` to a temp file in the destination's parent directory,
-/// enforcing `max_bytes` during streaming, then atomically rename over the
-/// destination. The hash and create/update decision are computed at commit.
+/// The staging file, the incremental hash, the byte budget, the optimistic-concurrency
+/// re-read and the atomic swap all live inside the backend: "write a sibling temp file
+/// then rename" is a filesystem mechanic, not a vault contract. This function is the
+/// thin adapter that keeps [`CommitError`] — and therefore every HTTP status code and
+/// message the upload endpoint returns — exactly as it was.
 ///
-/// `expected_hash`, when set, triggers an optimistic-concurrency re-read of the
-/// destination at commit; a mismatch aborts with `HashConflict`.
-///
-/// On any failure the temp file is removed and the destination is left untouched.
-pub fn commit_stream<I>(
-    vault_path: &Path,
-    dest_path: &str,
-    expected_hash: Option<&str>,
+/// Takes owned arguments so the caller can drive it as a concurrent task while it
+/// pumps the request body into `chunks`.
+pub async fn commit_stream_via_backend(
+    backend: Arc<dyn VaultBackend>,
+    dest_path: String,
+    expected_hash: Option<String>,
     max_bytes: usize,
-    mut chunks: I,
-) -> Result<CommitOutcome, CommitError>
-where
-    I: Iterator<Item = Result<Vec<u8>, String>>,
-{
-    let absolute = resolve_guarded_destination(vault_path, dest_path)?;
-    let parent = absolute
-        .parent()
-        .ok_or_else(|| CommitError::Io("destination has no parent directory".to_string()))?;
-
-    let created = !absolute.exists();
-
-    let temp_path = parent.join(format!("{TEMP_PREFIX}{}.tmp", random_token()));
-    let mut temp_file = match fs::File::create(&temp_path) {
-        Ok(file) => file,
-        Err(error) => return Err(CommitError::Io(error.to_string())),
-    };
-
-    let mut total: usize = 0;
-    // FNV-1a, computed incrementally so we never buffer the whole file in RAM.
-    // Must stay byte-for-byte equivalent to `crate::tools::content_hash`.
-    let mut hash_state: u64 = 0xcbf2_9ce4_8422_2325;
-    let result = (|| -> Result<(), CommitError> {
-        while let Some(chunk) = chunks.next() {
-            let chunk = chunk.map_err(CommitError::Io)?;
-            total = total.saturating_add(chunk.len());
-            if total > max_bytes {
-                return Err(CommitError::TooLarge);
-            }
-            temp_file
-                .write_all(&chunk)
-                .map_err(|error| CommitError::Io(error.to_string()))?;
-            for byte in &chunk {
-                hash_state ^= u64::from(*byte);
-                hash_state = hash_state.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-        temp_file
-            .flush()
-            .map_err(|error| CommitError::Io(error.to_string()))?;
-        Ok(())
-    })();
-
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    drop(temp_file);
-
-    // Optimistic concurrency: re-read the destination at commit if requested.
-    if let Some(expected) = expected_hash {
-        let current_hash = match fs::read(&absolute) {
-            Ok(bytes) => Some(crate::tools::content_hash(&bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                let _ = fs::remove_file(&temp_path);
-                return Err(CommitError::Io(error.to_string()));
-            }
-        };
-        if current_hash.as_deref() != Some(expected) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(CommitError::HashConflict {
-                expected: expected.to_string(),
-                found: current_hash.unwrap_or_else(|| "null".to_string()),
-            });
-        }
-    }
-
-    let hash = format!("fnv1a64:{hash_state:016x}");
-    if let Err(error) = fs::rename(&temp_path, &absolute) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(CommitError::Io(error.to_string()));
-    }
-
+    chunks: UploadChunks,
+) -> Result<CommitOutcome, CommitError> {
+    let outcome = backend
+        .execute(BackendRequest::Mutation(
+            MutationRequest::CommitUploadStream {
+                path: dest_path,
+                expected_hash,
+                max_bytes,
+                chunks,
+            },
+        ))
+        .await
+        .and_then(|response| response.into_upload_outcome())?;
     Ok(CommitOutcome {
-        created,
-        bytes_written: total,
-        hash,
+        created: outcome.created,
+        bytes_written: outcome.bytes_written,
+        hash: outcome.hash,
     })
 }
 
@@ -479,158 +359,85 @@ mod tests {
         assert!(store.mint(pending("a/b.bin", TOKEN_TTL)).is_err());
     }
 
-    #[test]
-    fn commit_stream_writes_file_and_reports_created() {
+    /// The adapter between the backend and [`CommitError`] is what decides the
+    /// upload endpoint's HTTP status codes, and for a conflict it also decides the
+    /// 409 body. These go through `commit_stream_via_backend` — the exact path
+    /// `upload_handler` drives — so a dropped or reordered field would fail here.
+    #[tokio::test]
+    async fn backend_failures_map_to_the_commit_error_taxonomy() {
+        use deep_obsidian_backend::FilesystemVaultBackend;
+
         let dir = std::env::temp_dir().join(format!(
-            "upload-test-{}-{}",
+            "upload-adapter-{}-{}",
             std::process::id(),
             random_token()
         ));
-        fs::create_dir_all(&dir).unwrap();
-        let chunks = vec![Ok(b"hello ".to_vec()), Ok(b"world".to_vec())];
-        let outcome = commit_stream(
-            &dir,
-            "sub/out.bin",
-            None,
-            DEFAULT_MAX_UPLOAD_BYTES,
-            chunks.into_iter(),
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("doc.bin"), b"current").unwrap();
+        let backend = || -> Arc<dyn VaultBackend> { Arc::new(FilesystemVaultBackend::new(&dir)) };
+
+        // Stale expected hash -> 409, carrying both hashes verbatim.
+        let error = commit_stream_via_backend(
+            backend(),
+            "doc.bin".to_string(),
+            Some("fnv1a64:0000000000000000".to_string()),
+            1024,
+            UploadChunks::new(std::iter::once(Ok(b"replacement".to_vec()))),
         )
-        .unwrap();
-        assert!(outcome.created);
-        assert_eq!(outcome.bytes_written, 11);
-        assert_eq!(outcome.hash, crate::tools::content_hash(b"hello world"));
-        let written = fs::read(dir.join("sub/out.bin")).unwrap();
-        assert_eq!(written, b"hello world");
-
-        // Second write is an update, not a create.
-        let chunks = vec![Ok(b"again".to_vec())];
-        let outcome = commit_stream(
-            &dir,
-            "sub/out.bin",
-            None,
-            DEFAULT_MAX_UPLOAD_BYTES,
-            chunks.into_iter(),
-        )
-        .unwrap();
-        assert!(!outcome.created);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn commit_stream_aborts_on_oversize() {
-        let dir = std::env::temp_dir().join(format!(
-            "upload-test-{}-{}",
-            std::process::id(),
-            random_token()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        // Cap of 4 bytes, stream 10.
-        let chunks = vec![Ok(b"12345".to_vec()), Ok(b"67890".to_vec())];
-        let err = commit_stream(&dir, "big.bin", None, 4, chunks.into_iter()).unwrap_err();
-        assert!(matches!(err, CommitError::TooLarge));
-        // Destination must not exist and no temp file left behind.
-        assert!(!dir.join("big.bin").exists());
-        let leftovers: Vec<_> = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".upload-"))
-            .collect();
-        assert!(leftovers.is_empty(), "temp file should be cleaned up");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn commit_stream_rejects_hash_conflict() {
-        let dir = std::env::temp_dir().join(format!(
-            "upload-test-{}-{}",
-            std::process::id(),
-            random_token()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("doc.bin"), b"current").unwrap();
-        let chunks = vec![Ok(b"new".to_vec())];
-        let err = commit_stream(
-            &dir,
-            "doc.bin",
-            Some("fnv1a64:0000000000000000"),
-            DEFAULT_MAX_UPLOAD_BYTES,
-            chunks.into_iter(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, CommitError::HashConflict { .. }));
-        // Original is untouched.
-        assert_eq!(fs::read(dir.join("doc.bin")).unwrap(), b"current");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn sweep_removes_only_stale_orphan_temp_files() {
-        let vault = std::env::temp_dir().join(format!(
-            "upload-sweep-{}-{}",
-            std::process::id(),
-            random_token()
-        ));
-        fs::create_dir_all(vault.join("sub")).unwrap();
-        let orphan = vault.join("sub/.upload-old.tmp");
-        fs::write(&orphan, b"junk").unwrap();
-        let keep = vault.join("sub/real.bin");
-        fs::write(&keep, b"data").unwrap();
-        let temp_named_but_not_prefix = vault.join("sub/notes.tmp");
-        fs::write(&temp_named_but_not_prefix, b"keep").unwrap();
-
-        // With `now` at the file's creation time, nothing is stale yet.
-        sweep_orphan_temp_files_at(&vault, SystemTime::now());
-        assert!(orphan.exists(), "fresh orphan must be preserved");
-
-        // Advance `now` well past the TTL: the orphan is now stale and removed,
-        // while non-`.upload-` files are always preserved regardless of age.
-        let future = SystemTime::now() + TOKEN_TTL + Duration::from_secs(60);
-        sweep_orphan_temp_files_at(&vault, future);
-        assert!(!orphan.exists(), "stale orphan should be removed");
-        assert!(keep.exists(), "unrelated file should be preserved");
-        assert!(
-            temp_named_but_not_prefix.exists(),
-            "non-upload .tmp file should be preserved"
+        .await
+        .expect_err("a stale expected hash must conflict");
+        assert!(matches!(error, CommitError::HashConflict { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "hash conflict: expected fnv1a64:0000000000000000, found {}",
+                crate::tools::content_hash(b"current")
+            )
         );
-        let _ = fs::remove_dir_all(&vault);
-    }
+        // The destination is untouched by a rejected commit.
+        assert_eq!(std::fs::read(dir.join("doc.bin")).unwrap(), b"current");
 
-    #[test]
-    fn commit_stream_rejects_symlink_escape() {
-        let outside = std::env::temp_dir().join(format!(
-            "upload-outside-{}-{}",
-            std::process::id(),
-            random_token()
-        ));
-        let vault = std::env::temp_dir().join(format!(
-            "upload-vault-{}-{}",
-            std::process::id(),
-            random_token()
-        ));
-        fs::create_dir_all(&outside).unwrap();
-        fs::create_dir_all(&vault).unwrap();
-        // Create a symlink inside the vault pointing outside it.
-        let link = vault.join("escape");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-        #[cfg(not(unix))]
-        {
-            let _ = link;
-            let _ = fs::remove_dir_all(&outside);
-            let _ = fs::remove_dir_all(&vault);
-            return;
-        }
-        let chunks = vec![Ok(b"x".to_vec())];
-        let err = commit_stream(
-            &vault,
-            "escape/evil.bin",
+        // Over the byte budget -> 413.
+        let error = commit_stream_via_backend(
+            backend(),
+            "big.bin".to_string(),
             None,
-            DEFAULT_MAX_UPLOAD_BYTES,
-            chunks.into_iter(),
+            4,
+            UploadChunks::new(std::iter::once(Ok(b"12345".to_vec()))),
         )
-        .unwrap_err();
-        assert!(matches!(err, CommitError::EscapesVault));
-        let _ = fs::remove_dir_all(&outside);
-        let _ = fs::remove_dir_all(&vault);
+        .await
+        .expect_err("an oversize body must be rejected");
+        assert!(matches!(error, CommitError::TooLarge));
+        assert_eq!(error.to_string(), "upload exceeds maximum allowed size");
+        assert!(!dir.join("big.bin").exists());
+
+        // Traversal -> the escape arm, which the endpoint reports as 403.
+        let error = commit_stream_via_backend(
+            backend(),
+            "../escaped.bin".to_string(),
+            None,
+            1024,
+            UploadChunks::new(std::iter::once(Ok(b"x".to_vec()))),
+        )
+        .await
+        .expect_err("a traversing destination must be rejected");
+        assert!(matches!(error, CommitError::EscapesVault));
+        assert_eq!(error.to_string(), "destination escapes the vault root");
+
+        // A successful commit still reports the canonical hash and byte count.
+        let outcome = commit_stream_via_backend(
+            backend(),
+            "fresh.bin".to_string(),
+            None,
+            1024,
+            UploadChunks::new(std::iter::once(Ok(b"landed".to_vec()))),
+        )
+        .await
+        .expect("a clean commit should succeed");
+        assert!(outcome.created);
+        assert_eq!(outcome.bytes_written, 6);
+        assert_eq!(outcome.hash, crate::tools::content_hash(b"landed"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
