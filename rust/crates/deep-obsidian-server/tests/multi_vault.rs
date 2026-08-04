@@ -1271,6 +1271,7 @@ impl CouchdbFixture {
         config.experimental = ExperimentalConfig {
             multi_vault: true,
             couchdb_vaults: true,
+            ..ExperimentalConfig::default()
         };
         // Replace the `team` filesystem mount with a couchdb one at the same prefix,
         // so the routing assertions below are about the BACKEND KIND rather than about
@@ -1337,6 +1338,7 @@ fn a_couchdb_mount_requires_the_couchdb_vaults_flag() {
         experimental: Some(ExperimentalConfig {
             multi_vault: true,
             couchdb_vaults: false,
+            ..ExperimentalConfig::default()
         }),
         ..Default::default()
     };
@@ -1349,6 +1351,7 @@ fn a_couchdb_mount_requires_the_couchdb_vaults_flag() {
         experimental: Some(ExperimentalConfig {
             multi_vault: true,
             couchdb_vaults: true,
+            ..ExperimentalConfig::default()
         }),
         ..Default::default()
     };
@@ -1965,5 +1968,621 @@ async fn grep_scoped_to_a_couchdb_mount_is_refused_honestly() {
     assert!(
         root.get("result").is_some(),
         "grep on the filesystem root must still work: {root}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// An ALGOLIA mount, through MCP
+// ---------------------------------------------------------------------------
+
+/// A filesystem root mount plus an Algolia mount at `_Shared`, backed by the
+/// in-process mock Algolia.
+///
+/// The mock's `JoinHandle` is held for the fixture's whole life: dropping it aborts the
+/// server task and every subsequent request would fail as a transport error, which
+/// would look like a backend bug.
+struct AlgoliaFixture {
+    inner: Fixture,
+    base_url: String,
+    _mock: tokio::task::JoinHandle<()>,
+    secrets: PathBuf,
+}
+
+impl AlgoliaFixture {
+    async fn new(name: &str) -> Self {
+        let inner = Fixture::new(name);
+        let base = inner
+            .index_dir
+            .parent()
+            .expect("fixture base")
+            .to_path_buf();
+        let (base_url, mock) = deep_obsidian_algolia::mock::spawn_mock().await;
+        Self {
+            inner,
+            base_url,
+            _mock: mock,
+            secrets: base.join("secrets.json"),
+        }
+    }
+
+    fn config_writable(&self, writable: bool) -> ResolvedServiceConfig {
+        let mut config = self.inner.config();
+        config.experimental = ExperimentalConfig {
+            multi_vault: true,
+            algolia_vaults: true,
+            ..ExperimentalConfig::default()
+        };
+        // Replace the `team` filesystem mount with an algolia one at the SAME prefix,
+        // so every assertion below is about the backend kind rather than about a
+        // different prefix.
+        config.mounts[1] = MountConfig {
+            id: "shared".to_string(),
+            mount_at: "_Shared".to_string(),
+            backend: MountBackendConfig::Algolia {
+                app_id: "TESTAPP".to_string(),
+                index_name: "team-wiki".to_string(),
+                api_key_ref: SecretRef::EncryptedFile {
+                    id: "algolia-api-key".to_string(),
+                },
+                base_url: Some(self.base_url.clone()),
+                writable,
+                participant_id: Some("paul@test".to_string()),
+                cache: None,
+                retention: None,
+                index_dir: None,
+            },
+        };
+        config
+    }
+
+    /// State over the algolia config, with the key in a TEMP secrets file.
+    ///
+    /// A temp store rather than the `DEEP_OBSIDIAN_ALGOLIA_API_KEY` override: the
+    /// environment is process-global, and setting it here would silently shadow the
+    /// configured key for every other test in this binary.
+    async fn state_writable(&self, writable: bool) -> AppState {
+        let resolver = SecretResolver::with_encrypted_file_path(self.secrets.clone());
+        resolver
+            .put(
+                &SecretRef::EncryptedFile {
+                    id: "algolia-api-key".to_string(),
+                },
+                secrecy::SecretString::new("test-key".to_string()),
+            )
+            .expect("store the fixture api key");
+        let config = self.config_writable(writable);
+        let backends = MountBackends::build_with_resolver(&config, &resolver);
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
+            .await
+            .expect("an algolia mount must not fail the bootstrap");
+        AppState::with_backends(config, runtimes, &backends)
+            .with_upload_base("http://127.0.0.1:4100".to_string())
+    }
+}
+
+/// The gate: an algolia mount needs its own experimental flag, and cannot be the root.
+#[test]
+fn an_algolia_mount_requires_the_algolia_vaults_flag_and_a_non_root_prefix() {
+    let mounts = vec![
+        MountConfig {
+            id: "vault".to_string(),
+            mount_at: String::new(),
+            backend: MountBackendConfig::Filesystem {
+                vault_path: PathBuf::from("/tmp/root-vault"),
+                index_dir: None,
+            },
+        },
+        MountConfig {
+            id: "shared".to_string(),
+            mount_at: "_Shared".to_string(),
+            backend: MountBackendConfig::Algolia {
+                app_id: "TESTAPP".to_string(),
+                index_name: "team-wiki".to_string(),
+                api_key_ref: SecretRef::EncryptedFile {
+                    id: "algolia-api-key".to_string(),
+                },
+                base_url: None,
+                writable: false,
+                participant_id: None,
+                cache: None,
+                retention: None,
+                index_dir: None,
+            },
+        },
+    ];
+
+    // Ungated: refused, and the message names the flag rather than the multi-vault one.
+    let error =
+        deep_obsidian_server::normalize_service_config(deep_obsidian_types::ServiceConfigInput {
+            mounts: Some(mounts.clone()),
+            experimental: Some(ExperimentalConfig {
+                multi_vault: true,
+                ..ExperimentalConfig::default()
+            }),
+            ..Default::default()
+        })
+        .expect_err("an ungated algolia mount must be refused");
+    assert!(error.to_string().contains("algoliaVaults"), "{error}");
+
+    // Gated: accepted.
+    assert!(deep_obsidian_server::normalize_service_config(
+        deep_obsidian_types::ServiceConfigInput {
+            mounts: Some(mounts.clone()),
+            experimental: Some(ExperimentalConfig {
+                multi_vault: true,
+                algolia_vaults: true,
+                ..ExperimentalConfig::default()
+            }),
+            ..Default::default()
+        }
+    )
+    .is_ok());
+
+    // At the vault root: refused, because `vaultPath` would have nothing to point at.
+    let mut rooted = mounts;
+    rooted.remove(0);
+    rooted[0].mount_at = String::new();
+    let error =
+        deep_obsidian_server::normalize_service_config(deep_obsidian_types::ServiceConfigInput {
+            mounts: Some(rooted),
+            experimental: Some(ExperimentalConfig {
+                multi_vault: true,
+                algolia_vaults: true,
+                ..ExperimentalConfig::default()
+            }),
+            ..Default::default()
+        })
+        .expect_err("an algolia root mount must be refused");
+    assert!(
+        error.to_string().contains("no local directory"),
+        "the refusal must say why: {error}"
+    );
+}
+
+/// Reads, writes, listings and outlines all work on an algolia mount, through the
+/// public JSON-RPC surface, in the LOGICAL namespace.
+#[tokio::test]
+async fn an_algolia_mount_serves_reads_writes_listings_and_outlines() {
+    let fixture = AlgoliaFixture::new("algolia-crud").await;
+    let state = fixture.state_writable(true).await;
+
+    // Write: routed to the algolia mount by prefix.
+    let created = tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "_Shared/Decisions/Retention.md",
+            "content": "# Retention\n\n## Policy\n\nKeep five versions of every note.\n",
+        }),
+    )
+    .await;
+    let created = structured(&created);
+    assert_eq!(created["created"], json!(true));
+    assert_eq!(created["path"], json!("_Shared/Decisions/Retention.md"));
+
+    // Read: the logical path, and the hash a client feeds back as `expectedHash`.
+    let read = tool_call(
+        &state,
+        "read_file",
+        json!({"path": "_Shared/Decisions/Retention.md"}),
+    )
+    .await;
+    let read = structured(&read);
+    assert!(
+        read["text"]
+            .as_str()
+            .expect("text")
+            .contains("Keep five versions"),
+        "{read}"
+    );
+    let hash = read["hash"].as_str().expect("a hash").to_string();
+    assert!(hash.starts_with("fnv1a64:"), "{hash}");
+
+    // The root listing merges the root mount with the SYNTHESIZED mount folder.
+    let children = tool_call(&state, "list_children", json!({})).await;
+    let paths: Vec<&str> = structured(&children)["children"]
+        .as_array()
+        .expect("children")
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect();
+    assert!(paths.contains(&"_Shared"), "{paths:?}");
+    assert!(paths.contains(&"Root.md"), "{paths:?}");
+
+    // Listing INSIDE the mount: folders synthesized from the index's facets.
+    let inside = tool_call(&state, "list_children", json!({"path": "_Shared"})).await;
+    let paths: Vec<&str> = structured(&inside)["children"]
+        .as_array()
+        .expect("children")
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect();
+    assert_eq!(paths, vec!["_Shared/Decisions"]);
+
+    // An outline is composed above the boundary from the hydrated text, so it works
+    // unchanged on a mount with no local index.
+    let outline = tool_call(
+        &state,
+        "note_outline",
+        json!({"path": "_Shared/Decisions/Retention.md"}),
+    )
+    .await;
+    let headings: Vec<&str> = structured(&outline)["headings"]
+        .as_array()
+        .expect("headings")
+        .iter()
+        .filter_map(|heading| heading["title"].as_str())
+        .collect();
+    assert!(headings.contains(&"Retention"), "{headings:?}");
+    assert!(headings.contains(&"Policy"), "{headings:?}");
+
+    // A stale `expectedHash` is rejected ABOVE the boundary, with the frozen hash
+    // wording — so the backend's fork path is only ever reached by a true race.
+    let stale = tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "_Shared/Decisions/Retention.md",
+            "content": "# Retention\n\nrewritten\n",
+            "expectedHash": "fnv1a64:0000000000000000",
+        }),
+    )
+    .await;
+    let message = error_message(&stale);
+    assert!(message.contains("hash"), "{message}");
+    // ...and the note was NOT rewritten.
+    let unchanged = tool_call(
+        &state,
+        "read_file",
+        json!({"path": "_Shared/Decisions/Retention.md"}),
+    )
+    .await;
+    assert_eq!(structured(&unchanged)["hash"], json!(hash));
+
+    // The matching hash is accepted, and updates the note.
+    let updated = tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "_Shared/Decisions/Retention.md",
+            "content": "# Retention\n\nrewritten\n",
+            "expectedHash": hash,
+        }),
+    )
+    .await;
+    assert_eq!(structured(&updated)["created"], json!(false));
+    assert_eq!(
+        structured(
+            &tool_call(
+                &state,
+                "read_file",
+                json!({"path": "_Shared/Decisions/Retention.md"})
+            )
+            .await
+        )["text"],
+        json!("# Retention\n\nrewritten\n")
+    );
+}
+
+/// A READ-ONLY algolia mount refuses a write with the message that names the setting.
+#[tokio::test]
+async fn a_read_only_algolia_mount_refuses_a_write_by_naming_the_setting() {
+    let fixture = AlgoliaFixture::new("algolia-read-only").await;
+    let state = fixture.state_writable(false).await;
+    let response = tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": "_Shared/A.md", "content": "# A\n"}),
+    )
+    .await;
+    let message = error_message(&response);
+    assert_eq!(message, deep_obsidian_backend::ALGOLIA_READ_ONLY_MESSAGE);
+    assert!(message.contains("\"writable\": true"), "{message}");
+}
+
+/// Every binary path an MCP client can reach on an algolia mount is refused, and each
+/// refusal says the mount is MARKDOWN ONLY rather than reporting a missing file, a
+/// permission problem or a generic unsupported operation.
+///
+/// Four of the five refusal paths are surfaced BY THE BACKEND (`Stat` on a binary path,
+/// `ReadBytes`, the upload mint's `ResolvePath`, and the upload commit); the fifth,
+/// `search_artifacts`, is surfaced by the INDEX layer instead — there is no local index
+/// to search, so it never reaches the backend at all. The distinction matters: the
+/// first four are storage facts, the last is an index fact.
+#[tokio::test]
+async fn every_binary_path_on_an_algolia_mount_is_refused_as_markdown_only() {
+    let fixture = AlgoliaFixture::new("algolia-binary").await;
+    let state = fixture.state_writable(true).await;
+
+    // (1) Artifact metadata: `read_artifact` stats before it reads, so `Stat` is where
+    // this surfaces.
+    let response = tool_call(
+        &state,
+        "read_artifact",
+        json!({"path": "_Shared/Assets/diagram.png"}),
+    )
+    .await;
+    assert_eq!(
+        error_message(&response),
+        deep_obsidian_backend::ALGOLIA_NO_BINARY_MESSAGE
+    );
+
+    // (2) Artifact BYTES: the same tool with a payload requested. Refused at the same
+    // place, so the caller never gets metadata for something it cannot then read.
+    let response = tool_call(
+        &state,
+        "read_artifact",
+        json!({"path": "_Shared/Assets/diagram.png", "includeBase64": true, "maxBytes": 1024}),
+    )
+    .await;
+    assert_eq!(
+        error_message(&response),
+        deep_obsidian_backend::ALGOLIA_NO_BINARY_MESSAGE
+    );
+
+    // (3) The out-of-band UPLOAD mint. Refused BEFORE a token is issued, which is the
+    // whole point: a token would fail only after the body had been uploaded.
+    let response = tool_call(
+        &state,
+        "request_vault_upload",
+        json!({"path": "_Shared/Assets/diagram.png"}),
+    )
+    .await;
+    assert_eq!(
+        error_message(&response),
+        deep_obsidian_backend::ALGOLIA_NO_UPLOAD_MESSAGE
+    );
+    // ...and a MARKDOWN destination is refused too: the upload endpoint is for bytes,
+    // and markdown reaches this mount through `upsert_note`.
+    let response = tool_call(
+        &state,
+        "request_vault_upload",
+        json!({"path": "_Shared/Notes/pasted.md"}),
+    )
+    .await;
+    assert_eq!(
+        error_message(&response),
+        deep_obsidian_backend::ALGOLIA_NO_UPLOAD_MESSAGE
+    );
+
+    // (4) `search_artifacts` is scoped recall, so it is refused by the INDEX layer for
+    // having no local index — not by the backend.
+    let response = tool_call(
+        &state,
+        "search_artifacts",
+        json!({"query": "diagram", "scope": "_Shared"}),
+    )
+    .await;
+    let message = error_message(&response);
+    assert!(
+        message.contains("no local search index"),
+        "search_artifacts must be refused by the index layer: {message}"
+    );
+
+    // The root mount is unaffected: an upload there still mints.
+    let response = tool_call(
+        &state,
+        "request_vault_upload",
+        json!({"path": "Assets/diagram.png"}),
+    )
+    .await;
+    assert!(
+        structured(&response)["uploadUrl"].is_string(),
+        "the filesystem root must still mint upload tokens: {response}"
+    );
+}
+
+/// Scoped index recall on an algolia mount is refused, and the refusal explains that
+/// the mount has no LOCAL index rather than implying something is broken.
+#[tokio::test]
+async fn scoped_index_recall_on_an_algolia_mount_is_refused_honestly() {
+    let fixture = AlgoliaFixture::new("algolia-recall").await;
+    let state = fixture.state_writable(true).await;
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": "_Shared/A.md", "content": "# A\n\nshared body\n"}),
+    )
+    .await;
+
+    for (tool, arguments) in [
+        (
+            "hybrid_search",
+            json!({"query": "shared", "scope": "_Shared"}),
+        ),
+        ("related_notes", json!({"path": "_Shared/A.md"})),
+        ("graph_traverse", json!({"path": "_Shared/A.md"})),
+    ] {
+        let response = tool_call(&state, tool, arguments).await;
+        let message = error_message(&response);
+        assert!(
+            message.contains("no local search index"),
+            "{tool} must be refused for having no local index: {message}"
+        );
+        // The refusal names the BACKEND KIND and points at the mounts that do work.
+        assert!(message.contains("algolia"), "{tool}: {message}");
+        assert!(
+            message.contains("read_file") && message.contains("grep_search"),
+            "{tool} must name what DOES work on this mount: {message}"
+        );
+        // ...and must not read as a malfunction.
+        assert!(
+            !message.contains("has no index."),
+            "{tool} must not use the old bare wording: {message}"
+        );
+        // The enumerated scopes must EXCLUDE the mount that was just refused. Naming it
+        // would tell the user to retry the exact call that failed.
+        assert!(
+            message.contains("'/'"),
+            "{tool} must name the root mount as a usable scope: {message}"
+        );
+        assert!(
+            !message.contains("'_Shared'"),
+            "{tool} must not suggest the mount it just refused: {message}"
+        );
+    }
+
+    // Scoping the SAME tool to the filesystem root still works, so the refusal is
+    // per-mount rather than a global loss of the tool.
+    let root = tool_call(
+        &state,
+        "hybrid_search",
+        json!({"query": "root", "scope": "/"}),
+    )
+    .await;
+    assert!(
+        root.get("result").is_some(),
+        "recall on the filesystem root must still work: {root}"
+    );
+}
+
+/// `vault_info` describes the algolia mount honestly: its kind, its real capability
+/// set, that it has NO local index — and it must not appear in `degradedMounts`, nor
+/// make the server report itself degraded, for a mount that is working as designed.
+#[tokio::test]
+async fn vault_info_describes_the_algolia_mount_and_never_calls_it_degraded() {
+    let fixture = AlgoliaFixture::new("algolia-vault-info").await;
+    let state = fixture.state_writable(true).await;
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": "_Shared/A.md", "content": "# A\n\nshared\n"}),
+    )
+    .await;
+
+    let info = tool_call(&state, "vault_info", json!({})).await;
+    let info = structured(&info);
+    let mounts = info["mounts"].as_array().expect("a mounts array");
+    let shared = mounts
+        .iter()
+        .find(|mount| mount["id"] == json!("shared"))
+        .expect("the algolia mount is listed");
+
+    assert_eq!(shared["backendKind"], json!("algolia"));
+    assert_eq!(shared["mountAt"], json!("_Shared"));
+    // Capabilities are the backend's own, and they are honest: a bounded grep, and
+    // nothing binary.
+    assert_eq!(shared["capabilities"], json!(["grep-search"]));
+    // No local index, said in a way a client can branch on, plus a note saying why.
+    assert_eq!(shared["localIndex"], json!(false));
+    assert_eq!(shared["indexStatus"], json!("none"));
+    assert!(
+        shared["indexNote"]
+            .as_str()
+            .expect("an index note")
+            .contains("no local search index by design"),
+        "{shared}"
+    );
+    // NOT degraded: a mount with no index cannot have a broken one.
+    assert_eq!(shared["ready"], json!(true));
+    assert!(
+        info.get("degradedMounts").is_none(),
+        "a working algolia mount must not be reported as degraded: {info}"
+    );
+    // The mount reports `Some(vec![])` from `conflicted_paths`, so `conflictedCount`
+    // IS present and is zero. That is a real answer, not an inapplicable one: this
+    // storage can record a divergence and currently records none — see
+    // `AlgoliaVaultBackend::conflicted_paths` for why "divergence" here is not
+    // CouchDB's unreconciled sibling revision.
+    assert_eq!(shared["conflictedCount"], json!(0));
+
+    // The root mount is still described as an indexed filesystem mount.
+    let root = mounts
+        .iter()
+        .find(|mount| mount["id"] == json!("vault"))
+        .expect("the root mount");
+    assert_eq!(root["backendKind"], json!("filesystem"));
+    assert_eq!(root["localIndex"], json!(true));
+    // ...and it answers `None` from `conflicted_paths`, so it gains no conflict field at
+    // all — which is the distinction `Some(vec![])` vs `None` exists to preserve.
+    assert!(
+        root.get("conflictedCount").is_none(),
+        "a filesystem mount has no sibling-version notion to report: {root}"
+    );
+
+    // ...and readiness is green, which is the property that would have been destroyed
+    // by registering a failing index runtime for the algolia mount.
+    let mut payload =
+        build_readiness_payload(&state.config, &state.runtimes.aggregate_diagnostics());
+    insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
+    assert_eq!(
+        readiness_status_code(&state.runtimes.aggregate_diagnostics()),
+        axum::http::StatusCode::OK,
+        "{payload}"
+    );
+
+    // `build_index` reports the algolia mount as SKIPPED rather than omitting it, so
+    // its `mounts` array is a complete list of the vault's mounts.
+    let rebuilt = tool_call(&state, "build_index", json!({})).await;
+    let rebuilt = structured(&rebuilt);
+    let shared = rebuilt["mounts"]
+        .as_array()
+        .expect("a mounts array")
+        .iter()
+        .find(|mount| mount["id"] == json!("shared"))
+        .expect("the algolia mount is reported");
+    assert_eq!(shared["skipped"], json!(true));
+    assert_eq!(shared["rebuilt"], json!(false));
+    assert!(shared["reason"]
+        .as_str()
+        .expect("a reason")
+        .contains("no local search index"));
+}
+
+/// `grep_search` scoped to the algolia mount by a glob DOES reach its bounded grep, and
+/// an anchorless regex there is refused with the message that explains the mechanism.
+#[tokio::test]
+async fn grep_scoped_to_an_algolia_mount_runs_and_refuses_honestly() {
+    let fixture = AlgoliaFixture::new("algolia-grep").await;
+    let state = fixture.state_writable(true).await;
+    if !state.rg_available {
+        eprintln!("skipping: ripgrep is not available, so grep_search is not advertised");
+        return;
+    }
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "_Shared/Decisions/Retention.md",
+            "content": "# Retention\n\nThe retention policy keeps five versions.\n",
+        }),
+    )
+    .await;
+
+    let response = tool_call(
+        &state,
+        "grep_search",
+        json!({"query": "retention policy", "glob": "_Shared/**/*.md"}),
+    )
+    .await;
+    let matches = structured(&response)["matches"]
+        .as_array()
+        .expect("matches")
+        .clone();
+    assert_eq!(matches.len(), 1, "{matches:?}");
+    // Reported in the LOGICAL namespace: the router relabels the mount-relative path.
+    assert_eq!(
+        matches[0]["path"],
+        json!("_Shared/Decisions/Retention.md"),
+        "{matches:?}"
+    );
+
+    // An anchorless regex is refused with the backend's own message, reached through
+    // the router — so the arm is genuinely live rather than defence in depth.
+    let response = tool_call(
+        &state,
+        "grep_search",
+        json!({"query": "[a-z]+", "regex": true, "glob": "_Shared/**/*.md"}),
+    )
+    .await;
+    let message = error_message(&response);
+    assert_eq!(
+        message,
+        deep_obsidian_backend::algolia::grep::ALGOLIA_GREP_NO_ANCHOR_MESSAGE
+    );
+    assert!(message.contains("lexical prefilter"), "{message}");
+    assert!(
+        !message.contains("ripgrep"),
+        "the refusal must not blame a missing binary: {message}"
     );
 }

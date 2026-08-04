@@ -249,6 +249,7 @@ impl Fixture {
             experimental: ExperimentalConfig {
                 multi_vault: true,
                 couchdb_vaults: true,
+                ..ExperimentalConfig::default()
             },
             auth: AuthConfig::default(),
             config_file_path: None,

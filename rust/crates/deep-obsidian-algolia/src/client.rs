@@ -49,12 +49,28 @@ impl AlgoliaError {
 
 pub type Result<T> = std::result::Result<T, AlgoliaError>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AlgoliaClient {
     http: reqwest::Client,
     app_id: String,
     api_key: String,
     base_url: String,
+}
+
+/// Hand-written so the API key cannot be printed.
+///
+/// A `#[derive(Debug)]` here put the admin key into every `{:?}` of this struct and
+/// of anything holding one — a single `debug!("{client:?}")` or a `#[derive(Debug)]`
+/// on an enclosing type would have written a live credential to the log. The field
+/// is named and elided rather than omitted, so a reader can see it exists.
+impl std::fmt::Debug for AlgoliaClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlgoliaClient")
+            .field("app_id", &self.app_id)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A search request, serialized into Algolia's url-encoded `params` form (the

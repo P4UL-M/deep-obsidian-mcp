@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod algolia;
 pub mod couchdb;
 pub mod filesystem;
 pub mod grep;
@@ -39,6 +40,10 @@ mod memory;
 #[cfg(test)]
 mod contract;
 
+pub use algolia::{
+    AlgoliaCredentials, AlgoliaOptions, AlgoliaVaultBackend, ALGOLIA_API_KEY_ENV,
+    ALGOLIA_NO_BINARY_MESSAGE, ALGOLIA_NO_UPLOAD_MESSAGE, ALGOLIA_READ_ONLY_MESSAGE,
+};
 pub use couchdb::{
     CouchDbVaultBackend, EntryContent, COUCHDB_GREP_UNSUPPORTED_MESSAGE, COUCHDB_READ_ONLY_MESSAGE,
     UPLOAD_COLLECT_ADVISORY_BYTES,
@@ -67,6 +72,10 @@ pub enum BackendKind {
     /// A read-only Self-hosted LiveSync vault in CouchDB, behind the supervised
     /// Node sidecar.
     Couchdb,
+    /// A shared, Markdown-only corpus stored as records in an Algolia index. Has no
+    /// local copy of its content and no local search index — see
+    /// [`algolia::AlgoliaVaultBackend`].
+    Algolia,
 }
 
 impl BackendKind {
@@ -75,6 +84,7 @@ impl BackendKind {
             BackendKind::Filesystem => "filesystem",
             BackendKind::InMemory => "in-memory",
             BackendKind::Couchdb => "couchdb",
+            BackendKind::Algolia => "algolia",
         }
     }
 }

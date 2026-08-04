@@ -770,12 +770,48 @@ fn filesystem_mount_paths(
                 .clone()
                 .unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id)),
         ),
+        // Unreachable in practice: an algolia mount gets no `RuntimeState` at all (see
+        // [`mount_has_local_index`]), so nothing asks it for a runtime config. Kept
+        // exhaustive and answered honestly rather than with a panic, because a future
+        // caller that DOES build a runtime for one would otherwise crash the server
+        // instead of reporting an empty vault path.
+        MountBackendConfig::Algolia { index_dir, .. } => (
+            PathBuf::new(),
+            index_dir
+                .clone()
+                .unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id)),
+        ),
     }
 }
 
 /// True when a mount reads a local directory, i.e. when `notify` can watch it.
 fn mount_is_filesystem(mount: &MountConfig) -> bool {
     matches!(mount.backend, MountBackendConfig::Filesystem { .. })
+}
+
+/// True when a mount is served by a LOCAL search index of its own.
+///
+/// # Why an algolia mount is `false`, and why that is not a degradation
+///
+/// A filesystem or couchdb mount is indexed locally: the server scans or walks its
+/// content into a SQLite index and every recall tool is answered from it. An
+/// Algolia-backed mount is the opposite arrangement — the remote index IS the corpus,
+/// several participants share it, and materializing a local copy would (a) duplicate
+/// the whole corpus on every participant's disk and (b) serve one participant's stale
+/// snapshot to a tool that looks authoritative.
+///
+/// So such a mount gets NO [`RuntimeState`], which is deliberate and load-bearing.
+/// The alternative — registering a runtime whose source fails — was rejected: a failed
+/// refresh is what marks a mount `Degraded`, and
+/// [`MountRuntimes::aggregate_diagnostics`] would then report the whole server
+/// degraded forever for a mount that is working exactly as designed. `/readyz` would
+/// be permanently red and the signal would be worthless.
+///
+/// What consumers see instead: [`MountRuntimes::for_mount`] answers `None`, and the
+/// tool layer's `mount_index` turns that into a refusal that says the mount has no
+/// local index. That refusal is the DESIGNED path here, not an error path.
+pub fn mount_has_local_index(mount: &MountConfig) -> bool {
+    !matches!(mount.backend, MountBackendConfig::Algolia { .. })
 }
 
 /// The config a single mount's [`RuntimeState`] runs against.
@@ -886,6 +922,12 @@ impl MountRuntime {
 ///   [`MountRuntimes::entries`] hands back — the same enumeration
 ///   `resources/list` already uses to list every mount's notes. What is missing is
 ///   not access, it is comparable scores across independently built indexes.
+/// # Not every mount is in here
+///
+/// A mount whose backend serves its own recall has NO local index and therefore no
+/// entry — see [`mount_has_local_index`]. So `entries()` is a subset of the router's
+/// mount table, and anything that must enumerate ALL mounts (capabilities,
+/// `vault_info.mounts[]`, the conflict report) reads the ROUTER instead.
 #[derive(Debug)]
 pub struct MountRuntimes {
     entries: Vec<MountRuntime>,
@@ -908,6 +950,9 @@ impl MountRuntimes {
         let entries: Vec<MountRuntime> = backends
             .entries()
             .iter()
+            // A mount with no local index of its own is not represented here at all.
+            // See `mount_has_local_index` for why that is right rather than a gap.
+            .filter(|entry| mount_has_local_index(&entry.mount))
             .map(|entry| {
                 let mount = entry.mount.clone();
                 let change_source = if mount_is_filesystem(&mount) {

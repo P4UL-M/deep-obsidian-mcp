@@ -248,6 +248,73 @@ pub enum MountBackendConfig {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         writable: bool,
     },
+    /// A shared, Markdown-only corpus stored as records in an Algolia index.
+    ///
+    /// # What this backend is, and is not
+    ///
+    /// The index IS the vault: there is no local mirror of the corpus and no
+    /// intention of building one, which is what makes a mount joinable by several
+    /// participants at once. Notes are stored as one small `note` record (metadata
+    /// plus the head-version pointer) and one `chunk` record per chunk of the
+    /// current version; a read reassembles the body from the chunks.
+    ///
+    /// Consequently it holds **Markdown only**. Binary attachments have no record
+    /// shape here, so reads, writes and out-of-band uploads of one are refused with
+    /// a message that says exactly that — see
+    /// `deep_obsidian_backend::ALGOLIA_NO_BINARY_MESSAGE`.
+    ///
+    /// # Why there is no plaintext key field
+    ///
+    /// Identical to the couchdb variant's reasoning: a secret is only ever a
+    /// [`SecretRef`], never a literal, which is what keeps `redact_config` an
+    /// identity function. `appId` and `indexName` are identifiers, not credentials,
+    /// exactly like `username` on the couchdb variant.
+    ///
+    /// `baseUrl` is validated to carry no userinfo, because it is rendered verbatim
+    /// by `doctor` and `print-config`.
+    #[serde(rename_all = "camelCase")]
+    Algolia {
+        /// Algolia application id, e.g. `ABC1234XYZ`. Not a secret.
+        app_id: String,
+        /// The main index holding the corpus. Its `_history` sibling is derived
+        /// from this name and provisioned lazily on the first supersession.
+        index_name: String,
+        /// Reference to the stored Algolia API key. Resolved at backend
+        /// construction; see the variant docs.
+        api_key_ref: SecretRef,
+        /// Override for the REST endpoint (`https://{appId}.algolia.net` by
+        /// default). Exists so a test, a demo or a proxy can be pointed at;
+        /// must not contain userinfo.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        /// Whether this mount accepts writes. **Defaults to `false`**, for the
+        /// same reason it does on the couchdb variant: `experimental.algoliaVaults`
+        /// gates the mount existing, `writable` gates it being written, and a user
+        /// may well want one writable shared wiki and one read-only mirror in the
+        /// same table.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        writable: bool,
+        /// Who this participant is in the shared corpus's audit trail. Lands on
+        /// every record this mount writes, so several people writing one index can
+        /// tell whose version they are looking at.
+        ///
+        /// Defaults to `<user>@unknown`; see
+        /// `deep_obsidian_backend::algolia::default_participant_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        participant_id: Option<String>,
+        /// Bounded local cache of hydrated note bodies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache: Option<AlgoliaCacheConfig>,
+        /// How much version history to keep per note.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retention: Option<AlgoliaRetentionConfig>,
+        /// Where this mount's *cache* lives. There is no local search index for an
+        /// Algolia mount (see the variant docs), so this directory holds the
+        /// hydrated-note cache only. Defaults to `<root indexDir>/mounts/<id>`,
+        /// exactly as for every other mount kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index_dir: Option<PathBuf>,
+    },
 }
 
 impl MountBackendConfig {
@@ -256,8 +323,41 @@ impl MountBackendConfig {
         match self {
             MountBackendConfig::Filesystem { .. } => "filesystem",
             MountBackendConfig::Couchdb { .. } => "couchdb",
+            MountBackendConfig::Algolia { .. } => "algolia",
         }
     }
+}
+
+/// Bounded LRU cache of hydrated note bodies for an Algolia mount.
+///
+/// The cache is never a write buffer: a write pushes upstream first and only then
+/// updates the cache, so a crash can lose a cache entry but never a note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AlgoliaCacheConfig {
+    /// Byte budget for cached bodies. Defaults to
+    /// `deep_obsidian_backend::algolia::DEFAULT_CACHE_MAX_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Mount-relative path prefixes exempt from eviction. Pinned entries still
+    /// count against `maxBytes`, so pinning more than the budget is a
+    /// configuration mistake rather than an unbounded cache.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_prefixes: Vec<String>,
+}
+
+/// How much version history one note keeps on an Algolia mount.
+///
+/// The rule is a floor UNIONED with a ceiling, never an intersection: keep the
+/// `minVersions` most recent versions PLUS anything younger than `maxAgeDays`. A
+/// note nobody has touched in a year therefore still has its last few versions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AlgoliaRetentionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_versions: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_days: Option<u64>,
 }
 
 /// E2EE material for a LiveSync vault. Both passphrases are [`SecretRef`]s for
@@ -347,6 +447,14 @@ pub struct ExperimentalConfig {
     /// community plugin. Retiring one must not silently retire the other.
     #[serde(default)]
     pub couchdb_vaults: bool,
+    /// Required to resolve a config declaring an `algolia` mount.
+    ///
+    /// Its own flag for the same reason `couchdbVaults` is: the risk it gates is
+    /// specific to this backend. An Algolia mount sends note bodies to a hosted
+    /// third-party service and, when `writable`, is a corpus SEVERAL people write
+    /// concurrently — neither of which is what `multiVault` is about.
+    #[serde(default)]
+    pub algolia_vaults: bool,
 }
 
 impl ExperimentalConfig {

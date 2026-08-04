@@ -226,14 +226,47 @@ pub struct MountIndexSummary {
     pub id: String,
     pub mount_at: String,
     pub backend_kind: &'static str,
-    pub diagnostics: RuntimeDiagnostics,
+    /// `None` when the mount has NO LOCAL INDEX BY DESIGN — an Algolia-backed corpus,
+    /// whose remote index is the corpus itself.
+    ///
+    /// Distinct from `Some(diagnostics)` carrying a failure, and the distinction is the
+    /// whole point: a mount with no local index is not broken, so it must not report an
+    /// index status of `degraded` nor appear in `degradedMounts`. Reporting it as
+    /// degraded would make `/readyz` permanently red for a correctly configured mount
+    /// and destroy the signal for the mounts that genuinely are failing.
+    pub diagnostics: Option<RuntimeDiagnostics>,
 }
 
 impl MountIndexSummary {
+    /// True when this mount is serving what it advertises.
+    ///
+    /// For an indexed mount that means its index has a snapshot. For a mount with no
+    /// local index there is nothing to be ready for, and the honest answer is that the
+    /// mount is fine — an index it never had cannot be missing.
     fn ready(&self) -> bool {
-        self.diagnostics.snapshot.is_some()
+        match &self.diagnostics {
+            Some(diagnostics) => diagnostics.snapshot.is_some(),
+            None => true,
+        }
+    }
+
+    /// The `indexStatus` string: the runtime's own, or `"none"`.
+    fn index_status(&self) -> &'static str {
+        match &self.diagnostics {
+            Some(diagnostics) => diagnostics.status.as_str(),
+            None => "none",
+        }
     }
 }
+
+/// What `mounts[].indexNote` says for a mount with no local index.
+///
+/// A note rather than a `lastError`: nothing went wrong, and putting it in an error
+/// field would make every `vault_info` on such a config look like a report of a
+/// problem.
+const NO_LOCAL_INDEX_NOTE: &str = "this mount has no local search index by design: its \
+backend serves its own content, so index-backed recall tools (hybrid_search, related_notes, \
+graph_traverse, search_artifacts) cannot be scoped to it";
 
 /// Whole-vault counts that are meaningful as a SUM over mounts.
 ///
@@ -251,7 +284,11 @@ const AGGREGATE_COUNT_KEYS: [&str; 7] = [
 ];
 
 fn mount_count(summary: &MountIndexSummary, key: &str) -> u64 {
-    let Some(snapshot) = &summary.diagnostics.snapshot else {
+    let Some(snapshot) = summary
+        .diagnostics
+        .as_ref()
+        .and_then(|diagnostics| diagnostics.snapshot.as_ref())
+    else {
         return 0;
     };
     let index = snapshot.index.as_ref();
@@ -311,13 +348,22 @@ pub fn insert_mount_index_detail(payload: &mut Value, summaries: &[MountIndexSum
                 ("id".to_string(), json!(summary.id)),
                 ("mountAt".to_string(), json!(summary.mount_at)),
                 ("backendKind".to_string(), json!(summary.backend_kind)),
-                (
-                    "indexStatus".to_string(),
-                    json!(summary.diagnostics.status.as_str()),
-                ),
+                ("indexStatus".to_string(), json!(summary.index_status())),
                 ("ready".to_string(), json!(summary.ready())),
+                // Stated explicitly rather than left to be inferred from
+                // `indexStatus: "none"`: a client deciding whether to send a scoped
+                // recall call needs a boolean, not a string it has to know the
+                // vocabulary of.
+                (
+                    "localIndex".to_string(),
+                    json!(summary.diagnostics.is_some()),
+                ),
             ]);
-            if let Some(snapshot) = &summary.diagnostics.snapshot {
+            let Some(diagnostics) = &summary.diagnostics else {
+                entry.insert("indexNote".to_string(), json!(NO_LOCAL_INDEX_NOTE));
+                return Value::Object(entry);
+            };
+            if let Some(snapshot) = &diagnostics.snapshot {
                 let index = snapshot.index.as_ref();
                 entry.insert(
                     "markdownFileCount".to_string(),
@@ -327,7 +373,7 @@ pub fn insert_mount_index_detail(payload: &mut Value, summaries: &[MountIndexSum
                 entry.insert("chunkCount".to_string(), json!(index.chunk_count));
                 entry.insert("generatedAt".to_string(), json!(index.generated_at));
             }
-            if let Some(error) = &summary.diagnostics.last_error {
+            if let Some(error) = &diagnostics.last_error {
                 entry.insert(
                     "lastError".to_string(),
                     json!({

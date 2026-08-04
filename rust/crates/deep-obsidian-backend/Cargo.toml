@@ -6,9 +6,24 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# The typed Algolia REST client the algolia backend speaks through. Acyclic: the
+# algolia crate depends on nothing in this workspace.
+deep-obsidian-algolia = { path = "../deep-obsidian-algolia" }
 deep-obsidian-core = { path = "../deep-obsidian-core" }
+# Deliberate, and a widening of this crate's tree: the algolia backend builds the
+# SAME chunk records the local indexer builds, so it calls `plan_note_chunks`,
+# `note_title`, `extract_wiki_links` and `extract_heading_sections` rather than
+# reimplementing them. Reimplementing is the one thing that must not happen — a
+# chunk boundary that differed from the indexer's would make the shared corpus
+# disagree with every local index built over the same notes. Acyclic (the index
+# crate depends only on core), at the cost of pulling the index's native deps
+# (rusqlite, sqlite-vec) into this crate's build.
+deep-obsidian-index = { path = "../deep-obsidian-index" }
 notify.workspace = true
 rand.workspace = true
+# The algolia backend's candidate-bounded grep evaluates the caller's pattern
+# locally over fetched chunk text; the ripgrep-backed grep shells out instead.
+regex.workspace = true
 # Secrets reach the sidecar only through its `initialize` call. `SecretString`
 # gives the credential struct a `Debug` that cannot print the value, so an
 # accidental `{:?}` on a config struct cannot leak a password.

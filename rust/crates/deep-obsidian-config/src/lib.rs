@@ -122,6 +122,35 @@ pub enum ConfigError {
     /// A `couchdb` mount with an empty `url` or `database`.
     #[error("mount {id:?} has an invalid couchdb backend: {reason}")]
     InvalidCouchdbBackend { id: String, reason: &'static str },
+    /// An `algolia` mount without the opt-in flag.
+    ///
+    /// Checked before [`Self::MultiVaultNotEnabled`] for the same reason the
+    /// couchdb gate is: an algolia mount is non-root-only, so it always makes the
+    /// table multi-mount and both gates would fire. This one names the flag the
+    /// user has actually not set for the feature they were reaching for.
+    #[error("algolia (shared Markdown corpus) vaults are EXPERIMENTAL: set {{\"experimental\": {{\"algoliaVaults\": true}}}} in the config to resolve mount {id:?} (the mount is read-only unless it also sets \"writable\": true)")]
+    AlgoliaVaultsNotEnabled { id: String },
+    /// An `algolia` mount at the vault root.
+    ///
+    /// Same cause as [`Self::CouchdbRootMountUnsupported`]:
+    /// `ResolvedServiceConfig::vault_path` is the ROOT mount's local directory and
+    /// still feeds `doctor`, the packaged index-dir derivation and the vault
+    /// overview. An Algolia corpus has no local directory, so a root algolia mount
+    /// would leave it undefined. Lifting BOTH restrictions is one piece of work and
+    /// belongs where those consumers stop requiring a root vault path.
+    #[error("mount {id:?} is an algolia backend at the vault root, which is not supported: a shared Algolia corpus has no local directory to serve as 'vaultPath'. Mount it at a non-root mountAt (e.g. \"_Shared\") alongside a filesystem root mount.")]
+    AlgoliaRootMountUnsupported { id: String },
+    /// An Algolia `baseUrl` carrying `user:password@` userinfo.
+    ///
+    /// Refused rather than stripped, exactly as for a couchdb `url`: `baseUrl` is
+    /// printed verbatim by `doctor` and `print-config`, so a credential that got
+    /// into it has already been written to disk in plaintext and the only useful
+    /// answer is to say so.
+    #[error("mount {id:?} has an algolia baseUrl containing embedded credentials; remove the 'user:password@' userinfo from the url and store the key as a secret reference in 'apiKeyRef' instead (the url is printed verbatim by 'doctor' and 'print-config')")]
+    AlgoliaBaseUrlHasUserinfo { id: String },
+    /// An `algolia` mount with an empty `appId` or `indexName`.
+    #[error("mount {id:?} has an invalid algolia backend: {reason}")]
+    InvalidAlgoliaBackend { id: String, reason: &'static str },
 }
 
 fn home_dir() -> PathBuf {
@@ -353,6 +382,30 @@ fn expand_mount_backend_paths(backend: MountBackendConfig) -> MountBackendConfig
             options,
             writable,
         },
+        // `indexDir` is the only path here: an Algolia mount has no local corpus,
+        // and `indexDir` holds nothing but its hydrated-note cache — which is
+        // exactly the sort of thing an operator points at `~/Library/Caches/...`.
+        MountBackendConfig::Algolia {
+            app_id,
+            index_name,
+            api_key_ref,
+            base_url,
+            writable,
+            participant_id,
+            cache,
+            retention,
+            index_dir,
+        } => MountBackendConfig::Algolia {
+            app_id,
+            index_name,
+            api_key_ref,
+            base_url,
+            writable,
+            participant_id,
+            cache,
+            retention,
+            index_dir: index_dir.map(expand_home_path),
+        },
     }
 }
 
@@ -399,6 +452,77 @@ fn validate_couchdb_backend(mount: &MountConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::CouchdbUrlHasUserinfo {
             id: mount.id.clone(),
         });
+    }
+    Ok(())
+}
+
+/// Validate the parts of an algolia backend that are checkable without connecting.
+///
+/// Reachability, key validity and key ACLs are deliberately NOT checked here: they
+/// are runtime readiness facts (the mount's `get_settings` probe), and a config must
+/// still load while Algolia is unreachable or the key has been rotated.
+///
+/// `participantId` is validated for SHAPE rather than existence. It is absent by
+/// default and defaulted at construction, but when a user does set it, it goes into
+/// every record's audit trail and into `filters` expressions, so a value containing
+/// a quote or a newline would be an injection into a filter string rather than a
+/// name. Rejecting it here is the only place that can.
+fn validate_algolia_backend(mount: &MountConfig) -> Result<(), ConfigError> {
+    let MountBackendConfig::Algolia {
+        app_id,
+        index_name,
+        base_url,
+        participant_id,
+        ..
+    } = &mount.backend
+    else {
+        return Ok(());
+    };
+    if app_id.trim().is_empty() {
+        return Err(ConfigError::InvalidAlgoliaBackend {
+            id: mount.id.clone(),
+            reason: "'appId' is empty; give the Algolia application id, e.g. \"ABC1234XYZ\"",
+        });
+    }
+    if index_name.trim().is_empty() {
+        return Err(ConfigError::InvalidAlgoliaBackend {
+            id: mount.id.clone(),
+            reason: "'indexName' is empty; give the index holding the shared corpus",
+        });
+    }
+    if let Some(base_url) = base_url {
+        if base_url.trim().is_empty() {
+            return Err(ConfigError::InvalidAlgoliaBackend {
+                id: mount.id.clone(),
+                reason: "'baseUrl' is present but empty; omit it to use \
+                         https://{appId}.algolia.net",
+            });
+        }
+        if url_authority_has_userinfo(base_url) {
+            return Err(ConfigError::AlgoliaBaseUrlHasUserinfo {
+                id: mount.id.clone(),
+            });
+        }
+    }
+    if let Some(participant_id) = participant_id {
+        if participant_id.trim().is_empty() {
+            return Err(ConfigError::InvalidAlgoliaBackend {
+                id: mount.id.clone(),
+                reason: "'participantId' is present but empty; omit it to default to \
+                         \"<user>@unknown\"",
+            });
+        }
+        if participant_id
+            .chars()
+            .any(|character| character == '"' || character == '\\' || character.is_control())
+        {
+            return Err(ConfigError::InvalidAlgoliaBackend {
+                id: mount.id.clone(),
+                reason: "'participantId' must not contain quotes, backslashes or control \
+                         characters: it is written into every record and into index filter \
+                         expressions",
+            });
+        }
     }
     Ok(())
 }
@@ -457,25 +581,41 @@ pub fn normalize_service_config(
                 return Err(ConfigError::VaultPathAndMountsBothSet);
             }
             let (mounts, root) = normalize_mounts(mounts)?;
-            // Couchdb gates first: a couchdb mount is non-root-only, so it always
-            // makes the table multi-mount and BOTH gates would fire. The couchdb
-            // errors are the specific ones, so they win — see
+            // Per-backend gates first: every non-filesystem backend is non-root-only,
+            // so it always makes the table multi-mount and BOTH its own gate and
+            // `MultiVaultNotEnabled` would fire. The backend-specific errors are the
+            // more actionable ones, so they win — see
             // `ConfigError::CouchdbVaultsNotEnabled`.
             for mount in &mounts {
-                if !matches!(mount.backend, MountBackendConfig::Couchdb { .. }) {
-                    continue;
+                match &mount.backend {
+                    MountBackendConfig::Filesystem { .. } => continue,
+                    MountBackendConfig::Couchdb { .. } => {
+                        if !experimental.couchdb_vaults {
+                            return Err(ConfigError::CouchdbVaultsNotEnabled {
+                                id: mount.id.clone(),
+                            });
+                        }
+                        if mount.mount_at.is_empty() {
+                            return Err(ConfigError::CouchdbRootMountUnsupported {
+                                id: mount.id.clone(),
+                            });
+                        }
+                        validate_couchdb_backend(mount)?;
+                    }
+                    MountBackendConfig::Algolia { .. } => {
+                        if !experimental.algolia_vaults {
+                            return Err(ConfigError::AlgoliaVaultsNotEnabled {
+                                id: mount.id.clone(),
+                            });
+                        }
+                        if mount.mount_at.is_empty() {
+                            return Err(ConfigError::AlgoliaRootMountUnsupported {
+                                id: mount.id.clone(),
+                            });
+                        }
+                        validate_algolia_backend(mount)?;
+                    }
                 }
-                if !experimental.couchdb_vaults {
-                    return Err(ConfigError::CouchdbVaultsNotEnabled {
-                        id: mount.id.clone(),
-                    });
-                }
-                if mount.mount_at.is_empty() {
-                    return Err(ConfigError::CouchdbRootMountUnsupported {
-                        id: mount.id.clone(),
-                    });
-                }
-                validate_couchdb_backend(mount)?;
             }
             // A single explicit root mount is exactly the legacy shape spelled out
             // longhand, so it needs no flag. Anything else does.
@@ -493,6 +633,12 @@ pub fn normalize_service_config(
                 // this shape, which is what keeps `vault_path` well-defined.
                 MountBackendConfig::Couchdb { .. } => {
                     return Err(ConfigError::CouchdbRootMountUnsupported {
+                        id: mounts[root].id.clone(),
+                    });
+                }
+                // Likewise unreachable, via `AlgoliaRootMountUnsupported`.
+                MountBackendConfig::Algolia { .. } => {
+                    return Err(ConfigError::AlgoliaRootMountUnsupported {
                         id: mounts[root].id.clone(),
                     });
                 }
@@ -1386,6 +1532,7 @@ mod tests {
             experimental: Some(ExperimentalConfig {
                 multi_vault,
                 couchdb_vaults,
+                ..ExperimentalConfig::default()
             }),
             ..ServiceConfigInput::default()
         }
@@ -1464,6 +1611,7 @@ mod tests {
             experimental: Some(ExperimentalConfig {
                 multi_vault: true,
                 couchdb_vaults: true,
+                ..ExperimentalConfig::default()
             }),
             ..ServiceConfigInput::default()
         };
@@ -1523,6 +1671,242 @@ mod tests {
                 .expect_err("an empty url/database must be refused");
             assert!(matches!(error, ConfigError::InvalidCouchdbBackend { .. }));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Algolia mounts
+    // -----------------------------------------------------------------------
+
+    fn algolia_mount(id: &str, mount_at: &str) -> MountConfig {
+        MountConfig {
+            id: id.to_string(),
+            mount_at: mount_at.to_string(),
+            backend: MountBackendConfig::Algolia {
+                app_id: "ABC1234XYZ".to_string(),
+                index_name: "team-wiki".to_string(),
+                api_key_ref: SecretRef::EncryptedFile {
+                    id: "algolia-api-key".to_string(),
+                },
+                base_url: None,
+                writable: false,
+                participant_id: None,
+                cache: None,
+                retention: None,
+                index_dir: None,
+            },
+        }
+    }
+
+    /// The input a working algolia config needs: a filesystem root plus the mount,
+    /// with `multiVault` and `algoliaVaults` set.
+    fn algolia_input(
+        mount: MountConfig,
+        multi_vault: bool,
+        algolia_vaults: bool,
+    ) -> ServiceConfigInput {
+        ServiceConfigInput {
+            mounts: Some(vec![
+                filesystem_mount("vault", "", "/tmp/root-vault"),
+                mount,
+            ]),
+            experimental: Some(ExperimentalConfig {
+                multi_vault,
+                algolia_vaults,
+                ..ExperimentalConfig::default()
+            }),
+            ..ServiceConfigInput::default()
+        }
+    }
+
+    /// The happy path, and the gate.
+    #[test]
+    fn an_algolia_mount_needs_its_own_flag_and_then_resolves() {
+        assert!(normalize_service_config(algolia_input(
+            algolia_mount("shared", "_Shared"),
+            true,
+            true
+        ))
+        .is_ok());
+
+        // Without the flag: refused, and by the ALGOLIA error rather than the
+        // multi-vault one — the mount makes the table multi-mount too, so both gates
+        // would otherwise fire and the less actionable one would win.
+        let error = normalize_service_config(algolia_input(
+            algolia_mount("shared", "_Shared"),
+            true,
+            false,
+        ))
+        .expect_err("an ungated algolia mount must be refused");
+        assert!(
+            matches!(error, ConfigError::AlgoliaVaultsNotEnabled { ref id } if id == "shared"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("algoliaVaults"), "{error}");
+        // ...and it says the mount is read-only unless `writable` is also set, so a
+        // user does not enable the flag and then wonder why writes fail.
+        assert!(error.to_string().contains("\"writable\": true"), "{error}");
+
+        // The multi-vault flag alone is not enough either, and the algolia error still
+        // wins when NEITHER is set.
+        let error = normalize_service_config(algolia_input(
+            algolia_mount("shared", "_Shared"),
+            false,
+            false,
+        ))
+        .expect_err("neither flag set");
+        assert!(
+            matches!(error, ConfigError::AlgoliaVaultsNotEnabled { .. }),
+            "{error}"
+        );
+    }
+
+    /// An algolia mount cannot be the ROOT mount: `vault_path` would have nothing to
+    /// point at, exactly as for a couchdb one.
+    #[test]
+    fn an_algolia_root_mount_is_refused() {
+        let input = ServiceConfigInput {
+            mounts: Some(vec![algolia_mount("shared", "")]),
+            experimental: Some(ExperimentalConfig {
+                multi_vault: true,
+                algolia_vaults: true,
+                ..ExperimentalConfig::default()
+            }),
+            ..ServiceConfigInput::default()
+        };
+        let error = normalize_service_config(input).expect_err("an algolia root is refused");
+        assert!(
+            matches!(error, ConfigError::AlgoliaRootMountUnsupported { ref id } if id == "shared"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("no local directory"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_algolia_app_id_or_index_name_is_refused() {
+        for (app_id, index_name) in [("", "team-wiki"), ("ABC1234XYZ", ""), ("  ", "team-wiki")] {
+            let mut mount = algolia_mount("shared", "_Shared");
+            if let MountBackendConfig::Algolia {
+                app_id: app_slot,
+                index_name: index_slot,
+                ..
+            } = &mut mount.backend
+            {
+                *app_slot = app_id.to_string();
+                *index_slot = index_name.to_string();
+            }
+            let error = normalize_service_config(algolia_input(mount, true, true))
+                .expect_err("an empty appId/indexName must be refused");
+            assert!(
+                matches!(error, ConfigError::InvalidAlgoliaBackend { .. }),
+                "({app_id:?}, {index_name:?}) produced {error}"
+            );
+        }
+    }
+
+    /// Embedded `user:password@` credentials in `baseUrl` are refused, because the url
+    /// is printed verbatim by `doctor` and `print-config`.
+    #[test]
+    fn an_algolia_base_url_with_userinfo_is_refused() {
+        for base_url in [
+            "https://admin:hunter2@proxy.example",
+            "http://admin@proxy.example:8080",
+        ] {
+            let mut mount = algolia_mount("shared", "_Shared");
+            if let MountBackendConfig::Algolia { base_url: slot, .. } = &mut mount.backend {
+                *slot = Some(base_url.to_string());
+            }
+            let error = normalize_service_config(algolia_input(mount, true, true))
+                .expect_err("userinfo must be refused");
+            assert!(
+                matches!(error, ConfigError::AlgoliaBaseUrlHasUserinfo { .. }),
+                "{base_url} produced {error}"
+            );
+            assert!(error.to_string().contains("apiKeyRef"), "{error}");
+        }
+
+        // An `@` in the PATH is legal and must not trip the check.
+        let mut mount = algolia_mount("shared", "_Shared");
+        if let MountBackendConfig::Algolia { base_url: slot, .. } = &mut mount.backend {
+            *slot = Some("https://proxy.example/algolia@v1".to_string());
+        }
+        assert!(normalize_service_config(algolia_input(mount, true, true)).is_ok());
+
+        // A present-but-empty `baseUrl` is a mistake rather than "use the default".
+        let mut mount = algolia_mount("shared", "_Shared");
+        if let MountBackendConfig::Algolia { base_url: slot, .. } = &mut mount.backend {
+            *slot = Some("   ".to_string());
+        }
+        assert!(matches!(
+            normalize_service_config(algolia_input(mount, true, true))
+                .expect_err("an empty baseUrl is refused"),
+            ConfigError::InvalidAlgoliaBackend { .. }
+        ));
+    }
+
+    /// `participantId` lands in every record AND in index filter expressions, so a
+    /// value carrying a quote, a backslash or a control character is refused here —
+    /// nowhere downstream can tell it apart from filter syntax.
+    #[test]
+    fn a_malformed_participant_id_is_refused() {
+        for participant in ["", "  ", "paul\"name\"", "paul\\test", "paul\nnewline"] {
+            let mut mount = algolia_mount("shared", "_Shared");
+            if let MountBackendConfig::Algolia {
+                participant_id: slot,
+                ..
+            } = &mut mount.backend
+            {
+                *slot = Some(participant.to_string());
+            }
+            let error = normalize_service_config(algolia_input(mount, true, true))
+                .expect_err("a malformed participantId must be refused");
+            assert!(
+                matches!(error, ConfigError::InvalidAlgoliaBackend { .. }),
+                "{participant:?} produced {error}"
+            );
+        }
+
+        // An ordinary identifier is fine.
+        let mut mount = algolia_mount("shared", "_Shared");
+        if let MountBackendConfig::Algolia {
+            participant_id: slot,
+            ..
+        } = &mut mount.backend
+        {
+            *slot = Some("paul@laptop".to_string());
+        }
+        assert!(normalize_service_config(algolia_input(mount, true, true)).is_ok());
+    }
+
+    /// `indexDir` is the ONLY path on an algolia mount, and it is home-expanded;
+    /// `appId`, `indexName` and `baseUrl` are not paths and must be left alone.
+    #[test]
+    fn the_algolia_index_dir_is_home_expanded_and_nothing_else_is() {
+        let mut mount = algolia_mount("shared", "_Shared");
+        if let MountBackendConfig::Algolia {
+            index_dir,
+            base_url,
+            ..
+        } = &mut mount.backend
+        {
+            *index_dir = Some(PathBuf::from("~/caches/shared"));
+            *base_url = Some("https://proxy.example".to_string());
+        }
+        let resolved =
+            normalize_service_config(algolia_input(mount, true, true)).expect("resolves");
+        let MountBackendConfig::Algolia {
+            index_dir,
+            base_url,
+            app_id,
+            ..
+        } = &resolved.mounts[1].backend
+        else {
+            panic!("the algolia mount survives normalization");
+        };
+        let expanded = index_dir.as_ref().expect("an index dir");
+        assert!(!expanded.to_string_lossy().starts_with('~'), "{expanded:?}");
+        assert!(expanded.ends_with("caches/shared"), "{expanded:?}");
+        assert_eq!(base_url.as_deref(), Some("https://proxy.example"));
+        assert_eq!(app_id, "ABC1234XYZ");
     }
 
     /// `~` is expanded in `sidecarPath` and `indexDir` (both are real paths) and NOT

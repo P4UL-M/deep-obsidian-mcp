@@ -1359,11 +1359,18 @@ fn require_single_mount(state: &AppState, tool: &str) -> Result<(), String> {
     ))
 }
 
-/// The mount roots a `scope` may name, rendered for an error message.
-fn mount_scope_hint(router: &deep_obsidian_backend::VaultRouter) -> String {
-    router
+/// The mount roots an index-backed `scope` may name, rendered for an error message.
+///
+/// Only mounts that HAVE a local search index. Every caller is an index-backed recall
+/// tool explaining which scopes would work, so listing a mount that has no index would
+/// name it as a remedy for the very failure it causes — and in the refusal for scoping
+/// to that mount, the suggestion would be to scope to that mount.
+fn mount_scope_hint(state: &AppState) -> String {
+    let scopes: Vec<String> = state
+        .router
         .mounts()
         .iter()
+        .filter(|mount| state.runtimes.for_mount(&mount.id).is_some())
         .map(|mount| {
             if mount.mount_at.is_empty() {
                 "'/'".to_string()
@@ -1371,8 +1378,14 @@ fn mount_scope_hint(router: &deep_obsidian_backend::VaultRouter) -> String {
                 format!("'{}'", mount.mount_at)
             }
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect();
+    if scopes.is_empty() {
+        // Unreachable today: the ROOT mount always has an index (it is the one mount
+        // that must be a filesystem vault). Answered rather than left as an empty list,
+        // which would render as a dangling "one of: ." .
+        return "no mount in this vault has a local search index".to_string();
+    }
+    scopes.join(", ")
 }
 
 /// Which mount's index serves a recall request, and how to render its paths.
@@ -1473,7 +1486,7 @@ fn resolve_recall_scope(
     let Some(scope) = scope else {
         return Err(format!(
             "{tool} requires a 'scope' on a multi-mount vault: every mount has its own search index, so an unscoped answer would silently omit every mount but one. Pass 'scope' naming the mount to search: {}.",
-            mount_scope_hint(state.router.as_ref())
+            mount_scope_hint(state)
         ));
     };
     let resolved = state
@@ -1484,7 +1497,7 @@ fn resolve_recall_scope(
         return Err(format!(
             "{tool} cannot scope to '{scope}': it is inside mount '{}' rather than naming a mount root, and this tool ranks results, so a narrower scope could only be honoured by filtering an already-truncated list. Pass one of: {}.",
             resolved.mount.id,
-            mount_scope_hint(state.router.as_ref())
+            mount_scope_hint(state)
         ));
     }
     mount_index(state, tool, resolved.mount)
@@ -1520,10 +1533,18 @@ fn resolve_recall_path(
     Ok((index, mount_relative))
 }
 
-/// The runtime backing one mount, or a clear error when that mount has no index.
+/// The runtime backing one mount, or a clear refusal when that mount has no LOCAL
+/// index.
 ///
-/// Unreachable while every backend is a filesystem vault; it is the seam a backend
-/// that brings its own index (or none) will report through.
+/// # This is a designed path, not a bug path
+///
+/// It used to be unreachable — every backend was a filesystem vault, every mount had
+/// an index. It is now the answer for a mount whose backend serves its own content and
+/// therefore has no local index at all (an Algolia-backed shared corpus; see
+/// [`crate::runtime::mount_has_local_index`]). So the wording must not imply a
+/// malfunction: it says WHY there is no index, and names what does work on such a
+/// mount, because a caller who reads "has no index." with no explanation will go
+/// looking for a broken build.
 fn mount_index(
     state: &AppState,
     tool: &str,
@@ -1534,8 +1555,16 @@ fn mount_index(
         .for_mount(&mount.id)
         .ok_or_else(|| {
             format!(
-                "{tool} cannot be served: mount '{}' has no index.",
-                mount.id
+                "{tool} cannot be scoped to mount '{}': that mount has no local search index. Its \
+                 backend ({}) serves its own content — the remote index IS the corpus — so there \
+                 is nothing local to rank over, and building a copy would serve one participant's \
+                 stale snapshot. Read and write notes on this mount normally (read_file, \
+                 upsert_note, list_children, note_outline), use grep_search with a 'glob' under \
+                 the mount for line search, and scope index-backed recall to a mount that has an \
+                 index: {}.",
+                mount.id,
+                mount.backend.descriptor().kind.as_str(),
+                mount_scope_hint(state)
             )
         })?
         .clone();
@@ -2092,6 +2121,26 @@ pub async fn call_tool(
                     }
                 }
             }
+            // A mount with no LOCAL index is reported as skipped rather than omitted.
+            // Omitting it would make `mounts` a silently incomplete list of the vault's
+            // mounts, which is worse than an entry saying there was nothing to rebuild.
+            for mount in state.router.mounts() {
+                if state.runtimes.for_mount(&mount.id).is_some() {
+                    continue;
+                }
+                mount_results.push(json!({
+                    "id": mount.id,
+                    "mountAt": mount.mount_at,
+                    "rebuilt": false,
+                    "skipped": true,
+                    "reason": format!(
+                        "mount '{}' has no local search index to rebuild: its backend ({}) serves \
+                         its own content",
+                        mount.id,
+                        mount.backend.descriptor().kind.as_str()
+                    ),
+                }));
+            }
             // A partial rebuild reported as success would be a wrong answer: the
             // mounts that DID rebuild keep their fresh index, and the failure names
             // every mount that did not.
@@ -2132,8 +2181,11 @@ pub async fn call_tool(
                 result.insert("embeddingDimensions".to_string(), json!(dimensions));
             }
             // Additive and multi-mount only, so the single-mount payload is
-            // byte-identical to the frozen shape.
-            if state.runtimes.is_multi_mount() {
+            // byte-identical to the frozen shape. Gated on the ROUTER rather than on
+            // the runtime table: a vault with a filesystem root plus an Algolia mount
+            // has one runtime and two mounts, and it is the second one a client needs
+            // to be told about.
+            if state.router.is_multi_mount() {
                 result.insert("mounts".to_string(), json!(mount_results));
             }
             Ok(json_text_result(Value::Object(result)))
