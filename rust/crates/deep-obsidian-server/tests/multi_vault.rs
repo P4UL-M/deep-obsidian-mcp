@@ -15,9 +15,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use deep_obsidian_server::health::{
+    build_readiness_payload, insert_mount_index_detail, readiness_status_code,
+};
 use deep_obsidian_server::mcp::{handle_request, AppState};
 use deep_obsidian_server::protocol::JsonRpcRequest;
-use deep_obsidian_server::runtime::RuntimeState;
+use deep_obsidian_server::runtime::MountRuntimes;
 use deep_obsidian_types::{
     AuthConfig, AutoReindexConfig, EmbeddingConfig, ExperimentalConfig, HttpConfig,
     MountBackendConfig, MountConfig, ResolvedServiceConfig, StdioMode, TransportMode,
@@ -69,16 +72,36 @@ impl Fixture {
         .expect("write Deep.md");
         fs::write(
             fixture.team_vault.join("Charter.md"),
-            "# Charter\n\nThe team charter lives on the team mount.\n",
+            // The wiki link gives the team mount a graph edge of its own, so
+            // `graph_traverse` on this mount has something to find that the ROOT
+            // mount's index could not possibly know about.
+            "# Charter\n\nThe team charter lives on the team mount.\n\nSee [[Roster]].\n",
         )
         .expect("write Charter.md");
+        fs::write(
+            fixture.team_vault.join("Roster.md"),
+            "# Roster\n\nThe team roster, and who signs the charter.\n",
+        )
+        .expect("write Roster.md");
         fixture
     }
 
+    /// Where the `team` mount's index must land, given no explicit `indexDir`:
+    /// keyed by MOUNT ID under the root's index dir.
+    fn team_index_dir(&self) -> PathBuf {
+        self.index_dir.join("mounts").join("team")
+    }
+
     fn config(&self) -> ResolvedServiceConfig {
+        self.config_with_team_vault(self.team_vault.clone())
+    }
+
+    /// The same two-mount config with the team mount pointed somewhere else, so a
+    /// broken mount can be built by naming a directory that does not exist.
+    fn config_with_team_vault(&self, team_vault: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
-            // Still the ROOT mount's path: the runtime watcher and the index
-            // consume it, and this slice does not federate either.
+            // Still the ROOT mount's path: it is what `vaultPath` has always meant,
+            // and the root mount's own runtime is built from this config verbatim.
             vault_path: self.root_vault.clone(),
             mounts: vec![
                 MountConfig {
@@ -93,7 +116,10 @@ impl Fixture {
                     id: "team".to_string(),
                     mount_at: "Team".to_string(),
                     backend: MountBackendConfig::Filesystem {
-                        vault_path: self.team_vault.clone(),
+                        vault_path: team_vault,
+                        // Deliberately unset: this pins the DERIVED default
+                        // (`<root index dir>/mounts/team`), which is the thing that
+                        // must not collide with the root's index.
                         index_dir: None,
                     },
                 },
@@ -121,11 +147,14 @@ impl Fixture {
     }
 
     async fn state(&self) -> AppState {
-        let config = self.config();
-        let (runtime, _auto_reindex) = RuntimeState::bootstrap(config.clone())
+        self.state_for(self.config()).await
+    }
+
+    async fn state_for(&self, config: ResolvedServiceConfig) -> AppState {
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
             .await
             .expect("bootstrap runtime");
-        AppState::new(config, runtime)
+        AppState::new(config, runtimes)
     }
 
     /// State with an upload base, so `request_vault_upload` can mint.
@@ -148,12 +177,13 @@ impl Drop for Fixture {
 // JSON-RPC driver
 // ---------------------------------------------------------------------------
 
-async fn tool_call(state: &AppState, name: &str, arguments: Value) -> Value {
+/// One JSON-RPC round trip through the public entry point.
+async fn request(state: &AppState, method: &str, params: Value) -> Value {
     let payload = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "tools/call",
-        "params": {"name": name, "arguments": arguments},
+        "method": method,
+        "params": params,
     });
     let parsed: JsonRpcRequest =
         serde_json::from_value(payload).expect("request payload to deserialize");
@@ -162,6 +192,15 @@ async fn tool_call(state: &AppState, name: &str, arguments: Value) -> Value {
         Ok(None) => json!({"__notification_no_response__": true}),
         Err(error) => serde_json::to_value(&error).expect("error response to serialize"),
     }
+}
+
+async fn tool_call(state: &AppState, name: &str, arguments: Value) -> Value {
+    request(
+        state,
+        "tools/call",
+        json!({"name": name, "arguments": arguments}),
+    )
+    .await
 }
 
 /// The tool's `structuredContent`, or a panic naming the error it returned.
@@ -302,7 +341,7 @@ async fn the_root_listing_merges_the_root_mount_with_a_synthesized_mount_folder(
         .iter()
         .map(|entry| entry["path"].as_str().expect("path"))
         .collect();
-    assert_eq!(paths, vec!["Team/Charter.md"]);
+    assert_eq!(paths, vec!["Team/Charter.md", "Team/Roster.md"]);
 
     // `foldersOnly` sees the synthesized folder too.
     let folders = tool_call(&state, "list_children", json!({"foldersOnly": true})).await;
@@ -352,17 +391,41 @@ async fn an_unscoped_grep_is_refused_rather_than_answered_from_one_mount() {
 }
 
 #[tokio::test]
-async fn index_backed_tools_refuse_a_multi_mount_vault_instead_of_reporting_partial_results() {
-    let fixture = Fixture::new("recall");
+async fn unscoped_index_recall_is_refused_and_names_the_scopes_that_would_work() {
+    let fixture = Fixture::new("recall-unscoped");
     let state = fixture.state().await;
 
     for (tool, arguments) in [
         ("hybrid_search", json!({"query": "charter"})),
-        ("find_files", json!({"query": "Charter"})),
         ("load_knowledge", json!({"subject": "charter"})),
-        ("recommend_folder", json!({"topic": "charter"})),
         ("search_artifacts", json!({"query": "charter"})),
-        ("build_index", json!({})),
+    ] {
+        let response = tool_call(&state, tool, arguments).await;
+        let message = error_message(&response);
+        assert!(
+            message.starts_with(tool) && message.contains("'scope'"),
+            "{tool} must name the missing argument, got: {message}"
+        );
+        // Every mount has an index now, so the refusal is about NOT MERGING them --
+        // and it lists the scopes that would work, both of them.
+        assert!(
+            message.contains("'/'") && message.contains("'Team'"),
+            "{tool} must name the usable scopes, got: {message}"
+        );
+    }
+}
+
+/// The tools with no argument that could ever name one mount. Their answer is a
+/// whole-vault ranking (a limit-truncated path match; a folder recommendation), so
+/// merging mounts is the only way to answer them and that is not this slice.
+#[tokio::test]
+async fn tools_without_a_scope_argument_still_refuse_a_multi_mount_vault() {
+    let fixture = Fixture::new("recall-unscopable");
+    let state = fixture.state().await;
+
+    for (tool, arguments) in [
+        ("find_files", json!({"query": "Charter"})),
+        ("recommend_folder", json!({"topic": "charter"})),
     ] {
         let response = tool_call(&state, tool, arguments).await;
         let message = error_message(&response);
@@ -371,34 +434,427 @@ async fn index_backed_tools_refuse_a_multi_mount_vault_instead_of_reporting_part
             "{tool} must refuse explicitly, got: {message}"
         );
         assert!(
-            message.contains("root mount"),
+            message.contains("merging"),
             "{tool} must name the reason, got: {message}"
         );
     }
 }
 
 #[tokio::test]
-async fn path_scoped_recall_works_inside_the_root_mount_and_is_refused_elsewhere() {
+async fn a_scoped_hybrid_search_is_served_by_that_mounts_index_with_logical_paths() {
+    let fixture = Fixture::new("recall-scoped");
+    let state = fixture.state().await;
+
+    // "roster" exists ONLY on the team mount. Before per-mount indexing this query
+    // could not be answered at all: the root mount's index has never seen the file.
+    let team = tool_call(
+        &state,
+        "hybrid_search",
+        json!({"query": "roster charter", "scope": "Team"}),
+    )
+    .await;
+    let matches = structured(&team)["matches"].as_array().expect("matches");
+    assert!(!matches.is_empty(), "team mount must serve its own notes");
+    let paths: Vec<&str> = matches
+        .iter()
+        .map(|item| item["path"].as_str().expect("path"))
+        .collect();
+    // LOGICAL paths, every one of them: the index stores `Roster.md`, the client
+    // must never see that spelling.
+    assert!(
+        paths.iter().all(|path| path.starts_with("Team/")),
+        "scoped results must be logical paths under the mount: {paths:?}"
+    );
+    assert!(paths.contains(&"Team/Roster.md"), "{paths:?}");
+    // The resource URI moves with the path, or a follow-up read would 404.
+    let roster = matches
+        .iter()
+        .find(|item| item["path"] == json!("Team/Roster.md"))
+        .expect("Roster match");
+    assert_eq!(
+        roster["resourceUri"],
+        json!("obsidian://note?path=Team%2FRoster.md")
+    );
+
+    // The root mount, addressed as "/", answers from its OWN index and cannot see
+    // the team mount's notes -- each index is self-contained.
+    let root = tool_call(
+        &state,
+        "hybrid_search",
+        json!({"query": "roster charter", "scope": "/"}),
+    )
+    .await;
+    let root_paths: Vec<&str> = structured(&root)["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .map(|item| item["path"].as_str().expect("path"))
+        .collect();
+    assert!(
+        root_paths.iter().all(|path| !path.starts_with("Team/")),
+        "the root mount's index must not contain another mount's notes: {root_paths:?}"
+    );
+}
+
+/// A scope must name a mount root. These tools truncate to `limit`, so a narrower
+/// scope could only be honoured by filtering an already-truncated list -- silently
+/// returning fewer results than asked for. The refusal is the exact answer.
+#[tokio::test]
+async fn a_scope_that_does_not_name_a_mount_root_is_refused() {
+    let fixture = Fixture::new("recall-deep-scope");
+    let state = fixture.state().await;
+
+    let response = tool_call(
+        &state,
+        "hybrid_search",
+        json!({"query": "deep", "scope": "Notes"}),
+    )
+    .await;
+    let message = error_message(&response);
+    assert!(
+        message.contains("Notes") && message.contains("'vault'"),
+        "the refusal must name the scope and its mount: {message}"
+    );
+    assert!(
+        message.contains("'/'") && message.contains("'Team'"),
+        "the refusal must name the usable scopes: {message}"
+    );
+}
+
+#[tokio::test]
+async fn path_taking_recall_routes_to_the_mount_owning_the_path() {
     let fixture = Fixture::new("path-recall");
     let state = fixture.state().await;
 
-    // Inside the root mount: indexed today, so it behaves exactly as it always has.
+    // Inside the root mount: unchanged behaviour.
     for tool in ["related_notes", "graph_traverse"] {
         let response = tool_call(&state, tool, json!({"path": "Root.md"})).await;
         assert_eq!(structured(&response)["path"], json!("Root.md"));
     }
 
-    // On another mount: refused, naming the path and the mount.
-    for tool in ["related_notes", "graph_traverse"] {
-        let response = tool_call(&state, tool, json!({"path": "Team/Charter.md"})).await;
-        let message = error_message(&response);
+    // On the team mount: served by the TEAM index, which is the only one that has
+    // ever seen this note. Previously an explicit refusal.
+    let related = tool_call(
+        &state,
+        "related_notes",
+        json!({"path": "Team/Charter.md", "limit": 5}),
+    )
+    .await;
+    let payload = structured(&related);
+    assert_eq!(payload["path"], json!("Team/Charter.md"));
+    for item in payload["matches"].as_array().expect("matches") {
+        let path = item["path"].as_str().expect("path");
         assert!(
-            message.starts_with(tool)
-                && message.contains("Team/Charter.md")
-                && message.contains("'team'"),
-            "{tool} must name the path and the mount, got: {message}"
+            path.starts_with("Team/"),
+            "related notes must be logical paths: {path}"
         );
     }
+
+    // The wiki link inside the team vault is an edge of the TEAM mount's graph, and
+    // both endpoints are reported logically.
+    let graph = tool_call(
+        &state,
+        "graph_traverse",
+        json!({"path": "Team/Charter.md", "direction": "outgoing", "depth": 1}),
+    )
+    .await;
+    let graph = structured(&graph);
+    assert_eq!(graph["path"], json!("Team/Charter.md"));
+    let node_paths: Vec<&str> = graph["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .map(|node| node["path"].as_str().expect("path"))
+        .collect();
+    assert!(
+        node_paths.contains(&"Team/Charter.md") && node_paths.contains(&"Team/Roster.md"),
+        "the mount's own graph must be traversable at logical paths: {node_paths:?}"
+    );
+    let edges = graph["edges"].as_array().expect("edges");
+    let edge = edges
+        .iter()
+        .find(|edge| edge["source"] == json!("Team/Charter.md"))
+        .expect("the charter's outgoing edge");
+    assert_eq!(edge["target"], json!("Team/Roster.md"));
+    // `rawLink` is the literal wiki-link text, not an address, so it is NOT
+    // rewritten -- it must still read back as what the note actually says.
+    assert_eq!(edge["rawLink"], json!("Roster"));
+}
+
+// ---------------------------------------------------------------------------
+// Per-mount indexes
+// ---------------------------------------------------------------------------
+
+/// The collision guarantee, on disk: each mount's SQLite index is its own file.
+/// Two runtimes sharing one index file would corrupt each other's writes.
+#[tokio::test]
+async fn every_mount_indexes_into_its_own_directory() {
+    let fixture = Fixture::new("index-dirs");
+    let state = fixture.state().await;
+    tool_call(&state, "build_index", json!({})).await;
+
+    let root_index = fixture.index_dir.join("index.sqlite");
+    let team_index = fixture.team_index_dir().join("index.sqlite");
+    assert!(root_index.is_file(), "root index at {root_index:?}");
+    assert!(team_index.is_file(), "team index at {team_index:?}");
+    assert_ne!(root_index, team_index);
+    // Derived from the ROOT index dir, so a packaged install (whose indexDir points
+    // outside every vault) keeps every mount's index outside every vault too.
+    assert!(team_index.starts_with(&fixture.index_dir));
+    // And neither vault got an index dir of its own by accident.
+    assert!(!fixture.team_vault.join(".deep-obsidian-mcp").exists());
+}
+
+#[tokio::test]
+async fn build_index_rebuilds_every_mount_and_reports_each_one() {
+    let fixture = Fixture::new("build-index");
+    let state = fixture.state().await;
+
+    let response = tool_call(&state, "build_index", json!({})).await;
+    let payload = structured(&response);
+    assert_eq!(payload["rebuilt"], json!(true));
+
+    let mounts = payload["mounts"].as_array().expect("mounts array");
+    assert_eq!(mounts.len(), 2);
+    for mount in mounts {
+        assert_eq!(mount["rebuilt"], json!(true), "{mount}");
+        assert!(
+            mount["noteCount"].as_u64().expect("noteCount") > 0,
+            "{mount}"
+        );
+    }
+    assert_eq!(mounts[0]["id"], json!("vault"));
+    assert_eq!(mounts[1]["id"], json!("team"));
+
+    // The top-level counts cover the whole logical vault, not just the root mount.
+    let total: u64 = mounts
+        .iter()
+        .map(|mount| mount["noteCount"].as_u64().expect("noteCount"))
+        .sum();
+    assert_eq!(payload["noteCount"], json!(total));
+    // 2 root notes + 2 team notes.
+    assert_eq!(total, 4);
+
+    // The rebuild is visible to a scoped search immediately.
+    let scoped = tool_call(
+        &state,
+        "hybrid_search",
+        json!({"query": "roster", "scope": "Team"}),
+    )
+    .await;
+    assert!(!structured(&scoped)["matches"]
+        .as_array()
+        .expect("matches")
+        .is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Resources: enumeration federates, because it does not rank
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn resources_enumerate_every_mount_at_logical_paths() {
+    let fixture = Fixture::new("resources");
+    let state = fixture.state().await;
+
+    let listed = request(&state, "resources/list", json!({})).await;
+    let names: Vec<&str> = listed["result"]["resources"]
+        .as_array()
+        .expect("resources")
+        .iter()
+        .filter_map(|resource| resource["name"].as_str())
+        .collect();
+    for expected in [
+        "Root.md",
+        "Notes/Deep.md",
+        "Team/Charter.md",
+        "Team/Roster.md",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "resources/list must enumerate {expected}: {names:?}"
+        );
+    }
+    assert_eq!(listed["result"]["_meta"]["noteResourceTotal"], json!(4));
+
+    // Globally lexicographic over LOGICAL paths, not grouped by mount: the same
+    // kind of list a single-mount client already receives.
+    let note_names: Vec<&str> = names
+        .iter()
+        .filter(|name| name.ends_with(".md"))
+        .copied()
+        .collect();
+    let mut sorted = note_names.clone();
+    sorted.sort_unstable();
+    assert_eq!(note_names, sorted, "note resources must be globally sorted");
+
+    let index = request(
+        &state,
+        "resources/read",
+        json!({"uri": "obsidian://vault/notes-index"}),
+    )
+    .await;
+    let text = index["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("notes-index text");
+    let manifest: Value = serde_json::from_str(text).expect("notes-index is JSON");
+    assert_eq!(manifest["noteCount"], json!(4));
+    let paths: Vec<&str> = manifest["notes"]
+        .as_array()
+        .expect("notes")
+        .iter()
+        .map(|note| note["path"].as_str().expect("path"))
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "Notes/Deep.md",
+            "Root.md",
+            "Team/Charter.md",
+            "Team/Roster.md"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_vault_overview_resource_sums_counts_and_details_each_mount() {
+    let fixture = Fixture::new("vault-overview");
+    let state = fixture.state().await;
+
+    let overview = request(
+        &state,
+        "resources/read",
+        json!({"uri": "obsidian://vault/info"}),
+    )
+    .await;
+    let text = overview["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("overview text");
+    let payload: Value = serde_json::from_str(text).expect("overview is JSON");
+
+    // `vaultPath` still means the root mount's path: unchanged meaning.
+    assert_eq!(
+        payload["vaultPath"],
+        json!(fixture.root_vault.to_string_lossy())
+    );
+    // The whole logical vault, not the root mount's share of it.
+    assert_eq!(payload["markdownFileCount"], json!(4));
+    let mounts = payload["mounts"].as_array().expect("mounts");
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[1]["id"], json!("team"));
+    assert_eq!(mounts[1]["mountAt"], json!("Team"));
+    assert_eq!(mounts[1]["indexStatus"], json!("ready"));
+    assert_eq!(mounts[1]["markdownFileCount"], json!(2));
+}
+
+// ---------------------------------------------------------------------------
+// Failure isolation
+// ---------------------------------------------------------------------------
+
+/// A non-root mount whose vault cannot be read must not take the server down --
+/// but readiness must not claim everything is fine either.
+#[tokio::test]
+async fn a_broken_mount_degrades_readiness_by_name_while_the_root_keeps_serving() {
+    let fixture = Fixture::new("broken-mount");
+    // A directory that is deliberately never created: the mount's index refresh
+    // fails, exactly as an unreadable vault folder would.
+    let missing = fixture.index_dir.parent().expect("base").join("gone");
+    let config = fixture.config_with_team_vault(missing);
+    // Bootstrap SUCCEEDS: a failing non-root mount is degradation, not a fatal
+    // startup error.
+    let state = fixture.state_for(config).await;
+
+    // The root mount still serves reads and its own recall.
+    let root = tool_call(&state, "read_file", json!({"path": "Root.md"})).await;
+    assert!(structured(&root)["text"]
+        .as_str()
+        .expect("text")
+        .contains("Root note"));
+    let scoped = tool_call(
+        &state,
+        "hybrid_search",
+        json!({"query": "root note", "scope": "/"}),
+    )
+    .await;
+    assert!(!structured(&scoped)["matches"]
+        .as_array()
+        .expect("matches")
+        .is_empty());
+
+    // Readiness is degraded, 503, and NAMES the mount. The top-level wording is
+    // frozen and says nothing about mounts, so the mount id appears in the additive
+    // per-mount detail rather than being laundered into `lastError`.
+    let diagnostics = state.runtimes.aggregate_diagnostics();
+    assert_eq!(diagnostics.status.as_str(), "degraded");
+    assert_eq!(
+        readiness_status_code(&diagnostics),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let mut payload = build_readiness_payload(&state.config, &diagnostics);
+    insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
+    assert_eq!(payload["status"], json!("degraded"));
+    assert_eq!(payload["ready"], json!(false));
+    assert_eq!(payload["degradedMounts"], json!(["team"]));
+    let mounts = payload["mounts"].as_array().expect("mounts");
+    assert_eq!(mounts[0]["indexStatus"], json!("ready"));
+    assert_eq!(mounts[1]["id"], json!("team"));
+    assert_eq!(mounts[1]["indexStatus"], json!("degraded"));
+    assert!(!mounts[1]["lastError"]["message"]
+        .as_str()
+        .expect("the failure message")
+        .is_empty());
+
+    // And enumeration refuses rather than silently dropping the broken mount's
+    // notes: a listing that omits them would assert they do not exist.
+    let listed = request(&state, "resources/list", json!({})).await;
+    let message = listed["error"]["message"]
+        .as_str()
+        .expect("resources/list must fail");
+    assert!(
+        message.contains("mount 'team'"),
+        "the failure must name the mount: {message}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// tools/list
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_scope_argument_is_declared_only_on_a_multi_mount_vault() {
+    let fixture = Fixture::new("tools-list");
+    let state = fixture.state().await;
+
+    let listed = request(&state, "tools/list", json!({})).await;
+    let tools = listed["result"]["tools"].as_array().expect("tools");
+    for name in ["hybrid_search", "search_artifacts", "load_knowledge"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == json!(name))
+            .unwrap_or_else(|| panic!("{name} tool definition"));
+        assert!(
+            tool["inputSchema"]["properties"]["scope"].is_object(),
+            "{name} must declare 'scope' on a multi-mount vault"
+        );
+        // Required, because the tool genuinely cannot answer without it here.
+        assert!(
+            tool["inputSchema"]["required"]
+                .as_array()
+                .expect("required")
+                .contains(&json!("scope")),
+            "{name} must require 'scope' on a multi-mount vault"
+        );
+    }
+    // The tools that cannot be scoped do not grow a meaningless argument.
+    for name in ["find_files", "recommend_folder"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == json!(name))
+            .unwrap_or_else(|| panic!("{name} tool definition"));
+        assert!(tool["inputSchema"]["properties"]["scope"].is_null());
+    }
+    // The single-mount half of this contract is frozen by the `tools_list` golden
+    // in `mcp_contract.rs`, which must never contain `scope`.
 }
 
 // ---------------------------------------------------------------------------

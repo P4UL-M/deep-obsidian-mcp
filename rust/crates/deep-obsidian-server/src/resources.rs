@@ -7,7 +7,7 @@ use deep_obsidian_core::text::{extract_block_sections, extract_heading_sections}
 use serde_json::json;
 use urlencoding::decode;
 
-use crate::health::build_vault_overview_payload;
+use crate::health::{build_vault_overview_payload, insert_mount_index_detail};
 use crate::mcp::AppState;
 use crate::protocol::{
     ResourceContents, ResourceDefinition, ResourceListResult, ResourceReadResult,
@@ -96,21 +96,66 @@ fn note_resource(path: &str) -> ResourceDefinition {
     }
 }
 
-fn sorted_note_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
-    let mut paths = paths.collect::<Vec<_>>();
+/// Every note in the logical vault, as a sorted list of LOGICAL paths.
+///
+/// # Why enumeration federates while recall does not
+///
+/// `resources/list` and `obsidian://vault/notes-index` enumerate; they do not rank.
+/// Concatenating each mount's index is therefore a COMPLETE answer, not a partial
+/// one — which is exactly why the recall tools still refuse: their answer is a
+/// top-`limit` ordering, and merging orderings needs comparable scores across
+/// independently built indexes.
+///
+/// # Ordering
+///
+/// Globally lexicographic over logical paths, NOT grouped by mount. Two reasons: a
+/// single-mount client already receives one globally sorted list, so a multi-mount
+/// vault hands back the same kind of object rather than a differently-shaped one;
+/// and it is stable under reordering the `mounts` table in the config, which is
+/// pure presentation. For a single mount this reduces to a plain lexicographic
+/// sort of the root index's own paths, which is exactly what this returned before
+/// there was more than one mount.
+///
+/// # A broken mount is an error, not a silent omission
+///
+/// If any mount's index cannot be read the whole listing fails, naming the mount.
+/// An enumeration that quietly drops one mount's notes tells a client those notes
+/// do not exist, which is worse than telling it the listing is unavailable.
+async fn all_logical_note_paths(state: &AppState, reason: &str) -> Result<Vec<String>, String> {
+    let mut paths: Vec<String> = Vec::new();
+    for entry in state.runtimes.entries() {
+        let snapshot = entry
+            .runtime
+            .fresh_snapshot(reason)
+            .await
+            .map_err(|error| {
+                if entry.is_root() {
+                    error
+                } else {
+                    format!("mount '{}' cannot be listed: {error}", entry.id)
+                }
+            })?;
+        paths.extend(
+            snapshot
+                .index
+                .file_snapshots
+                .iter()
+                // Index paths are mount-relative; the identity for the root mount.
+                .map(|file| {
+                    if entry.mount_at.is_empty() {
+                        file.path.clone()
+                    } else {
+                        format!("{}/{}", entry.mount_at, file.path)
+                    }
+                }),
+        );
+    }
     paths.sort_unstable();
-    paths
+    Ok(paths)
 }
 
 pub async fn list_resources(state: &AppState) -> Result<ResourceListResult, String> {
-    let snapshot = state.runtime.fresh_snapshot("resources/list").await?;
-    let note_paths = sorted_note_paths(
-        snapshot
-            .index
-            .file_snapshots
-            .iter()
-            .map(|entry| entry.path.as_str()),
-    );
+    let note_paths = all_logical_note_paths(state, "resources/list").await?;
     let note_count = note_paths.len();
     let listed_count = note_count.min(NOTE_RESOURCE_LIST_LIMIT);
 
@@ -122,7 +167,7 @@ pub async fn list_resources(state: &AppState) -> Result<ResourceListResult, Stri
         note_paths
             .iter()
             .take(NOTE_RESOURCE_LIST_LIMIT)
-            .map(|path| note_resource(path)),
+            .map(|path| note_resource(path.as_str())),
     );
 
     Ok(ResourceListResult {
@@ -251,10 +296,13 @@ async fn read_note_text(
 pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadResult, String> {
     if uri == VAULT_INFO_URI {
         let snapshot = state
-            .runtime
+            .runtime()
             .fresh_snapshot("resources/read:vault-info")
             .await?;
-        let payload = build_vault_overview_payload(&state.config, &snapshot);
+        let mut payload = build_vault_overview_payload(&state.config, &snapshot);
+        // Additive, multi-mount only: the counts above are the ROOT mount's, so make
+        // them cover the whole logical vault and report each mount's own state.
+        insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
         return Ok(ResourceReadResult {
             contents: vec![ResourceContents {
                 uri: uri.to_string(),
@@ -266,17 +314,9 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
     }
 
     if uri == NOTES_INDEX_URI {
-        let snapshot = state
-            .runtime
-            .fresh_snapshot("resources/read:notes-index")
-            .await?;
-        let note_paths = sorted_note_paths(
-            snapshot
-                .index
-                .file_snapshots
-                .iter()
-                .map(|entry| entry.path.as_str()),
-        );
+        // Every mount, in one globally sorted list of logical paths. See
+        // `all_logical_note_paths` for why enumeration federates and ranking does not.
+        let note_paths = all_logical_note_paths(state, "resources/read:notes-index").await?;
         let notes = note_paths
             .iter()
             .map(|path| {
@@ -374,13 +414,6 @@ pub fn note_name(path: &str) -> String {
 mod tests {
     use super::*;
     use deep_obsidian_backend::FilesystemVaultBackend;
-
-    #[test]
-    fn sorted_note_paths_are_stable() {
-        let paths = sorted_note_paths(["z.md", "a.md", "folder/b.md"].into_iter());
-
-        assert_eq!(paths, vec!["a.md", "folder/b.md", "z.md"]);
-    }
 
     #[test]
     fn notes_index_resource_describes_truncated_lists() {

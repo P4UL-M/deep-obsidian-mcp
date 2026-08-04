@@ -125,6 +125,39 @@ pub fn default_packaged_index_dir(vault_path: &Path) -> PathBuf {
         .join(stable_vault_hash(vault_path))
 }
 
+/// Directory component under a root index dir reserved for non-root mounts.
+/// A literal, so the collision argument below can name it.
+pub const MOUNT_INDEX_DIR_SEGMENT: &str = "mounts";
+
+/// Where a NON-ROOT mount's index lives when its own `indexDir` is unset.
+///
+/// Derived from the ROOT mount's already-resolved `index_dir` rather than from the
+/// mount's vault path, for one decisive reason: **packaged mode is only recorded in
+/// the resolved root `index_dir`**. Nothing at serve time can tell a packaged
+/// install (whose indexes must live under Application Support / `XDG_DATA_HOME`,
+/// outside every vault) from a source install; the installer expresses it by
+/// writing an explicit `indexDir`. Nesting under that path therefore inherits
+/// packaged-ness for free, and inherits an operator's explicit `indexDir` too.
+///
+/// Keyed by MOUNT ID, not by a vault-path hash like
+/// [`default_packaged_index_dir`]. Hash keying would give two mounts that name the
+/// same `vaultPath` the same index directory, i.e. two independent
+/// `RuntimeState`s writing one SQLite file. Mount ids are unique per config
+/// ([`ConfigError::DuplicateMountId`]) and constrained to `[a-z0-9][a-z0-9-]*`, so
+/// id keying is strictly 1:1 with the runtime that owns it, is a single safe path
+/// segment, and cannot collide on a case-insensitive filesystem.
+///
+/// # Non-collision
+///
+/// * with the ROOT mount: the root's index is `<index_dir>/index.sqlite` and the
+///   index crate creates nothing else in that directory, so the
+///   `<index_dir>/mounts/` subtree is unreachable from it;
+/// * between non-root mounts: distinct ids, one segment each, no separators or
+///   `.`/`..` (validated), so distinct sibling directories.
+pub fn default_mount_index_dir(root_index_dir: &Path, mount_id: &str) -> PathBuf {
+    root_index_dir.join(MOUNT_INDEX_DIR_SEGMENT).join(mount_id)
+}
+
 /// Per-user application data directory used in packaged mode (where indexes live
 /// outside the vault). Platform-native: macOS Application Support, otherwise the
 /// XDG data home (Linux/apt installs).
@@ -670,8 +703,9 @@ pub mod secrets;
 #[cfg(test)]
 mod tests {
     use super::{
-        default_packaged_index_dir, expand_home_path, is_loopback_host, normalize_persisted_config,
-        normalize_service_config, to_persisted_config, ConfigError, DEFAULT_CONFIG_APP_DIR,
+        default_mount_index_dir, default_packaged_index_dir, expand_home_path, is_loopback_host,
+        normalize_persisted_config, normalize_service_config, to_persisted_config, ConfigError,
+        DEFAULT_CONFIG_APP_DIR,
     };
     use deep_obsidian_types::{
         AuthConfigInput, ExperimentalConfig, MountBackendConfig, MountConfig,
@@ -1144,5 +1178,34 @@ mod tests {
         assert!(rendered.contains(DEFAULT_CONFIG_APP_DIR));
         assert!(path.parent().unwrap().ends_with("indexes"));
         assert_eq!(path.file_name().unwrap().to_string_lossy().len(), 16);
+    }
+
+    /// The whole point of the derivation: no two mounts, and no mount and the
+    /// root, can ever name the same index directory.
+    #[test]
+    fn default_mount_index_dir_cannot_collide() {
+        let root = std::path::Path::new("/data/index");
+        let team = default_mount_index_dir(root, "team");
+        let other = default_mount_index_dir(root, "other-team");
+
+        assert_eq!(team, root.join("mounts").join("team"));
+        // Distinct ids -> distinct sibling directories...
+        assert_ne!(team, other);
+        // ...and neither is the root's own index directory, nor an ancestor or
+        // descendant of the root's index FILE (`<root>/index.sqlite`).
+        assert_ne!(team, root);
+        assert!(team.starts_with(root));
+        assert!(!team.starts_with(root.join("index.sqlite")));
+        assert!(!root.join("index.sqlite").starts_with(&team));
+    }
+
+    /// Packaged mode is inherited rather than re-derived: the root index dir is
+    /// the only place it is recorded.
+    #[test]
+    fn default_mount_index_dir_inherits_packaged_root() {
+        let packaged_root = default_packaged_index_dir(std::path::Path::new("~/Vault"));
+        let mount = default_mount_index_dir(&packaged_root, "team");
+        assert!(mount.starts_with(&packaged_root));
+        assert!(mount.to_string_lossy().contains(DEFAULT_CONFIG_APP_DIR));
     }
 }

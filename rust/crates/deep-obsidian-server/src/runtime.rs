@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use deep_obsidian_backend::watch::watch_reason;
+use deep_obsidian_config::default_mount_index_dir;
 use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_index::embeddings::{
     EmbeddingConfig as IndexEmbeddingConfig, EmbeddingProvider as IndexEmbeddingProvider,
@@ -14,7 +15,7 @@ use deep_obsidian_index::index::{
     get_search_index_with_artifacts, same_artifact_embedding_config, same_artifact_snapshots,
     same_semantic_config, SearchIndex, SemanticBackend,
 };
-use deep_obsidian_types::ResolvedServiceConfig;
+use deep_obsidian_types::{MountBackendConfig, MountConfig, ResolvedServiceConfig};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use secrecy::ExposeSecret;
 use std::path::PathBuf;
@@ -70,6 +71,29 @@ impl RuntimeReadiness {
             Self::Loading => "loading",
             Self::Ready => "ready",
             Self::Degraded => "degraded",
+        }
+    }
+
+    /// Severity, for aggregating several mounts into one answer.
+    ///
+    /// `Degraded` outranks `Loading`: a mount that has already failed is a
+    /// harder fact about the server than a mount that has not finished yet, and a
+    /// reader who sees only the aggregate must not be told "loading" while an
+    /// index is known broken.
+    fn severity(self) -> u8 {
+        match self {
+            Self::Ready => 0,
+            Self::Loading => 1,
+            Self::Degraded => 2,
+        }
+    }
+
+    /// The worse of two readiness states.
+    fn worst(self, other: Self) -> Self {
+        if other.severity() > self.severity() {
+            other
+        } else {
+            self
         }
     }
 }
@@ -234,21 +258,6 @@ impl RuntimeState {
         })
     }
 
-    pub async fn bootstrap(
-        config: ResolvedServiceConfig,
-    ) -> Result<(Arc<Self>, Option<AutoReindexHandle>), String> {
-        let runtime = Self::new(config);
-        runtime.startup_refresh_with_watchdog().await?;
-
-        let handle = if runtime.config.auto_reindex.enabled {
-            Some(start_auto_reindex_tasks(runtime.clone()))
-        } else {
-            None
-        };
-
-        Ok((runtime, handle))
-    }
-
     /// Runs the startup refresh with a watchdog: if the vault scan has not
     /// completed after `STARTUP_SCAN_WARN_AFTER`, log what is happening and the
     /// most likely cause. A macOS TCC consent dialog suspends the scan's
@@ -271,26 +280,6 @@ Security and restart the service",
                 refresh.await
             }
         }
-    }
-
-    pub fn start_initial_refresh(self: &Arc<Self>) -> JoinHandle<()> {
-        let runtime = self.clone();
-        tokio::spawn(async move {
-            match runtime.startup_refresh_with_watchdog().await {
-                Ok(snapshot) => {
-                    info!(
-                        "initial index {} at {}",
-                        if snapshot.rebuilt {
-                            "rebuilt"
-                        } else {
-                            "loaded"
-                        },
-                        snapshot.index.generated_at,
-                    );
-                }
-                Err(error) => warn!("initial index refresh failed: {error}"),
-            }
-        })
     }
 
     pub fn config(&self) -> &ResolvedServiceConfig {
@@ -606,6 +595,276 @@ fn unix_time_ms() -> u128 {
         .as_millis()
 }
 
+// ---------------------------------------------------------------------------
+// One index runtime per mount
+// ---------------------------------------------------------------------------
+
+/// The vault path and index directory one mount's [`RuntimeState`] must use.
+///
+/// For the ROOT mount this is the resolved config verbatim — see
+/// [`mount_runtime_config`].
+fn filesystem_mount_paths(
+    config: &ResolvedServiceConfig,
+    mount: &MountConfig,
+) -> (PathBuf, PathBuf) {
+    match &mount.backend {
+        MountBackendConfig::Filesystem {
+            vault_path,
+            index_dir,
+        } => (
+            vault_path.clone(),
+            index_dir
+                .clone()
+                .unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id)),
+        ),
+    }
+}
+
+/// The config a single mount's [`RuntimeState`] runs against.
+///
+/// [`RuntimeState`] reads exactly four things out of its config — `vault_path`,
+/// `index_dir`, `embedding`/`artifact_embedding`, and `auto_reindex` — so giving
+/// each mount a clone with the first two rewritten is enough to give it its own
+/// index, its own watcher and its own refresh lifecycle, with no change to the
+/// index crate (which stays path-based, one vault at a time).
+///
+/// # Why the root mount gets the config UNCHANGED
+///
+/// `ResolvedServiceConfig::vault_path` *is* the root mount's vault path and
+/// `index_dir` already resolves the root mount's `indexDir` (see
+/// `normalize_service_config`). Returning the config verbatim for the root
+/// therefore is not an optimization — it is what makes "a single-mount config
+/// behaves exactly as before" a structural property: the one runtime a
+/// single-mount server builds is constructed from the identical config value it
+/// was constructed from before this slice existed.
+fn mount_runtime_config(
+    config: &ResolvedServiceConfig,
+    mount: &MountConfig,
+) -> ResolvedServiceConfig {
+    if mount.mount_at.is_empty() {
+        return config.clone();
+    }
+    let (vault_path, index_dir) = filesystem_mount_paths(config, mount);
+    ResolvedServiceConfig {
+        vault_path,
+        index_dir,
+        ..config.clone()
+    }
+}
+
+/// One mount's index runtime, with the logical prefix its index paths sit under.
+#[derive(Debug)]
+pub struct MountRuntime {
+    /// The mount id, matching `VaultRouter`'s mount of the same name.
+    pub id: String,
+    /// The logical folder prefix; `""` for the root mount. Index paths are
+    /// MOUNT-RELATIVE, so this is what turns them into logical vault paths.
+    pub mount_at: String,
+    pub runtime: Arc<RuntimeState>,
+}
+
+impl MountRuntime {
+    pub fn is_root(&self) -> bool {
+        self.mount_at.is_empty()
+    }
+}
+
+/// One [`RuntimeState`] per mount: per-mount index, watcher and refresh lifecycle.
+///
+/// # Concurrency
+///
+/// Each mount's refresh serializes on ITS OWN `RuntimeState::refresh_lock`, so a
+/// slow rebuild of one vault never blocks a read served from another's index.
+/// There is deliberately no table-wide lock.
+///
+/// # Failure isolation
+///
+/// The ROOT mount is load-bearing (it holds the vault root, and every legacy
+/// config is exactly one root mount), so a root index failure at startup stays
+/// fatal — unchanged from before. A NON-ROOT mount that fails to index is logged
+/// and left `Degraded`: the root mount keeps serving, and
+/// [`MountRuntimes::aggregate_diagnostics`] reports the server as degraded so
+/// `/readyz` cannot claim everything is fine.
+///
+/// # Where the next two slices attach
+///
+/// * **A backend that brings its OWN index** (one fed by a change feed rather than
+///   by scanning a directory) replaces the [`RuntimeState`] in a
+///   [`MountRuntime`], not this table: every consumer only ever asks a mount for a
+///   snapshot and translates the mount-relative paths in it. The one thing that has
+///   to generalize is [`filesystem_mount_paths`], which is the only place that
+///   assumes a mount's backend config carries a vault directory — a non-filesystem
+///   variant would supply its own runtime instead of a `(vault_path, index_dir)`
+///   pair.
+/// * **Federated recall** needs every mount's index at once, which is exactly what
+///   [`MountRuntimes::entries`] hands back — the same enumeration
+///   `resources/list` already uses to list every mount's notes. What is missing is
+///   not access, it is comparable scores across independently built indexes.
+#[derive(Debug)]
+pub struct MountRuntimes {
+    entries: Vec<MountRuntime>,
+    /// Index of the root mount in `entries`. Always valid: a resolved config
+    /// always declares exactly one root mount.
+    root: usize,
+}
+
+impl MountRuntimes {
+    /// Construct one runtime per mount. Pure construction: no IO, no index build.
+    pub fn new(config: &ResolvedServiceConfig) -> Arc<Self> {
+        let entries: Vec<MountRuntime> = config
+            .mount_table()
+            .into_iter()
+            .map(|mount| MountRuntime {
+                runtime: RuntimeState::new(mount_runtime_config(config, &mount)),
+                id: mount.id,
+                mount_at: mount.mount_at,
+            })
+            .collect();
+        let root = entries
+            .iter()
+            .position(MountRuntime::is_root)
+            // `mount_table` synthesizes the implicit root mount and
+            // `normalize_service_config` rejects a table without one, so a config
+            // reaching here without a root mount is a programming error.
+            .expect("resolved config to declare a root mount");
+        Arc::new(Self { entries, root })
+    }
+
+    /// Construct every mount's runtime and run each one's startup index refresh.
+    ///
+    /// Sequential on purpose: the refreshes are CPU- and IO-heavy vault scans, and
+    /// running one vault at a time keeps startup cost identical to the
+    /// single-mount case for the common single-mount config.
+    pub async fn bootstrap(
+        config: &ResolvedServiceConfig,
+    ) -> Result<(Arc<Self>, Vec<AutoReindexHandle>), String> {
+        let runtimes = Self::new(config);
+        for entry in &runtimes.entries {
+            if let Err(error) = entry.runtime.startup_refresh_with_watchdog().await {
+                if entry.is_root() {
+                    // Fatal, exactly as a single-mount startup failure has always been.
+                    return Err(error);
+                }
+                warn!(
+                    "mount '{}' failed its initial index refresh: {error}; the vault root keeps \
+serving and readiness reports the server as degraded",
+                    entry.id,
+                );
+            }
+        }
+        let handles = runtimes.start_auto_reindex();
+        Ok((runtimes, handles))
+    }
+
+    /// Start the background watcher/periodic-sync task for every mount, when
+    /// auto-reindex is enabled. One watcher per mount, each on its own vault.
+    pub fn start_auto_reindex(&self) -> Vec<AutoReindexHandle> {
+        if !self.root().config().auto_reindex.enabled {
+            return Vec::new();
+        }
+        self.entries
+            .iter()
+            .map(|entry| start_auto_reindex_tasks(entry.runtime.clone()))
+            .collect()
+    }
+
+    /// Refresh every mount's index in the background, logging per mount.
+    pub fn start_initial_refresh(self: &Arc<Self>) -> JoinHandle<()> {
+        let runtimes = self.clone();
+        tokio::spawn(async move {
+            for entry in &runtimes.entries {
+                match entry.runtime.startup_refresh_with_watchdog().await {
+                    Ok(snapshot) => {
+                        info!(
+                            "initial index for mount '{}' {} at {}",
+                            entry.id,
+                            if snapshot.rebuilt {
+                                "rebuilt"
+                            } else {
+                                "loaded"
+                            },
+                            snapshot.index.generated_at,
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            "initial index refresh failed for mount '{}': {error}",
+                            entry.id
+                        )
+                    }
+                }
+            }
+        })
+    }
+
+    pub fn entries(&self) -> &[MountRuntime] {
+        &self.entries
+    }
+
+    /// The ROOT mount's runtime: the one every non-federated caller means.
+    pub fn root(&self) -> &Arc<RuntimeState> {
+        &self.entries[self.root].runtime
+    }
+
+    /// The runtime serving `mount_id`, or `None` when that mount has no index of
+    /// its own.
+    pub fn for_mount(&self, mount_id: &str) -> Option<&Arc<RuntimeState>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == mount_id)
+            .map(|entry| &entry.runtime)
+    }
+
+    pub fn is_multi_mount(&self) -> bool {
+        self.entries.len() > 1
+    }
+
+    /// Per-mount diagnostics, in config order.
+    pub fn mount_diagnostics(&self) -> Vec<(&MountRuntime, RuntimeDiagnostics)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry, entry.runtime.diagnostics()))
+            .collect()
+    }
+
+    /// The whole server's index diagnostics.
+    ///
+    /// A single-mount config returns the root runtime's diagnostics VERBATIM, so
+    /// every health and readiness payload it produces is unchanged.
+    ///
+    /// For several mounts the answer is the honest conjunction: the worst status
+    /// wins, a refresh anywhere counts as in flight, and the snapshot (which
+    /// carries the index statistics and drives `ready`) is only offered when EVERY
+    /// mount has one. `last_success`/`last_error` stay the root mount's — another
+    /// mount's message must not be laundered into a field whose wording says
+    /// nothing about mounts; the additive per-mount detail names it instead.
+    pub fn aggregate_diagnostics(&self) -> RuntimeDiagnostics {
+        let root = self.root().diagnostics();
+        if !self.is_multi_mount() {
+            return root;
+        }
+        let mut status = root.status;
+        let mut refresh_in_flight = root.refresh_in_flight;
+        let mut all_ready = root.snapshot.is_some();
+        for entry in &self.entries {
+            if entry.is_root() {
+                continue;
+            }
+            let diagnostics = entry.runtime.diagnostics();
+            status = status.worst(diagnostics.status);
+            refresh_in_flight |= diagnostics.refresh_in_flight;
+            all_ready &= diagnostics.snapshot.is_some();
+        }
+        RuntimeDiagnostics {
+            status,
+            refresh_in_flight,
+            snapshot: if all_ready { root.snapshot } else { None },
+            last_success: root.last_success,
+            last_error: root.last_error,
+        }
+    }
+}
+
 /// Upper bound on the auto-reindex periodic interval while backing off.
 const AUTO_REINDEX_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
@@ -789,6 +1048,188 @@ mod tests {
             auth: deep_obsidian_types::AuthConfig::default(),
             config_file_path: None,
         }
+    }
+
+    /// The two-mount table the derivation tests share.
+    fn two_mount_config(root_vault: PathBuf, team_vault: PathBuf) -> ResolvedServiceConfig {
+        let index_dir = temp_path("two_mount_index");
+        ResolvedServiceConfig {
+            mounts: vec![
+                MountConfig {
+                    id: "vault".to_string(),
+                    mount_at: String::new(),
+                    backend: MountBackendConfig::Filesystem {
+                        vault_path: root_vault.clone(),
+                        index_dir: None,
+                    },
+                },
+                MountConfig {
+                    id: "team".to_string(),
+                    mount_at: "Team".to_string(),
+                    backend: MountBackendConfig::Filesystem {
+                        vault_path: team_vault,
+                        index_dir: None,
+                    },
+                },
+            ],
+            experimental: deep_obsidian_types::ExperimentalConfig { multi_vault: true },
+            ..test_config(root_vault, index_dir)
+        }
+    }
+
+    /// The load-bearing identity: the ROOT mount's runtime is built from the
+    /// resolved config VERBATIM, which is what makes a single-mount server behave
+    /// exactly as it did before there was a mount table.
+    #[test]
+    fn the_root_mounts_runtime_config_is_the_resolved_config_verbatim() {
+        let config = two_mount_config(temp_path("root_vault"), temp_path("team_vault"));
+        let root = &config.mount_table()[0];
+        assert_eq!(mount_runtime_config(&config, root), config);
+
+        // ...and a legacy `vaultPath`-only config, whose root mount is implicit.
+        let legacy = test_config(temp_path("legacy_vault"), temp_path("legacy_index"));
+        let implicit_root = &legacy.mount_table()[0];
+        assert_eq!(mount_runtime_config(&legacy, implicit_root), legacy);
+    }
+
+    /// A non-root mount indexes ITS OWN vault into a directory that cannot collide
+    /// with the root's, and inherits everything else (embedding config, cadence).
+    #[test]
+    fn a_non_root_mounts_runtime_config_retargets_only_the_two_paths() {
+        let team_vault = temp_path("team_vault");
+        let config = two_mount_config(temp_path("root_vault"), team_vault.clone());
+        let team = &config.mount_table()[1];
+        let derived = mount_runtime_config(&config, team);
+
+        assert_eq!(derived.vault_path, team_vault);
+        assert_eq!(
+            derived.index_dir,
+            config.index_dir.join("mounts").join("team")
+        );
+        assert_ne!(derived.index_dir, config.index_dir);
+        // Everything the index build depends on besides the paths is inherited, so a
+        // mount cannot silently embed with different settings than its siblings.
+        assert_eq!(derived.embedding, config.embedding);
+        assert_eq!(derived.artifact_embedding, config.artifact_embedding);
+        assert_eq!(derived.auto_reindex, config.auto_reindex);
+    }
+
+    /// An explicit per-mount `indexDir` wins over the derived default.
+    #[test]
+    fn an_explicit_mount_index_dir_is_honoured() {
+        let chosen = temp_path("chosen_index");
+        let mut config = two_mount_config(temp_path("root_vault"), temp_path("team_vault"));
+        config.mounts[1].backend = MountBackendConfig::Filesystem {
+            vault_path: temp_path("team_vault"),
+            index_dir: Some(chosen.clone()),
+        };
+        let team = &config.mount_table()[1];
+        assert_eq!(mount_runtime_config(&config, team).index_dir, chosen);
+    }
+
+    /// Each mount gets its OWN runtime, so its refresh serializes on its own lock
+    /// rather than behind a single global one.
+    #[test]
+    fn every_mount_gets_a_distinct_runtime() {
+        let config = two_mount_config(temp_path("root_vault"), temp_path("team_vault"));
+        let runtimes = MountRuntimes::new(&config);
+
+        assert!(runtimes.is_multi_mount());
+        assert_eq!(runtimes.entries().len(), 2);
+        assert!(Arc::ptr_eq(
+            runtimes.root(),
+            runtimes.for_mount("vault").unwrap()
+        ));
+        let team = runtimes.for_mount("team").expect("team runtime");
+        assert!(!Arc::ptr_eq(runtimes.root(), team));
+        assert!(runtimes.for_mount("absent").is_none());
+    }
+
+    #[test]
+    fn readiness_aggregates_to_the_worst_mount() {
+        assert_eq!(
+            RuntimeReadiness::Ready.worst(RuntimeReadiness::Loading),
+            RuntimeReadiness::Loading
+        );
+        // A known failure outranks "not finished yet": a reader of the aggregate must
+        // not be told "loading" while an index is known broken.
+        assert_eq!(
+            RuntimeReadiness::Loading.worst(RuntimeReadiness::Degraded),
+            RuntimeReadiness::Degraded
+        );
+        assert_eq!(
+            RuntimeReadiness::Degraded.worst(RuntimeReadiness::Ready),
+            RuntimeReadiness::Degraded
+        );
+        assert_eq!(
+            RuntimeReadiness::Ready.worst(RuntimeReadiness::Ready),
+            RuntimeReadiness::Ready
+        );
+    }
+
+    /// A single-mount config's aggregate is the root runtime's diagnostics
+    /// verbatim, so every health and readiness payload it produces is unchanged.
+    #[test]
+    fn a_single_mount_aggregate_is_the_root_diagnostics_verbatim() {
+        let config = test_config(temp_path("solo_vault"), temp_path("solo_index"));
+        let runtimes = MountRuntimes::new(&config);
+        assert!(!runtimes.is_multi_mount());
+
+        let aggregate = runtimes.aggregate_diagnostics();
+        let root = runtimes.root().diagnostics();
+        assert_eq!(aggregate.status, root.status);
+        assert_eq!(aggregate.status, RuntimeReadiness::Loading);
+        assert!(aggregate.snapshot.is_none());
+    }
+
+    /// A failing NON-ROOT mount is degradation, not a fatal startup error: the
+    /// bootstrap succeeds, the root mount is ready, and the aggregate is degraded.
+    #[tokio::test]
+    async fn a_failing_non_root_mount_degrades_without_failing_the_bootstrap() {
+        let root_vault = temp_path("isolation_root");
+        fs::create_dir_all(&root_vault).expect("root vault");
+        fs::write(root_vault.join("Note.md"), "# Note\n\nbody").expect("note");
+        // Never created, so the team mount's index refresh fails.
+        let team_vault = temp_path("isolation_team_missing");
+        let config = two_mount_config(root_vault.clone(), team_vault);
+
+        let (runtimes, _handles) = MountRuntimes::bootstrap(&config)
+            .await
+            .expect("a non-root mount failure must not fail the bootstrap");
+
+        assert_eq!(
+            runtimes.root().diagnostics().status,
+            RuntimeReadiness::Ready
+        );
+        assert_eq!(
+            runtimes.for_mount("team").unwrap().diagnostics().status,
+            RuntimeReadiness::Degraded
+        );
+        let aggregate = runtimes.aggregate_diagnostics();
+        assert_eq!(aggregate.status, RuntimeReadiness::Degraded);
+        // `ready` is driven by the snapshot, which is withheld until EVERY mount has
+        // one -- so `/readyz` cannot report 200 while a mount is broken.
+        assert!(aggregate.snapshot.is_none());
+
+        let _ = fs::remove_dir_all(&root_vault);
+        let _ = fs::remove_dir_all(&config.index_dir);
+    }
+
+    /// A failing ROOT mount stays fatal, exactly as a single-mount startup failure
+    /// has always been.
+    #[tokio::test]
+    async fn a_failing_root_mount_still_fails_the_bootstrap() {
+        let root = temp_path("root_failure");
+        let vault_path = root.join("vault");
+        let index_dir = root.join("index-file");
+        fs::create_dir_all(&vault_path).expect("vault");
+        // A FILE where the index directory must be: the index build cannot proceed.
+        fs::write(&index_dir, "not a directory").expect("index file");
+
+        let config = test_config(vault_path, index_dir);
+        assert!(MountRuntimes::bootstrap(&config).await.is_err());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -21,10 +21,12 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::auth::AuthState;
-use crate::health::{build_health_payload, build_readiness_payload, readiness_status_code};
+use crate::health::{
+    build_health_payload, build_readiness_payload, insert_mount_index_detail, readiness_status_code,
+};
 use crate::mcp::{handle_request, AppState};
 use crate::protocol::JsonRpcRequest;
-use crate::runtime::{AutoReindexHandle, RuntimeState};
+use crate::runtime::{AutoReindexHandle, MountRuntimes};
 
 /// Environment variable carrying a literal bearer token. When set and non-empty
 /// it enables authentication and overrides any configured `token_ref` — useful
@@ -128,7 +130,9 @@ fn enforce_auth_exposure(
 pub struct ServiceBootstrapContext {
     pub config: ResolvedServiceConfig,
     pub endpoints: ServiceEndpoints,
-    pub auto_reindex: Option<AutoReindexHandle>,
+    /// One handle per mount, when auto-reindex is enabled. Dropping them stops
+    /// every watcher.
+    pub auto_reindex: Vec<AutoReindexHandle>,
     pub initial_index: tokio::task::JoinHandle<()>,
     pub server_handle: tokio::task::JoinHandle<io::Result<()>>,
 }
@@ -141,21 +145,19 @@ impl Drop for ServiceBootstrapContext {
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let diagnostics = state.runtime.diagnostics();
-    (
-        StatusCode::OK,
-        Json(build_health_payload(&state.config, &diagnostics)),
-    )
-        .into_response()
+    // Aggregated across mounts: identical to the root runtime's diagnostics for a
+    // single-mount config, worst-of across mounts otherwise.
+    let diagnostics = state.runtimes.aggregate_diagnostics();
+    let mut payload = build_health_payload(&state.config, &diagnostics);
+    insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
+    (StatusCode::OK, Json(payload)).into_response()
 }
 
 async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let diagnostics = state.runtime.diagnostics();
-    (
-        readiness_status_code(&diagnostics),
-        Json(build_readiness_payload(&state.config, &diagnostics)),
-    )
-        .into_response()
+    let diagnostics = state.runtimes.aggregate_diagnostics();
+    let mut payload = build_readiness_payload(&state.config, &diagnostics);
+    insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
+    (readiness_status_code(&diagnostics), Json(payload)).into_response()
 }
 
 async fn mcp_handler(
@@ -322,11 +324,11 @@ pub async fn run_http_service(
     }
 
     // Build state first so the startup gate can run through the backend. Both
-    // `RuntimeState::new` and `AppState::new` are pure construction, so this does
+    // `MountRuntimes::new` and `AppState::new` are pure construction, so this does
     // not change what happens before the gate — only where the gate asks.
-    let runtime = RuntimeState::new(config.clone());
+    let runtimes = MountRuntimes::new(&config);
     let state =
-        AppState::new(config.clone(), runtime.clone()).with_upload_base(upload_base_url(&config));
+        AppState::new(config.clone(), runtimes.clone()).with_upload_base(upload_base_url(&config));
 
     // Startup validation gate. Every mount must be reachable, and the backend
     // reports unreachability with core's wording, so the failure a user sees for a
@@ -378,12 +380,10 @@ pub async fn run_http_service(
         }
         result
     });
-    let initial_index = runtime.start_initial_refresh();
-    let auto_reindex = if runtime.config().auto_reindex.enabled {
-        Some(crate::runtime::start_auto_reindex_tasks(runtime.clone()))
-    } else {
-        None
-    };
+    // Every mount is refreshed and watched. A non-root mount that fails is logged
+    // and left degraded rather than taking the service down with it.
+    let initial_index = runtimes.start_initial_refresh();
+    let auto_reindex = runtimes.start_auto_reindex();
 
     Ok(ServiceBootstrapContext {
         config,
@@ -536,9 +536,6 @@ mod tests {
 
         let state = state.expect("auth state resolves from store");
         assert!(state.enabled);
-        assert_eq!(
-            state.token.expect("token present").expose_secret(),
-            &token
-        );
+        assert_eq!(state.token.expect("token present").expose_secret(), &token);
     }
 }

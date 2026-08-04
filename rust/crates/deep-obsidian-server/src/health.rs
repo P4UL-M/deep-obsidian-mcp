@@ -212,6 +212,146 @@ fn insert_runtime_diagnostics(payload: &mut Map<String, Value>, diagnostics: &Ru
     }
 }
 
+// ---------------------------------------------------------------------------
+// Additive multi-mount detail
+// ---------------------------------------------------------------------------
+
+/// One mount's index state, as the payload builders need it.
+///
+/// Joins what the router knows (id, prefix, backend kind) with what that mount's
+/// [`RuntimeState`](crate::runtime::RuntimeState) knows (readiness, snapshot,
+/// failure). Built by [`AppState::mount_index_summaries`](crate::mcp::AppState::mount_index_summaries).
+#[derive(Debug, Clone)]
+pub struct MountIndexSummary {
+    pub id: String,
+    pub mount_at: String,
+    pub backend_kind: &'static str,
+    pub diagnostics: RuntimeDiagnostics,
+}
+
+impl MountIndexSummary {
+    fn ready(&self) -> bool {
+        self.diagnostics.snapshot.is_some()
+    }
+}
+
+/// Whole-vault counts that are meaningful as a SUM over mounts.
+///
+/// Each is a count of things in the index, so adding them across mounts answers
+/// the same question for the whole logical vault. Only keys already present in a
+/// payload are replaced, so no payload grows a field it never had.
+const AGGREGATE_COUNT_KEYS: [&str; 7] = [
+    "markdownFileCount",
+    "artifactFileCount",
+    "artifactCount",
+    "vectorizedArtifactCount",
+    "skippedArtifactCount",
+    "noteCount",
+    "chunkCount",
+];
+
+fn mount_count(summary: &MountIndexSummary, key: &str) -> u64 {
+    let Some(snapshot) = &summary.diagnostics.snapshot else {
+        return 0;
+    };
+    let index = snapshot.index.as_ref();
+    match key {
+        "markdownFileCount" => index.file_snapshots.len() as u64,
+        "artifactFileCount" => index.artifact_snapshots.len() as u64,
+        "artifactCount" => index.artifact_count as u64,
+        "vectorizedArtifactCount" => index.vectorized_artifact_count as u64,
+        "skippedArtifactCount" => index.skipped_artifact_count as u64,
+        "noteCount" => index.note_count as u64,
+        "chunkCount" => index.chunk_count as u64,
+        _ => 0,
+    }
+}
+
+/// Add per-mount index detail to a health, readiness or vault-overview payload,
+/// and make its whole-vault counts cover every mount.
+///
+/// **Additive, and multi-mount only.** A single-mount config returns immediately,
+/// so every payload it produces — and every golden that freezes one — is
+/// untouched. This is the same discipline as `vault_info.mounts`: the multi-mount
+/// shape is a superset, never a reshaping.
+///
+/// What it does on a multi-mount config:
+///
+/// * replaces each already-present count in [`AGGREGATE_COUNT_KEYS`] with the sum
+///   over mounts, so `markdownFileCount` means the whole logical vault rather than
+///   the root mount's share of it;
+/// * adds `mounts`, one entry per mount, carrying that mount's own index status,
+///   counts, timestamp and failure;
+/// * adds `degradedMounts` when any mount's index failed. That is what makes the
+///   aggregate `status: "degraded"` actionable: the top-level wording is frozen and
+///   says nothing about mounts, so the mount is NAMED here instead of another
+///   mount's message being laundered into `lastError`.
+pub fn insert_mount_index_detail(payload: &mut Value, summaries: &[MountIndexSummary]) {
+    if summaries.len() < 2 {
+        return;
+    }
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+
+    for key in AGGREGATE_COUNT_KEYS {
+        if object.contains_key(key) {
+            let total: u64 = summaries
+                .iter()
+                .map(|summary| mount_count(summary, key))
+                .sum();
+            object.insert(key.to_string(), json!(total));
+        }
+    }
+
+    let mounts = summaries
+        .iter()
+        .map(|summary| {
+            let mut entry = Map::from_iter([
+                ("id".to_string(), json!(summary.id)),
+                ("mountAt".to_string(), json!(summary.mount_at)),
+                ("backendKind".to_string(), json!(summary.backend_kind)),
+                (
+                    "indexStatus".to_string(),
+                    json!(summary.diagnostics.status.as_str()),
+                ),
+                ("ready".to_string(), json!(summary.ready())),
+            ]);
+            if let Some(snapshot) = &summary.diagnostics.snapshot {
+                let index = snapshot.index.as_ref();
+                entry.insert(
+                    "markdownFileCount".to_string(),
+                    json!(index.file_snapshots.len()),
+                );
+                entry.insert("noteCount".to_string(), json!(index.note_count));
+                entry.insert("chunkCount".to_string(), json!(index.chunk_count));
+                entry.insert("generatedAt".to_string(), json!(index.generated_at));
+            }
+            if let Some(error) = &summary.diagnostics.last_error {
+                entry.insert(
+                    "lastError".to_string(),
+                    json!({
+                        "reason": error.reason,
+                        "message": error.message,
+                        "finishedAtUnixMs": error.finished_at_unix_ms,
+                    }),
+                );
+            }
+            Value::Object(entry)
+        })
+        .collect::<Vec<_>>();
+    object.insert("mounts".to_string(), json!(mounts));
+
+    let degraded = summaries
+        .iter()
+        .filter(|summary| !summary.ready())
+        .map(|summary| json!(summary.id))
+        .collect::<Vec<_>>();
+    if !degraded.is_empty() {
+        object.insert("degradedMounts".to_string(), json!(degraded));
+    }
+}
+
 pub fn build_vault_overview_payload(
     config: &ResolvedServiceConfig,
     snapshot: &RuntimeIndexSnapshot,
