@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path};
 
-use deep_obsidian_backend::{BackendError, BackendRequest, VaultBackend, VaultError};
+use deep_obsidian_backend::{BackendError, BackendRequest, RouterError, VaultError, VaultRouter};
 use deep_obsidian_core::text::{extract_block_sections, extract_heading_sections};
 use serde_json::json;
 use urlencoding::decode;
@@ -188,15 +188,22 @@ pub fn list_resource_templates() -> ResourceTemplateListResult {
 /// Those guards and that wording are preserved here so the public contract is
 /// unchanged; the read itself goes through the backend.
 ///
-/// `vault_path` is taken alongside `backend` on purpose. The vault-root check is
+/// `vault_path` is taken alongside the router on purpose. The vault-root check is
 /// this module's own stricter pre-guard and reports the *configured* path verbatim,
 /// whereas the backend's health probe would report the normalized one — a
 /// difference that is invisible for ordinary paths but would change a public error
 /// string for a path containing `.`/`..` or a trailing slash. The read itself, and
 /// only the read, crosses the boundary.
+///
+/// `vault_path` is the ROOT mount's path. On a multi-mount config the pre-guard
+/// therefore still checks the root vault even for a path that routes elsewhere.
+/// That is deliberate rather than overlooked: the check's wording is frozen by the
+/// `error_path_traversal` and `error_missing_file` goldens, the startup gate
+/// already requires every mount to be reachable, and making the guard per-mount
+/// would change a public error string for zero practical gain.
 async fn read_note_text(
     vault_path: &Path,
-    backend: &dyn VaultBackend,
+    router: &VaultRouter,
     relative_path: &str,
 ) -> Result<String, String> {
     if !fs::metadata(vault_path)
@@ -222,15 +229,19 @@ async fn read_note_text(
         return Err(format!("path escapes the vault: {relative_path}"));
     }
 
-    backend
+    // Routed: a single-mount config takes the router's pass-through fast path, so
+    // the request reaches the same backend with the same path as before.
+    router
         .execute(BackendRequest::read_text(relative_path))
         .await
-        .and_then(|response| response.into_text())
+        .and_then(|response| Ok(response.into_text()?))
         .map_err(|error| match error {
             // The lexical guard above already rejected everything core reports
             // lexically, so this can only be core's canonicalization (symlink)
             // guard — an escape in the legacy wording.
-            BackendError::Vault(VaultError::InvalidVaultRelativePath(path)) => {
+            RouterError::Backend(BackendError::Vault(VaultError::InvalidVaultRelativePath(
+                path,
+            ))) => {
                 format!("path escapes the vault: {path}")
             }
             other => other.to_string(),
@@ -296,7 +307,7 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let path = params
             .get("path")
             .ok_or_else(|| "missing note path".to_string())?;
-        let text = read_note_text(&state.config.vault_path, state.backend.as_ref(), path).await?;
+        let text = read_note_text(&state.config.vault_path, state.router.as_ref(), path).await?;
         return Ok(ResourceReadResult {
             contents: vec![ResourceContents {
                 uri: note_uri(path),
@@ -313,7 +324,7 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let slug = params
             .get("slug")
             .ok_or_else(|| "missing heading slug".to_string())?;
-        let text = read_note_text(&state.config.vault_path, state.backend.as_ref(), path).await?;
+        let text = read_note_text(&state.config.vault_path, state.router.as_ref(), path).await?;
         let heading = extract_heading_sections(&text)
             .into_iter()
             .find(|section| section.slug == *slug)
@@ -334,7 +345,7 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let id = params
             .get("id")
             .ok_or_else(|| "missing block id".to_string())?;
-        let text = read_note_text(&state.config.vault_path, state.backend.as_ref(), path).await?;
+        let text = read_note_text(&state.config.vault_path, state.router.as_ref(), path).await?;
         let block = extract_block_sections(&text)
             .into_iter()
             .find(|section| section.id == *id)
@@ -391,6 +402,14 @@ mod tests {
         assert_eq!(resource.mime_type, "text/markdown");
     }
 
+    /// The legacy topology, as a router: one filesystem mount at the vault root.
+    fn single_mount_router(vault: &std::path::Path) -> VaultRouter {
+        VaultRouter::single(
+            "vault",
+            std::sync::Arc::new(FilesystemVaultBackend::new(vault)),
+        )
+    }
+
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -406,7 +425,9 @@ mod tests {
         let vault = temp_dir("resources-read-note");
         fs::create_dir_all(vault.join("Notes")).unwrap();
         fs::write(vault.join("Home.md"), "home").unwrap();
-        let backend = FilesystemVaultBackend::new(&vault);
+        // A single root mount: the router hands the request straight through, so
+        // these frozen strings are asserted against the same path as before.
+        let backend = single_mount_router(&vault);
 
         assert_eq!(
             read_note_text(&vault, &backend, "Home.md").await.unwrap(),
@@ -443,7 +464,7 @@ mod tests {
         );
 
         let absent = temp_dir("resources-read-note-absent");
-        let absent_backend = FilesystemVaultBackend::new(&absent);
+        let absent_backend = single_mount_router(&absent);
         assert_eq!(
             read_note_text(&absent, &absent_backend, "Home.md")
                 .await
@@ -466,7 +487,7 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, vault.join("escape")).unwrap();
         fs::write(outside.join("secret.md"), "secret").unwrap();
-        let backend = FilesystemVaultBackend::new(&vault);
+        let backend = single_mount_router(&vault);
 
         assert_eq!(
             read_note_text(&vault, &backend, "escape/secret.md")

@@ -109,6 +109,11 @@ impl Fixture {
         ResolvedServiceConfig {
             vault_path: self.vault_path.clone(),
             index_dir: self.index_dir.clone(),
+            // Legacy shape: no declared mounts, so the router synthesizes the one
+            // implicit root mount. Every golden below is therefore asserting the
+            // single-mount path.
+            mounts: Vec::new(),
+            experimental: Default::default(),
             transport: TransportMode::Http,
             stdio_mode: StdioMode::Auto,
             http: HttpConfig {

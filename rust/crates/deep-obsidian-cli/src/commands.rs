@@ -16,7 +16,8 @@ use deep_obsidian_config::{
 };
 use deep_obsidian_server::{run_http_service, run_stdio_service};
 use deep_obsidian_types::{
-    PersistedServiceConfig, ResolvedServiceConfig, SecretRef, ServiceEndpoints, TransportMode,
+    MountBackendConfig, PersistedServiceConfig, ResolvedServiceConfig, SecretRef, ServiceEndpoints,
+    TransportMode,
 };
 use reqwest::Client;
 use rusqlite::{Connection, OpenFlags};
@@ -641,6 +642,20 @@ pub fn setup_service(
     interactive_auth: bool,
 ) -> Result<SetupServiceReport> {
     let mut service = ensure_service_transport_http(resolved.service.clone())?;
+    // Refused rather than half-handled. `setup-service` rewrites the vault path to
+    // an absolute one, derives the packaged index dir from it, and runs the macOS
+    // TCC preflight against it -- all through `service.vault_path`, which is only
+    // the ROOT mount. For a declared mount table that would silently absolutize
+    // nothing (`to_persisted_config` omits `vaultPath` when `mounts` is set, so the
+    // rewrite would be discarded) and would preflight only one of the vaults.
+    // Making it per-mount means making the packaged index dir per-mount too, which
+    // is the per-mount-index slice.
+    if !service.mounts.is_empty() {
+        anyhow::bail!(
+            "setup-service does not support a multi-mount config yet: it would absolutize and preflight only the root mount's vault. Edit {} by hand, or use a single top-level vaultPath.",
+            resolved.config_path.display()
+        );
+    }
     service.vault_path = absolute_path(&service.vault_path)?;
     if matches!(resolved.sources.index_dir, ResolvedSource::Default) {
         service.index_dir = default_packaged_index_dir(&service.vault_path);
@@ -2821,11 +2836,27 @@ fn redact_config(config: &PersistedServiceConfig) -> PersistedServiceConfig {
 
 fn render_doctor_report(report: &DoctorReport) -> String {
     let mut output = String::new();
+    // A mounts config writes no top-level `vaultPath`, so fall back to the root
+    // mount's path. Legacy configs always have `vaultPath` and so render exactly
+    // the same line as before.
     let vault = report
         .config
         .vault_path
         .as_ref()
         .map(|path| path.display().to_string())
+        .or_else(|| {
+            report
+                .config
+                .mounts
+                .as_ref()?
+                .iter()
+                .find(|mount| mount.mount_at.is_empty())
+                .map(|mount| match &mount.backend {
+                    MountBackendConfig::Filesystem { vault_path, .. } => {
+                        vault_path.display().to_string()
+                    }
+                })
+        })
         .unwrap_or_else(|| "(missing)".to_string());
     let transport = report
         .config
@@ -2857,6 +2888,31 @@ fn render_doctor_report(report: &DoctorReport) -> String {
         "config precedence: cli > config > env > default"
     );
     let _ = writeln!(&mut output, "vault: {}", vault);
+    // One line per mount, and ONLY for a config that declared a mount table.
+    // A legacy config has `mounts: None` and so gains no line at all, keeping
+    // `doctor` output for existing installs unchanged.
+    if let Some(mounts) = &report.config.mounts {
+        for mount in mounts {
+            let mount_at = if mount.mount_at.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", mount.mount_at)
+            };
+            let location = match &mount.backend {
+                MountBackendConfig::Filesystem { vault_path, .. } => {
+                    vault_path.display().to_string()
+                }
+            };
+            let _ = writeln!(
+                &mut output,
+                "mount {} at {} ({}): {}",
+                mount.id,
+                mount_at,
+                mount.backend.kind_name(),
+                location
+            );
+        }
+    }
     let _ = writeln!(&mut output, "index sqlite: {}", report.index.path.display());
     let _ = writeln!(&mut output, "index size bytes: {}", index_size);
     let _ = writeln!(&mut output, "transport: {}", transport);
@@ -2989,6 +3045,8 @@ mod tests {
         ResolvedServiceConfig {
             vault_path: vault_path.to_path_buf(),
             index_dir: index_dir.to_path_buf(),
+            mounts: Vec::new(),
+            experimental: Default::default(),
             transport: TransportMode::Http,
             stdio_mode: StdioMode::Auto,
             http: HttpConfig {

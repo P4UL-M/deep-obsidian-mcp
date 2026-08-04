@@ -1,7 +1,8 @@
 use deep_obsidian_types::{
     AuthConfig, AuthConfigInput, AutoReindexConfig, AutoReindexConfigInput, EmbeddingConfig,
-    EmbeddingConfigInput, EmbeddingProvider, HttpConfig, HttpConfigInput, PersistedServiceConfig,
-    ResolvedServiceConfig, ServiceConfigInput, StdioMode, TransportMode,
+    EmbeddingConfigInput, EmbeddingProvider, HttpConfig, HttpConfigInput, MountBackendConfig,
+    MountConfig, PersistedServiceConfig, ResolvedServiceConfig, ServiceConfigInput, StdioMode,
+    TransportMode,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -51,6 +52,42 @@ pub enum ConfigError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// Both the legacy top-level `vaultPath` and an explicit `mounts` table were
+    /// given. Rejected rather than resolved by precedence: both spell "where the
+    /// root of the vault is", and silently preferring one would mean a user who
+    /// added `mounts` to an existing config could keep serving the old vault
+    /// without any signal. An empty `mounts` array is NOT ambiguous and is
+    /// treated as absent.
+    #[error("config sets both 'vaultPath' and 'mounts'; use one or the other (move the vault path into a mount with mountAt \"\", or drop the mounts array)")]
+    VaultPathAndMountsBothSet,
+    /// A mount table with no mount at the vault root. Rejected this slice:
+    /// `vaultPath` is the root mount's path and feeds the runtime watcher, the
+    /// search index, and `doctor`, so a rootless table would leave it undefined.
+    /// Lifting this requires those consumers to become per-mount first.
+    #[error("mount table has no root mount; exactly one mount must have mountAt \"\" (or \"/\")")]
+    MissingRootMount,
+    /// A mount id outside the accepted slug shape.
+    #[error("invalid mount id {id:?}: ids must match [a-z0-9][a-z0-9-]* (lowercase letters, digits and hyphens, not starting with a hyphen)")]
+    InvalidMountId { id: String },
+    #[error("duplicate mount id {id:?}: mount ids must be unique")]
+    DuplicateMountId { id: String },
+    #[error("invalid mountAt {mount_at:?} on mount {id:?}: {reason}")]
+    InvalidMountAt {
+        id: String,
+        mount_at: String,
+        reason: &'static str,
+    },
+    /// Two mounts claiming the identical normalized prefix. Nesting is fine
+    /// (longest prefix wins), an exact tie is not resolvable.
+    #[error("mounts {first:?} and {second:?} both mount at {mount_at:?}; each mountAt must be claimed by exactly one mount")]
+    DuplicateMountAt {
+        mount_at: String,
+        first: String,
+        second: String,
+    },
+    /// More than a single root mount without the opt-in flag.
+    #[error("multi-vault mounts are experimental: set {{\"experimental\": {{\"multiVault\": true}}}} in the config to resolve a table of {count} mounts")]
+    MultiVaultNotEnabled { count: usize },
 }
 
 fn home_dir() -> PathBuf {
@@ -150,13 +187,166 @@ pub fn normalize_http_path(value: Option<&str>, fallback: &str) -> String {
     )
 }
 
+/// Canonicalize a `mountAt` into its internal form: no leading or trailing
+/// slash, forward slashes only, `""` for the vault root.
+///
+/// A leading `/` is accepted and stripped rather than rejected as "absolute".
+/// That is forced by the spec of the field itself: `"/"` must mean the vault
+/// root, so the leading slash is unambiguously vault-root-relative here, and
+/// reading `"/Team"` as anything other than `"Team"` would be inconsistent with
+/// it. Genuinely path-shaped input is still refused: backslashes (Windows
+/// separators, which would make `a\b` a single opaque segment), `.`/`..`
+/// segments, empty interior segments, and `~` (home expansion has no meaning in
+/// a logical namespace).
+fn normalize_mount_at(id: &str, raw: &str) -> Result<String, ConfigError> {
+    let reject = |reason: &'static str| ConfigError::InvalidMountAt {
+        id: id.to_string(),
+        mount_at: raw.to_string(),
+        reason,
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.contains('\\') {
+        return Err(reject(
+            "backslashes are not path separators here; use forward slashes",
+        ));
+    }
+    if trimmed.starts_with('~') {
+        return Err(reject(
+            "mountAt is a logical vault-relative prefix, not a filesystem path, so '~' cannot be expanded",
+        ));
+    }
+    let inner = trimmed.trim_matches('/');
+    if inner.is_empty() {
+        return Ok(String::new());
+    }
+    for segment in inner.split('/') {
+        match segment {
+            "" => return Err(reject("contains an empty path segment")),
+            "." | ".." => {
+                return Err(reject("contains a '.' or '..' segment"));
+            }
+            _ => {}
+        }
+    }
+    Ok(inner.to_string())
+}
+
+/// True for ids matching `[a-z0-9][a-z0-9-]*`.
+///
+/// Deliberately narrower than "any non-empty string". A mount id is a durable,
+/// user-visible name that this slice already puts into error messages and
+/// `vault_info`, and that the per-mount index slice will want to use as a
+/// directory component. Restricting it to a lowercase slug now avoids two
+/// specific traps later: ids that collide on a case-insensitive filesystem
+/// (`Work` vs `work`), and ids that need quoting or escaping wherever they are
+/// interpolated. Widening the rule later is compatible; narrowing it is not.
+fn is_valid_mount_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}
+        _ => return false,
+    }
+    chars.all(|character| {
+        character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+    })
+}
+
+/// Expand `~` in whatever paths a mount's backend carries.
+fn expand_mount_backend_paths(backend: MountBackendConfig) -> MountBackendConfig {
+    match backend {
+        MountBackendConfig::Filesystem {
+            vault_path,
+            index_dir,
+        } => MountBackendConfig::Filesystem {
+            vault_path: expand_home_path(vault_path),
+            index_dir: index_dir.map(expand_home_path),
+        },
+    }
+}
+
+/// Validate and canonicalize a declared mount table.
+///
+/// Returns the normalized mounts and the index of the root mount. Nesting is
+/// allowed — `""` and `"Team"` and `"Team/Alpha"` can coexist, and the router
+/// resolves by longest prefix — but an exact `mountAt` tie is rejected because
+/// nothing could break it.
+fn normalize_mounts(mounts: Vec<MountConfig>) -> Result<(Vec<MountConfig>, usize), ConfigError> {
+    let mut normalized: Vec<MountConfig> = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        let id = mount.id.trim().to_string();
+        if !is_valid_mount_id(&id) {
+            return Err(ConfigError::InvalidMountId { id });
+        }
+        if let Some(existing) = normalized.iter().find(|other| other.id == id) {
+            return Err(ConfigError::DuplicateMountId {
+                id: existing.id.clone(),
+            });
+        }
+        let mount_at = normalize_mount_at(&id, &mount.mount_at)?;
+        if let Some(existing) = normalized.iter().find(|other| other.mount_at == mount_at) {
+            return Err(ConfigError::DuplicateMountAt {
+                mount_at,
+                first: existing.id.clone(),
+                second: id,
+            });
+        }
+        normalized.push(MountConfig {
+            id,
+            mount_at,
+            backend: expand_mount_backend_paths(mount.backend),
+        });
+    }
+
+    let root = normalized
+        .iter()
+        .position(|mount| mount.mount_at.is_empty())
+        .ok_or(ConfigError::MissingRootMount)?;
+    Ok((normalized, root))
+}
+
 pub fn normalize_service_config(
     input: ServiceConfigInput,
 ) -> Result<ResolvedServiceConfig, ConfigError> {
-    let vault_path = expand_home_path(input.vault_path.ok_or(ConfigError::MissingVaultPath)?);
+    let experimental = input.experimental.unwrap_or_default();
+    // An empty `mounts` array carries no information, so it is treated as absent
+    // rather than as an (unsatisfiable) rootless table.
+    let declared_mounts = input.mounts.filter(|mounts| !mounts.is_empty());
+
+    let (mounts, vault_path, mount_index_dir) = match declared_mounts {
+        Some(mounts) => {
+            if input.vault_path.is_some() {
+                return Err(ConfigError::VaultPathAndMountsBothSet);
+            }
+            let (mounts, root) = normalize_mounts(mounts)?;
+            // A single explicit root mount is exactly the legacy shape spelled out
+            // longhand, so it needs no flag. Anything else does.
+            if mounts.len() > 1 && !experimental.multi_vault {
+                return Err(ConfigError::MultiVaultNotEnabled {
+                    count: mounts.len(),
+                });
+            }
+            let (vault_path, mount_index_dir) = match &mounts[root].backend {
+                MountBackendConfig::Filesystem {
+                    vault_path,
+                    index_dir,
+                } => (vault_path.clone(), index_dir.clone()),
+            };
+            (mounts, vault_path, mount_index_dir)
+        }
+        // Legacy: one implicit root mount. `mounts` stays empty so saving the
+        // config back cannot invent a mount table the user never wrote.
+        None => (
+            Vec::new(),
+            expand_home_path(input.vault_path.ok_or(ConfigError::MissingVaultPath)?),
+            None,
+        ),
+    };
+
     let index_dir = input
         .index_dir
         .map(expand_home_path)
+        .or(mount_index_dir)
         .unwrap_or_else(|| default_index_dir(&vault_path));
     let transport = input.transport.unwrap_or(TransportMode::Http);
     let stdio_mode = input.stdio_mode.unwrap_or(StdioMode::Auto);
@@ -168,6 +358,8 @@ pub fn normalize_service_config(
 
     Ok(ResolvedServiceConfig {
         vault_path,
+        mounts,
+        experimental,
         index_dir,
         transport,
         stdio_mode,
@@ -195,6 +387,8 @@ pub fn normalize_persisted_config(
 ) -> Result<PersistedServiceConfig, ConfigError> {
     let resolved = normalize_service_config(ServiceConfigInput {
         vault_path: input.vault_path,
+        mounts: input.mounts,
+        experimental: input.experimental,
         index_dir: input.index_dir,
         transport: input.transport,
         stdio_mode: input.stdio_mode,
@@ -210,8 +404,28 @@ pub fn normalize_persisted_config(
 }
 
 pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceConfig {
+    // A legacy config round-trips as legacy: `mounts` is empty exactly when the
+    // user never wrote one, and `vaultPath` is written back as it always was. A
+    // config that DID declare mounts round-trips the other way -- `mounts` is
+    // emitted and `vaultPath` is omitted, because emitting both would produce a
+    // file this same function's input validation rejects as ambiguous.
+    let declared_mounts = !config.mounts.is_empty();
     PersistedServiceConfig {
-        vault_path: Some(config.vault_path.clone()),
+        vault_path: if declared_mounts {
+            None
+        } else {
+            Some(config.vault_path.clone())
+        },
+        mounts: if declared_mounts {
+            Some(config.mounts.clone())
+        } else {
+            None
+        },
+        experimental: if config.experimental.is_default() {
+            None
+        } else {
+            Some(config.experimental.clone())
+        },
         index_dir: Some(config.index_dir.clone()),
         transport: Some(config.transport),
         stdio_mode: Some(config.stdio_mode),
@@ -456,10 +670,396 @@ pub mod secrets;
 #[cfg(test)]
 mod tests {
     use super::{
-        default_packaged_index_dir, expand_home_path, is_loopback_host, normalize_service_config,
-        to_persisted_config, DEFAULT_CONFIG_APP_DIR,
+        default_packaged_index_dir, expand_home_path, is_loopback_host, normalize_persisted_config,
+        normalize_service_config, to_persisted_config, ConfigError, DEFAULT_CONFIG_APP_DIR,
     };
-    use deep_obsidian_types::{AuthConfigInput, SecretRef, ServiceConfigInput};
+    use deep_obsidian_types::{
+        AuthConfigInput, ExperimentalConfig, MountBackendConfig, MountConfig,
+        PersistedServiceConfig, SecretRef, ServiceConfigInput,
+    };
+    use std::path::PathBuf;
+
+    // -----------------------------------------------------------------------
+    // Mount table helpers
+    // -----------------------------------------------------------------------
+
+    fn filesystem_mount(id: &str, mount_at: &str, vault_path: &str) -> MountConfig {
+        MountConfig {
+            id: id.to_string(),
+            mount_at: mount_at.to_string(),
+            backend: MountBackendConfig::Filesystem {
+                vault_path: PathBuf::from(vault_path),
+                index_dir: None,
+            },
+        }
+    }
+
+    fn mounts_input(mounts: Vec<MountConfig>, multi_vault: bool) -> ServiceConfigInput {
+        ServiceConfigInput {
+            mounts: Some(mounts),
+            experimental: Some(ExperimentalConfig { multi_vault }),
+            ..ServiceConfigInput::default()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy equivalence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn legacy_vault_path_resolves_to_an_implicit_root_mount() {
+        let resolved = normalize_service_config(ServiceConfigInput {
+            vault_path: Some(PathBuf::from("/tmp/vault")),
+            ..ServiceConfigInput::default()
+        })
+        .expect("normalize");
+
+        // Nothing is invented: the declared table stays empty so the config can be
+        // saved back as legacy.
+        assert!(resolved.mounts.is_empty());
+        assert!(!resolved.is_multi_mount());
+        assert!(to_persisted_config(&resolved).mounts.is_none());
+        assert_eq!(
+            to_persisted_config(&resolved).vault_path,
+            Some(PathBuf::from("/tmp/vault"))
+        );
+
+        // But the routing view sees exactly one root mount.
+        let table = resolved.mount_table();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0].id, "vault");
+        assert_eq!(table[0].mount_at, "");
+        assert_eq!(
+            table[0].backend,
+            MountBackendConfig::Filesystem {
+                vault_path: PathBuf::from("/tmp/vault"),
+                index_dir: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_single_explicit_root_mount_matches_legacy_and_needs_no_flag() {
+        let legacy = normalize_service_config(ServiceConfigInput {
+            vault_path: Some(PathBuf::from("/tmp/vault")),
+            ..ServiceConfigInput::default()
+        })
+        .expect("normalize legacy");
+        // No experimental flag: one root mount is the legacy shape written longhand.
+        let explicit = normalize_service_config(mounts_input(
+            vec![filesystem_mount("vault", "", "/tmp/vault")],
+            false,
+        ))
+        .expect("normalize explicit");
+
+        assert_eq!(explicit.vault_path, legacy.vault_path);
+        assert_eq!(explicit.index_dir, legacy.index_dir);
+        assert!(!explicit.is_multi_mount());
+        // The routing view is identical, which is what makes behaviour identical.
+        assert_eq!(explicit.mount_table(), legacy.mount_table());
+    }
+
+    #[test]
+    fn an_empty_mounts_array_is_treated_as_absent_not_as_a_rootless_table() {
+        let resolved = normalize_service_config(ServiceConfigInput {
+            vault_path: Some(PathBuf::from("/tmp/vault")),
+            mounts: Some(Vec::new()),
+            ..ServiceConfigInput::default()
+        })
+        .expect("normalize");
+        assert_eq!(resolved.vault_path, PathBuf::from("/tmp/vault"));
+        assert!(resolved.mounts.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vault_path_together_with_mounts_is_rejected_as_ambiguous() {
+        let error = normalize_service_config(ServiceConfigInput {
+            vault_path: Some(PathBuf::from("/tmp/vault")),
+            mounts: Some(vec![filesystem_mount("vault", "", "/tmp/other")]),
+            ..ServiceConfigInput::default()
+        })
+        .expect_err("both set");
+        assert!(matches!(error, ConfigError::VaultPathAndMountsBothSet));
+    }
+
+    #[test]
+    fn multiple_mounts_require_the_experimental_flag() {
+        let mounts = vec![
+            filesystem_mount("vault", "", "/tmp/vault"),
+            filesystem_mount("team", "Team", "/tmp/team"),
+        ];
+        let error = normalize_service_config(mounts_input(mounts.clone(), false))
+            .expect_err("flag missing");
+        assert!(matches!(
+            error,
+            ConfigError::MultiVaultNotEnabled { count: 2 }
+        ));
+        assert!(error.to_string().contains("multiVault"));
+
+        let resolved = normalize_service_config(mounts_input(mounts, true)).expect("flag set");
+        assert!(resolved.is_multi_mount());
+        assert_eq!(resolved.vault_path, PathBuf::from("/tmp/vault"));
+    }
+
+    #[test]
+    fn a_mount_table_without_a_root_mount_is_rejected() {
+        let error = normalize_service_config(mounts_input(
+            vec![
+                filesystem_mount("team", "Team", "/tmp/team"),
+                filesystem_mount("archive", "Archive", "/tmp/archive"),
+            ],
+            true,
+        ))
+        .expect_err("rootless");
+        assert!(matches!(error, ConfigError::MissingRootMount));
+    }
+
+    #[test]
+    fn duplicate_mount_ids_are_rejected() {
+        let error = normalize_service_config(mounts_input(
+            vec![
+                filesystem_mount("vault", "", "/tmp/vault"),
+                filesystem_mount("vault", "Team", "/tmp/team"),
+            ],
+            true,
+        ))
+        .expect_err("duplicate id");
+        assert!(matches!(
+            error,
+            ConfigError::DuplicateMountId { ref id } if id == "vault"
+        ));
+    }
+
+    #[test]
+    fn duplicate_mount_at_is_rejected_even_when_spelled_differently() {
+        // "/Team/" and "Team" normalize to the same prefix, so this is a real tie.
+        let error = normalize_service_config(mounts_input(
+            vec![
+                filesystem_mount("vault", "", "/tmp/vault"),
+                filesystem_mount("team", "Team", "/tmp/team"),
+                filesystem_mount("team-two", "/Team/", "/tmp/team2"),
+            ],
+            true,
+        ))
+        .expect_err("duplicate mountAt");
+        assert!(matches!(
+            error,
+            ConfigError::DuplicateMountAt { ref mount_at, .. } if mount_at == "Team"
+        ));
+    }
+
+    #[test]
+    fn nested_mounts_are_allowed() {
+        // Longest-prefix routing makes "Team" and "Team/Alpha" unambiguous, so a
+        // nested mount is legal.
+        let resolved = normalize_service_config(mounts_input(
+            vec![
+                filesystem_mount("vault", "", "/tmp/vault"),
+                filesystem_mount("team", "Team", "/tmp/team"),
+                filesystem_mount("alpha", "Team/Alpha", "/tmp/alpha"),
+            ],
+            true,
+        ))
+        .expect("nested mounts");
+        assert_eq!(resolved.mounts.len(), 3);
+    }
+
+    #[test]
+    fn mount_at_is_normalized_to_a_slashless_prefix() {
+        let resolved = normalize_service_config(mounts_input(
+            vec![
+                // "/" is the documented root spelling.
+                filesystem_mount("vault", "/", "/tmp/vault"),
+                filesystem_mount("team", "/Team/Alpha/", "/tmp/alpha"),
+            ],
+            true,
+        ))
+        .expect("normalize");
+        assert_eq!(resolved.mounts[0].mount_at, "");
+        assert_eq!(resolved.mounts[1].mount_at, "Team/Alpha");
+    }
+
+    #[test]
+    fn malformed_mount_at_values_are_rejected() {
+        for bad in [
+            "../escape",
+            "Team/../Other",
+            "Team\\Alpha",
+            "~/Team",
+            "a//b",
+            "Team/./Alpha",
+        ] {
+            let error = normalize_service_config(mounts_input(
+                vec![
+                    filesystem_mount("vault", "", "/tmp/vault"),
+                    filesystem_mount("bad", bad, "/tmp/bad"),
+                ],
+                true,
+            ))
+            .expect_err(bad);
+            assert!(
+                matches!(error, ConfigError::InvalidMountAt { .. }),
+                "{bad:?} produced {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_mount_ids_are_rejected() {
+        for bad in ["", "Team", "-team", "team_two", "team.two", "team/two"] {
+            let error = normalize_service_config(mounts_input(
+                vec![
+                    filesystem_mount("vault", "", "/tmp/vault"),
+                    filesystem_mount(bad, "Team", "/tmp/team"),
+                ],
+                true,
+            ))
+            .expect_err("invalid id");
+            assert!(
+                matches!(error, ConfigError::InvalidMountId { .. }),
+                "{bad:?} produced {error}"
+            );
+        }
+        // The accepted shape.
+        for good in ["team", "team-two", "t", "2nd-vault"] {
+            normalize_service_config(mounts_input(
+                vec![
+                    filesystem_mount("vault", "", "/tmp/vault"),
+                    filesystem_mount(good, "Team", "/tmp/team"),
+                ],
+                true,
+            ))
+            .unwrap_or_else(|error| panic!("{good:?} rejected: {error}"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Derived fields and round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vault_path_and_index_dir_come_from_the_root_mount() {
+        let resolved = normalize_service_config(mounts_input(
+            vec![
+                MountConfig {
+                    id: "vault".to_string(),
+                    mount_at: String::new(),
+                    backend: MountBackendConfig::Filesystem {
+                        vault_path: PathBuf::from("/tmp/vault"),
+                        index_dir: Some(PathBuf::from("/tmp/root-index")),
+                    },
+                },
+                // A non-root mount's indexDir is accepted but not consumed yet.
+                MountConfig {
+                    id: "team".to_string(),
+                    mount_at: "Team".to_string(),
+                    backend: MountBackendConfig::Filesystem {
+                        vault_path: PathBuf::from("/tmp/team"),
+                        index_dir: Some(PathBuf::from("/tmp/team-index")),
+                    },
+                },
+            ],
+            true,
+        ))
+        .expect("normalize");
+        assert_eq!(resolved.vault_path, PathBuf::from("/tmp/vault"));
+        assert_eq!(resolved.index_dir, PathBuf::from("/tmp/root-index"));
+
+        // An explicit top-level indexDir still wins over the root mount's.
+        let resolved = normalize_service_config(ServiceConfigInput {
+            index_dir: Some(PathBuf::from("/tmp/top-level")),
+            ..mounts_input(
+                vec![MountConfig {
+                    id: "vault".to_string(),
+                    mount_at: String::new(),
+                    backend: MountBackendConfig::Filesystem {
+                        vault_path: PathBuf::from("/tmp/vault"),
+                        index_dir: Some(PathBuf::from("/tmp/root-index")),
+                    },
+                }],
+                false,
+            )
+        })
+        .expect("normalize");
+        assert_eq!(resolved.index_dir, PathBuf::from("/tmp/top-level"));
+    }
+
+    #[test]
+    fn a_mounts_config_round_trips_and_a_legacy_config_stays_legacy() {
+        let text = r#"{
+            "experimental": { "multiVault": true, "someFutureFlag": "ignored" },
+            "mounts": [
+                { "id": "vault", "mountAt": "", "backend": { "kind": "filesystem", "vaultPath": "/tmp/vault" } },
+                { "id": "team", "mountAt": "/Team/", "backend": { "kind": "filesystem", "vaultPath": "/tmp/team" } }
+            ]
+        }"#;
+        let parsed: PersistedServiceConfig = serde_json::from_str(text).expect("parse");
+        let persisted = normalize_persisted_config(parsed).expect("normalize");
+
+        // Emitting `vaultPath` alongside `mounts` would produce a file this same
+        // function rejects, so it must be omitted.
+        assert!(persisted.vault_path.is_none());
+        let mounts = persisted.mounts.as_ref().expect("mounts persisted");
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[1].mount_at, "Team");
+        assert_eq!(
+            persisted.experimental,
+            Some(ExperimentalConfig { multi_vault: true })
+        );
+        let serialized = serde_json::to_string(&persisted).expect("serialize");
+        assert!(serialized.contains("\"mountAt\""));
+        assert!(serialized.contains("\"kind\":\"filesystem\""));
+        // Re-parsing the emitted form resolves to the same table (a true round trip).
+        let reparsed: PersistedServiceConfig = serde_json::from_str(&serialized).expect("reparse");
+        assert_eq!(
+            normalize_persisted_config(reparsed).expect("renormalize"),
+            persisted
+        );
+
+        // A legacy config saved back gains neither field.
+        let legacy: PersistedServiceConfig =
+            serde_json::from_str(r#"{"vaultPath": "/tmp/vault"}"#).expect("parse legacy");
+        let legacy = normalize_persisted_config(legacy).expect("normalize legacy");
+        assert!(legacy.mounts.is_none());
+        assert!(legacy.experimental.is_none());
+        let serialized = serde_json::to_string(&legacy).expect("serialize legacy");
+        assert!(!serialized.contains("mounts"));
+        assert!(!serialized.contains("experimental"));
+    }
+
+    #[test]
+    fn unknown_experimental_flags_are_tolerated() {
+        // A config written by a newer build must still load; the unknown flag is
+        // simply dropped.
+        let parsed: PersistedServiceConfig = serde_json::from_str(
+            r#"{"vaultPath": "/tmp/vault", "experimental": {"notAFlagWeKnow": true}}"#,
+        )
+        .expect("parse");
+        let experimental = parsed.experimental.as_ref().expect("experimental");
+        assert!(!experimental.multi_vault);
+    }
+
+    #[test]
+    fn mount_vault_paths_expand_the_home_prefix() {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let resolved = normalize_service_config(mounts_input(
+            vec![filesystem_mount("vault", "", "~/Vault")],
+            false,
+        ))
+        .expect("normalize");
+        assert_eq!(resolved.vault_path, home.join("Vault"));
+        assert_eq!(
+            resolved.mounts[0].backend,
+            MountBackendConfig::Filesystem {
+                vault_path: home.join("Vault"),
+                index_dir: None,
+            }
+        );
+    }
 
     #[test]
     fn is_loopback_host_recognizes_local_addresses() {

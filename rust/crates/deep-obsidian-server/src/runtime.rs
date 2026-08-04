@@ -769,6 +769,8 @@ mod tests {
         ResolvedServiceConfig {
             vault_path,
             index_dir,
+            mounts: Vec::new(),
+            experimental: Default::default(),
             transport: TransportMode::Http,
             stdio_mode: StdioMode::Newline,
             http: HttpConfig {

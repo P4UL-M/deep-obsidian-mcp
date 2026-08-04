@@ -202,8 +202,23 @@ pub(crate) async fn upload_handler(
     // the chunks synchronously on its own blocking thread. The lock is NOT held
     // during streaming, and the commit runs concurrently with the pump below.
     let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(4);
-    let backend = state.backend.clone();
-    let dest_path = pending.dest_path.clone();
+    // Route to the mount owning the destination. The commit needs an owned handle
+    // it can hold across the stream, so it takes the backend rather than issuing a
+    // routed request. The path is rewritten to be mount-relative here, exactly as
+    // `VaultRouter::execute` would.
+    let (backend, dest_path) = match state.router.resolve(&pending.dest_path) {
+        Ok(resolved) => (
+            resolved.mount.backend.clone(),
+            resolved.backend_relative_path.clone(),
+        ),
+        // A minted token always named a routable path (the mint validates it
+        // through the router), so this is unreachable. Report it as an invalid
+        // token rather than leaking anything about the mount table.
+        Err(_) => {
+            state.uploads.release(&token);
+            return (StatusCode::FORBIDDEN, "invalid upload token").into_response();
+        }
+    };
     let expected_hash = pending.expected_hash.clone();
     let max_bytes = pending.max_bytes;
 
@@ -313,10 +328,11 @@ pub async fn run_http_service(
     let state =
         AppState::new(config.clone(), runtime.clone()).with_upload_base(upload_base_url(&config));
 
-    // Startup validation gate. The backend reports unreachability with core's
-    // wording, so the failure a user sees is unchanged.
+    // Startup validation gate. Every mount must be reachable, and the backend
+    // reports unreachability with core's wording, so the failure a user sees for a
+    // single-mount config is unchanged.
     state
-        .backend
+        .router
         .execute(deep_obsidian_backend::BackendRequest::health_overview())
         .await
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -401,6 +417,8 @@ mod tests {
         ResolvedServiceConfig {
             vault_path: PathBuf::from("/tmp/vault"),
             index_dir: PathBuf::from("/tmp/index"),
+            mounts: Vec::new(),
+            experimental: Default::default(),
             transport: TransportMode::Http,
             stdio_mode: StdioMode::Auto,
             http: HttpConfig {

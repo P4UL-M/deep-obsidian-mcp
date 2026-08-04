@@ -28,6 +28,7 @@ use thiserror::Error;
 
 pub mod filesystem;
 pub mod grep;
+pub mod router;
 pub mod watch;
 
 #[cfg(test)]
@@ -39,6 +40,7 @@ mod contract;
 pub use deep_obsidian_core::vault::{VaultChildEntry, VaultEntryKind, VaultError};
 pub use filesystem::FilesystemVaultBackend;
 pub use grep::{resolve_ripgrep, RIPGREP_UNAVAILABLE_MESSAGE};
+pub use router::{Mount, Resolved, RouterError, VaultRouter};
 pub use watch::{should_ignore_watch_path, watch_reason, ChangeEvent, ChangeStream};
 
 // ---------------------------------------------------------------------------

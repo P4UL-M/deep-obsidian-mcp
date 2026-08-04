@@ -146,10 +146,95 @@ pub struct AuthConfigInput {
     pub allowed_origins: Option<Vec<String>>,
 }
 
+/// Where one mount's content actually lives.
+///
+/// Tagged by `kind` so a new provider is a purely additive change: adding
+/// `{"kind": "couchdb", ...}` neither renames nor reshapes the existing variant,
+/// and an old binary reading a new config fails with "unknown variant" rather
+/// than silently mis-parsing. Every variant is expected to carry its own
+/// connection shape; nothing is hoisted to the mount level except `id` and
+/// `mountAt`, which are provider-independent by definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MountBackendConfig {
+    /// A vault rooted at a local directory. `vaultPath` accepts `~` just like the
+    /// top-level `vaultPath` does.
+    ///
+    /// The per-variant `rename_all` is required: on a tagged enum the container
+    /// attribute renames VARIANTS, not their fields.
+    #[serde(rename_all = "camelCase")]
+    Filesystem {
+        vault_path: PathBuf,
+        /// Reserved for the per-mount index slice. For the ROOT mount it is
+        /// honoured as the fallback when the top-level `indexDir` is unset; for a
+        /// non-root mount it is recorded and validated but not yet consumed,
+        /// because the search index still covers only the root mount.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index_dir: Option<PathBuf>,
+    },
+}
+
+impl MountBackendConfig {
+    /// The provider name, matching the serde tag.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            MountBackendConfig::Filesystem { .. } => "filesystem",
+        }
+    }
+}
+
+/// One mount in the vault's logical namespace.
+///
+/// The same type serves the input, persisted, and resolved forms: the only
+/// normalization a mount needs is `mountAt` canonicalization and `~` expansion,
+/// and both are idempotent, so a second pass over an already-resolved mount is a
+/// no-op. That keeps `print-config` a true round trip instead of a lossy
+/// re-render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MountConfig {
+    /// Stable, user-chosen identifier. Surfaces in error messages and in
+    /// `vault_info`, so it is restricted to a conservative slug (see
+    /// `deep-obsidian-config`).
+    pub id: String,
+    /// Logical vault-relative folder prefix this mount appears at. `""` is the
+    /// vault root. Stored without leading or trailing slashes, forward slashes
+    /// only; `"/"` and `"/Team/"` both normalize to `""` and `"Team"`.
+    #[serde(default)]
+    pub mount_at: String,
+    pub backend: MountBackendConfig,
+}
+
+/// Opt-in flags for behaviour that is not yet stable.
+///
+/// Deliberately WITHOUT `deny_unknown_fields`: a config written by a newer build
+/// that names a flag this build has never heard of must still load, because the
+/// flags themselves are expected to churn and disappear. Unknown flags are
+/// dropped, which is the correct reading of "a feature this build does not have".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExperimentalConfig {
+    /// Required to resolve a config with anything other than a single root mount.
+    #[serde(default)]
+    pub multi_vault: bool,
+}
+
+impl ExperimentalConfig {
+    /// True when no flag is set, i.e. the section carries no information and can
+    /// be omitted from a persisted config.
+    pub fn is_default(&self) -> bool {
+        self == &ExperimentalConfig::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceConfigInput {
     pub vault_path: Option<PathBuf>,
+    /// Explicit mount table. Mutually exclusive with `vault_path`; see
+    /// `deep-obsidian-config::normalize_service_config`.
+    pub mounts: Option<Vec<MountConfig>>,
+    pub experimental: Option<ExperimentalConfig>,
     pub index_dir: Option<PathBuf>,
     pub transport: Option<TransportMode>,
     pub stdio_mode: Option<StdioMode>,
@@ -165,6 +250,12 @@ pub struct ServiceConfigInput {
 #[serde(rename_all = "camelCase")]
 pub struct PersistedServiceConfig {
     pub vault_path: Option<PathBuf>,
+    /// Omitted entirely for a legacy `vaultPath`-only config, so saving one back
+    /// leaves it legacy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mounts: Option<Vec<MountConfig>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<ExperimentalConfig>,
     pub index_dir: Option<PathBuf>,
     pub transport: Option<TransportMode>,
     pub stdio_mode: Option<StdioMode>,
@@ -179,7 +270,22 @@ pub struct PersistedServiceConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedServiceConfig {
+    /// The ROOT mount's vault path. Unchanged meaning: the runtime watcher, the
+    /// search index, and `doctor` all still consume exactly this. A resolved
+    /// config always has a root mount, so this always has a meaning.
     pub vault_path: PathBuf,
+    /// The mount table AS DECLARED, normalized.
+    ///
+    /// Empty means the config declared no `mounts` at all — i.e. it is a legacy
+    /// `vaultPath` config whose single root mount is implicit. Reading this field
+    /// directly is almost always wrong; use [`ResolvedServiceConfig::mount_table`],
+    /// which materializes the implicit root mount so callers see one shape.
+    ///
+    /// The distinction is kept only so a legacy config saved back stays legacy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountConfig>,
+    #[serde(default, skip_serializing_if = "ExperimentalConfig::is_default")]
+    pub experimental: ExperimentalConfig,
     pub index_dir: PathBuf,
     pub transport: TransportMode,
     pub stdio_mode: StdioMode,
@@ -199,7 +305,38 @@ pub struct ServiceEndpoints {
     pub health: String,
 }
 
+/// Identifier given to the implicit root mount of a legacy `vaultPath` config.
+/// Chosen to be a valid mount id, so a user migrating to an explicit `mounts`
+/// table can keep it verbatim and nothing (ids in errors, in `vault_info`) moves.
+pub const IMPLICIT_ROOT_MOUNT_ID: &str = "vault";
+
 impl ResolvedServiceConfig {
+    /// The mount table every consumer should route against.
+    ///
+    /// Always non-empty and always containing exactly one mount whose `mount_at`
+    /// is `""`, because [`normalize_service_config`](../deep_obsidian_config/fn.normalize_service_config.html)
+    /// enforces both. A legacy config yields one synthesized root mount, so a
+    /// caller never has to special-case the legacy shape.
+    pub fn mount_table(&self) -> Vec<MountConfig> {
+        if self.mounts.is_empty() {
+            return vec![MountConfig {
+                id: IMPLICIT_ROOT_MOUNT_ID.to_string(),
+                mount_at: String::new(),
+                backend: MountBackendConfig::Filesystem {
+                    vault_path: self.vault_path.clone(),
+                    index_dir: None,
+                },
+            }];
+        }
+        self.mounts.clone()
+    }
+
+    /// True when more than one mount is in play. The gate for every
+    /// "not federated yet" guard: single-mount configs must never take one.
+    pub fn is_multi_mount(&self) -> bool {
+        self.mounts.len() > 1
+    }
+
     pub fn service_endpoints(&self) -> ServiceEndpoints {
         ServiceEndpoints {
             mcp: format!(

@@ -222,6 +222,18 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
 
     let input = ServiceConfigInput {
         vault_path,
+        // Mounts and the experimental flags are config-file only: there is no CLI
+        // flag or env var that can express a mount table, so nothing to merge.
+        // Note that combining `--vault-path` (or the vault env vars) with a config
+        // file that declares `mounts` is rejected downstream as ambiguous, which
+        // is the intended behaviour -- the override would silently apply to only
+        // one of the two vault roots.
+        mounts: config_file
+            .as_ref()
+            .and_then(|config| config.mounts.clone()),
+        experimental: config_file
+            .as_ref()
+            .and_then(|config| config.experimental.clone()),
         index_dir,
         transport: Some(transport),
         stdio_mode: Some(stdio_mode),
