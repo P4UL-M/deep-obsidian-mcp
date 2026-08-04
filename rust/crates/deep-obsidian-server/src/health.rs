@@ -296,6 +296,8 @@ mod tests {
         ResolvedServiceConfig {
             vault_path: PathBuf::from("/tmp/deep-obsidian-test-vault"),
             index_dir: PathBuf::from("/tmp/deep-obsidian-test-index"),
+            mounts: Vec::new(),
+            experimental: Default::default(),
             transport: TransportMode::Http,
             stdio_mode: StdioMode::Newline,
             http: HttpConfig {

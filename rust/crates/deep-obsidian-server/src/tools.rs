@@ -1280,10 +1280,66 @@ async fn backend_call(
     request: BackendRequest,
 ) -> Result<deep_obsidian_backend::BackendResponse, String> {
     state
-        .backend
+        .router
         .execute(request)
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Refuse a tool that reads the whole vault through the search index, on a config
+/// with more than one mount.
+///
+/// The index still covers only the root mount (per-mount indexing is a later
+/// slice), and these tools take no argument that could narrow them to one mount.
+/// Answering from the root mount alone would present a partial result as a
+/// complete one, so this is an error, not a caveat. Single-mount configs never
+/// reach it.
+fn require_single_mount(state: &AppState, tool: &str) -> Result<(), String> {
+    if !state.router.is_multi_mount() {
+        return Ok(());
+    }
+    Err(format!(
+        "{tool} does not support a multi-mount vault yet: the search index covers only the root mount, so results would silently omit every other mount. Reduce the vault to a single mount, or wait for federated recall."
+    ))
+}
+
+/// Refuse a path-scoped index-backed tool when the path is not on the root mount.
+///
+/// The mirror image of [`require_single_mount`] for tools that DO take a path: a
+/// path inside the root mount is indexed and works exactly as it always has, and
+/// only a path on another mount is refused.
+fn require_root_mount_path(state: &AppState, tool: &str, path: &str) -> Result<(), String> {
+    if !state.router.is_multi_mount() {
+        return Ok(());
+    }
+    let resolved = state
+        .router
+        .resolve(path)
+        .map_err(|error| error.to_string())?;
+    if resolved.mount.is_root() {
+        return Ok(());
+    }
+    Err(format!(
+        "{tool} does not support paths outside the root mount yet: {path} is on mount '{}', and the search index covers only the root mount.",
+        resolved.mount.id
+    ))
+}
+
+/// One descriptor per mount, for the additive `vault_info.mounts` array.
+fn mount_descriptors(router: &deep_obsidian_backend::VaultRouter) -> Vec<Value> {
+    router
+        .mounts()
+        .iter()
+        .map(|mount| {
+            let descriptor = mount.backend.descriptor();
+            json!({
+                "id": mount.id,
+                "mountAt": mount.mount_at,
+                "backendKind": descriptor.kind.as_str(),
+                "capabilities": descriptor.capabilities,
+            })
+        })
+        .collect()
 }
 
 /// Read a note's text through the backend.
@@ -1331,6 +1387,18 @@ pub async fn call_tool(
             .await
             .map_err(|error| error.to_string())?;
             if let Some(object) = payload.as_object_mut() {
+                // Additive and multi-mount ONLY. A single-mount config (legacy
+                // `vaultPath` or one explicit root mount) must render byte-identically
+                // to the frozen golden, so the field is absent rather than a
+                // one-element array. `build_vault_overview_payload` is deliberately
+                // NOT the place for this: it also feeds the `obsidian://vault-info`
+                // resource and both health payloads.
+                if state.router.is_multi_mount() {
+                    object.insert(
+                        "mounts".to_string(),
+                        json!(mount_descriptors(state.router.as_ref())),
+                    );
+                }
                 match health {
                     // Sparse backend: nothing to probe, so omit the status field entirely.
                     index_search::EmbeddingBackendHealth::NotApplicable => {}
@@ -1490,6 +1558,7 @@ pub async fn call_tool(
             ))
         }
         "find_files" => {
+            require_single_mount(state, "find_files")?;
             let query = string_arg(arguments, "query")?;
             let mode = optional_enum_string_arg(arguments, "mode", &["substring", "regex"])?
                 .unwrap_or_else(|| "substring".to_string());
@@ -1565,6 +1634,7 @@ pub async fn call_tool(
             ))
         }
         "build_index" => {
+            require_single_mount(state, "build_index")?;
             let snapshot = state.runtime.rebuild("manual build_index").await?;
             let mut result = Map::new();
             result.insert("rebuilt".to_string(), json!(true));
@@ -1590,6 +1660,7 @@ pub async fn call_tool(
             Ok(json_text_result(Value::Object(result)))
         }
         "hybrid_search" => {
+            require_single_mount(state, "hybrid_search")?;
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
@@ -1644,6 +1715,7 @@ pub async fn call_tool(
             ))
         }
         "search_artifacts" => {
+            require_single_mount(state, "search_artifacts")?;
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
@@ -1697,6 +1769,7 @@ pub async fn call_tool(
         }
         "related_notes" => {
             let path = string_arg(arguments, "path")?;
+            require_root_mount_path(state, "related_notes", &path)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
             let snapshot = state.runtime.fresh_snapshot("related_notes").await?;
             let index = snapshot.index;
@@ -1719,6 +1792,7 @@ pub async fn call_tool(
         }
         "graph_traverse" => {
             let path = string_arg(arguments, "path")?;
+            require_root_mount_path(state, "graph_traverse", &path)?;
             let direction = optional_enum_string_arg(
                 arguments,
                 "direction",
@@ -1754,6 +1828,7 @@ pub async fn call_tool(
             })))
         }
         "load_knowledge" => {
+            require_single_mount(state, "load_knowledge")?;
             let subject = string_arg(arguments, "subject")?;
             validate_format_arg(arguments)?;
             let project = optional_string_arg(arguments, "project");
@@ -1917,6 +1992,7 @@ pub async fn call_tool(
             ))
         }
         "recommend_folder" => {
+            require_single_mount(state, "recommend_folder")?;
             let topic = string_arg(arguments, "topic")?;
             let project = optional_string_arg(arguments, "project");
             let folders = backend_call(state, BackendRequest::top_level_folders())
@@ -2123,8 +2199,10 @@ pub async fn call_tool(
             // Best-effort cleanup of staging files orphaned by a crashed upload. The
             // backend owns the staging mechanics, so it owns the sweep; failures are
             // ignored exactly as before.
+            // Through the router: the sweep fans out to every mount, since a
+            // crashed upload could have staged bytes in any of them.
             let _ = state
-                .backend
+                .router
                 .execute(BackendRequest::sweep_orphan_staging_files())
                 .await;
             let expires_at = std::time::SystemTime::now() + crate::uploads::TOKEN_TTL;
@@ -2239,6 +2317,8 @@ mod tests {
         ResolvedServiceConfig {
             index_dir: vault_path.join(".deep-obsidian-mcp-test"),
             vault_path,
+            mounts: Vec::new(),
+            experimental: Default::default(),
             transport: TransportMode::Http,
             stdio_mode: StdioMode::Auto,
             http: HttpConfig {
@@ -3093,13 +3173,17 @@ mod tests {
             .expect("bootstrap runtime");
         // Force the unavailable state regardless of the host environment: a backend
         // whose `rg` path does not exist reports no grep capability.
+        let backend: std::sync::Arc<dyn deep_obsidian_backend::VaultBackend> =
+            std::sync::Arc::new(deep_obsidian_backend::FilesystemVaultBackend::with_ripgrep(
+                config.vault_path.clone(),
+                vault_path.join("definitely-missing-rg"),
+            ));
         let state = AppState {
-            backend: std::sync::Arc::new(
-                deep_obsidian_backend::FilesystemVaultBackend::with_ripgrep(
-                    config.vault_path.clone(),
-                    vault_path.join("definitely-missing-rg"),
-                ),
-            ),
+            router: std::sync::Arc::new(deep_obsidian_backend::VaultRouter::single(
+                "vault",
+                backend.clone(),
+            )),
+            backend,
             config: std::sync::Arc::new(config),
             runtime,
             auth: std::sync::Arc::new(crate::auth::AuthState::disabled()),

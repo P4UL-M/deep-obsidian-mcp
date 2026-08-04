@@ -33,6 +33,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let input = ServiceConfigInput {
         vault_path: Some(args.vault),
+        // The dev binary takes a single `--vault`; a mount table is config-file only.
+        mounts: None,
+        experimental: None,
         index_dir: args.index_dir,
         transport: Some(TransportMode::Http),
         stdio_mode: None,
