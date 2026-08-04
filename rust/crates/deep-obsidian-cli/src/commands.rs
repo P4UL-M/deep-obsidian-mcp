@@ -11,13 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use deep_obsidian_config::{
-    build_service_endpoints, default_packaged_index_dir, render_config_text,
-    secrets::SecretResolver, to_persisted_config, write_config_file,
+    build_service_endpoints, default_mount_index_dir, default_packaged_index_dir,
+    render_config_text, secrets::SecretResolver, to_persisted_config, write_config_file,
 };
 use deep_obsidian_server::{run_http_service, run_stdio_service};
 use deep_obsidian_types::{
-    MountBackendConfig, PersistedServiceConfig, ResolvedServiceConfig, SecretRef, ServiceEndpoints,
-    TransportMode,
+    MountBackendConfig, MountConfig, PersistedServiceConfig, ResolvedServiceConfig, SecretRef,
+    ServiceEndpoints, TransportMode,
 };
 use reqwest::Client;
 use rusqlite::{Connection, OpenFlags};
@@ -2834,6 +2834,48 @@ fn redact_config(config: &PersistedServiceConfig) -> PersistedServiceConfig {
     config.clone()
 }
 
+/// One `doctor` line describing a mount: where its content lives, and where its
+/// own search index lives.
+///
+/// The index directory is the additive half. Each mount indexes independently now,
+/// so an operator diagnosing a stale or oversized index needs to know which
+/// directory belongs to which mount. The ROOT mount's is the resolved top-level one
+/// (also printed as `index sqlite`); a non-root mount's is its explicit `indexDir`
+/// or the id-keyed default beneath the root's.
+///
+/// Only reached for a config that DECLARED a mount table, so a legacy `vaultPath`
+/// install's `doctor` output is unchanged.
+fn render_mount_line(mount: &MountConfig, root_index_dir: Option<&Path>) -> String {
+    let mount_at = if mount.mount_at.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", mount.mount_at)
+    };
+    let (location, declared_index_dir) = match &mount.backend {
+        MountBackendConfig::Filesystem {
+            vault_path,
+            index_dir,
+        } => (vault_path.display().to_string(), index_dir.clone()),
+    };
+    let index_dir = if mount.mount_at.is_empty() {
+        root_index_dir.map(Path::to_path_buf)
+    } else {
+        declared_index_dir
+            .or_else(|| root_index_dir.map(|root| default_mount_index_dir(root, &mount.id)))
+    };
+    let index_note = index_dir
+        .map(|dir| format!(" [index: {}]", dir.display()))
+        .unwrap_or_default();
+    format!(
+        "mount {} at {} ({}): {}{}",
+        mount.id,
+        mount_at,
+        mount.backend.kind_name(),
+        location,
+        index_note
+    )
+}
+
 fn render_doctor_report(report: &DoctorReport) -> String {
     let mut output = String::new();
     // A mounts config writes no top-level `vaultPath`, so fall back to the root
@@ -2892,25 +2934,13 @@ fn render_doctor_report(report: &DoctorReport) -> String {
     // A legacy config has `mounts: None` and so gains no line at all, keeping
     // `doctor` output for existing installs unchanged.
     if let Some(mounts) = &report.config.mounts {
+        // The RESOLVED root index directory, which is what a non-root mount's
+        // default is derived from. `report.index.path` is `<root index dir>/
+        // index.sqlite`, so its parent is that directory however it was resolved
+        // (explicit `indexDir`, the root mount's own, or the packaged default).
+        let root_index_dir = report.index.path.parent();
         for mount in mounts {
-            let mount_at = if mount.mount_at.is_empty() {
-                "/".to_string()
-            } else {
-                format!("/{}", mount.mount_at)
-            };
-            let location = match &mount.backend {
-                MountBackendConfig::Filesystem { vault_path, .. } => {
-                    vault_path.display().to_string()
-                }
-            };
-            let _ = writeln!(
-                &mut output,
-                "mount {} at {} ({}): {}",
-                mount.id,
-                mount_at,
-                mount.backend.kind_name(),
-                location
-            );
+            let _ = writeln!(&mut output, "{}", render_mount_line(mount, root_index_dir));
         }
     }
     let _ = writeln!(&mut output, "index sqlite: {}", report.index.path.display());
@@ -3016,12 +3046,14 @@ fn render_probe_report(report: &ProbeReport) -> String {
 mod tests {
     use super::{
         embedding_diagnostics, enable_obsidian_snippets, inspect_index, normalize_cli_args,
-        redact_config, setup_service, IndexDiagnostics, INDEX_SQLITE_FILENAME,
+        redact_config, render_mount_line, setup_service, IndexDiagnostics, MountConfig,
+        INDEX_SQLITE_FILENAME,
     };
     use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
     use deep_obsidian_types::{
         AutoReindexConfig, EmbeddingConfig, EmbeddingConfigInput, EmbeddingProvider, HttpConfig,
-        PersistedServiceConfig, ResolvedServiceConfig, SecretRef, StdioMode, TransportMode,
+        MountBackendConfig, PersistedServiceConfig, ResolvedServiceConfig, SecretRef, StdioMode,
+        TransportMode,
     };
     use rusqlite::Connection;
     use std::fs;
@@ -3356,6 +3388,17 @@ mod tests {
         }
     }
 
+    fn filesystem_mount(id: &str, mount_at: &str, index_dir: Option<&str>) -> MountConfig {
+        MountConfig {
+            id: id.to_string(),
+            mount_at: mount_at.to_string(),
+            backend: MountBackendConfig::Filesystem {
+                vault_path: PathBuf::from(format!("/vaults/{id}")),
+                index_dir: index_dir.map(PathBuf::from),
+            },
+        }
+    }
+
     /// Overwriting an existing config must leave a faithful `.bak` copy of the
     /// previous content — the failure mode of the wizard-overwrite accident,
     /// where one wrong answer replaced the whole file with no recovery path.
@@ -3431,5 +3474,37 @@ mod tests {
         );
         let new_text = fs::read_to_string(&config_path).expect("new config");
         assert!(new_text.contains("4200"), "new config written: {new_text}");
+    }
+
+    /// `doctor` names each mount's own index directory, so an operator can tell
+    /// which directory belongs to which mount.
+    #[test]
+    fn doctor_mount_lines_name_each_mounts_index_directory() {
+        let root_index = Path::new("/data/index");
+
+        // The root mount reports the resolved top-level index dir verbatim.
+        assert_eq!(
+            render_mount_line(&filesystem_mount("vault", "", None), Some(root_index)),
+            "mount vault at / (filesystem): /vaults/vault [index: /data/index]"
+        );
+        // A non-root mount reports the id-keyed default beneath it...
+        assert_eq!(
+            render_mount_line(&filesystem_mount("team", "Team", None), Some(root_index)),
+            "mount team at /Team (filesystem): /vaults/team [index: /data/index/mounts/team]"
+        );
+        // ...or its own explicit indexDir when it has one.
+        assert_eq!(
+            render_mount_line(
+                &filesystem_mount("team", "Team", Some("/elsewhere/team-index")),
+                Some(root_index)
+            ),
+            "mount team at /Team (filesystem): /vaults/team [index: /elsewhere/team-index]"
+        );
+        // With no resolvable root index dir the line degrades to its previous shape
+        // rather than printing a guess.
+        assert_eq!(
+            render_mount_line(&filesystem_mount("team", "Team", None), None),
+            "mount team at /Team (filesystem): /vaults/team"
+        );
     }
 }

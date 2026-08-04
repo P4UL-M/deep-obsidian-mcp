@@ -165,10 +165,13 @@ pub enum MountBackendConfig {
     #[serde(rename_all = "camelCase")]
     Filesystem {
         vault_path: PathBuf,
-        /// Reserved for the per-mount index slice. For the ROOT mount it is
-        /// honoured as the fallback when the top-level `indexDir` is unset; for a
-        /// non-root mount it is recorded and validated but not yet consumed,
-        /// because the search index still covers only the root mount.
+        /// Where this mount's search index lives.
+        ///
+        /// For the ROOT mount it is the fallback when the top-level `indexDir` is
+        /// unset. For a non-root mount it overrides the derived default,
+        /// `<root indexDir>/mounts/<id>` — see
+        /// `deep_obsidian_config::default_mount_index_dir` for why that default is
+        /// keyed by mount id and cannot collide with any other mount's.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index_dir: Option<PathBuf>,
     },

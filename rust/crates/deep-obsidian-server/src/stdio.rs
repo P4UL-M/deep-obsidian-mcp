@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::mcp::{handle_request, AppState};
 use crate::protocol::JsonRpcRequest;
-use crate::runtime::RuntimeState;
+use crate::runtime::MountRuntimes;
 
 fn parse_json_message(payload: &str) -> io::Result<JsonRpcRequest> {
     serde_json::from_str(payload).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
@@ -91,10 +91,10 @@ fn send_message(stdout: &mut impl Write, message: &Value, mode: StdioMode) -> io
 }
 
 pub async fn run_stdio_service(config: ResolvedServiceConfig) -> io::Result<()> {
-    let (runtime, _auto_reindex) = RuntimeState::bootstrap(config.clone())
+    let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
         .await
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
-    let state = AppState::new(config.clone(), runtime);
+    let state = AppState::new(config.clone(), runtimes);
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     let mut buffer = Vec::new();
@@ -140,9 +140,8 @@ pub async fn run_stdio_service(config: ResolvedServiceConfig) -> io::Result<()> 
                 Ok(Some(response)) => send_message(&mut stdout, &response, output_mode)?,
                 Ok(None) => {}
                 Err(error) => {
-                    let payload = serde_json::to_value(&error).map_err(|error| {
-                        io::Error::new(io::ErrorKind::InvalidData, error)
-                    })?;
+                    let payload = serde_json::to_value(&error)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                     send_message(&mut stdout, &payload, output_mode)?;
                 }
             }

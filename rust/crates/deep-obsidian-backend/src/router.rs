@@ -16,14 +16,22 @@
 //! of something that has to be re-verified against every golden whenever the
 //! multi-mount code below changes.
 //!
-//! ## What this slice does NOT do
+//! ## What this router does NOT do
 //!
-//! Nothing here federates *recall*. The search index still covers the root mount
-//! only, so whole-vault manifest requests ([`ManifestRequest::WalkMarkdown`],
-//! [`ManifestRequest::TopLevelFolders`]) and unscoped [`RecallRequest::Grep`] are
-//! refused on a multi-mount router with [`RouterError::FederationUnsupported`]
-//! rather than answered from a single mount. Presenting one mount's results as
-//! the whole vault's would be a wrong answer, not a partial one.
+//! Nothing here federates. Every mount now has its own search index (the server
+//! holds one index runtime per mount), but an operation whose ANSWER spans mounts
+//! still has to merge and re-rank independently built result sets, and that is not
+//! implemented. So whole-vault manifest requests
+//! ([`ManifestRequest::WalkMarkdown`], [`ManifestRequest::TopLevelFolders`]) and
+//! unscoped [`RecallRequest::Grep`] are refused on a multi-mount router with
+//! [`RouterError::FederationUnsupported`] rather than answered from a single mount.
+//! Presenting one mount's results as the whole vault's would be a wrong answer, not
+//! a partial one.
+//!
+//! Requests that CAN name one mount do route: a `glob`-scoped grep here, and every
+//! path- or scope-bearing recall tool in the server, which uses
+//! [`VaultRouter::resolve`] to pick the mount and [`Mount::to_logical`] to present
+//! that mount's paths back in the logical namespace.
 
 use std::sync::Arc;
 
@@ -69,7 +77,16 @@ impl Mount {
     }
 
     /// Render a mount-relative path back into the logical namespace.
-    fn to_logical(&self, relative: &str) -> String {
+    ///
+    /// The inverse of [`VaultRouter::resolve`]'s `backend_relative_path`, and the
+    /// only correct way to present a path that came OUT of a mount — a search
+    /// index, a grep hit, a listing — to a client, which only ever knows logical
+    /// paths.
+    ///
+    /// For the root mount this is the identity function. That is load-bearing:
+    /// every single-mount caller that pipes results through it is provably
+    /// unchanged.
+    pub fn to_logical(&self, relative: &str) -> String {
         if self.mount_at.is_empty() {
             relative.to_string()
         } else if relative.is_empty() {
@@ -300,8 +317,10 @@ impl VaultRouter {
     /// branch of [`VaultRouter::execute`] refuses whole-vault manifests outright.
     /// So this fast path is load-bearing for exactly one thing: letting
     /// [`ManifestRequest::WalkMarkdown`] and [`ManifestRequest::TopLevelFolders`]
-    /// work at all. Whoever federates those (slice 2b) can drop it; until then it is
-    /// the reason `find_files` and `recommend_folder` still function.
+    /// work at all. Whoever federates those can drop it; until then it is the reason
+    /// `find_files` and `recommend_folder` still function on a single-mount vault
+    /// (both refuse a multi-mount one, because their answer is a whole-vault
+    /// ranking, not an enumeration).
     fn single_root_mount(&self) -> Option<&Mount> {
         match self.mounts.as_slice() {
             [only] if only.is_root() => Some(only),
@@ -340,6 +359,21 @@ impl VaultRouter {
             mount,
             backend_relative_path,
         })
+    }
+
+    /// True when the subtree `logical_prefix` contains a mount OTHER than
+    /// `mount_id`.
+    ///
+    /// The guard every "scope it to one mount" argument needs. Resolving a prefix
+    /// to its owning mount is not enough: with mounts at `""` and `Team/Alpha`, the
+    /// prefix `Team` resolves to the ROOT mount, yet part of that subtree lives on
+    /// the `alpha` mount. Serving the scope from the resolved mount alone would
+    /// silently omit it, so callers refuse instead.
+    pub fn scope_contains_other_mount(&self, mount_id: &str, logical_prefix: &str) -> bool {
+        let prefix = normalize_prefix(logical_prefix);
+        self.mounts
+            .iter()
+            .any(|mount| mount.id != mount_id && prefix_contains(&prefix, &mount.mount_at))
     }
 
     /// The mount backing `logical_path`, for callers that need to hold the
@@ -655,11 +689,7 @@ impl VaultRouter {
         let resolved = self.resolve(&prefix)?;
         // The scoped subtree must contain no OTHER mount, or the single-mount run
         // below would silently skip part of it.
-        if self
-            .mounts
-            .iter()
-            .any(|mount| mount.id != resolved.mount.id && prefix_contains(&prefix, &mount.mount_at))
-        {
+        if self.scope_contains_other_mount(&resolved.mount.id, &prefix) {
             return Err(UNSCOPED);
         }
 
@@ -835,6 +865,29 @@ mod tests {
         assert!(error.to_string().contains("Elsewhere/Note.md"));
         // ...while a path inside the mount still routes.
         assert!(router.resolve("Team/Note.md").is_ok());
+    }
+
+    #[test]
+    fn scope_contains_other_mount_only_reports_mounts_inside_the_subtree() {
+        let vaults = Vaults::new("scope-guard");
+        let router = VaultRouter::new(vec![
+            Mount::new("vault", "", vaults.vault("root", &[])),
+            Mount::new("alpha", "Team/Alpha", vaults.vault("alpha", &[])),
+        ])
+        .expect("router");
+
+        // `Team` resolves to the ROOT mount, but part of that subtree is served by
+        // `alpha`, so the root mount alone does not cover it.
+        assert!(router.scope_contains_other_mount("vault", "Team"));
+        assert!(router.scope_contains_other_mount("vault", "Team/Alpha"));
+        // A sibling folder on a name boundary is NOT inside the subtree.
+        assert!(!router.scope_contains_other_mount("vault", "Teamwork"));
+        // A subtree with nothing else grafted in it.
+        assert!(!router.scope_contains_other_mount("vault", "Notes"));
+        // The mount itself is never "another mount".
+        assert!(!router.scope_contains_other_mount("alpha", "Team/Alpha"));
+        // Spelling-insensitive, like every other prefix comparison here.
+        assert!(router.scope_contains_other_mount("vault", "/Team/"));
     }
 
     #[test]

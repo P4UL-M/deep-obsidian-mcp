@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -18,10 +19,11 @@ use deep_obsidian_index::search::{self as index_search, RankingOptions, RelatedN
 use regex::RegexBuilder;
 use serde_json::{json, Map, Value};
 
-use crate::health::build_vault_overview_payload;
+use crate::health::{build_vault_overview_payload, insert_mount_index_detail};
 use crate::mcp::AppState;
 use crate::protocol::{ToolCallResult, ToolContent, ToolDefinition};
 use crate::resources::{artifact_uri, block_uri, heading_uri, note_name, note_uri};
+use crate::runtime::{RuntimeIndexSnapshot, RuntimeState};
 const JSON_SCHEMA_URI: &str = "http://json-schema.org/draft-07/schema#";
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const DEFAULT_MAX_TEXT_CHARS: usize = 20_000;
@@ -90,9 +92,7 @@ fn missing_required_argument(key: &str) -> String {
         "query" => Some("the text or pattern to search for"),
         "topic" => Some("the subject to recommend a folder for"),
         "subject" => Some("the conversation subject or user problem to ground against the vault"),
-        "path" => {
-            Some("vault-relative file path, e.g. \"Projets/A2A/Current Sprint.md\"")
-        }
+        "path" => Some("vault-relative file path, e.g. \"Projets/A2A/Current Sprint.md\""),
         "heading" => Some("the exact heading title of the section"),
         "content" => Some("the replacement body content for the targeted section"),
         _ => None,
@@ -763,7 +763,58 @@ fn tool_annotations(read_only: bool, destructive: Option<bool>, idempotent: Opti
     Value::Object(annotations)
 }
 
-fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
+/// The recall tools that a `scope` argument can route to exactly one mount's
+/// index.
+///
+/// Deliberately short. A tool belongs here only if answering it from ONE mount's
+/// index is a complete answer to the scoped question. `find_files` and
+/// `recommend_folder` do not qualify — see [`require_single_mount`].
+const SCOPE_ROUTED_RECALL_TOOLS: [&str; 3] =
+    ["hybrid_search", "search_artifacts", "load_knowledge"];
+
+/// The multi-mount-only `scope` property.
+///
+/// A mount root rather than an arbitrary folder, because these tools RANK: a
+/// deeper scope could only be honoured by filtering an already-truncated top-`limit`
+/// list, which would silently return fewer results than asked for. Naming a mount
+/// exactly keeps the answer exact. See [`resolve_recall_scope`].
+fn scope_property() -> Value {
+    json!({
+        "type": "string",
+        "description": "Which mount to search, on a multi-mount vault. Must name a mount root exactly ('/' for the mount at the vault root; see vault_info.mounts[].mountAt for the rest). That mount's index serves the whole request and results are reported as logical vault paths. Selecting a mount does NOT include content grafted under it by another mount: search each mount in turn to cover the whole vault."
+    })
+}
+
+/// Add the `scope` argument to the routable recall tools.
+///
+/// Applied ONLY for a multi-mount config. A single-mount vault has nothing to
+/// choose between, so its `tools/list` is byte-identical to the frozen golden —
+/// the same reason `grep_search` is registered conditionally and
+/// `vault_info.mounts` is emitted conditionally.
+fn insert_scope_argument(definitions: &mut [ToolDefinition]) {
+    for definition in definitions
+        .iter_mut()
+        .filter(|definition| SCOPE_ROUTED_RECALL_TOOLS.contains(&definition.name.as_str()))
+    {
+        let Some(schema) = definition.input_schema.as_object_mut() else {
+            continue;
+        };
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            properties.insert("scope".to_string(), scope_property());
+        }
+        // Required, not optional: these tools cannot answer an unscoped question on
+        // a multi-mount vault at all, so the schema says so rather than letting a
+        // client discover it through an error.
+        match schema.get_mut("required").and_then(Value::as_array_mut) {
+            Some(required) => required.push(json!("scope")),
+            None => {
+                schema.insert("required".to_string(), json!(["scope"]));
+            }
+        }
+    }
+}
+
+fn tool_definitions(rg_available: bool, multi_mount: bool) -> Vec<ToolDefinition> {
     let mut definitions = vec![
         ToolDefinition {
             name: "load_knowledge".to_string(),
@@ -1081,11 +1132,14 @@ fn tool_definitions(rg_available: bool) -> Vec<ToolDefinition> {
     if !rg_available {
         definitions.retain(|definition| definition.name != "grep_search");
     }
+    if multi_mount {
+        insert_scope_argument(&mut definitions);
+    }
     definitions
 }
 
-pub fn list_tools(rg_available: bool) -> Vec<ToolDefinition> {
-    tool_definitions(rg_available)
+pub fn list_tools(rg_available: bool, multi_mount: bool) -> Vec<ToolDefinition> {
+    tool_definitions(rg_available, multi_mount)
 }
 
 fn hybrid_search_match_json(
@@ -1286,60 +1340,284 @@ async fn backend_call(
         .map_err(|error| error.to_string())
 }
 
-/// Refuse a tool that reads the whole vault through the search index, on a config
-/// with more than one mount.
+/// Refuse a whole-vault tool that has no way to name a single mount.
 ///
-/// The index still covers only the root mount (per-mount indexing is a later
-/// slice), and these tools take no argument that could narrow them to one mount.
-/// Answering from the root mount alone would present a partial result as a
-/// complete one, so this is an error, not a caveat. Single-mount configs never
-/// reach it.
+/// Every mount now has its own index, so the limitation is no longer "only the
+/// root mount is indexed" — it is that answering these tools across mounts means
+/// MERGING and re-ranking several independent result sets, which this slice
+/// deliberately does not do. `find_files` (a limit-truncated path match over the
+/// whole vault) and `recommend_folder` (a whole-vault placement ranking) are both
+/// exactly that question, and neither has an argument that could narrow it, so the
+/// honest answer is still an error rather than one mount's partial view.
+/// Single-mount configs never reach it.
 fn require_single_mount(state: &AppState, tool: &str) -> Result<(), String> {
     if !state.router.is_multi_mount() {
         return Ok(());
     }
     Err(format!(
-        "{tool} does not support a multi-mount vault yet: the search index covers only the root mount, so results would silently omit every other mount. Reduce the vault to a single mount, or wait for federated recall."
+        "{tool} does not support a multi-mount vault yet: it takes no argument that could narrow it to one mount, and answering it across mounts would mean merging and re-ranking each mount's own index, which is not implemented. Reduce the vault to a single mount, or use a recall tool that takes 'scope'."
     ))
 }
 
-/// Refuse a path-scoped index-backed tool when the path is not on the root mount.
-///
-/// The mirror image of [`require_single_mount`] for tools that DO take a path: a
-/// path inside the root mount is indexed and works exactly as it always has, and
-/// only a path on another mount is refused.
-fn require_root_mount_path(state: &AppState, tool: &str, path: &str) -> Result<(), String> {
-    if !state.router.is_multi_mount() {
-        return Ok(());
-    }
-    let resolved = state
-        .router
-        .resolve(path)
-        .map_err(|error| error.to_string())?;
-    if resolved.mount.is_root() {
-        return Ok(());
-    }
-    Err(format!(
-        "{tool} does not support paths outside the root mount yet: {path} is on mount '{}', and the search index covers only the root mount.",
-        resolved.mount.id
-    ))
-}
-
-/// One descriptor per mount, for the additive `vault_info.mounts` array.
-fn mount_descriptors(router: &deep_obsidian_backend::VaultRouter) -> Vec<Value> {
+/// The mount roots a `scope` may name, rendered for an error message.
+fn mount_scope_hint(router: &deep_obsidian_backend::VaultRouter) -> String {
     router
         .mounts()
         .iter()
         .map(|mount| {
-            let descriptor = mount.backend.descriptor();
-            json!({
-                "id": mount.id,
-                "mountAt": mount.mount_at,
-                "backendKind": descriptor.kind.as_str(),
-                "capabilities": descriptor.capabilities,
-            })
+            if mount.mount_at.is_empty() {
+                "'/'".to_string()
+            } else {
+                format!("'{}'", mount.mount_at)
+            }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Which mount's index serves a recall request, and how to render its paths.
+///
+/// A search index is built from ONE vault directory and therefore stores
+/// MOUNT-RELATIVE paths. Every path leaving it must be translated back into the
+/// logical namespace, which is the only addressing scheme a client knows.
+///
+/// # The root mount is the identity, and that is load-bearing
+///
+/// For the root mount `mount_at` is `""`, so [`ScopedIndex::to_logical`] and
+/// [`ScopedIndex::relabel_path`] are both the identity function. That is what lets
+/// the translation be applied unconditionally in every recall tool while the 37
+/// single-mount goldens stay byte-identical: a single-mount config has only a root
+/// mount, so every translation below is provably a no-op rather than conditionally
+/// skipped.
+///
+/// The opposite direction (logical -> mount-relative) is NOT duplicated here:
+/// `VaultRouter::resolve` already returns it as `backend_relative_path`, and
+/// having one implementation is what keeps a read and a recall of the same path
+/// agreeing on which mount owns it.
+struct ScopedIndex {
+    runtime: Arc<RuntimeState>,
+    /// The logical folder this mount's index paths sit under; `""` for the root.
+    mount_at: String,
+}
+
+impl ScopedIndex {
+    /// A mount-relative index path as a logical vault path. Identity for the root.
+    fn to_logical(&self, mount_relative: &str) -> String {
+        if self.mount_at.is_empty() {
+            mount_relative.to_string()
+        } else if mount_relative.is_empty() {
+            self.mount_at.clone()
+        } else {
+            format!("{}/{}", self.mount_at, mount_relative)
+        }
+    }
+
+    /// Translate the `path` field of an already-built result object in place.
+    fn relabel_path(&self, value: &mut Value, key: &str) {
+        if self.mount_at.is_empty() {
+            return;
+        }
+        if let Some(object) = value.as_object_mut() {
+            if let Some(path) = object.get(key).and_then(Value::as_str) {
+                let logical = self.to_logical(path);
+                object.insert(key.to_string(), json!(logical));
+                // The resource URI is derived from the path, so it has to move with it.
+                if object.contains_key("resourceUri") {
+                    object.insert("resourceUri".to_string(), json!(note_uri(&logical)));
+                }
+                if object.contains_key("wikiLink") {
+                    object.insert("wikiLink".to_string(), json!(note_wiki_link(&logical)));
+                }
+            }
+        }
+    }
+}
+
+/// The index serving a recall tool that takes a `scope`.
+///
+/// * single mount — the root runtime, unconditionally: `scope` is not even in the
+///   tool schema, so this is the pre-slice behaviour verbatim;
+/// * multi-mount, no `scope` — refused. Each mount has its own index, so an
+///   unscoped answer would silently omit every other mount;
+/// * multi-mount, `scope` naming a mount root — that mount's runtime.
+///
+/// A `scope` must name a mount root EXACTLY. These tools rank and truncate to
+/// `limit`, so a narrower scope could only be honoured by filtering an
+/// already-truncated list — silently returning fewer results than asked for. A
+/// refusal that names the acceptable scopes is the exact answer; an approximate
+/// one is not.
+///
+/// # `scope` selects a MOUNT, not a folder subtree
+///
+/// `'/'` therefore means "the mount at the vault root", not "the whole logical
+/// vault": it is answered from the root mount's own index, and content grafted
+/// under it by another mount is not included. That is the only reading that leaves
+/// the root mount reachable at all — every non-root mount is nested inside the
+/// root's subtree by definition, so treating `'/'` as a subtree would refuse it
+/// always. The tool schema says so in as many words, and the refusal above
+/// enumerates every mount, so a caller who wants the whole vault knows exactly
+/// which calls to make. (Contrast `grep_search`, whose `glob` genuinely IS a
+/// subtree filter and so must refuse a scope containing another mount — see
+/// [`VaultRouter::scope_contains_other_mount`](deep_obsidian_backend::VaultRouter::scope_contains_other_mount).)
+fn resolve_recall_scope(
+    state: &AppState,
+    tool: &str,
+    scope: Option<&str>,
+) -> Result<ScopedIndex, String> {
+    if !state.router.is_multi_mount() {
+        return Ok(ScopedIndex {
+            runtime: state.runtime().clone(),
+            mount_at: String::new(),
+        });
+    }
+    let Some(scope) = scope else {
+        return Err(format!(
+            "{tool} requires a 'scope' on a multi-mount vault: every mount has its own search index, so an unscoped answer would silently omit every mount but one. Pass 'scope' naming the mount to search: {}.",
+            mount_scope_hint(state.router.as_ref())
+        ));
+    };
+    let resolved = state
+        .router
+        .resolve(scope)
+        .map_err(|error| error.to_string())?;
+    if !resolved.backend_relative_path.trim_matches('/').is_empty() {
+        return Err(format!(
+            "{tool} cannot scope to '{scope}': it is inside mount '{}' rather than naming a mount root, and this tool ranks results, so a narrower scope could only be honoured by filtering an already-truncated list. Pass one of: {}.",
+            resolved.mount.id,
+            mount_scope_hint(state.router.as_ref())
+        ));
+    }
+    mount_index(state, tool, resolved.mount)
+}
+
+/// The index serving a recall tool that takes a note `path`: the mount owning it.
+///
+/// Returns the index alongside the path as that mount's index stores it. The
+/// mount's graph and similarity neighbourhood are SELF-CONTAINED: a link from a
+/// note on one mount to a note on another is not an edge in either mount's index,
+/// because each index is built from one vault directory. Cross-mount edges are a
+/// federation concern, not something this can synthesize.
+fn resolve_recall_path(
+    state: &AppState,
+    tool: &str,
+    logical_path: &str,
+) -> Result<(ScopedIndex, String), String> {
+    if !state.router.is_multi_mount() {
+        return Ok((
+            ScopedIndex {
+                runtime: state.runtime().clone(),
+                mount_at: String::new(),
+            },
+            logical_path.to_string(),
+        ));
+    }
+    let resolved = state
+        .router
+        .resolve(logical_path)
+        .map_err(|error| error.to_string())?;
+    let mount_relative = resolved.backend_relative_path.clone();
+    let index = mount_index(state, tool, resolved.mount)?;
+    Ok((index, mount_relative))
+}
+
+/// The runtime backing one mount, or a clear error when that mount has no index.
+///
+/// Unreachable while every backend is a filesystem vault; it is the seam a backend
+/// that brings its own index (or none) will report through.
+fn mount_index(
+    state: &AppState,
+    tool: &str,
+    mount: &deep_obsidian_backend::Mount,
+) -> Result<ScopedIndex, String> {
+    let runtime = state
+        .runtimes
+        .for_mount(&mount.id)
+        .ok_or_else(|| {
+            format!(
+                "{tool} cannot be served: mount '{}' has no index.",
+                mount.id
+            )
+        })?
+        .clone();
+    Ok(ScopedIndex {
+        runtime,
+        mount_at: mount.mount_at.clone(),
+    })
+}
+
+/// One entry of `build_index`'s additive per-mount report.
+fn build_index_mount_json(
+    id: &str,
+    mount_at: &str,
+    outcome: Result<&RuntimeIndexSnapshot, &str>,
+) -> Value {
+    let mut entry = Map::from_iter([
+        ("id".to_string(), json!(id)),
+        ("mountAt".to_string(), json!(mount_at)),
+    ]);
+    match outcome {
+        Ok(snapshot) => {
+            entry.insert("rebuilt".to_string(), json!(true));
+            entry.insert(
+                "generatedAt".to_string(),
+                json!(snapshot.index.generated_at),
+            );
+            entry.insert("noteCount".to_string(), json!(snapshot.index.note_count));
+            entry.insert("chunkCount".to_string(), json!(snapshot.index.chunk_count));
+            entry.insert(
+                "semanticBackend".to_string(),
+                json!(snapshot.index.semantic_backend.as_str()),
+            );
+        }
+        Err(error) => {
+            entry.insert("rebuilt".to_string(), json!(false));
+            entry.insert("error".to_string(), json!(error));
+        }
+    }
+    Value::Object(entry)
+}
+
+/// Sum an integer field over a per-mount report.
+fn sum_mount_field(mounts: &[Value], key: &str) -> u64 {
+    mounts
+        .iter()
+        .filter_map(|mount| mount.get(key).and_then(Value::as_u64))
+        .sum()
+}
+
+/// Merge each mount's declared capabilities into a `mounts` array that
+/// [`insert_mount_index_detail`] has already placed in `payload`.
+///
+/// The two halves of a mount's description come from two places — the backend
+/// declares what it can do, the runtime reports how its index is doing — and
+/// `vault_info` is the one payload that wants both, so they are joined here rather
+/// than either side reaching into the other.
+fn insert_mount_capabilities(payload: &mut Value, router: &deep_obsidian_backend::VaultRouter) {
+    let Some(mounts) = payload
+        .as_object_mut()
+        .and_then(|object| object.get_mut("mounts"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in mounts.iter_mut() {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        let Some(id) = object
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        if let Some(mount) = router.mounts().iter().find(|mount| mount.id == id) {
+            object.insert(
+                "capabilities".to_string(),
+                json!(mount.backend.descriptor().capabilities),
+            );
+        }
+    }
 }
 
 /// Read a note's text through the backend.
@@ -1375,7 +1653,7 @@ pub async fn call_tool(
     let config = state.config.as_ref();
     match name {
         "vault_info" => {
-            let snapshot = state.runtime.fresh_snapshot("vault_info").await?;
+            let snapshot = state.runtime().fresh_snapshot("vault_info").await?;
             let mut payload = build_vault_overview_payload(config, &snapshot);
             // Non-fatal live health probe for the note embedding backend. vault_info must
             // never error when the backend is down — it reports the status as a field.
@@ -1386,35 +1664,27 @@ pub async fn call_tool(
             })
             .await
             .map_err(|error| error.to_string())?;
+            // Additive and multi-mount ONLY. A single-mount config (legacy
+            // `vaultPath` or one explicit root mount) must render byte-identically
+            // to the frozen golden, so the fields are absent rather than
+            // one-element arrays. `build_vault_overview_payload` is deliberately NOT
+            // the place for this: it also feeds the `obsidian://vault/info` resource
+            // and both health payloads, which add the same detail themselves.
+            //
+            // The counts above describe the ROOT mount's index; this makes them
+            // cover the whole logical vault and adds each mount's own numbers.
+            insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
+            insert_mount_capabilities(&mut payload, state.router.as_ref());
             if let Some(object) = payload.as_object_mut() {
-                // Additive and multi-mount ONLY. A single-mount config (legacy
-                // `vaultPath` or one explicit root mount) must render byte-identically
-                // to the frozen golden, so the field is absent rather than a
-                // one-element array. `build_vault_overview_payload` is deliberately
-                // NOT the place for this: it also feeds the `obsidian://vault-info`
-                // resource and both health payloads.
-                if state.router.is_multi_mount() {
-                    object.insert(
-                        "mounts".to_string(),
-                        json!(mount_descriptors(state.router.as_ref())),
-                    );
-                }
                 match health {
                     // Sparse backend: nothing to probe, so omit the status field entirely.
                     index_search::EmbeddingBackendHealth::NotApplicable => {}
                     index_search::EmbeddingBackendHealth::Reachable => {
-                        object.insert(
-                            "embeddingBackendStatus".to_string(),
-                            json!("reachable"),
-                        );
+                        object.insert("embeddingBackendStatus".to_string(), json!("reachable"));
                     }
                     index_search::EmbeddingBackendHealth::Unreachable(reason) => {
-                        object.insert(
-                            "embeddingBackendStatus".to_string(),
-                            json!("unreachable"),
-                        );
-                        object
-                            .insert("embeddingBackendError".to_string(), json!(reason));
+                        object.insert("embeddingBackendStatus".to_string(), json!("unreachable"));
+                        object.insert("embeddingBackendError".to_string(), json!(reason));
                     }
                 }
             }
@@ -1634,16 +1904,63 @@ pub async fn call_tool(
             ))
         }
         "build_index" => {
-            require_single_mount(state, "build_index")?;
-            let snapshot = state.runtime.rebuild("manual build_index").await?;
+            // Every mount, sequentially. `build_index` is the one recall-adjacent tool
+            // that needs no scope: rebuilding is exhaustive by nature, so doing all
+            // mounts is the complete answer rather than a merge of partial ones.
+            let root_snapshot = state.runtime().rebuild("manual build_index").await?;
+            let mut mount_results = Vec::new();
+            let mut failures = Vec::new();
+            for entry in state.runtimes.entries() {
+                if entry.is_root() {
+                    mount_results.push(build_index_mount_json(
+                        &entry.id,
+                        &entry.mount_at,
+                        Ok(&root_snapshot),
+                    ));
+                    continue;
+                }
+                match entry.runtime.rebuild("manual build_index").await {
+                    Ok(snapshot) => mount_results.push(build_index_mount_json(
+                        &entry.id,
+                        &entry.mount_at,
+                        Ok(&snapshot),
+                    )),
+                    Err(error) => {
+                        failures.push(format!("'{}': {error}", entry.id));
+                        mount_results.push(build_index_mount_json(
+                            &entry.id,
+                            &entry.mount_at,
+                            Err(&error),
+                        ));
+                    }
+                }
+            }
+            // A partial rebuild reported as success would be a wrong answer: the
+            // mounts that DID rebuild keep their fresh index, and the failure names
+            // every mount that did not.
+            if !failures.is_empty() {
+                return Err(format!(
+                    "build_index rebuilt every other mount but failed for {}",
+                    failures.join("; ")
+                ));
+            }
+            let snapshot = &root_snapshot;
             let mut result = Map::new();
             result.insert("rebuilt".to_string(), json!(true));
             result.insert(
                 "generatedAt".to_string(),
                 json!(snapshot.index.generated_at),
             );
-            result.insert("noteCount".to_string(), json!(snapshot.index.note_count));
-            result.insert("chunkCount".to_string(), json!(snapshot.index.chunk_count));
+            // Aggregate across mounts. Identical to the root's own numbers for a
+            // single-mount config, where the loop above ran exactly once.
+            result.insert(
+                "noteCount".to_string(),
+                json!(sum_mount_field(&mount_results, "noteCount")),
+            );
+            result.insert(
+                "chunkCount".to_string(),
+                json!(sum_mount_field(&mount_results, "chunkCount")),
+            );
             result.insert(
                 "semanticBackend".to_string(),
                 json!(snapshot.index.semantic_backend.as_str()),
@@ -1657,10 +1974,19 @@ pub async fn call_tool(
             if let Some(dimensions) = snapshot.index.embedding_dimensions {
                 result.insert("embeddingDimensions".to_string(), json!(dimensions));
             }
+            // Additive and multi-mount only, so the single-mount payload is
+            // byte-identical to the frozen shape.
+            if state.runtimes.is_multi_mount() {
+                result.insert("mounts".to_string(), json!(mount_results));
+            }
             Ok(json_text_result(Value::Object(result)))
         }
         "hybrid_search" => {
-            require_single_mount(state, "hybrid_search")?;
+            let scoped = resolve_recall_scope(
+                state,
+                "hybrid_search",
+                optional_string_arg(arguments, "scope").as_deref(),
+            )?;
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
@@ -1668,7 +1994,7 @@ pub async fn call_tool(
             let semantic_weight = clamped_f64_arg(arguments, "semanticWeight", 1.0, 0.0, 1.0);
             let bm25_weight = clamped_f64_arg(arguments, "bm25Weight", 1.0, 0.0, 1.0);
             let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
-            let snapshot = state.runtime.fresh_snapshot("hybrid_search").await?;
+            let snapshot = scoped.runtime.fresh_snapshot("hybrid_search").await?;
             let index = snapshot.index;
             let outcome = hybrid_search_matches(
                 index.clone(),
@@ -1686,7 +2012,13 @@ pub async fn call_tool(
             let mut match_values = outcome
                 .matches
                 .into_iter()
-                .map(|item| hybrid_search_match_json(&item, text_options))
+                .map(|item| {
+                    let mut value = hybrid_search_match_json(&item, text_options);
+                    // Index paths are mount-relative; clients only know logical ones.
+                    // A no-op for the root mount.
+                    scoped.relabel_path(&mut value, "path");
+                    value
+                })
                 .collect::<Vec<_>>();
             let response_truncated =
                 apply_response_text_budget(&mut match_values, "text", RESPONSE_TEXT_BUDGET_CHARS);
@@ -1715,11 +2047,15 @@ pub async fn call_tool(
             ))
         }
         "search_artifacts" => {
-            require_single_mount(state, "search_artifacts")?;
+            let scoped = resolve_recall_scope(
+                state,
+                "search_artifacts",
+                optional_string_arg(arguments, "scope").as_deref(),
+            )?;
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
-            let snapshot = state.runtime.fresh_snapshot("search_artifacts").await?;
+            let snapshot = scoped.runtime.fresh_snapshot("search_artifacts").await?;
             let index = snapshot.index;
             let query_for_search = query.clone();
             // artifact_semantic_search embeds the query via the (multimodal) artifact
@@ -1754,7 +2090,8 @@ pub async fn call_tool(
                     "matches": matches
                         .into_iter()
                         .map(|item| json!({
-                            "path": item.path,
+                            // Logical path: identity on the root mount.
+                            "path": scoped.to_logical(&item.path),
                             "title": item.title,
                             "kind": item.kind,
                             "mimeType": item.mime_type,
@@ -1769,22 +2106,24 @@ pub async fn call_tool(
         }
         "related_notes" => {
             let path = string_arg(arguments, "path")?;
-            require_root_mount_path(state, "related_notes", &path)?;
+            // Served by whichever mount owns the path, from that mount's index.
+            let (scoped, mount_path) = resolve_recall_path(state, "related_notes", &path)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
-            let snapshot = state.runtime.fresh_snapshot("related_notes").await?;
+            let snapshot = scoped.runtime.fresh_snapshot("related_notes").await?;
             let index = snapshot.index;
             let matches = index_search::related_notes_with_options(
                 &index,
-                &path,
+                &mount_path,
                 RelatedNoteOptions { limit },
             )
             .map_err(|error| error.to_string())?;
             Ok(json_text_result(json!({
+                // Echoed as the caller spelled it, in the logical namespace.
                 "path": path,
                 "rebuilt": snapshot.rebuilt,
                 "semanticBackend": index.semantic_backend.as_str(),
                 "count": matches.len(),
-                "matches": matches.into_iter().map(|item| note_result_json(item.path, item.title, |object| {
+                "matches": matches.into_iter().map(|item| note_result_json(scoped.to_logical(&item.path), item.title, |object| {
                     object.insert("score".to_string(), json!(item.score));
                     object.insert("sharedLinks".to_string(), json!(item.shared_links));
                 })).collect::<Vec<_>>()
@@ -1792,7 +2131,7 @@ pub async fn call_tool(
         }
         "graph_traverse" => {
             let path = string_arg(arguments, "path")?;
-            require_root_mount_path(state, "graph_traverse", &path)?;
+            let (scoped, mount_path) = resolve_recall_path(state, "graph_traverse", &path)?;
             let direction = optional_enum_string_arg(
                 arguments,
                 "direction",
@@ -1801,15 +2140,16 @@ pub async fn call_tool(
             .unwrap_or_else(|| "both".to_string());
             let depth = clamped_usize_arg(arguments, "depth", 1, 1, 6);
             let limit = clamped_usize_arg(arguments, "limit", 100, 1, 500);
-            let snapshot = state.runtime.fresh_snapshot("graph_traverse").await?;
+            let snapshot = scoped.runtime.fresh_snapshot("graph_traverse").await?;
             let index = snapshot.index;
             let graph_direction = match direction.as_str() {
                 "incoming" => index_graph::GraphDirection::Incoming,
                 "outgoing" => index_graph::GraphDirection::Outgoing,
                 _ => index_graph::GraphDirection::Both,
             };
-            let graph = index_graph::graph_traverse(&index, &path, graph_direction, depth, limit)
-                .map_err(|error| error.to_string())?;
+            let graph =
+                index_graph::graph_traverse(&index, &mount_path, graph_direction, depth, limit)
+                    .map_err(|error| error.to_string())?;
             Ok(json_text_result(json!({
                 "path": path,
                 "rebuilt": snapshot.rebuilt,
@@ -1817,18 +2157,24 @@ pub async fn call_tool(
                 "depth": depth,
                 "nodeCount": graph.nodes.len(),
                 "edgeCount": graph.edges.len(),
-                "nodes": graph.nodes.into_iter().map(|node| note_result_json(node.path, node.title, |object| {
+                "nodes": graph.nodes.into_iter().map(|node| note_result_json(scoped.to_logical(&node.path), node.title, |object| {
                     object.insert("depth".to_string(), json!(node.depth));
                 })).collect::<Vec<_>>(),
+                // Node paths are addresses and are translated; `rawLink` is the wiki
+                // link's literal source text, not a path, so it is left alone.
                 "edges": graph.edges.into_iter().map(|edge| json!({
-                    "source": edge.source,
-                    "target": edge.target,
+                    "source": scoped.to_logical(&edge.source),
+                    "target": scoped.to_logical(&edge.target),
                     "rawLink": edge.raw_link
                 })).collect::<Vec<_>>()
             })))
         }
         "load_knowledge" => {
-            require_single_mount(state, "load_knowledge")?;
+            let scoped = resolve_recall_scope(
+                state,
+                "load_knowledge",
+                optional_string_arg(arguments, "scope").as_deref(),
+            )?;
             let subject = string_arg(arguments, "subject")?;
             validate_format_arg(arguments)?;
             let project = optional_string_arg(arguments, "project");
@@ -1837,7 +2183,7 @@ pub async fn call_tool(
             let include_graph = bool_arg(arguments, "includeGraph", true);
             let graph_depth = clamped_usize_arg(arguments, "graphDepth", 1, 1, 3);
             let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
-            let snapshot = state.runtime.fresh_snapshot("load_knowledge").await?;
+            let snapshot = scoped.runtime.fresh_snapshot("load_knowledge").await?;
             let index = snapshot.index;
             let query = [Some(subject.clone()), project.clone()]
                 .into_iter()
@@ -1857,6 +2203,10 @@ pub async fn call_tool(
             let degraded = chunk_outcome.degraded;
             let degradation_reason = chunk_outcome.degradation_reason.clone();
 
+            // `chunk_paths` stay MOUNT-relative: they are the addresses fed back into
+            // this mount's index below (related-note seeds, the graph root). Only the
+            // rendered payload is translated to logical paths, by `relabel_path`.
+            // Both are the identity on the root mount.
             let mut chunk_paths = Vec::new();
             let mut chunks = Vec::new();
             for chunk in chunk_outcome.matches {
@@ -1867,6 +2217,7 @@ pub async fn call_tool(
                 if let Some(chunk_object) = chunk_value.as_object_mut() {
                     chunk_object.insert("wikiLink".to_string(), json!(note_wiki_link(&chunk.path)));
                 }
+                scoped.relabel_path(&mut chunk_value, "path");
                 chunks.push(chunk_value);
             }
             let response_truncated =
@@ -1911,14 +2262,20 @@ pub async fn call_tool(
                     },
                 ) {
                     for note in related {
+                        let logical = scoped.to_logical(&note.path);
                         merge_knowledge_note(
                             &mut note_bucket,
                             KnowledgeNote {
-                                path: note.path.clone(),
+                                wiki_link: note_wiki_link(&logical),
+                                path: logical,
                                 title: note.title.clone(),
-                                wiki_link: note_wiki_link(&note.path),
                                 score: note.score * 0.85,
-                                reasons: vec![format!("related to {}", seed_path)],
+                                // The reason is shown to a caller, so it names the
+                                // seed by its logical path too.
+                                reasons: vec![format!(
+                                    "related to {}",
+                                    scoped.to_logical(seed_path)
+                                )],
                                 shared_links: note.shared_links,
                             },
                         );
@@ -1952,12 +2309,12 @@ pub async fn call_tool(
                 )
                 .map_err(|error| error.to_string())?;
                 json!({
-                    "nodes": graph_payload.nodes.into_iter().map(|node| note_result_json(node.path, node.title, |object| {
+                    "nodes": graph_payload.nodes.into_iter().map(|node| note_result_json(scoped.to_logical(&node.path), node.title, |object| {
                         object.insert("depth".to_string(), json!(node.depth));
                     })).collect::<Vec<_>>(),
                     "edges": graph_payload.edges.into_iter().map(|edge| json!({
-                        "source": edge.source,
-                        "target": edge.target,
+                        "source": scoped.to_logical(&edge.source),
+                        "target": scoped.to_logical(&edge.target),
                         "rawLink": edge.raw_link
                     })).collect::<Vec<_>>()
                 })
@@ -2006,7 +2363,7 @@ pub async fn call_tool(
                     "scores": []
                 })));
             }
-            let snapshot = state.runtime.fresh_snapshot("recommend_folder").await?;
+            let snapshot = state.runtime().fresh_snapshot("recommend_folder").await?;
             let index = snapshot.index;
             let query = [Some(topic.clone()), project.clone()]
                 .into_iter()
@@ -2291,7 +2648,7 @@ mod tests {
         tool_definitions, update_or_create_note_section, TextPayloadOptions,
     };
     use crate::mcp::AppState;
-    use crate::runtime::RuntimeState;
+    use crate::runtime::MountRuntimes;
     use deep_obsidian_types::{
         AutoReindexConfig, EmbeddingConfig, EmbeddingProvider, HttpConfig, ResolvedServiceConfig,
         StdioMode, TransportMode,
@@ -2341,15 +2698,48 @@ mod tests {
 
     async fn test_state(vault_path: PathBuf) -> AppState {
         let config = test_config(vault_path);
-        let (runtime, _auto_reindex) = RuntimeState::bootstrap(config.clone())
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
             .await
             .expect("bootstrap runtime");
-        AppState::new(config, runtime)
+        AppState::new(config, runtimes)
     }
 
     /// An unroutable base URL (loopback, reserved port) that refuses connections
     /// immediately, so a live embed against it fails fast with a connection error.
     const DEAD_BACKEND_URL: &str = "http://127.0.0.1:1";
+
+    /// `build_index` now loops over the mount table and SUMS the per-mount counts
+    /// instead of reading the root snapshot's fields directly. This pins that a
+    /// single-mount payload is unchanged by that: the loop runs exactly once, the
+    /// sums equal the root index's own numbers, and no `mounts` array appears.
+    ///
+    /// The one payload of this slice that no golden covers, hence the explicit test.
+    #[tokio::test]
+    async fn build_index_on_a_single_mount_reports_exactly_the_root_index() {
+        let vault_path = temp_dir("build-index-single-mount");
+        fs::write(
+            vault_path.join("Note.md"),
+            "# Note\n\nInstall the service and validate the runtime.\n",
+        )
+        .expect("write note");
+        let state = test_state(vault_path).await;
+        let result = call_tool(&state, "build_index", &json!({}))
+            .await
+            .expect("build_index should succeed");
+        let payload = &result.structured_content;
+
+        let snapshot = state.runtime().snapshot().expect("snapshot after rebuild");
+        assert_eq!(payload["rebuilt"], json!(true));
+        assert_eq!(payload["noteCount"], json!(snapshot.index.note_count));
+        assert_eq!(payload["chunkCount"], json!(snapshot.index.chunk_count));
+        assert_eq!(payload["generatedAt"], json!(snapshot.index.generated_at));
+        assert_eq!(
+            payload["semanticBackend"],
+            json!(snapshot.index.semantic_backend.as_str())
+        );
+        // Additive multi-mount detail must NOT appear for one mount.
+        assert!(payload.get("mounts").is_none());
+    }
 
     /// Healthy-path: `hybrid_search` on a sparse index always reports `degraded:false`
     /// and omits `degradationReason`. The degraded:true path (backend down) is proven
@@ -2363,9 +2753,13 @@ mod tests {
         )
         .expect("write note");
         let state = test_state(vault_path).await;
-        let result = call_tool(&state, "hybrid_search", &json!({"query": "install runtime"}))
-            .await
-            .expect("hybrid_search should succeed");
+        let result = call_tool(
+            &state,
+            "hybrid_search",
+            &json!({"query": "install runtime"}),
+        )
+        .await
+        .expect("hybrid_search should succeed");
         assert_eq!(result.structured_content["degraded"], json!(false));
         assert!(result.structured_content.get("degradationReason").is_none());
     }
@@ -2380,9 +2774,13 @@ mod tests {
         )
         .expect("write note");
         let state = test_state(vault_path).await;
-        let result = call_tool(&state, "load_knowledge", &json!({"subject": "install runtime"}))
-            .await
-            .expect("load_knowledge should succeed");
+        let result = call_tool(
+            &state,
+            "load_knowledge",
+            &json!({"subject": "install runtime"}),
+        )
+        .await
+        .expect("load_knowledge should succeed");
         assert_eq!(result.structured_content["degraded"], json!(false));
         assert!(result.structured_content.get("degradationReason").is_none());
     }
@@ -2417,10 +2815,10 @@ mod tests {
             base_url: Some(DEAD_BACKEND_URL.to_string()),
             ..EmbeddingConfig::default()
         };
-        let (runtime, _auto_reindex) = RuntimeState::bootstrap(config.clone())
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
             .await
             .expect("bootstrap runtime");
-        let state = AppState::new(config, runtime);
+        let state = AppState::new(config, runtimes);
 
         let error = call_tool(&state, "search_artifacts", &json!({"query": "diagram"}))
             .await
@@ -2493,7 +2891,9 @@ mod tests {
         .expect("identical duplicate should be accepted");
 
         assert_eq!(content, "# Note\n\nSame text");
-        assert!(warning.expect("warning should be set").contains("identical"));
+        assert!(warning
+            .expect("warning should be set")
+            .contains("identical"));
     }
 
     #[test]
@@ -2650,7 +3050,7 @@ mod tests {
 
     #[test]
     fn update_note_section_schema_declares_conditional_heading_requirement() {
-        let definitions = tool_definitions(true);
+        let definitions = tool_definitions(true, false);
         let definition = definitions
             .iter()
             .find(|definition| definition.name == "update_note_section")
@@ -3085,9 +3485,7 @@ mod tests {
                 put(crate::bootstrap::upload_handler).layer(DefaultBodyLimit::disable()),
             )
             .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
@@ -3113,13 +3511,13 @@ mod tests {
 
     #[test]
     fn tool_list_omits_grep_search_when_ripgrep_unavailable() {
-        let available = super::tool_definitions(true);
+        let available = super::tool_definitions(true, false);
         assert!(
             available.iter().any(|tool| tool.name == "grep_search"),
             "grep_search should be present when ripgrep is available"
         );
 
-        let unavailable = super::tool_definitions(false);
+        let unavailable = super::tool_definitions(false, false);
         assert!(
             !unavailable.iter().any(|tool| tool.name == "grep_search"),
             "grep_search must be omitted when ripgrep is unavailable"
@@ -3130,11 +3528,8 @@ mod tests {
 
     #[test]
     fn consolidated_tool_surface() {
-        let definitions = super::tool_definitions(true);
-        let names: Vec<&str> = definitions
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
+        let definitions = super::tool_definitions(true, false);
+        let names: Vec<&str> = definitions.iter().map(|tool| tool.name.as_str()).collect();
         // search_artifacts re-exposes artifact semantic search (dropped with semantic_search's scope).
         assert!(names.contains(&"search_artifacts"));
         // The decommissioned/merged tools must be gone.
@@ -3168,7 +3563,7 @@ mod tests {
     async fn grep_search_returns_clear_error_when_ripgrep_unavailable() {
         let vault_path = temp_dir("grep-disabled");
         let config = test_config(vault_path.clone());
-        let (runtime, _auto_reindex) = RuntimeState::bootstrap(config.clone())
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
             .await
             .expect("bootstrap runtime");
         // Force the unavailable state regardless of the host environment: a backend
@@ -3185,7 +3580,7 @@ mod tests {
             )),
             backend,
             config: std::sync::Arc::new(config),
-            runtime,
+            runtimes,
             auth: std::sync::Arc::new(crate::auth::AuthState::disabled()),
             rg_available: false,
             uploads: crate::uploads::UploadStore::new(),
@@ -3231,8 +3626,11 @@ mod tests {
             json!({"path": "a.md", "text": "small"}),
             json!({"path": "b.md", "text": "also small"}),
         ];
-        let truncated =
-            super::apply_response_text_budget(&mut matches, "text", super::RESPONSE_TEXT_BUDGET_CHARS);
+        let truncated = super::apply_response_text_budget(
+            &mut matches,
+            "text",
+            super::RESPONSE_TEXT_BUDGET_CHARS,
+        );
         assert!(!truncated);
         assert_eq!(matches[0]["text"], "small");
         assert_eq!(matches[1]["text"], "also small");
@@ -3243,7 +3641,10 @@ mod tests {
     #[test]
     fn search_snippet_options_default_to_snippet_cap_but_respect_explicit() {
         let defaulted = TextPayloadOptions::search_snippet_from_arguments(&json!({}), true);
-        assert_eq!(defaulted.max_text_chars, super::DEFAULT_SEARCH_SNIPPET_CHARS);
+        assert_eq!(
+            defaulted.max_text_chars,
+            super::DEFAULT_SEARCH_SNIPPET_CHARS
+        );
         assert!(defaulted.include_text);
 
         let explicit =
@@ -3251,8 +3652,10 @@ mod tests {
         assert_eq!(explicit.max_text_chars, 5000);
 
         // Explicit value above the ceiling is clamped to the per-field max.
-        let clamped =
-            TextPayloadOptions::search_snippet_from_arguments(&json!({"maxTextChars": 999999}), true);
+        let clamped = TextPayloadOptions::search_snippet_from_arguments(
+            &json!({"maxTextChars": 999999}),
+            true,
+        );
         assert_eq!(clamped.max_text_chars, super::DEFAULT_MAX_TEXT_CHARS);
     }
 
@@ -3308,7 +3711,9 @@ mod tests {
         );
         let omitted = matches
             .iter()
-            .filter(|item| item.get("textOmitted").and_then(serde_json::Value::as_bool) == Some(true))
+            .filter(|item| {
+                item.get("textOmitted").and_then(serde_json::Value::as_bool) == Some(true)
+            })
             .count();
         assert!(omitted > 0, "expected at least one omitted match text");
     }
@@ -3332,9 +3737,13 @@ mod tests {
         let state = test_state(vault_path).await;
 
         // Default snippet cap (no maxTextChars override) = DEFAULT_SEARCH_SNIPPET_CHARS.
-        let result = call_tool(&state, "hybrid_search", &json!({"query": "gizmotron", "limit": 5}))
-            .await
-            .expect("hybrid_search should succeed");
+        let result = call_tool(
+            &state,
+            "hybrid_search",
+            &json!({"query": "gizmotron", "limit": 5}),
+        )
+        .await
+        .expect("hybrid_search should succeed");
         let matches = result.structured_content["matches"]
             .as_array()
             .expect("matches array");
@@ -3353,7 +3762,11 @@ mod tests {
             text.chars().count()
         );
         // Truncation is signaled on the match (the cap actually fired on the grown text).
-        assert_eq!(hit.get("textTruncated").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            hit.get("textTruncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -3377,7 +3790,10 @@ mod tests {
         assert!(result.structured_content.get("responseTruncated").is_none());
         assert!(result.structured_content.get("truncationNote").is_none());
         // Full text present and not omitted for a small response.
-        assert!(matches[0].get("text").and_then(serde_json::Value::as_str).is_some());
+        assert!(matches[0]
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
         assert!(matches[0].get("textOmitted").is_none());
     }
 }

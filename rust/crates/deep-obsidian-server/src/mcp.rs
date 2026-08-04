@@ -6,19 +6,28 @@ use deep_obsidian_types::{MountBackendConfig, ResolvedServiceConfig};
 use serde_json::{json, Value};
 
 use crate::auth::AuthState;
+use crate::health::MountIndexSummary;
 use crate::protocol::{
     InitializeResult, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
     PromptGetResult, PromptListResult, ResourceListResult, ResourceReadResult,
     ResourceTemplateListResult, ServerInfo, ToolCallResult, ToolListResult,
 };
-use crate::runtime::RuntimeState;
+use crate::runtime::{MountRuntimes, RuntimeDiagnostics, RuntimeReadiness, RuntimeState};
 use crate::uploads::UploadStore;
 use crate::{prompts, resources, tools};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ResolvedServiceConfig>,
-    pub runtime: Arc<RuntimeState>,
+    /// One index runtime per mount, each with its own index directory, watcher and
+    /// refresh lifecycle. A single-mount config holds exactly one, built from the
+    /// config verbatim, so it behaves identically to the pre-slice single runtime.
+    ///
+    /// Use [`AppState::runtime`] for the ROOT mount, or
+    /// [`MountRuntimes::for_mount`] to serve a path that routes elsewhere. Never
+    /// serve a caller-supplied path from the root runtime on a multi-mount config:
+    /// its index does not contain the other mounts' notes.
+    pub runtimes: Arc<MountRuntimes>,
     /// Resolved HTTP authentication state. Disabled by default; populated by the
     /// HTTP bootstrap via [`AppState::with_auth`]. Unused under stdio.
     pub auth: Arc<AuthState>,
@@ -26,8 +35,9 @@ pub struct AppState {
     /// All vault IO for tool and resource handling goes through here.
     ///
     /// `config.vault_path` deliberately stays available alongside it: it is the
-    /// ROOT mount's path, and the index crate and the runtime watcher still consume
-    /// the raw path this slice.
+    /// ROOT mount's path, which is what `vaultPath` has always meant. Each mount's
+    /// own vault path now reaches the index crate through that mount's
+    /// [`RuntimeState`] instead (see [`MountRuntimes`]).
     pub router: Arc<VaultRouter>,
     /// The ROOT mount's backend, unrouted.
     ///
@@ -114,7 +124,7 @@ impl AppState {
     /// Build state with no upload base (used by the stdio transport).
     ///
     /// Constructs one backend per configured mount and wires them into the router.
-    pub fn new(config: ResolvedServiceConfig, runtime: Arc<RuntimeState>) -> Self {
+    pub fn new(config: ResolvedServiceConfig, runtimes: Arc<MountRuntimes>) -> Self {
         let router = build_router(&config);
         let root = router
             .root()
@@ -123,7 +133,7 @@ impl AppState {
         let rg_available = backend.descriptor().supports(Capability::GrepSearch);
         Self {
             config: Arc::new(config),
-            runtime,
+            runtimes,
             auth: Arc::new(AuthState::disabled()),
             router: Arc::new(router),
             backend,
@@ -131,6 +141,47 @@ impl AppState {
             uploads: UploadStore::new(),
             upload_base: None,
         }
+    }
+
+    /// The ROOT mount's index runtime.
+    ///
+    /// The right handle for anything that is about the vault root itself — health,
+    /// readiness, the vault overview. NOT the right handle for a caller-supplied
+    /// path on a multi-mount config; route that through
+    /// [`MountRuntimes::for_mount`].
+    pub fn runtime(&self) -> &Arc<RuntimeState> {
+        self.runtimes.root()
+    }
+
+    /// One summary per mount, joining the router's view of a mount (id, prefix,
+    /// backend kind) with its runtime's index state.
+    ///
+    /// The single input to every additive multi-mount payload field. Mount order is
+    /// the ROUTER's, i.e. config order, so `vault_info.mounts`, the health payloads
+    /// and the vault overview all list mounts in the same order.
+    pub fn mount_index_summaries(&self) -> Vec<MountIndexSummary> {
+        self.router
+            .mounts()
+            .iter()
+            .map(|mount| MountIndexSummary {
+                id: mount.id.clone(),
+                mount_at: mount.mount_at.clone(),
+                backend_kind: mount.backend.descriptor().kind.as_str(),
+                diagnostics: self
+                    .runtimes
+                    .for_mount(&mount.id)
+                    .map(|runtime| runtime.diagnostics())
+                    // A mount with no runtime of its own has no index to report on.
+                    // Unreachable while every backend is a filesystem vault.
+                    .unwrap_or_else(|| RuntimeDiagnostics {
+                        status: RuntimeReadiness::Degraded,
+                        refresh_in_flight: false,
+                        snapshot: None,
+                        last_success: None,
+                        last_error: None,
+                    }),
+            })
+            .collect()
     }
 
     /// Attach an upload base URL, enabling `request_vault_upload`.
@@ -200,7 +251,7 @@ pub async fn handle_request(
             serde_json::to_value(json_response(
                 id,
                 ToolListResult {
-                    tools: tools::list_tools(state.rg_available),
+                    tools: tools::list_tools(state.rg_available, state.router.is_multi_mount()),
                 },
             ))
             .expect("tool list response to serialize"),
