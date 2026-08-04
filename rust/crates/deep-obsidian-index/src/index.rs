@@ -70,6 +70,26 @@ pub enum IndexError {
     MissingIndexContext,
     #[error("embedding error: {0}")]
     Embedding(String),
+    /// A [`NoteSource`] failed to enumerate or fetch.
+    ///
+    /// Distinct from [`IndexError::Io`] on purpose. `Io`'s rendering runs through
+    /// `describe_io_error`, which enriches a `PermissionDenied` with filesystem
+    /// remediation ("grant the binary Full Disk Access…") and always names a local
+    /// path. Both are actively wrong for a source with no local directory: there is
+    /// no path to name, and the fix for a refused CouchDB connection is not a macOS
+    /// privacy setting. So a non-filesystem source reports here instead, and the
+    /// message is whatever that source already rendered.
+    #[error("note source error: {message}")]
+    Source { message: String },
+}
+
+impl IndexError {
+    /// Wrap an already-rendered source failure.
+    pub fn source(message: impl Into<String>) -> Self {
+        IndexError::Source {
+            message: message.into(),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, IndexError>;
@@ -417,7 +437,13 @@ pub fn list_markdown_files(vault_path: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
-pub(crate) fn artifact_mime_and_kind(path: &Path) -> Option<(&'static str, &'static str)> {
+/// The MIME type and artifact kind for a path's extension, or `None` when the
+/// extension is not a recognized artifact type.
+///
+/// Public so an out-of-crate [`NoteSource`](crate::source::NoteSource) can classify
+/// its own artifacts with the same table the filesystem source uses — otherwise two
+/// sources could disagree about what is indexable.
+pub fn artifact_mime_and_kind(path: &Path) -> Option<(&'static str, &'static str)> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
         "pdf" => Some(("application/pdf", "pdf")),

@@ -26,9 +26,11 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod couchdb;
 pub mod filesystem;
 pub mod grep;
 pub mod router;
+pub mod sidecar;
 pub mod watch;
 
 #[cfg(test)]
@@ -37,10 +39,17 @@ mod memory;
 #[cfg(test)]
 mod contract;
 
+pub use couchdb::{
+    CouchDbVaultBackend, COUCHDB_GREP_UNSUPPORTED_MESSAGE, COUCHDB_READ_ONLY_MESSAGE,
+};
 pub use deep_obsidian_core::vault::{VaultChildEntry, VaultEntryKind, VaultError};
 pub use filesystem::FilesystemVaultBackend;
 pub use grep::{resolve_ripgrep, RIPGREP_UNAVAILABLE_MESSAGE};
 pub use router::{Mount, Resolved, RouterError, VaultRouter};
+pub use sidecar::{
+    CompatibilityStatus, SidecarConfig, SidecarCredentials, SidecarError, SidecarSupervisor,
+    SupervisorHealth,
+};
 pub use watch::{should_ignore_watch_path, watch_reason, ChangeEvent, ChangeStream};
 
 // ---------------------------------------------------------------------------
@@ -54,6 +63,9 @@ pub use watch::{should_ignore_watch_path, watch_reason, ChangeEvent, ChangeStrea
 pub enum BackendKind {
     Filesystem,
     InMemory,
+    /// A read-only Self-hosted LiveSync vault in CouchDB, behind the supervised
+    /// Node sidecar.
+    Couchdb,
 }
 
 impl BackendKind {
@@ -61,6 +73,7 @@ impl BackendKind {
         match self {
             BackendKind::Filesystem => "filesystem",
             BackendKind::InMemory => "in-memory",
+            BackendKind::Couchdb => "couchdb",
         }
     }
 }

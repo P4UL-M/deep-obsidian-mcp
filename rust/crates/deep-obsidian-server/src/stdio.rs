@@ -4,6 +4,7 @@ use deep_obsidian_types::{ResolvedServiceConfig, StdioMode};
 use serde_json::Value;
 
 use crate::mcp::{handle_request, AppState};
+use crate::mounts::MountBackends;
 use crate::protocol::JsonRpcRequest;
 use crate::runtime::MountRuntimes;
 
@@ -91,10 +92,12 @@ fn send_message(stdout: &mut impl Write, message: &Value, mode: StdioMode) -> io
 }
 
 pub async fn run_stdio_service(config: ResolvedServiceConfig) -> io::Result<()> {
-    let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
+    // Built once and shared; see `crate::mounts`.
+    let backends = MountBackends::build(&config);
+    let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
         .await
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
-    let state = AppState::new(config.clone(), runtimes);
+    let state = AppState::with_backends(config.clone(), runtimes, &backends);
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     let mut buffer = Vec::new();

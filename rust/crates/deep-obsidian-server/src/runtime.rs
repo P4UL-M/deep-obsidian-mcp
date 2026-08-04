@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use deep_obsidian_backend::watch::watch_reason;
+use deep_obsidian_backend::watch::{watch_reason, ChangeEvent};
+use deep_obsidian_backend::VaultBackend;
 use deep_obsidian_config::default_mount_index_dir;
 use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_index::embeddings::{
@@ -11,14 +12,17 @@ use deep_obsidian_index::embeddings::{
     DEFAULT_EMBEDDING_MAX_CHARS, DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
 };
 use deep_obsidian_index::index::{
-    build_index_with_artifacts, collect_artifact_snapshots, collect_snapshots,
-    get_search_index_with_artifacts, same_artifact_embedding_config, same_artifact_snapshots,
-    same_semantic_config, SearchIndex, SemanticBackend,
+    build_index_from_source, get_search_index_from_source, same_artifact_embedding_config,
+    same_artifact_snapshots, same_semantic_config, SearchIndex, SemanticBackend,
 };
+use deep_obsidian_index::source::{FilesystemSource, NoteSource};
+use deep_obsidian_index::sqlite::index_file_path;
 use deep_obsidian_types::{MountBackendConfig, MountConfig, ResolvedServiceConfig};
+
+use crate::mounts::MountBackends;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use secrecy::ExposeSecret;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -190,9 +194,90 @@ fn index_artifact_embedding_config(
     .normalize())
 }
 
-#[derive(Debug)]
+/// The vault one [`RuntimeState`] indexes, and where its SQLite file lives.
+///
+/// Introduced so a mount whose notes are not on disk can be indexed. The
+/// filesystem case is constructed from `(vault_path, index_dir)` exactly as before
+/// — `FilesystemSource::new(vault_path)` paired with
+/// `sqlite::index_file_path(vault_path, Some(index_dir))` is *literally* what
+/// `build_index_with_artifacts` did internally, so the filesystem index build is
+/// byte-for-byte unchanged rather than merely intended to be.
+///
+/// # Why this is a FACTORY and not a source
+///
+/// A remote source caches its manifest, because one refresh asks for it up to four
+/// times and each ask is a network conversation (see [`crate::couchdb_source`]). That
+/// cache must be scoped to ONE refresh. Holding a single long-lived source instance
+/// here would scope it to the process instead, and then the second refresh would read
+/// the first refresh's manifest, compare it against the index built from that same
+/// manifest, conclude "unchanged", and clear the stale flag — so a couchdb mount
+/// would serve its startup snapshot forever and no change feed could ever move it.
+///
+/// So [`RuntimeState`] mints one source per refresh and threads it through both the
+/// reuse check and the build. That gets both properties at once: one consistent
+/// manifest *within* a refresh, and a fresh one *between* refreshes. A
+/// [`FilesystemSource`] is stateless, so for a filesystem mount the factory is
+/// nothing but a constructor call and behaviour is unchanged.
+#[derive(Clone)]
+pub struct IndexTarget {
+    source_factory: Arc<dyn Fn() -> Arc<dyn NoteSource> + Send + Sync>,
+    index_file: PathBuf,
+    /// Only for `Debug`; the sources themselves are minted on demand.
+    describes: String,
+}
+
+impl std::fmt::Debug for IndexTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexTarget")
+            .field("index_file", &self.index_file)
+            .field("source", &self.describes)
+            .finish()
+    }
+}
+
+impl IndexTarget {
+    /// A local vault directory indexed into `index_dir`.
+    pub fn filesystem(vault_path: &Path, index_dir: &Path) -> Self {
+        let vault_path = vault_path.to_path_buf();
+        Self {
+            index_file: index_file_path(&vault_path, Some(index_dir)),
+            describes: format!("filesystem({})", vault_path.display()),
+            source_factory: Arc::new(move || Arc::new(FilesystemSource::new(vault_path.clone()))),
+        }
+    }
+
+    /// Any other source, minted afresh for each refresh by `factory`.
+    pub fn from_factory(
+        describes: impl Into<String>,
+        index_dir: &Path,
+        factory: impl Fn() -> Arc<dyn NoteSource> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            // `index_file_path` falls back to a vault-relative default only when
+            // `index_dir` is `None`; passing `Some` makes the first argument unused,
+            // so a source with no local directory is fine here.
+            index_file: index_file_path(Path::new(""), Some(index_dir)),
+            describes: describes.into(),
+            source_factory: Arc::new(factory),
+        }
+    }
+
+    /// A source for exactly one refresh.
+    fn source(&self) -> Arc<dyn NoteSource> {
+        (self.source_factory)()
+    }
+
+    pub fn index_file(&self) -> &Path {
+        &self.index_file
+    }
+}
+
 pub struct RuntimeState {
     config: Arc<ResolvedServiceConfig>,
+    /// What this runtime indexes. For the ROOT mount of any config this is
+    /// `IndexTarget::filesystem(&config.vault_path, &config.index_dir)`, i.e. the
+    /// pre-existing behaviour spelled out.
+    target: IndexTarget,
     snapshot: RwLock<Option<RuntimeIndexSnapshot>>,
     refresh_lock: Mutex<()>,
     refresh_in_flight: AtomicBool,
@@ -222,6 +307,19 @@ enum WatchSignal {
     Error(String),
 }
 
+/// Owns a change-feed pump task, aborting it on drop.
+///
+/// The mirror of what the `notify` watcher does for a filesystem mount: dropping the
+/// handle stops delivery. Without this, a dropped `AutoReindexHandle` would leave a
+/// task forwarding events into a channel nobody reads.
+struct WatchPump(JoinHandle<()>);
+
+impl Drop for WatchPump {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn start_recursive_watcher(
     vault_path: PathBuf,
     sender: mpsc::UnboundedSender<WatchSignal>,
@@ -242,10 +340,30 @@ fn start_recursive_watcher(
     Ok(watcher)
 }
 
+impl std::fmt::Debug for RuntimeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeState")
+            .field("target", &self.target)
+            .field("refresh_in_flight", &self.refresh_in_flight)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RuntimeState {
+    /// A runtime indexing the config's own vault directory.
+    ///
+    /// Signature and behaviour unchanged: the target it derives is exactly what the
+    /// path-based index entry points constructed internally before this slice.
     pub fn new(config: ResolvedServiceConfig) -> Arc<Self> {
+        let target = IndexTarget::filesystem(&config.vault_path, &config.index_dir);
+        Self::with_target(config, target)
+    }
+
+    /// A runtime indexing an arbitrary [`NoteSource`].
+    pub fn with_target(config: ResolvedServiceConfig, target: IndexTarget) -> Arc<Self> {
         Arc::new(Self {
             config: Arc::new(config),
+            target,
             snapshot: RwLock::new(None),
             refresh_lock: Mutex::new(()),
             refresh_in_flight: AtomicBool::new(false),
@@ -439,21 +557,31 @@ Security and restart the service",
             return self.snapshot();
         }
 
+        // ONE source for this whole refresh: the reuse check and the build below both
+        // read through it, so they cannot disagree about what the vault contains, and
+        // the next refresh gets a fresh one. See `IndexTarget`.
+        let source = self.target.source();
+
         if !force_rebuild {
-            if let Some(snapshot) = self.reuse_current_snapshot_if_unchanged(&reason).await? {
+            if let Some(snapshot) = self
+                .reuse_current_snapshot_if_unchanged(&reason, source.clone())
+                .await?
+            {
                 return Ok(snapshot);
             }
         }
 
         let config = self.config.clone();
+        let index_file = self.target.index_file.clone();
         self.refresh_in_flight.store(true, Ordering::SeqCst);
         let operation_result = if force_rebuild {
+            let source = source.clone();
             tokio::task::spawn_blocking(move || {
                 let embedding_config = index_embedding_config(&config)?;
                 let artifact_embedding_config = index_artifact_embedding_config(&config)?;
-                build_index_with_artifacts(
-                    &config.vault_path,
-                    Some(config.index_dir.as_path()),
+                build_index_from_source(
+                    source.as_ref(),
+                    &index_file,
                     Some(&embedding_config),
                     Some(&artifact_embedding_config),
                 )
@@ -464,12 +592,13 @@ Security and restart the service",
             .map_err(|error| error.to_string())
             .and_then(|result| result)
         } else {
+            let source = source.clone();
             tokio::task::spawn_blocking(move || {
                 let embedding_config = index_embedding_config(&config)?;
                 let artifact_embedding_config = index_artifact_embedding_config(&config)?;
-                get_search_index_with_artifacts(
-                    &config.vault_path,
-                    Some(config.index_dir.as_path()),
+                get_search_index_from_source(
+                    source.as_ref(),
+                    &index_file,
                     Some(&embedding_config),
                     Some(&artifact_embedding_config),
                 )
@@ -530,9 +659,12 @@ Security and restart the service",
         }
     }
 
+    /// Takes the refresh's source rather than minting one, so it reads the SAME
+    /// manifest the build below will.
     async fn reuse_current_snapshot_if_unchanged(
         &self,
         reason: &str,
+        source: Arc<dyn NoteSource>,
     ) -> Result<Option<RuntimeIndexSnapshot>, String> {
         let Some(current) = self
             .snapshot
@@ -545,9 +677,13 @@ Security and restart the service",
         let config = self.config.clone();
         let current_index = current.index.clone();
         let unchanged = tokio::task::spawn_blocking(move || {
-            let snapshots =
-                collect_snapshots(&config.vault_path).map_err(|error| error.to_string())?;
-            let artifact_snapshots = collect_artifact_snapshots(&config.vault_path)
+            // Through the source, not the path collectors: a remote source pins ONE
+            // manifest for the refresh that owns it (see the couchdb source), so
+            // these two calls plus the two inside `get_search_index_from_source`
+            // become one remote walk instead of four.
+            let snapshots = source.note_snapshots().map_err(|error| error.to_string())?;
+            let artifact_snapshots = source
+                .artifact_snapshots()
                 .map_err(|error| error.to_string())?;
             let embedding_config = index_embedding_config(&config)?;
             let artifact_embedding_config = index_artifact_embedding_config(&config)?;
@@ -599,10 +735,19 @@ fn unix_time_ms() -> u128 {
 // One index runtime per mount
 // ---------------------------------------------------------------------------
 
-/// The vault path and index directory one mount's [`RuntimeState`] must use.
+/// The vault path and index directory one mount's [`RuntimeState`] config must
+/// carry.
 ///
 /// For the ROOT mount this is the resolved config verbatim — see
 /// [`mount_runtime_config`].
+///
+/// Note that this no longer decides where the index is BUILT: that is
+/// [`IndexTarget`], derived from the mount's backend by
+/// [`crate::mounts::MountBackendEntry::index_target`]. What survives here is the
+/// config a runtime reports about itself (`vault_path` for diagnostics and the
+/// startup watchdog message, `index_dir` for the health payload), which for a
+/// backend with no local directory is the mount's index directory and an empty
+/// vault path.
 fn filesystem_mount_paths(
     config: &ResolvedServiceConfig,
     mount: &MountConfig,
@@ -617,7 +762,20 @@ fn filesystem_mount_paths(
                 .clone()
                 .unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id)),
         ),
+        // No local directory to report. The empty path is never opened: a couchdb
+        // mount's `IndexTarget` carries a `CouchDbSource`, not a `FilesystemSource`.
+        MountBackendConfig::Couchdb { index_dir, .. } => (
+            PathBuf::new(),
+            index_dir
+                .clone()
+                .unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id)),
+        ),
     }
+}
+
+/// True when a mount reads a local directory, i.e. when `notify` can watch it.
+fn mount_is_filesystem(mount: &MountConfig) -> bool {
+    matches!(mount.backend, MountBackendConfig::Filesystem { .. })
 }
 
 /// The config a single mount's [`RuntimeState`] runs against.
@@ -652,6 +810,32 @@ fn mount_runtime_config(
     }
 }
 
+/// How a mount learns that its content changed.
+///
+/// The two arms are the reason `notify` did not simply generalize: a filesystem
+/// mount's watcher is constructed FROM A PATH and owned by the watching task, while
+/// a couchdb mount's feed is owned by the backend (whose supervisor re-arms it
+/// across sidecar restarts) and merely subscribed to. Modelling that as one thing
+/// would have meant either giving `notify` a fake path or giving the backend a fake
+/// watcher.
+pub enum ChangeSource {
+    /// Watch a local directory with `notify`, exactly as before.
+    LocalDirectory(PathBuf),
+    /// Subscribe to a backend's change stream.
+    Backend(Arc<dyn VaultBackend>),
+}
+
+impl std::fmt::Debug for ChangeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChangeSource::LocalDirectory(path) => {
+                f.debug_tuple("LocalDirectory").field(path).finish()
+            }
+            ChangeSource::Backend(_) => f.write_str("Backend(..)"),
+        }
+    }
+}
+
 /// One mount's index runtime, with the logical prefix its index paths sit under.
 #[derive(Debug)]
 pub struct MountRuntime {
@@ -661,6 +845,8 @@ pub struct MountRuntime {
     /// MOUNT-RELATIVE, so this is what turns them into logical vault paths.
     pub mount_at: String,
     pub runtime: Arc<RuntimeState>,
+    /// What drives this mount's staleness signal.
+    pub change_source: ChangeSource,
 }
 
 impl MountRuntime {
@@ -710,14 +896,34 @@ pub struct MountRuntimes {
 
 impl MountRuntimes {
     /// Construct one runtime per mount. Pure construction: no IO, no index build.
-    pub fn new(config: &ResolvedServiceConfig) -> Arc<Self> {
-        let entries: Vec<MountRuntime> = config
-            .mount_table()
-            .into_iter()
-            .map(|mount| MountRuntime {
-                runtime: RuntimeState::new(mount_runtime_config(config, &mount)),
-                id: mount.id,
-                mount_at: mount.mount_at,
+    ///
+    /// Takes the already-built [`MountBackends`] rather than deriving everything from
+    /// the config, because a couchdb mount's index must read through THE SAME sidecar
+    /// supervisor its router backend uses — see [`crate::mounts`].
+    ///
+    /// Must be called from inside a tokio runtime: a couchdb mount's source captures
+    /// the current runtime handle for its sync→async bridge.
+    pub fn new(config: &ResolvedServiceConfig, backends: &MountBackends) -> Arc<Self> {
+        let handle = tokio::runtime::Handle::current();
+        let entries: Vec<MountRuntime> = backends
+            .entries()
+            .iter()
+            .map(|entry| {
+                let mount = entry.mount.clone();
+                let change_source = if mount_is_filesystem(&mount) {
+                    ChangeSource::LocalDirectory(filesystem_mount_paths(config, &mount).0)
+                } else {
+                    ChangeSource::Backend(entry.backend.clone())
+                };
+                MountRuntime {
+                    runtime: RuntimeState::with_target(
+                        mount_runtime_config(config, &mount),
+                        entry.index_target(&handle),
+                    ),
+                    id: mount.id,
+                    mount_at: mount.mount_at,
+                    change_source,
+                }
             })
             .collect();
         let root = entries
@@ -737,8 +943,9 @@ impl MountRuntimes {
     /// single-mount case for the common single-mount config.
     pub async fn bootstrap(
         config: &ResolvedServiceConfig,
+        backends: &MountBackends,
     ) -> Result<(Arc<Self>, Vec<AutoReindexHandle>), String> {
-        let runtimes = Self::new(config);
+        let runtimes = Self::new(config, backends);
         for entry in &runtimes.entries {
             if let Err(error) = entry.runtime.startup_refresh_with_watchdog().await {
                 if entry.is_root() {
@@ -764,7 +971,7 @@ serving and readiness reports the server as degraded",
         }
         self.entries
             .iter()
-            .map(|entry| start_auto_reindex_tasks(entry.runtime.clone()))
+            .map(|entry| start_auto_reindex_tasks(entry.runtime.clone(), &entry.change_source))
             .collect()
     }
 
@@ -881,20 +1088,64 @@ fn auto_reindex_interval(base: Duration, consecutive_failures: u32) -> Duration 
         .max(base)
 }
 
-pub fn start_auto_reindex_tasks(runtime: Arc<RuntimeState>) -> AutoReindexHandle {
+/// Start one mount's watch + periodic-sync task.
+///
+/// # What replaced `notify` for a couchdb mount
+///
+/// The loop below is UNCHANGED: it still receives `WatchSignal`s over one channel,
+/// debounces them, and falls back to the periodic sync. Only the producer differs.
+/// A filesystem mount still gets `start_recursive_watcher`; a couchdb mount gets a
+/// pump task that forwards its backend's [`ChangeStream`] onto the same channel and
+/// translates [`ChangeEvent`] into `WatchSignal` one-for-one (which is exactly what
+/// `ChangeEvent` was built to mirror). So the debounce, the backoff, and the
+/// periodic-sync fallback are shared by construction rather than reimplemented, and
+/// a mount whose change feed never arms still reindexes on the periodic tick.
+pub fn start_auto_reindex_tasks(
+    runtime: Arc<RuntimeState>,
+    change_source: &ChangeSource,
+) -> AutoReindexHandle {
     let stopped = Arc::new(AtomicBool::new(false));
     let task_stopped = stopped.clone();
     let config = runtime.config.clone();
     let debounce_ms = config.auto_reindex.debounce_ms.max(100);
     let sync_interval_ms = config.auto_reindex.interval_ms.max(1000);
 
+    // Subscribing happens on THIS thread, before the task is spawned, so the
+    // subscription cannot be missed between spawn and first poll.
+    enum Producer {
+        Directory(PathBuf),
+        Backend(Arc<dyn VaultBackend>),
+    }
+    let producer = match change_source {
+        ChangeSource::LocalDirectory(path) => Producer::Directory(path.clone()),
+        ChangeSource::Backend(backend) => Producer::Backend(backend.clone()),
+    };
+
     let join_handle = tokio::spawn(async move {
         let (watch_tx, mut watch_rx) = mpsc::unbounded_channel();
-        let mut watcher = match start_recursive_watcher(config.vault_path.clone(), watch_tx) {
-            Ok(watcher) => Some(watcher),
-            Err(error) => {
-                warn!("watch setup failed: {error}");
-                None
+        // Holds whatever keeps the subscription alive: the `notify` watcher, or the
+        // pump task's handle. Dropping it stops delivery, exactly as before.
+        let mut watcher: Option<Box<dyn std::any::Any + Send>> = match producer {
+            Producer::Directory(path) => match start_recursive_watcher(path, watch_tx) {
+                Ok(watcher) => Some(Box::new(watcher)),
+                Err(error) => {
+                    warn!("watch setup failed: {error}");
+                    None
+                }
+            },
+            Producer::Backend(backend) => {
+                let mut stream = backend.changes(None);
+                Some(Box::new(WatchPump(tokio::spawn(async move {
+                    while let Some(event) = stream.recv().await {
+                        let signal = match event {
+                            ChangeEvent::Change(reason) => WatchSignal::Change(reason),
+                            ChangeEvent::Error(error) => WatchSignal::Error(error),
+                        };
+                        if watch_tx.send(signal).is_err() {
+                            break;
+                        }
+                    }
+                }))))
             }
         };
         let base_interval = Duration::from_millis(sync_interval_ms);
@@ -1072,7 +1323,10 @@ mod tests {
                     },
                 },
             ],
-            experimental: deep_obsidian_types::ExperimentalConfig { multi_vault: true },
+            experimental: deep_obsidian_types::ExperimentalConfig {
+                multi_vault: true,
+                ..Default::default()
+            },
             ..test_config(root_vault, index_dir)
         }
     }
@@ -1129,10 +1383,14 @@ mod tests {
 
     /// Each mount gets its OWN runtime, so its refresh serializes on its own lock
     /// rather than behind a single global one.
-    #[test]
-    fn every_mount_gets_a_distinct_runtime() {
+    ///
+    /// `#[tokio::test]` because `MountRuntimes::new` captures the current runtime
+    /// handle for a source that needs to bridge sync→async.
+    #[tokio::test]
+    async fn every_mount_gets_a_distinct_runtime() {
         let config = two_mount_config(temp_path("root_vault"), temp_path("team_vault"));
-        let runtimes = MountRuntimes::new(&config);
+        let backends = MountBackends::build(&config);
+        let runtimes = MountRuntimes::new(&config, &backends);
 
         assert!(runtimes.is_multi_mount());
         assert_eq!(runtimes.entries().len(), 2);
@@ -1169,10 +1427,11 @@ mod tests {
 
     /// A single-mount config's aggregate is the root runtime's diagnostics
     /// verbatim, so every health and readiness payload it produces is unchanged.
-    #[test]
-    fn a_single_mount_aggregate_is_the_root_diagnostics_verbatim() {
+    #[tokio::test]
+    async fn a_single_mount_aggregate_is_the_root_diagnostics_verbatim() {
         let config = test_config(temp_path("solo_vault"), temp_path("solo_index"));
-        let runtimes = MountRuntimes::new(&config);
+        let backends = MountBackends::build(&config);
+        let runtimes = MountRuntimes::new(&config, &backends);
         assert!(!runtimes.is_multi_mount());
 
         let aggregate = runtimes.aggregate_diagnostics();
@@ -1193,7 +1452,8 @@ mod tests {
         let team_vault = temp_path("isolation_team_missing");
         let config = two_mount_config(root_vault.clone(), team_vault);
 
-        let (runtimes, _handles) = MountRuntimes::bootstrap(&config)
+        let backends = MountBackends::build(&config);
+        let (runtimes, _handles) = MountRuntimes::bootstrap(&config, &backends)
             .await
             .expect("a non-root mount failure must not fail the bootstrap");
 
@@ -1227,7 +1487,8 @@ mod tests {
         fs::write(&index_dir, "not a directory").expect("index file");
 
         let config = test_config(vault_path, index_dir);
-        assert!(MountRuntimes::bootstrap(&config).await.is_err());
+        let backends = MountBackends::build(&config);
+        assert!(MountRuntimes::bootstrap(&config, &backends).await.is_err());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1356,5 +1617,141 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    // -----------------------------------------------------------------------
+    // The per-refresh source contract
+    // -----------------------------------------------------------------------
+
+    /// A source whose manifest CHANGES on every `note_snapshots()` call.
+    ///
+    /// Stands in for a remote source that caches its manifest for the lifetime of one
+    /// source value: each `note_snapshots()` here reports a different note body size,
+    /// so an index built from call N cannot compare equal to call N+1.
+    #[derive(Debug, Default)]
+    struct DriftingSource {
+        /// This instance's fixed manifest generation, pinned at construction — exactly
+        /// the shape `CouchDbSource` has. The FACTORY owns the construction counter;
+        /// the source only needs to know which generation it is.
+        generation: u64,
+    }
+
+    impl deep_obsidian_index::source::NoteSource for DriftingSource {
+        fn ensure_ready(&self) -> deep_obsidian_index::index::Result<()> {
+            Ok(())
+        }
+
+        fn note_snapshots(
+            &self,
+        ) -> deep_obsidian_index::index::Result<Vec<deep_obsidian_index::index::FileSnapshot>>
+        {
+            Ok(vec![deep_obsidian_index::index::FileSnapshot {
+                path: "Note.md".to_string(),
+                // Both move per generation, so neither `same_snapshots` nor the
+                // incremental refresh can mistake one for another.
+                mtime_ms: 1_700_000_000_000 + self.generation,
+                size: 32 + self.generation,
+            }])
+        }
+
+        fn artifact_snapshots(
+            &self,
+        ) -> deep_obsidian_index::index::Result<Vec<deep_obsidian_index::index::ArtifactSnapshot>>
+        {
+            Ok(Vec::new())
+        }
+
+        fn ensure_path(&self, _path: &str) -> deep_obsidian_index::index::Result<()> {
+            Ok(())
+        }
+
+        fn read_note(&self, _path: &str) -> deep_obsidian_index::index::Result<String> {
+            Ok(format!("# Note\n\ngeneration {}\n", self.generation))
+        }
+
+        fn read_artifact(
+            &self,
+            _path: &str,
+            _max_bytes: u64,
+        ) -> deep_obsidian_index::index::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+    }
+
+    /// The regression guard for the manifest pin.
+    ///
+    /// A source that caches its manifest for its own lifetime is correct ONLY if a
+    /// fresh one is minted per refresh. If `IndexTarget` held a single instance
+    /// instead, the second refresh would read the first refresh's manifest, compare it
+    /// against the index built from that same manifest, conclude "unchanged", and
+    /// clear the stale flag — so a couchdb mount would serve its startup snapshot
+    /// forever and no change feed could move it. This test fails in that world.
+    #[tokio::test]
+    async fn each_refresh_gets_a_freshly_minted_source() {
+        let root = temp_path("per_refresh_source");
+        let index_dir = root.join("index");
+        std::fs::create_dir_all(&index_dir).expect("index dir");
+
+        let constructions = Arc::new(AtomicU64::new(0));
+        let factory_constructions = constructions.clone();
+        let target = IndexTarget::from_factory("drifting", &index_dir, move || {
+            let generation = factory_constructions.fetch_add(1, Ordering::SeqCst);
+            Arc::new(DriftingSource { generation })
+        });
+        let runtime = RuntimeState::with_target(
+            test_config(root.join("unused-vault"), index_dir.clone()),
+            target,
+        );
+
+        let first = runtime.refresh("first").await.expect("first refresh");
+        let second = runtime.refresh("second").await.expect("second refresh");
+
+        // A source was minted per refresh...
+        assert!(
+            constructions.load(Ordering::SeqCst) >= 2,
+            "expected a source per refresh, got {}",
+            constructions.load(Ordering::SeqCst)
+        );
+        // ...and the second refresh actually saw the moved manifest rather than
+        // reusing the first snapshot.
+        assert_ne!(
+            first.index.file_snapshots, second.index.file_snapshots,
+            "the second refresh reused a pinned manifest: the index cannot ever update"
+        );
+        assert_eq!(second.reason, "second");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Within ONE refresh, the reuse check and the build must read the SAME source, or
+    /// they could disagree about what the vault contains and persist an index whose
+    /// snapshots do not match its content.
+    #[tokio::test]
+    async fn one_refresh_uses_a_single_source_for_the_reuse_check_and_the_build() {
+        let root = temp_path("single_source_per_refresh");
+        let index_dir = root.join("index");
+        std::fs::create_dir_all(&index_dir).expect("index dir");
+
+        let constructions = Arc::new(AtomicU64::new(0));
+        let factory_constructions = constructions.clone();
+        let target = IndexTarget::from_factory("drifting", &index_dir, move || {
+            let generation = factory_constructions.fetch_add(1, Ordering::SeqCst);
+            Arc::new(DriftingSource { generation })
+        });
+        let runtime = RuntimeState::with_target(
+            test_config(root.join("unused-vault"), index_dir.clone()),
+            target,
+        );
+
+        runtime.refresh("only").await.expect("refresh");
+        // Exactly one source for the whole refresh: the reuse check (which short
+        // circuits on the first refresh, having no snapshot) and the build share it.
+        assert_eq!(
+            constructions.load(Ordering::SeqCst),
+            1,
+            "a refresh must mint exactly one source"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

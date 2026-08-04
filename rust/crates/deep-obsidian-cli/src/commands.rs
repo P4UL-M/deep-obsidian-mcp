@@ -1757,11 +1757,20 @@ pub async fn serve(resolved: &ResolvedRuntimeConfig) -> Result<ServeReport> {
                 server_result = &mut bootstrap.server_handle => {
                     match server_result {
                         Ok(Ok(())) => {}
-                        Ok(Err(error)) => return Err(error.into()),
-                        Err(error) => return Err(anyhow!("HTTP server task failed: {error}")),
+                        Ok(Err(error)) => {
+                            bootstrap.shutdown_sidecars().await;
+                            return Err(error.into());
+                        }
+                        Err(error) => {
+                            bootstrap.shutdown_sidecars().await;
+                            return Err(anyhow!("HTTP server task failed: {error}"));
+                        }
                     }
                 }
             }
+            // Stop any sidecar children gracefully before the context drops (whose
+            // `Drop` would kill them instead).
+            bootstrap.shutdown_sidecars().await;
             Ok(ServeReport {
                 message: format!(
                     "Rust native server stopped for {} (health={})",
@@ -2856,6 +2865,16 @@ fn render_mount_line(mount: &MountConfig, root_index_dir: Option<&Path>) -> Stri
             vault_path,
             index_dir,
         } => (vault_path.display().to_string(), index_dir.clone()),
+        // `url` and `database` only: no credential, and no `passwordRef`
+        // identifier either. The url is validated at config load to carry no
+        // userinfo (`ConfigError::CouchdbUrlHasUserinfo`), which is what makes
+        // printing it verbatim safe.
+        MountBackendConfig::Couchdb {
+            url,
+            database,
+            index_dir,
+            ..
+        } => (format!("{url}/{database} (read-only)"), index_dir.clone()),
     };
     let index_dir = if mount.mount_at.is_empty() {
         root_index_dir.map(Path::to_path_buf)
@@ -2897,6 +2916,10 @@ fn render_doctor_report(report: &DoctorReport) -> String {
                     MountBackendConfig::Filesystem { vault_path, .. } => {
                         vault_path.display().to_string()
                     }
+                    // Unreachable: a couchdb mount cannot be the root mount
+                    // (`ConfigError::CouchdbRootMountUnsupported`), which is
+                    // precisely what keeps this line able to name a directory.
+                    MountBackendConfig::Couchdb { .. } => "(missing)".to_string(),
                 })
         })
         .unwrap_or_else(|| "(missing)".to_string());

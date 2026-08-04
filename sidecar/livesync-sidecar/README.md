@@ -208,6 +208,80 @@ radius, on purpose.
   every `PUT`/`DELETE` and every mutating `POST`, and the test requires that list
   to be empty.
 
+## How the Rust server runs this
+
+The supervisor lives in `rust/crates/deep-obsidian-backend/src/sidecar.rs`. It spawns
+`node <bundle.mjs>` — argv is *exactly* those two elements and nothing is ever
+appended, which is what makes the "no secret in argv" assertion checkable rather than
+aspirational.
+
+### Configuring a mount
+
+A CouchDB vault is a `couchdb` entry in the config's `mounts` table:
+
+```json
+{
+  "mounts": [
+    { "id": "vault", "mountAt": "", "backend": {
+        "kind": "filesystem", "vaultPath": "~/Vault" } },
+    { "id": "live", "mountAt": "LiveSync", "backend": {
+        "kind": "couchdb",
+        "url": "https://couch.example",
+        "database": "vault",
+        "username": "vaultuser",
+        "passwordRef": { "kind": "encryptedFile", "id": "livesync-password" },
+        "e2ee": { "passphraseRef": { "kind": "osKeyring",
+                                     "service": "deep-obsidian-mcp",
+                                     "account": "livesync-e2ee" } },
+        "options": { "requestTimeoutMs": 45000 } } }
+  ],
+  "experimental": { "multiVault": true, "couchdbVaults": true }
+}
+```
+
+Constraints the config layer enforces, each with a user-facing error:
+
+- **Both experimental flags are required.** `couchdbVaults` gates the backend;
+  `multiVault` is tripped as well because a couchdb mount is always a second mount.
+  The `couchdbVaults` error wins when neither is set, since it names the flag for the
+  feature actually being used.
+- **Non-root only.** `ResolvedServiceConfig.vault_path` is the root mount's local
+  directory and still feeds `doctor` and the packaged index-dir derivation; a CouchDB
+  vault has no local directory, so it cannot be the root mount.
+- **Secrets are references, never literals.** There is no plaintext `password` field
+  at all — mirroring `embedding.apiKeyRef` and `auth.tokenRef`. That is what makes the
+  CLI's `redact_config` an identity function: the persisted config has nothing secret
+  in it to strip.
+- **`url` must not carry userinfo.** `https://user:pw@host` is rejected, because the
+  url is printed verbatim by `doctor` and `print-config`.
+
+### Locating the bundle (what packaging must honour)
+
+In precedence order:
+
+1. the mount's `sidecarPath`;
+2. `DEEP_OBSIDIAN_LIVESYNC_SIDECAR`;
+3. `sidecar/livesync-sidecar/dist/sidecar.mjs`, searched next to the running
+   executable and up its ancestors, then from the working directory and up.
+
+A packaging slice therefore has exactly two options: keep that relative layout under
+the same prefix as the binary, or set `DEEP_OBSIDIAN_LIVESYNC_SIDECAR` in the service
+unit. Both are checked before the child is spawned, so a missing bundle is a clear
+configuration error rather than an EOF on a pipe. `DEEP_OBSIDIAN_NODE` overrides the
+`node` executable for hosts where it is not on `PATH`.
+
+### Supervision
+
+Construction does no IO, so a mount whose CouchDB is down still builds and is reported
+as degraded instead of taking the server down. The handshake runs on first use: it
+sends `initialize`, asserts the echoed `supported` triple **exactly**, and records the
+compatibility verdict. A non-`ok` verdict leaves the child alive (so `health` still
+answers) and fails every data method with that status — which is what degrades the one
+mount while the vault root keeps serving. If the child exits, the next call restarts it
+with bounded exponential backoff (capped at 30s), replays `changesSince` from the last
+opaque cursor, then re-arms `watch`; the catch-up is what stops a restart from silently
+dropping edits made while it was down.
+
 ## Tests
 
 ```sh
@@ -216,6 +290,13 @@ npm run typecheck
 npm run build      # required: the suite drives dist/sidecar.mjs
 npm test
 ```
+
+`npm run mock-couch` starts `test/mock-couch.mjs` over a real socket
+(`test/mock-couch-server.mjs`), so a non-Node parent can drive the same fixture vaults.
+The Rust suite `deep-obsidian-backend/tests/couchdb_sidecar.rs` uses it to run the real
+bundle against the real fixtures; reimplementing the emulator in Rust was rejected
+because its endpoint set was discovered empirically against upstream's request shapes
+and a second copy would drift from it silently.
 
 The suite spawns the **built bundle as a child process** and speaks the real
 protocol over real pipes. That is deliberate: it exercises the newline framing,
@@ -228,10 +309,29 @@ The mock's endpoint set was discovered empirically (`DEBUG_REQUESTS=1` logs ever
 request), and anything it does not model answers `501` and is recorded, so a new
 upstream request shape fails loudly instead of silently degrading.
 
-### Deferred to slice 3c (real CouchDB + real plugin)
+### Still deferred: real plugin-generated fixtures
 
-These are **not** faked green here; they have no hermetic coverage and are called
-out so the next slice knows what to exercise:
+Slice 3c (the Rust backend) closed the *supervision* half of this list: the real
+bundle is now driven end to end against the fixture CouchDB from Rust, and an
+env-gated test (`DEEP_OBSIDIAN_COUCHDB_URL`) points the real sidecar at a real
+CouchDB and asserts it **classifies** it rather than crashing — verified against
+`couchdb:3`, which reports `unknown-schema` for an empty database.
+
+What that test deliberately does **not** do is seed a vault. Writing LiveSync
+documents by hand would produce a fixture that satisfies a test while proving nothing
+about the format, which is the exact trap this file warns about below. Closing the
+remaining gaps needs the real plugin:
+
+1. install Self-hosted LiveSync in a scratch vault, point it at a throwaway CouchDB,
+   and replicate a few notes, one attachment, one deletion and one deliberate conflict;
+2. dump the database (`_all_docs?include_docs=true`) and commit it, recording the
+   plugin version in the fixture;
+3. repeat with E2EE enabled, and again with path obfuscation — that is what would
+   finally exercise a *successful* decrypt and obfuscated-id resolution;
+4. re-run on every `commonlibVersion` bump; a diff in the dump is the signal that
+   `maxSchemaVersion` needs review.
+
+Until then these have no hermetic coverage and are **not** faked green:
 
 - **Real E2EE round-trip.** Fixture ciphertext would need the plugin's HKDF key
   schedule to be trustworthy. `test/compat.test.mjs` covers the

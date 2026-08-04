@@ -25,6 +25,7 @@ use crate::health::{
     build_health_payload, build_readiness_payload, insert_mount_index_detail, readiness_status_code,
 };
 use crate::mcp::{handle_request, AppState};
+use crate::mounts::MountBackends;
 use crate::protocol::JsonRpcRequest;
 use crate::runtime::{AutoReindexHandle, MountRuntimes};
 
@@ -135,12 +136,33 @@ pub struct ServiceBootstrapContext {
     pub auto_reindex: Vec<AutoReindexHandle>,
     pub initial_index: tokio::task::JoinHandle<()>,
     pub server_handle: tokio::task::JoinHandle<io::Result<()>>,
+    /// Sidecar supervisors to stop when the service stops. Empty unless a couchdb
+    /// mount is configured.
+    sidecars: Vec<Arc<deep_obsidian_backend::SidecarSupervisor>>,
+}
+
+impl ServiceBootstrapContext {
+    /// Stop the sidecar children gracefully: `shutdown`, close stdin, then SIGKILL
+    /// after a grace period.
+    ///
+    /// Separate from `Drop` because a graceful stop is async and `Drop` is not. The
+    /// `Drop` below is the backstop for a process that exits without calling this;
+    /// it relies on `kill_on_drop(true)`, set when the child is spawned, so no
+    /// sidecar can outlive the server either way.
+    pub async fn shutdown_sidecars(&self) {
+        for supervisor in &self.sidecars {
+            supervisor.shutdown().await;
+        }
+    }
 }
 
 impl Drop for ServiceBootstrapContext {
     fn drop(&mut self) {
         self.initial_index.abort();
         self.server_handle.abort();
+        // The supervisors' own `Drop` (and the child's `kill_on_drop`) does the
+        // killing; dropping the last handle here is what triggers it.
+        self.sidecars.clear();
     }
 }
 
@@ -326,9 +348,13 @@ pub async fn run_http_service(
     // Build state first so the startup gate can run through the backend. Both
     // `MountRuntimes::new` and `AppState::new` are pure construction, so this does
     // not change what happens before the gate — only where the gate asks.
-    let runtimes = MountRuntimes::new(&config);
-    let state =
-        AppState::new(config.clone(), runtimes.clone()).with_upload_base(upload_base_url(&config));
+    // The backends are built ONCE and shared: the router serves reads through them
+    // and each mount's index runtime reads through the same object, which for a
+    // couchdb mount means the same supervised sidecar process.
+    let backends = MountBackends::build(&config);
+    let runtimes = MountRuntimes::new(&config, &backends);
+    let state = AppState::with_backends(config.clone(), runtimes.clone(), &backends)
+        .with_upload_base(upload_base_url(&config));
 
     // Startup validation gate. Every mount must be reachable, and the backend
     // reports unreachability with core's wording, so the failure a user sees for a
@@ -391,6 +417,7 @@ pub async fn run_http_service(
         auto_reindex,
         initial_index,
         server_handle,
+        sidecars: backends.supervisors(),
     })
 }
 

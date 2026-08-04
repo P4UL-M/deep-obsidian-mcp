@@ -156,6 +156,12 @@ pub struct AuthConfigInput {
 /// `mountAt`, which are provider-independent by definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+// The couchdb variant is much larger than the filesystem one (a connection shape and
+// two secret references against two paths). Boxing it to equalize them is refused:
+// this enum is deserialized once per mount at startup and lives in a `Vec` of at most
+// a handful of entries, so its size is not a cost anywhere, while an indirection would
+// complicate every `match` arm and the serde round trip for nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum MountBackendConfig {
     /// A vault rooted at a local directory. `vaultPath` accepts `~` just like the
     /// top-level `vaultPath` does.
@@ -175,6 +181,53 @@ pub enum MountBackendConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index_dir: Option<PathBuf>,
     },
+    /// A read-only Self-hosted LiveSync vault in CouchDB, reached through the
+    /// supervised Node sidecar (`sidecar/livesync-sidecar`).
+    ///
+    /// # Why there is no plaintext password field
+    ///
+    /// Mirrors [`EmbeddingConfig::api_key_ref`] and [`AuthConfig::token_ref`]: a
+    /// secret is only ever a [`SecretRef`] pointing at the OS keyring or the
+    /// encrypted secrets file, never a literal. That is what makes
+    /// `redact_config` an identity function — the persisted config has nothing
+    /// secret in it to redact. `username` is deliberately plaintext: a CouchDB
+    /// user name is an identifier, not a credential, exactly like `baseUrl` on
+    /// the embedding config.
+    ///
+    /// `url` is validated to carry no userinfo (`https://user:pw@host`), because
+    /// it is rendered verbatim by `doctor` and `print-config`.
+    #[serde(rename_all = "camelCase")]
+    Couchdb {
+        /// CouchDB server origin WITHOUT the database path, e.g.
+        /// `https://couch.example`. Must not contain userinfo.
+        url: String,
+        /// The LiveSync database name.
+        database: String,
+        /// CouchDB user name. Not a secret; see the variant docs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        /// Reference to the stored CouchDB password. Resolved at backend
+        /// construction and handed to the sidecar only through `initialize`.
+        password_ref: SecretRef,
+        /// End-to-end-encryption material, when the vault is encrypted or has
+        /// path obfuscation enabled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        e2ee: Option<CouchdbE2eeConfig>,
+        /// Explicit path to the built sidecar bundle. When unset the backend
+        /// falls back to `DEEP_OBSIDIAN_LIVESYNC_SIDECAR` and then to a
+        /// bundled-relative default; see
+        /// `deep_obsidian_backend::sidecar::locate_sidecar_bundle`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sidecar_path: Option<PathBuf>,
+        /// Where this mount's search index lives. Defaults to
+        /// `<root indexDir>/mounts/<id>`, exactly as for a filesystem mount.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index_dir: Option<PathBuf>,
+        /// Chunking / hashing knobs forwarded verbatim to the sidecar's
+        /// `initialize.options`. These must match how the vault was written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<CouchdbOptions>,
+    },
 }
 
 impl MountBackendConfig {
@@ -182,8 +235,52 @@ impl MountBackendConfig {
     pub fn kind_name(&self) -> &'static str {
         match self {
             MountBackendConfig::Filesystem { .. } => "filesystem",
+            MountBackendConfig::Couchdb { .. } => "couchdb",
         }
     }
+}
+
+/// E2EE material for a LiveSync vault. Both passphrases are [`SecretRef`]s for
+/// the same reason the CouchDB password is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CouchdbE2eeConfig {
+    /// Reference to the vault's end-to-end-encryption passphrase.
+    pub passphrase_ref: SecretRef,
+    /// Reference to the path-obfuscation passphrase. Set only when the vault
+    /// has path obfuscation enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obfuscate_passphrase_ref: Option<SecretRef>,
+}
+
+/// Tuning knobs mirroring the sidecar's `InitializeOptions` one-for-one.
+///
+/// Every field is optional and omitted when unset, so an unset section forwards
+/// nothing and the sidecar applies upstream's own defaults. Deliberately
+/// `deny_unknown_fields`: a typo'd chunking knob would silently change how
+/// content is reassembled, which is exactly the class of bug that must fail loudly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CouchdbOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_chunk_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_chunk_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_alg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_eden: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_compression: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_filename_case_sensitive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_splitter_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2ee_algorithm: Option<String>,
+    /// Per-HTTP-request timeout applied to the sidecar's CouchDB transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
 }
 
 /// One mount in the vault's logical namespace.
@@ -220,6 +317,16 @@ pub struct ExperimentalConfig {
     /// Required to resolve a config with anything other than a single root mount.
     #[serde(default)]
     pub multi_vault: bool,
+    /// Required to resolve a config declaring a `couchdb` mount.
+    ///
+    /// Separate from [`Self::multi_vault`] even though a couchdb mount always
+    /// implies a multi-mount table this slice (couchdb cannot be the root mount):
+    /// the two flags gate different risks. `multiVault` is about routing across
+    /// several vaults; `couchdbVaults` is about a read-only backend that
+    /// supervises a Node child process and reads a format owned by a
+    /// community plugin. Retiring one must not silently retire the other.
+    #[serde(default)]
+    pub couchdb_vaults: bool,
 }
 
 impl ExperimentalConfig {

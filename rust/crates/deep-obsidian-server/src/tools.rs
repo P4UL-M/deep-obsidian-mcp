@@ -2698,10 +2698,11 @@ mod tests {
 
     async fn test_state(vault_path: PathBuf) -> AppState {
         let config = test_config(vault_path);
-        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
+        let backends = crate::mounts::MountBackends::build(&config);
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
             .await
             .expect("bootstrap runtime");
-        AppState::new(config, runtimes)
+        AppState::with_backends(config, runtimes, &backends)
     }
 
     /// An unroutable base URL (loopback, reserved port) that refuses connections
@@ -2815,10 +2816,11 @@ mod tests {
             base_url: Some(DEAD_BACKEND_URL.to_string()),
             ..EmbeddingConfig::default()
         };
-        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
+        let backends = crate::mounts::MountBackends::build(&config);
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
             .await
             .expect("bootstrap runtime");
-        let state = AppState::new(config, runtimes);
+        let state = AppState::with_backends(config, runtimes, &backends);
 
         let error = call_tool(&state, "search_artifacts", &json!({"query": "diagram"}))
             .await
@@ -3563,7 +3565,8 @@ mod tests {
     async fn grep_search_returns_clear_error_when_ripgrep_unavailable() {
         let vault_path = temp_dir("grep-disabled");
         let config = test_config(vault_path.clone());
-        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config)
+        let backends = crate::mounts::MountBackends::build(&config);
+        let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
             .await
             .expect("bootstrap runtime");
         // Force the unavailable state regardless of the host environment: a backend

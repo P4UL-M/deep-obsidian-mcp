@@ -9,7 +9,22 @@ async-trait.workspace = true
 deep-obsidian-core = { path = "../deep-obsidian-core" }
 notify.workspace = true
 rand.workspace = true
+# Secrets reach the sidecar only through its `initialize` call. `SecretString`
+# gives the credential struct a `Debug` that cannot print the value, so an
+# accidental `{:?}` on a config struct cannot leak a password.
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# The sidecar's stderr is drained to `debug!`. Already a workspace dependency
+# used by the index and server crates; no new external crate.
+tracing.workspace = true
+
+[dev-dependencies]
+# The couchdb integration suite drives the mock CouchDB fixture over JSON lines and
+# builds credential structs; both are already workspace dependencies of this crate's
+# dependents, so nothing new enters the tree.
+secrecy.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
