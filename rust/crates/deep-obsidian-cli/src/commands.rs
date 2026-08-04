@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use deep_obsidian_config::{
-    build_service_endpoints, default_packaged_index_dir, secrets::SecretResolver,
-    to_persisted_config, write_config_file,
+    build_service_endpoints, default_packaged_index_dir, render_config_text,
+    secrets::SecretResolver, to_persisted_config, write_config_file,
 };
 use deep_obsidian_server::{run_http_service, run_stdio_service};
 use deep_obsidian_types::{
@@ -722,6 +722,26 @@ pub fn setup_service(
             config_path.display()
         ));
     } else {
+        // Never clobber silently: when replacing an existing config with
+        // different content, keep the previous file next to the new one so a
+        // wrong wizard answer stays recoverable.
+        if config_path.exists() {
+            let new_text = render_config_text(&config_path, &config)?;
+            let old_text = fs::read_to_string(&config_path).unwrap_or_default();
+            if old_text != new_text {
+                let backup_path = config_path.with_extension("json.bak");
+                fs::copy(&config_path, &backup_path).with_context(|| {
+                    format!(
+                        "failed to back up existing config to {}",
+                        backup_path.display()
+                    )
+                })?;
+                final_messages.push(format!(
+                    "backed up previous config: {}",
+                    backup_path.display()
+                ));
+            }
+        }
         write_config_file(&config_path, &config)?;
         wrote_config = true;
         final_messages.push(format!("wrote config: {}", config_path.display()));
@@ -766,22 +786,58 @@ fn setup_service_wizard(
     vault_snippets: bool,
 ) -> Result<SetupServiceReport> {
     let mut options = options.clone();
+    // Prefill every prompt from the existing config file so re-running the
+    // wizard is an edit, not a from-scratch rewrite: pressing Enter keeps the
+    // current value instead of replacing it.
+    let existing = deep_obsidian_config::read_config_file(
+        options
+            .config
+            .clone()
+            .unwrap_or_else(deep_obsidian_config::default_config_path),
+    )
+    .ok()
+    .flatten();
     if options.vault_path.is_none() {
-        options.vault_path = Some(PathBuf::from(prompt_string("Vault path", None)?));
+        let existing_vault = existing
+            .as_ref()
+            .and_then(|config| config.vault_path.as_ref())
+            .map(|path| path.display().to_string());
+        let answer = prompt_string("Vault path", existing_vault.as_deref())?;
+        if answer.trim().is_empty() {
+            return Err(anyhow!("vault path is required"));
+        }
+        options.vault_path = Some(PathBuf::from(answer));
     }
 
     let install_mcp = mcp || prompt_bool("Configure MCP clients?", false)?;
     let install_skills = skills || prompt_bool("Install packaged skills?", false)?;
     let install_vault_snippets = vault_snippets || prompt_bool("Install vault snippets?", false)?;
-    let enable_embeddings = prompt_bool("Enable embeddings?", false)?;
+    let existing_embedding = existing
+        .as_ref()
+        .and_then(|config| config.embedding.clone());
+    let has_embeddings = existing_embedding
+        .as_ref()
+        .map(|embedding| embedding.provider.is_some() || embedding.model.is_some())
+        .unwrap_or(false);
+    let enable_embeddings = prompt_bool("Enable embeddings?", has_embeddings)?;
 
     if enable_embeddings {
         options.embedding_provider = Some("openai-compatible".to_string());
-        let model = prompt_string("Embedding model", None)?;
+        let model = prompt_string(
+            "Embedding model",
+            existing_embedding
+                .as_ref()
+                .and_then(|embedding| embedding.model.as_deref()),
+        )?;
         if !model.trim().is_empty() {
             options.embedding_model = Some(model);
         }
-        let base_url = prompt_string("Embedding base URL", None)?;
+        let base_url = prompt_string(
+            "Embedding base URL",
+            existing_embedding
+                .as_ref()
+                .and_then(|embedding| embedding.base_url.as_deref()),
+        )?;
         if !base_url.trim().is_empty() {
             options.embedding_base_url = Some(base_url);
         }
@@ -826,9 +882,20 @@ fn setup_service_wizard(
         }
     }
 
+    // This prompt is the one that made the wizard destructive: it is always
+    // answered, which sets `auth_changed` and bypasses the existing-config
+    // guard. Defaulting it from the current file means Enter keeps auth ENABLED
+    // on a vault that already had it, instead of silently deprovisioning the
+    // token. (The token itself is still regenerated and printed, so the change
+    // is visible rather than silent.)
+    let auth_enabled = existing
+        .as_ref()
+        .and_then(|config| config.auth.as_ref())
+        .and_then(|auth| auth.enabled)
+        .unwrap_or(false);
     let enable_auth = prompt_bool(
         "Enable HTTP bearer authentication (required for non-loopback exposure)?",
-        false,
+        auth_enabled,
     )?;
 
     setup_service(
@@ -2893,8 +2960,9 @@ fn render_probe_report(report: &ProbeReport) -> String {
 mod tests {
     use super::{
         embedding_diagnostics, enable_obsidian_snippets, inspect_index, normalize_cli_args,
-        redact_config, IndexDiagnostics, INDEX_SQLITE_FILENAME,
+        redact_config, setup_service, IndexDiagnostics, INDEX_SQLITE_FILENAME,
     };
+    use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
     use deep_obsidian_types::{
         AutoReindexConfig, EmbeddingConfig, EmbeddingConfigInput, EmbeddingProvider, HttpConfig,
         PersistedServiceConfig, ResolvedServiceConfig, SecretRef, StdioMode, TransportMode,
@@ -3199,5 +3267,111 @@ mod tests {
             serde_json::json!(["templates", "hide-agent-wiki-folders"])
         );
         assert_eq!(appearance["theme"], "obsidian");
+    }
+
+    fn resolved_runtime(
+        config_path: PathBuf,
+        service: ResolvedServiceConfig,
+    ) -> ResolvedRuntimeConfig {
+        let default_source = || ResolvedSource::Default;
+        ResolvedRuntimeConfig {
+            config_path,
+            config_file: None,
+            service,
+            sources: ResolvedSources {
+                vault_path: ResolvedSource::Cli,
+                index_dir: ResolvedSource::Cli,
+                transport: default_source(),
+                stdio_mode: default_source(),
+                http_host: default_source(),
+                http_port: default_source(),
+                http_mcp_path: default_source(),
+                http_health_path: default_source(),
+                auto_reindex_enabled: default_source(),
+                auto_reindex_debounce_ms: default_source(),
+                auto_reindex_interval_ms: default_source(),
+                embedding_provider: default_source(),
+                embedding_model: default_source(),
+                embedding_base_url: default_source(),
+                embedding_api_key_ref: default_source(),
+            },
+        }
+    }
+
+    /// Overwriting an existing config must leave a faithful `.bak` copy of the
+    /// previous content — the failure mode of the wizard-overwrite accident,
+    /// where one wrong answer replaced the whole file with no recovery path.
+    /// A no-op rewrite must not create a backup.
+    #[test]
+    fn setup_service_backs_up_previous_config_on_overwrite() {
+        let root = unique_temp_dir("setup-backup");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).expect("vault dir");
+        fs::write(vault.join("Home.md"), "# Home\n").expect("seed note");
+        let index_dir = root.join("index");
+        let config_path = root.join("config.json");
+        let backup_path = config_path.with_extension("json.bak");
+
+        let mut service = resolved_config(&vault, &index_dir);
+
+        // First write: nothing to back up.
+        let report = setup_service(
+            &resolved_runtime(config_path.clone(), service.clone()),
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .expect("first setup");
+        assert!(report.written);
+        assert!(!backup_path.exists(), "first write must not leave a backup");
+        let first_text = fs::read_to_string(&config_path).expect("config written");
+
+        // Rewriting identical content is not a clobber, so no backup either.
+        let report = setup_service(
+            &resolved_runtime(config_path.clone(), service.clone()),
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .expect("idempotent setup");
+        assert!(report.written);
+        assert!(
+            !backup_path.exists(),
+            "an unchanged rewrite must not leave a backup"
+        );
+
+        // Overwrite with changed content -> .bak holds the previous file.
+        service.http.port = 4200;
+        let report = setup_service(
+            &resolved_runtime(config_path.clone(), service),
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .expect("overwrite setup");
+        assert!(report.written);
+        assert!(report
+            .messages
+            .iter()
+            .any(|message| message.starts_with("backed up previous config:")));
+        assert_eq!(
+            fs::read_to_string(&backup_path).expect("backup exists"),
+            first_text,
+            "backup must hold the pre-overwrite content"
+        );
+        let new_text = fs::read_to_string(&config_path).expect("new config");
+        assert!(new_text.contains("4200"), "new config written: {new_text}");
     }
 }
