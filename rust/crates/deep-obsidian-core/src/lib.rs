@@ -1,6 +1,8 @@
+pub mod hash;
 pub mod text;
 pub mod vault;
 
+pub use hash::{content_hash, ContentHasher};
 pub use text::{
     count_terms, extract_block_sections, extract_heading_sections, extract_wiki_links,
     frontmatter_title, heading_title, normalize_heading_slug, note_title, tokenize, BlockSection,

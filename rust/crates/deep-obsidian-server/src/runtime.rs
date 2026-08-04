@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use deep_obsidian_backend::watch::watch_reason;
 use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_index::embeddings::{
     EmbeddingConfig as IndexEmbeddingConfig, EmbeddingProvider as IndexEmbeddingProvider,
@@ -16,7 +17,7 @@ use deep_obsidian_index::index::{
 use deep_obsidian_types::ResolvedServiceConfig;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use secrecy::ExposeSecret;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -195,57 +196,6 @@ impl Drop for AutoReindexHandle {
 enum WatchSignal {
     Change(String),
     Error(String),
-}
-
-fn should_ignore_watch_path(relative_path: Option<&str>) -> bool {
-    let Some(relative_path) = relative_path else {
-        return false;
-    };
-
-    let normalized = relative_path.replace('\\', "/");
-    let segments = normalized
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.is_empty() {
-        return false;
-    }
-
-    if segments.iter().any(|segment| segment.starts_with('.')) {
-        return true;
-    }
-    if segments.iter().any(|segment| *segment == "node_modules") {
-        return true;
-    }
-
-    let basename = segments.last().copied().unwrap_or_default();
-    if basename.ends_with(".md") {
-        return false;
-    }
-
-    !basename.contains('.')
-}
-
-fn watch_reason(vault_path: &Path, event: &Event) -> Option<String> {
-    if event.paths.is_empty() {
-        return Some("watch:unknown".to_string());
-    }
-
-    for path in &event.paths {
-        let relative = path
-            .strip_prefix(vault_path)
-            .ok()
-            .map(|value| value.to_string_lossy().replace('\\', "/"));
-        if should_ignore_watch_path(relative.as_deref()) {
-            continue;
-        }
-        return Some(match relative {
-            Some(value) if !value.is_empty() => format!("watch:{value}"),
-            _ => "watch:unknown".to_string(),
-        });
-    }
-
-    None
 }
 
 fn start_recursive_watcher(

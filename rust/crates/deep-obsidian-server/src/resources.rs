@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path};
 
+use deep_obsidian_backend::{BackendError, BackendRequest, VaultBackend, VaultError};
 use deep_obsidian_core::text::{extract_block_sections, extract_heading_sections};
-use deep_obsidian_core::vault::VaultError;
 use serde_json::json;
 use urlencoding::decode;
 
@@ -186,8 +186,19 @@ pub fn list_resource_templates() -> ResourceTemplateListResult {
 ///   `path escapes the vault` rather than `invalid vault-relative path`.
 ///
 /// Those guards and that wording are preserved here so the public contract is
-/// unchanged; the read itself goes through core.
-fn read_note_text(vault_path: &Path, relative_path: &str) -> Result<String, String> {
+/// unchanged; the read itself goes through the backend.
+///
+/// `vault_path` is taken alongside `backend` on purpose. The vault-root check is
+/// this module's own stricter pre-guard and reports the *configured* path verbatim,
+/// whereas the backend's health probe would report the normalized one — a
+/// difference that is invisible for ordinary paths but would change a public error
+/// string for a path containing `.`/`..` or a trailing slash. The read itself, and
+/// only the read, crosses the boundary.
+async fn read_note_text(
+    vault_path: &Path,
+    backend: &dyn VaultBackend,
+    relative_path: &str,
+) -> Result<String, String> {
     if !fs::metadata(vault_path)
         .map(|metadata| metadata.is_dir())
         .unwrap_or(false)
@@ -211,13 +222,15 @@ fn read_note_text(vault_path: &Path, relative_path: &str) -> Result<String, Stri
         return Err(format!("path escapes the vault: {relative_path}"));
     }
 
-    deep_obsidian_core::vault::read_text_file(vault_path, relative_path)
-        .map(|result| result.text)
+    backend
+        .execute(BackendRequest::read_text(relative_path))
+        .await
+        .and_then(|response| response.into_text())
         .map_err(|error| match error {
             // The lexical guard above already rejected everything core reports
             // lexically, so this can only be core's canonicalization (symlink)
             // guard — an escape in the legacy wording.
-            VaultError::InvalidVaultRelativePath(path) => {
+            BackendError::Vault(VaultError::InvalidVaultRelativePath(path)) => {
                 format!("path escapes the vault: {path}")
             }
             other => other.to_string(),
@@ -283,7 +296,7 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let path = params
             .get("path")
             .ok_or_else(|| "missing note path".to_string())?;
-        let text = read_note_text(&state.config.vault_path, path)?;
+        let text = read_note_text(&state.config.vault_path, state.backend.as_ref(), path).await?;
         return Ok(ResourceReadResult {
             contents: vec![ResourceContents {
                 uri: note_uri(path),
@@ -300,7 +313,7 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let slug = params
             .get("slug")
             .ok_or_else(|| "missing heading slug".to_string())?;
-        let text = read_note_text(&state.config.vault_path, path)?;
+        let text = read_note_text(&state.config.vault_path, state.backend.as_ref(), path).await?;
         let heading = extract_heading_sections(&text)
             .into_iter()
             .find(|section| section.slug == *slug)
@@ -321,7 +334,7 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let id = params
             .get("id")
             .ok_or_else(|| "missing block id".to_string())?;
-        let text = read_note_text(&state.config.vault_path, path)?;
+        let text = read_note_text(&state.config.vault_path, state.backend.as_ref(), path).await?;
         let block = extract_block_sections(&text)
             .into_iter()
             .find(|section| section.id == *id)
@@ -349,6 +362,7 @@ pub fn note_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deep_obsidian_backend::FilesystemVaultBackend;
 
     #[test]
     fn sorted_note_paths_are_stable() {
@@ -387,29 +401,39 @@ mod tests {
 
     /// `resources/read` error strings are public MCP behaviour; these freeze the
     /// wording that the (now removed) server-local vault helper emitted.
-    #[test]
-    fn read_note_text_preserves_legacy_error_wording() {
+    #[tokio::test]
+    async fn read_note_text_preserves_legacy_error_wording() {
         let vault = temp_dir("resources-read-note");
         fs::create_dir_all(vault.join("Notes")).unwrap();
         fs::write(vault.join("Home.md"), "home").unwrap();
-
-        assert_eq!(read_note_text(&vault, "Home.md").unwrap(), "home");
+        let backend = FilesystemVaultBackend::new(&vault);
 
         assert_eq!(
-            read_note_text(&vault, "../escape.md").unwrap_err(),
+            read_note_text(&vault, &backend, "Home.md").await.unwrap(),
+            "home"
+        );
+
+        assert_eq!(
+            read_note_text(&vault, &backend, "../escape.md")
+                .await
+                .unwrap_err(),
             "path escapes the vault: ../escape.md"
         );
         // Stricter than core, which would normalize this to `Home.md`.
         assert_eq!(
-            read_note_text(&vault, "Notes/../Home.md").unwrap_err(),
+            read_note_text(&vault, &backend, "Notes/../Home.md")
+                .await
+                .unwrap_err(),
             "path escapes the vault: Notes/../Home.md"
         );
         assert_eq!(
-            read_note_text(&vault, "/").unwrap_err(),
+            read_note_text(&vault, &backend, "/").await.unwrap_err(),
             "invalid vault-relative path: /"
         );
         // A missing note keeps the enriched IO wording from core.
-        let missing = read_note_text(&vault, "Missing.md").unwrap_err();
+        let missing = read_note_text(&vault, &backend, "Missing.md")
+            .await
+            .unwrap_err();
         assert!(
             missing.starts_with(&format!(
                 "io error for {}:",
@@ -419,8 +443,11 @@ mod tests {
         );
 
         let absent = temp_dir("resources-read-note-absent");
+        let absent_backend = FilesystemVaultBackend::new(&absent);
         assert_eq!(
-            read_note_text(&absent, "Home.md").unwrap_err(),
+            read_note_text(&absent, &absent_backend, "Home.md")
+                .await
+                .unwrap_err(),
             format!(
                 "vault path does not exist or is not a directory: {}",
                 absent.display()
@@ -431,17 +458,20 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn read_note_text_reports_symlink_escapes_as_vault_escapes() {
+    #[tokio::test]
+    async fn read_note_text_reports_symlink_escapes_as_vault_escapes() {
         let vault = temp_dir("resources-read-symlink-vault");
         let outside = temp_dir("resources-read-symlink-outside");
         fs::create_dir_all(&vault).unwrap();
         fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, vault.join("escape")).unwrap();
         fs::write(outside.join("secret.md"), "secret").unwrap();
+        let backend = FilesystemVaultBackend::new(&vault);
 
         assert_eq!(
-            read_note_text(&vault, "escape/secret.md").unwrap_err(),
+            read_note_text(&vault, &backend, "escape/secret.md")
+                .await
+                .unwrap_err(),
             "path escapes the vault: escape/secret.md"
         );
 

@@ -1,6 +1,6 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
+use deep_obsidian_backend::{Capability, FilesystemVaultBackend, VaultBackend};
 use deep_obsidian_types::ResolvedServiceConfig;
 use serde_json::{json, Value};
 
@@ -21,12 +21,15 @@ pub struct AppState {
     /// Resolved HTTP authentication state. Disabled by default; populated by the
     /// HTTP bootstrap via [`AppState::with_auth`]. Unused under stdio.
     pub auth: Arc<AuthState>,
-    /// Absolute path to the resolved `rg` (ripgrep) binary, resolved once at
-    /// startup. When ripgrep cannot be found this is the bare `rg` fallback and
-    /// `rg_available` is `false`.
-    pub ripgrep_path: Arc<PathBuf>,
-    /// Whether ripgrep was resolved to a real executable at startup. Drives both
-    /// conditional `grep_search` registration and the defensive call guard.
+    /// The vault, behind the backend boundary. All vault IO for tool and resource
+    /// handling goes through here.
+    ///
+    /// `config.vault_path` deliberately stays available alongside it: the index
+    /// crate and the runtime watcher still consume the raw path this slice.
+    pub backend: Arc<dyn VaultBackend>,
+    /// Whether the backend can serve line search. Derived from
+    /// [`Capability::GrepSearch`] at construction; drives both conditional
+    /// `grep_search` registration and the defensive call guard.
     pub rg_available: bool,
     /// Shared store of pending out-of-band uploads. Both the `request_vault_upload`
     /// tool handler (mint) and the `PUT /upload/{token}` endpoint (consume) share it.
@@ -39,14 +42,23 @@ pub struct AppState {
 
 impl AppState {
     /// Build state with no upload base (used by the stdio transport).
+    ///
+    /// Constructs the filesystem backend from the resolved vault path. Multi-vault
+    /// routing arrives in a later slice; until then there is exactly one backend per
+    /// process and it is chosen here.
     pub fn new(config: ResolvedServiceConfig, runtime: Arc<RuntimeState>) -> Self {
-        let ripgrep_path = tools::resolve_ripgrep();
-        let rg_available = ripgrep_path.is_file();
+        // The index dir is declared so a vault-internal one cannot leak into
+        // `grep_search` results as phantom vault paths.
+        let backend: Arc<dyn VaultBackend> = Arc::new(
+            FilesystemVaultBackend::new(config.vault_path.clone())
+                .with_index_dir(config.index_dir.clone()),
+        );
+        let rg_available = backend.descriptor().supports(Capability::GrepSearch);
         Self {
             config: Arc::new(config),
             runtime,
             auth: Arc::new(AuthState::disabled()),
-            ripgrep_path: Arc::new(ripgrep_path),
+            backend,
             rg_available,
             uploads: UploadStore::new(),
             upload_base: None,
