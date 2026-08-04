@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
 use deep_obsidian_core::describe_io_error;
@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::embeddings::{self, EmbeddingBatchOptions, EmbeddingConfig, EmbeddingProvider};
+use crate::source::{FilesystemSource, NoteSource};
 use crate::sqlite;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,10 +175,20 @@ impl SearchIndex {
     }
 }
 
+/// Runtime-only companion to a loaded [`SearchIndex`] (never serialized — the field on
+/// `SearchIndex` is `#[serde(skip_serializing, skip_deserializing)]`, so the on-disk
+/// schema is unaffected by anything here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexContext {
-    pub vault_path: PathBuf,
-    pub index_dir: Option<PathBuf>,
+    /// Fully resolved SQLite index file. Query-time vector operations open this
+    /// directly. It is stored pre-resolved rather than as a `(vault_path, index_dir)`
+    /// pair because the pair cannot be resolved for a vault that has no local
+    /// directory, while the index file always has one.
+    pub index_file: PathBuf,
+    /// Local vault directory, when the source behind this index had one (see
+    /// [`NoteSource::local_vault_path`]). `None` for non-filesystem sources. Carried for
+    /// diagnostics; nothing on the query path reads it.
+    pub vault_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -406,7 +417,7 @@ pub fn list_markdown_files(vault_path: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
-fn artifact_mime_and_kind(path: &Path) -> Option<(&'static str, &'static str)> {
+pub(crate) fn artifact_mime_and_kind(path: &Path) -> Option<(&'static str, &'static str)> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
         "pdf" => Some(("application/pdf", "pdf")),
@@ -1326,60 +1337,16 @@ pub fn now_utc_string() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// Note manifest for a local vault directory. Thin wrapper over
+/// [`FilesystemSource::note_snapshots`], which owns the walk.
 pub fn collect_snapshots(vault_path: &Path) -> Result<Vec<FileSnapshot>> {
-    let files = list_markdown_files(vault_path)?;
-    let mut snapshots = Vec::with_capacity(files.len());
-
-    for relative_path in files {
-        let absolute = ensure_inside_vault(vault_path, &relative_path)?;
-        let metadata = fs::metadata(&absolute).map_err(|source| IndexError::Io {
-            path: absolute.clone(),
-            source,
-        })?;
-        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-        let mtime_ms = modified
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
-        snapshots.push(FileSnapshot {
-            path: relative_path,
-            mtime_ms,
-            size: metadata.len(),
-        });
-    }
-
-    Ok(snapshots)
+    FilesystemSource::new(vault_path).note_snapshots()
 }
 
+/// Artifact manifest for a local vault directory. Thin wrapper over
+/// [`FilesystemSource::artifact_snapshots`].
 pub fn collect_artifact_snapshots(vault_path: &Path) -> Result<Vec<ArtifactSnapshot>> {
-    let files = list_artifact_files(vault_path)?;
-    let mut snapshots = Vec::with_capacity(files.len());
-
-    for relative_path in files {
-        let absolute = ensure_inside_vault(vault_path, &relative_path)?;
-        let metadata = fs::metadata(&absolute).map_err(|source| IndexError::Io {
-            path: absolute.clone(),
-            source,
-        })?;
-        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-        let mtime_ms = modified
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
-        let (mime_type, kind) =
-            artifact_mime_and_kind(Path::new(&relative_path)).ok_or_else(|| {
-                IndexError::Embedding(format!("unsupported artifact path: {relative_path}"))
-            })?;
-        snapshots.push(ArtifactSnapshot {
-            path: relative_path,
-            mtime_ms,
-            size: metadata.len(),
-            mime_type: mime_type.to_string(),
-            kind: kind.to_string(),
-        });
-    }
-
-    Ok(snapshots)
+    FilesystemSource::new(vault_path).artifact_snapshots()
 }
 
 pub fn same_snapshots(left: &[FileSnapshot], right: &[FileSnapshot]) -> bool {
@@ -1805,7 +1772,7 @@ pub fn index_context(index: &SearchIndex) -> Result<&IndexContext> {
 
 pub fn open_index_connection_for_index(index: &SearchIndex, read_only: bool) -> Result<Connection> {
     let context = index_context(index)?;
-    let index_file = index_file_path(&context.vault_path, context.index_dir.as_deref());
+    let index_file = context.index_file.clone();
     open_index_connection(&index_file, read_only).map_err(|source| IndexError::Io {
         path: index_file,
         source: std::io::Error::new(std::io::ErrorKind::Other, source),
@@ -1817,14 +1784,10 @@ pub fn query_vector_blob(vector: &[f64]) -> Vec<u8> {
 }
 
 fn prepare_note_from_snapshot(
-    resolved_vault_path: &Path,
+    source: &dyn NoteSource,
     snapshot: &FileSnapshot,
 ) -> Result<PreparedNote> {
-    let absolute = ensure_inside_vault(resolved_vault_path, &snapshot.path)?;
-    let content = fs::read_to_string(&absolute).map_err(|source| IndexError::Io {
-        path: absolute.clone(),
-        source,
-    })?;
+    let content = source.read_note(&snapshot.path)?;
     let stem = path_stem(&snapshot.path);
     let title = note_title(stem, &content);
     let term_counts = count_terms(&format!("{title}\n{content}"));
@@ -1916,16 +1879,20 @@ fn path_title(path: &str) -> String {
 }
 
 fn prepare_artifact_from_snapshot(
-    resolved_vault_path: &Path,
+    source: &dyn NoteSource,
     snapshot: &ArtifactSnapshot,
     load_bytes: bool,
 ) -> Result<PreparedArtifact> {
-    let absolute = ensure_inside_vault(resolved_vault_path, &snapshot.path)?;
+    // Validated unconditionally: the previous filesystem code resolved the artifact path
+    // before deciding whether to read it, so an unaddressable path fails even when the
+    // bytes are skipped.
+    source.ensure_path(&snapshot.path)?;
+    // The budget is decided HERE, from the manifest size, because the very same
+    // comparison feeds `metadata_json`'s "vectorization" field below and the index-wide
+    // `skipped_artifact_count`. Letting the source re-decide could mark an artifact
+    // `eligible` while storing no embedding for it.
     let bytes = if load_bytes && snapshot.size <= DEFAULT_MAX_ARTIFACT_BYTES {
-        Some(fs::read(&absolute).map_err(|source| IndexError::Io {
-            path: absolute.clone(),
-            source,
-        })?)
+        source.read_artifact(&snapshot.path, DEFAULT_MAX_ARTIFACT_BYTES)?
     } else {
         None
     };
@@ -2836,11 +2803,29 @@ pub fn build_index_with_artifacts(
     embedding_config: Option<&EmbeddingConfig>,
     artifact_embedding_config: Option<&EmbeddingConfig>,
 ) -> Result<SearchIndex> {
-    let snapshots = collect_snapshots(vault_path)?;
-    let artifact_snapshots = collect_artifact_snapshots(vault_path)?;
-    build_index_from_snapshots_with_artifacts(
-        vault_path,
-        index_dir,
+    build_index_from_source(
+        &FilesystemSource::new(vault_path),
+        &index_file_path(vault_path, index_dir),
+        embedding_config,
+        artifact_embedding_config,
+    )
+}
+
+/// Build an index from any [`NoteSource`], persisting it to `index_file`.
+///
+/// The source-based counterpart of [`build_index_with_artifacts`]; that function is a
+/// wrapper that pairs a [`FilesystemSource`] with the vault's default index location.
+pub fn build_index_from_source(
+    source: &dyn NoteSource,
+    index_file: &Path,
+    embedding_config: Option<&EmbeddingConfig>,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> Result<SearchIndex> {
+    let snapshots = source.note_snapshots()?;
+    let artifact_snapshots = source.artifact_snapshots()?;
+    build_index_from_source_snapshots(
+        source,
+        index_file,
         snapshots,
         artifact_snapshots,
         embedding_config,
@@ -2849,20 +2834,30 @@ pub fn build_index_with_artifacts(
 }
 
 pub fn load_index(vault_path: &Path, index_dir: Option<&Path>) -> Result<Option<SearchIndex>> {
-    let index_file = index_file_path(vault_path, index_dir);
+    load_index_from_file(&index_file_path(vault_path, index_dir), Some(vault_path))
+}
+
+/// Load a persisted index straight from its SQLite file.
+///
+/// `vault_path` only populates [`IndexContext::vault_path`] for diagnostics; pass `None`
+/// for a vault with no local directory.
+pub fn load_index_from_file(
+    index_file: &Path,
+    vault_path: Option<&Path>,
+) -> Result<Option<SearchIndex>> {
     if !index_file.exists() {
         return Ok(None);
     }
 
-    let connection = open_index_connection(&index_file, true).map_err(|source| IndexError::Io {
-        path: index_file.clone(),
+    let connection = open_index_connection(index_file, true).map_err(|source| IndexError::Io {
+        path: index_file.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::Other, source),
     })?;
     match load_search_index_from_connection(&connection) {
         Ok(mut index) => {
             index.context = Some(IndexContext {
-                vault_path: vault_path.to_path_buf(),
-                index_dir: index_dir.map(PathBuf::from),
+                index_file: index_file.to_path_buf(),
+                vault_path: vault_path.map(PathBuf::from),
             });
             Ok(Some(index))
         }
@@ -2874,13 +2869,19 @@ pub fn load_persisted_index_header(
     vault_path: &Path,
     index_dir: Option<&Path>,
 ) -> Result<Option<PersistedIndexHeader>> {
-    let index_file = index_file_path(vault_path, index_dir);
+    load_persisted_index_header_from_file(&index_file_path(vault_path, index_dir))
+}
+
+/// Read just the header (version, semantic config, snapshots) of a persisted index.
+pub fn load_persisted_index_header_from_file(
+    index_file: &Path,
+) -> Result<Option<PersistedIndexHeader>> {
     if !index_file.exists() {
         return Ok(None);
     }
 
-    let connection = open_index_connection(&index_file, true).map_err(|source| IndexError::Io {
-        path: index_file.clone(),
+    let connection = open_index_connection(index_file, true).map_err(|source| IndexError::Io {
+        path: index_file.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::Other, source),
     })?;
     let metadata = match metadata_from_connection(&connection) {
@@ -2922,7 +2923,25 @@ pub fn persisted_index_matches_with_artifacts(
     embedding_config: Option<&EmbeddingConfig>,
     artifact_embedding_config: Option<&EmbeddingConfig>,
 ) -> Result<bool> {
-    let Some(header) = load_persisted_index_header(vault_path, index_dir)? else {
+    persisted_index_matches_from_file(
+        &index_file_path(vault_path, index_dir),
+        snapshots,
+        artifact_snapshots,
+        embedding_config,
+        artifact_embedding_config,
+    )
+}
+
+/// Snapshot-reuse check against a persisted index file: are these manifests and this
+/// semantic configuration already what the index on disk was built from?
+pub fn persisted_index_matches_from_file(
+    index_file: &Path,
+    snapshots: &[FileSnapshot],
+    artifact_snapshots: &[ArtifactSnapshot],
+    embedding_config: Option<&EmbeddingConfig>,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> Result<bool> {
+    let Some(header) = load_persisted_index_header_from_file(index_file)? else {
         return Ok(false);
     };
     Ok(same_snapshots(&header.file_snapshots, snapshots)
@@ -3427,8 +3446,8 @@ fn replace_index_metadata(
 }
 
 fn refresh_index_incremental(
-    vault_path: &Path,
-    index_dir: Option<&Path>,
+    source: &dyn NoteSource,
+    index_file: &Path,
     mut existing: SearchIndex,
     snapshots: Vec<FileSnapshot>,
     artifact_snapshots: Vec<ArtifactSnapshot>,
@@ -3449,7 +3468,7 @@ fn refresh_index_incremental(
         return Ok(existing);
     }
 
-    let resolved = ensure_vault_path(vault_path)?;
+    source.ensure_ready()?;
     let index_config = normalized_embedding_config(embedding_config);
     let artifact_config = normalized_embedding_config(artifact_embedding_config);
     let expected_dimensions = if index_config.supports_embeddings() {
@@ -3466,7 +3485,7 @@ fn refresh_index_incremental(
     let mut prepared_notes = snapshots
         .iter()
         .filter(|snapshot| changed_paths.contains(snapshot.path.as_str()))
-        .map(|snapshot| prepare_note_from_snapshot(&resolved, snapshot))
+        .map(|snapshot| prepare_note_from_snapshot(source, snapshot))
         .collect::<Result<Vec<_>>>()?;
     let note_embedding_outcome =
         embed_prepared_notes(&mut prepared_notes, &index_config, expected_dimensions)?;
@@ -3494,11 +3513,7 @@ fn refresh_index_incremental(
         .iter()
         .filter(|snapshot| artifact_changed_paths.contains(snapshot.path.as_str()))
         .map(|snapshot| {
-            prepare_artifact_from_snapshot(
-                &resolved,
-                snapshot,
-                artifact_config.supports_embeddings(),
-            )
+            prepare_artifact_from_snapshot(source, snapshot, artifact_config.supports_embeddings())
         })
         .collect::<Result<Vec<_>>>()?;
     let (artifact_embedding_dimensions, artifact_embedding_error) = embed_prepared_artifacts(
@@ -3512,10 +3527,9 @@ fn refresh_index_incremental(
         existing.artifact_embedding_dimensions = artifact_embedding_dimensions;
     }
 
-    let index_file = index_file_path(vault_path, index_dir);
     let mut connection =
-        open_index_connection(&index_file, false).map_err(|source| IndexError::Io {
-            path: index_file.clone(),
+        open_index_connection(index_file, false).map_err(|source| IndexError::Io {
+            path: index_file.to_path_buf(),
             source: std::io::Error::new(std::io::ErrorKind::Other, source),
         })?;
     connection
@@ -3642,8 +3656,8 @@ fn refresh_index_incremental(
 
     let mut loaded = load_search_index_from_connection(&connection)?;
     loaded.context = Some(IndexContext {
-        vault_path: vault_path.to_path_buf(),
-        index_dir: index_dir.map(PathBuf::from),
+        index_file: index_file.to_path_buf(),
+        vault_path: source.local_vault_path().map(PathBuf::from),
     });
     apply_runtime_embedding_config(&mut loaded, embedding_config);
     apply_runtime_artifact_embedding_config(&mut loaded, artifact_embedding_config);
@@ -3664,9 +3678,27 @@ pub fn get_search_index_with_artifacts(
     embedding_config: Option<&EmbeddingConfig>,
     artifact_embedding_config: Option<&EmbeddingConfig>,
 ) -> Result<(SearchIndex, bool)> {
-    if let Some(mut existing) = load_index(vault_path, index_dir)? {
-        let snapshots = collect_snapshots(vault_path)?;
-        let artifact_snapshots = collect_artifact_snapshots(vault_path)?;
+    get_search_index_from_source(
+        &FilesystemSource::new(vault_path),
+        &index_file_path(vault_path, index_dir),
+        embedding_config,
+        artifact_embedding_config,
+    )
+}
+
+/// Load-or-refresh-or-rebuild an index for any [`NoteSource`].
+///
+/// The source-based counterpart of [`get_search_index_with_artifacts`]. Returns the index
+/// and whether it had to be (re)written.
+pub fn get_search_index_from_source(
+    source: &dyn NoteSource,
+    index_file: &Path,
+    embedding_config: Option<&EmbeddingConfig>,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> Result<(SearchIndex, bool)> {
+    if let Some(mut existing) = load_index_from_file(index_file, source.local_vault_path())? {
+        let snapshots = source.note_snapshots()?;
+        let artifact_snapshots = source.artifact_snapshots()?;
         if same_snapshots(&existing.file_snapshots, &snapshots)
             && same_artifact_snapshots(&existing.artifact_snapshots, &artifact_snapshots)
             && same_semantic_config(&existing, embedding_config)
@@ -3680,8 +3712,8 @@ pub fn get_search_index_with_artifacts(
             && same_artifact_embedding_config(&existing, artifact_embedding_config)
         {
             if let Ok(updated) = refresh_index_incremental(
-                vault_path,
-                index_dir,
+                source,
+                index_file,
                 existing,
                 snapshots,
                 artifact_snapshots,
@@ -3693,9 +3725,9 @@ pub fn get_search_index_with_artifacts(
         }
     }
 
-    let rebuilt = build_index_with_artifacts(
-        vault_path,
-        index_dir,
+    let rebuilt = build_index_from_source(
+        source,
+        index_file,
         embedding_config,
         artifact_embedding_config,
     )?;
@@ -3726,12 +3758,36 @@ pub fn build_index_from_snapshots_with_artifacts(
     embedding_config: Option<&EmbeddingConfig>,
     artifact_embedding_config: Option<&EmbeddingConfig>,
 ) -> Result<SearchIndex> {
-    let resolved = ensure_vault_path(vault_path)?;
+    build_index_from_source_snapshots(
+        &FilesystemSource::new(vault_path),
+        &index_file_path(vault_path, index_dir),
+        snapshots,
+        artifact_snapshots,
+        embedding_config,
+        artifact_embedding_config,
+    )
+}
+
+/// Build an index from already-collected manifests, reading content through `source` and
+/// persisting to `index_file`.
+///
+/// The source-based counterpart of [`build_index_from_snapshots_with_artifacts`]. Split
+/// out from the manifest collection so a caller that already holds snapshots (a
+/// snapshot-reuse check, an incremental refresh decision) does not re-enumerate the vault.
+pub fn build_index_from_source_snapshots(
+    source: &dyn NoteSource,
+    index_file: &Path,
+    snapshots: Vec<FileSnapshot>,
+    artifact_snapshots: Vec<ArtifactSnapshot>,
+    embedding_config: Option<&EmbeddingConfig>,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> Result<SearchIndex> {
+    source.ensure_ready()?;
     let index_config = normalized_embedding_config(embedding_config);
     let artifact_config = normalized_embedding_config(artifact_embedding_config);
     let mut prepared_notes = snapshots
         .iter()
-        .map(|snapshot| prepare_note_from_snapshot(&resolved, snapshot))
+        .map(|snapshot| prepare_note_from_snapshot(source, snapshot))
         .collect::<Result<Vec<_>>>()?;
     let note_embedding_outcome = embed_prepared_notes(&mut prepared_notes, &index_config, None)?;
     let embedding_dimensions = note_embedding_outcome.dimensions;
@@ -3745,11 +3801,7 @@ pub fn build_index_from_snapshots_with_artifacts(
     let mut prepared_artifacts = artifact_snapshots
         .iter()
         .map(|snapshot| {
-            prepare_artifact_from_snapshot(
-                &resolved,
-                snapshot,
-                artifact_config.supports_embeddings(),
-            )
+            prepare_artifact_from_snapshot(source, snapshot, artifact_config.supports_embeddings())
         })
         .collect::<Result<Vec<_>>>()?;
     let (artifact_embedding_dimensions, artifact_embedding_error) =
@@ -3863,12 +3915,11 @@ pub fn build_index_from_snapshots_with_artifacts(
         chunks,
         artifacts,
         context: Some(IndexContext {
-            vault_path: resolved.clone(),
-            index_dir: index_dir.map(PathBuf::from),
+            index_file: index_file.to_path_buf(),
+            vault_path: source.local_vault_path().map(PathBuf::from),
         }),
     };
 
-    let index_file = index_file_path(vault_path, index_dir);
     if let Some(parent) = index_file.parent() {
         fs::create_dir_all(parent).map_err(|source| IndexError::Io {
             path: parent.to_path_buf(),
@@ -3876,8 +3927,8 @@ pub fn build_index_from_snapshots_with_artifacts(
         })?;
     }
     let mut connection =
-        open_index_connection(&index_file, false).map_err(|source| IndexError::Io {
-            path: index_file.clone(),
+        open_index_connection(index_file, false).map_err(|source| IndexError::Io {
+            path: index_file.to_path_buf(),
             source: std::io::Error::new(std::io::ErrorKind::Other, source),
         })?;
     write_search_index_to_connection(&mut connection, &index)?;
