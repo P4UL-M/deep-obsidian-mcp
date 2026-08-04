@@ -28,11 +28,12 @@ use std::time::Duration;
 
 use deep_obsidian_backend::sidecar::{
     CompatibilityStatus, SidecarConfig, SidecarCredentials, SidecarError, SidecarLaunch,
-    SidecarSupervisor,
+    SidecarMode, SidecarSupervisor,
 };
 use deep_obsidian_backend::{
-    BackendRequest, Capability, CouchDbVaultBackend, ManifestRequest, MutationRequest,
-    RecallRequest, VaultBackend, COUCHDB_GREP_UNSUPPORTED_MESSAGE, COUCHDB_READ_ONLY_MESSAGE,
+    BackendError, BackendRequest, BaseVersion, Capability, CouchDbVaultBackend, ManifestRequest,
+    MutationRequest, RecallRequest, VaultBackend, COUCHDB_GREP_UNSUPPORTED_MESSAGE,
+    COUCHDB_READ_ONLY_MESSAGE,
 };
 use secrecy::SecretString;
 
@@ -110,11 +111,29 @@ struct MockCouch {
 }
 
 impl MockCouch {
+    /// A read-only fixture: every mutating request is refused and recorded, which
+    /// is what the read-only proofs assert on.
     fn start(vault: &str) -> Self {
-        let mut child = Command::new("node")
+        Self::start_with(vault, false)
+    }
+
+    /// A fixture that ACCEPTS writes with CouchDB's real 409 semantics. Needed for
+    /// the write tests and for nothing else, so it is opt-in here exactly as it is
+    /// opt-in in the mock itself.
+    fn start_writable(vault: &str) -> Self {
+        Self::start_with(vault, true)
+    }
+
+    fn start_with(vault: &str, writable: bool) -> Self {
+        let mut command = Command::new("node");
+        command
             .arg("test/mock-couch-server.mjs")
             .arg("--vault")
-            .arg(vault)
+            .arg(vault);
+        if writable {
+            command.arg("--writable");
+        }
+        let mut child = command
             .current_dir(sidecar_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -165,6 +184,25 @@ impl MockCouch {
         let reply = self.command(serde_json::json!({"command": "writes"}));
         reply["writes"].as_array().cloned().unwrap_or_default()
     }
+
+    /// Answer the next `count` mutating requests 500 WITHOUT applying them: a
+    /// transient remote failure whose precondition is still valid on retry.
+    fn fail_next_writes(&mut self, count: u32) {
+        let reply = self.command(serde_json::json!({
+            "command": "fail-next-writes", "count": count
+        }));
+        assert_eq!(reply["ok"], serde_json::json!(true), "{reply}");
+    }
+
+    /// APPLY the next `count` entry-root PUTs and then answer 500: the write lands and
+    /// the client never hears about it. The only way to reach the ambiguous-conflict
+    /// path from outside.
+    fn drop_next_entry_put_responses(&mut self, count: u32) {
+        let reply = self.command(serde_json::json!({
+            "command": "drop-next-entry-put-responses", "count": count
+        }));
+        assert_eq!(reply["ok"], serde_json::json!(true), "{reply}");
+    }
 }
 
 impl Drop for MockCouch {
@@ -188,22 +226,41 @@ fn credentials(couch: &MockCouch) -> SidecarCredentials {
 }
 
 fn config(couch: &MockCouch) -> SidecarConfig {
+    config_with_mode(couch, SidecarMode::ReadOnly)
+}
+
+fn config_with_mode(couch: &MockCouch, mode: SidecarMode) -> SidecarConfig {
     SidecarConfig {
         launch: SidecarLaunch {
             node: PathBuf::from("node"),
             bundle: bundle_path(),
         },
         credentials: credentials(couch),
+        mode,
         options: None,
         request_timeout: Duration::from_secs(30),
         restart_backoff_base: Duration::from_millis(20),
     }
 }
 
-/// A backend over a freshly started fixture.
+/// A READ-ONLY backend over a freshly started fixture.
 fn backend(couch: &MockCouch) -> (Arc<SidecarSupervisor>, CouchDbVaultBackend) {
     let supervisor = SidecarSupervisor::new(config(couch));
-    (supervisor.clone(), CouchDbVaultBackend::new(supervisor))
+    (
+        supervisor.clone(),
+        CouchDbVaultBackend::from_supervisor(supervisor),
+    )
+}
+
+/// A WRITABLE backend over a freshly started fixture. The backend derives its
+/// writability from the supervisor's mode, so naming the mode here is the only way
+/// to get one.
+fn writable_backend(couch: &MockCouch) -> (Arc<SidecarSupervisor>, CouchDbVaultBackend) {
+    let supervisor = SidecarSupervisor::new(config_with_mode(couch, SidecarMode::ReadWrite));
+    (
+        supervisor.clone(),
+        CouchDbVaultBackend::from_supervisor(supervisor),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +496,599 @@ async fn resolve_path_rejects_traversal_without_the_sidecar() {
 }
 
 // ---------------------------------------------------------------------------
+// Guarded writes
+// ---------------------------------------------------------------------------
+
+/// Read a note's text and the opaque version it was read at — the pair the write path
+/// threads.
+async fn read_versioned(backend: &CouchDbVaultBackend, path: &str) -> (String, Option<String>) {
+    backend
+        .execute(BackendRequest::read_text(path))
+        .await
+        .unwrap_or_else(|error| panic!("read {path}: {error}"))
+        .into_versioned_text()
+        .expect("versioned text")
+}
+
+/// A writable mount advertises write capabilities; a read-only one does not, and the
+/// capability set is derived from the sidecar's mode rather than declared beside it.
+#[tokio::test]
+async fn write_capabilities_follow_the_mounts_mode() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+
+    let (read_only_supervisor, read_only) = backend(&couch);
+    assert!(!read_only.is_writable());
+    let descriptor = read_only.descriptor();
+    assert!(!descriptor.supports(Capability::BinaryWrite));
+    assert!(!descriptor.supports(Capability::Upload));
+
+    let (writable_supervisor, writable) = writable_backend(&couch);
+    assert!(writable.is_writable());
+    let descriptor = writable.descriptor();
+    assert!(descriptor.supports(Capability::BinaryWrite));
+    assert!(descriptor.supports(Capability::Upload));
+    // Reads are unchanged by the mode, and grep is still absent: writability says
+    // nothing about ripgrep.
+    assert!(descriptor.supports(Capability::BinaryRead));
+    assert!(!descriptor.supports(Capability::GrepSearch));
+
+    read_only_supervisor.shutdown().await;
+    writable_supervisor.shutdown().await;
+}
+
+/// The happy path: read, write back under the observed revision, read again.
+///
+/// Also the proof that the revision a read hands out is the one a write accepts — if
+/// the two disagreed, this would fail with a conflict rather than succeed.
+#[tokio::test]
+async fn a_write_guarded_by_the_revision_a_read_returned_lands() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    let (text, version) = read_versioned(&backend, "Beta.md").await;
+    let version = version.expect("a couchdb read must carry its revision");
+    assert!(!text.is_empty());
+
+    let updated = "Beta note, rewritten by the agent.\n";
+    let response = backend
+        .execute(BackendRequest::write_text_guarded(
+            "Beta.md",
+            updated,
+            BaseVersion::Version(version.clone()),
+        ))
+        .await
+        .expect("a write under the observed revision must land");
+    assert!(
+        matches!(
+            response,
+            deep_obsidian_backend::BackendResponse::Mutation(
+                deep_obsidian_backend::MutationResponse::Written { created: false }
+            )
+        ),
+        "overwriting an existing note is not a create: {response:?}"
+    );
+
+    let (after, after_version) = read_versioned(&backend, "Beta.md").await;
+    assert_eq!(after, updated, "the write must be readable back exactly");
+    assert_ne!(
+        after_version.as_deref(),
+        Some(version.as_str()),
+        "the revision must have moved"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// The heart of the slice: a write whose precondition is stale FAILS, and the note is
+/// left exactly as the other writer left it.
+///
+/// This is the case a filesystem mount cannot detect — it would rename over the other
+/// writer's content and report success. Here the storage adjudicates, the loser is
+/// told, and no version is lost.
+#[tokio::test]
+async fn a_write_whose_precondition_went_stale_is_refused_and_loses_nothing() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    // Both "clients" read the same base revision.
+    let (_, base) = read_versioned(&backend, "Beta.md").await;
+    let base = base.expect("a revision");
+
+    // The first writer lands.
+    let winner = "written by the client that got there first\n";
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "Beta.md",
+            winner,
+            BaseVersion::Version(base.clone()),
+        ))
+        .await
+        .expect("the first write must land");
+
+    // The second writer still holds the ORIGINAL revision, exactly as it would if it
+    // had checked `expectedHash` a moment before the first writer committed.
+    let error = backend
+        .execute(BackendRequest::write_text_guarded(
+            "Beta.md",
+            "written by the client that was too late\n",
+            BaseVersion::Version(base.clone()),
+        ))
+        .await
+        .expect_err("a stale precondition must be refused, never overwritten");
+
+    // Structurally a version conflict...
+    assert!(
+        matches!(error, BackendError::VersionConflict { .. }),
+        "unexpected error: {error:?}"
+    );
+    let message = error.to_string();
+    // ...reported in the taxonomy a caller already handles for a stale expectedHash,
+    // so a client does not need a new branch to do the right thing.
+    assert!(
+        message.starts_with("hash conflict for Beta.md:"),
+        "the wording must land in the existing hash-conflict taxonomy: {message}"
+    );
+    assert!(
+        message.contains("nothing was written"),
+        "the message must say the write did not happen: {message}"
+    );
+    assert!(
+        message.contains(&base),
+        "the message must name the precondition that failed: {message}"
+    );
+
+    // The winner's content survived untouched. Nothing was merged, nothing was lost.
+    let (after, _) = read_versioned(&backend, "Beta.md").await;
+    assert_eq!(after, winner);
+
+    supervisor.shutdown().await;
+}
+
+/// A caller that observed "nothing is here" gets create-only semantics, so a
+/// concurrent create is reported rather than clobbered.
+#[tokio::test]
+async fn an_absent_precondition_is_create_only() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    // A genuine create.
+    let response = backend
+        .execute(BackendRequest::write_text_guarded(
+            "Notes/Brand New.md",
+            "# Brand New\n\nfresh\n",
+            BaseVersion::Absent,
+        ))
+        .await
+        .expect("a create-only write to a free path must land");
+    assert!(
+        matches!(
+            response,
+            deep_obsidian_backend::BackendResponse::Mutation(
+                deep_obsidian_backend::MutationResponse::Written { created: true }
+            )
+        ),
+        "a first write reports created: {response:?}"
+    );
+
+    // The same claim against a path that is now occupied must fail: the caller's
+    // observation is no longer true.
+    let error = backend
+        .execute(BackendRequest::write_text_guarded(
+            "Notes/Brand New.md",
+            "# Brand New\n\nsomeone else got here first\n",
+            BaseVersion::Absent,
+        ))
+        .await
+        .expect_err("create-only over an existing entry must be refused");
+    assert!(
+        matches!(error, BackendError::VersionConflict { .. }),
+        "unexpected error: {error:?}"
+    );
+
+    // A soft-deleted entry OCCUPIES its path: `Removed.md` looks free to a listing but
+    // is a live document with a revision, so create-only must lose there too. Reported
+    // rather than silently resurrected, because "create" and "bring back" are
+    // different intents.
+    let error = backend
+        .execute(BackendRequest::write_text_guarded(
+            "Removed.md",
+            "resurrected by accident\n",
+            BaseVersion::Absent,
+        ))
+        .await
+        .expect_err("create-only over a tombstone must be refused");
+    assert!(
+        matches!(error, BackendError::VersionConflict { .. }),
+        "unexpected error: {error:?}"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// The protected-template policy is the vault's, not the filesystem's: a writable
+/// couchdb mount refuses the same paths with core's byte-identical wording.
+#[tokio::test]
+async fn protected_template_paths_are_refused_with_cores_wording() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    for path in ["Templates/T.md", "Notes/Template/T.md", "templates/t.md"] {
+        let error = backend
+            .execute(BackendRequest::write_text(path, "body"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("writes to protected template folders are forbidden: {path}"),
+            "for {path}"
+        );
+    }
+
+    // Refused ABOVE the remote: not one write request was issued.
+    supervisor.shutdown().await;
+    assert_eq!(couch.writes(), Vec::<serde_json::Value>::new());
+}
+
+/// A transient `remote-error` is retried once under the same precondition, and the
+/// write lands. Retrying is safe by construction (content-addressed chunks, entry root
+/// last), which is why the policy lives here rather than in the sidecar.
+#[tokio::test]
+async fn a_transient_remote_error_is_retried_once_and_the_write_lands() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    let (_, base) = read_versioned(&backend, "Beta.md").await;
+    // The next mutating request is answered 500 WITHOUT being applied, so the retry
+    // starts from an unchanged remote and its original precondition still holds.
+    couch.fail_next_writes(1);
+
+    let updated = "survived a transient remote failure\n";
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "Beta.md",
+            updated,
+            BaseVersion::from_read(base),
+        ))
+        .await
+        .expect("a transient remote error must be retried, not surfaced");
+
+    let (after, _) = read_versioned(&backend, "Beta.md").await;
+    assert_eq!(after, updated);
+
+    supervisor.shutdown().await;
+}
+
+/// The one ambiguous case, and the only place a conflict does not become an error.
+///
+/// The write LANDS and its response is dropped, so the retry meets a revision that is
+/// its own. A revision cannot tell that apart from a competing writer — the content
+/// can. Since the remote already holds exactly the requested bytes, the write is
+/// reported as the no-op it is instead of as a failure for something that succeeded.
+#[tokio::test]
+async fn a_write_whose_response_was_lost_is_reported_as_the_no_op_it_is() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    let (_, base) = read_versioned(&backend, "Beta.md").await;
+    // Apply the next entry-root PUT and then answer 500: the write lands, the client
+    // never hears about it.
+    couch.drop_next_entry_put_responses(1);
+
+    let desired = "landed but unacknowledged\n";
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "Beta.md",
+            desired,
+            BaseVersion::from_read(base),
+        ))
+        .await
+        .expect("a write that demonstrably landed must not be reported as a conflict");
+
+    // And it really is the requested content, not a guess.
+    let (after, _) = read_versioned(&backend, "Beta.md").await;
+    assert_eq!(after, desired);
+
+    supervisor.shutdown().await;
+}
+
+/// The same lost-response machinery, but the content does NOT match: the carve-out
+/// must not fire, and the conflict must be reported.
+///
+/// This is what keeps the previous test from being a loophole — the discriminator is
+/// byte-equality with the requested content, not "a retry happened".
+#[tokio::test]
+async fn an_ambiguous_conflict_whose_content_differs_is_still_a_conflict() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    let (_, base) = read_versioned(&backend, "Beta.md").await;
+    let base = base.expect("a revision");
+    // A competing writer lands first, so the stale precondition below can only be a
+    // genuine conflict.
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "Beta.md",
+            "the other client's content\n",
+            BaseVersion::Version(base.clone()),
+        ))
+        .await
+        .expect("the competing write must land");
+
+    let error = backend
+        .execute(BackendRequest::write_text_guarded(
+            "Beta.md",
+            "my content, which is not what is there\n",
+            BaseVersion::Version(base),
+        ))
+        .await
+        .expect_err("differing content must still conflict");
+    assert!(matches!(error, BackendError::VersionConflict { .. }));
+    // The other client's content is intact.
+    let (after, _) = read_versioned(&backend, "Beta.md").await;
+    assert_eq!(after, "the other client's content\n");
+
+    supervisor.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Uploads
+// ---------------------------------------------------------------------------
+
+/// A binary upload lands through the sidecar and reads back byte-identical.
+#[tokio::test]
+async fn an_upload_round_trips_binary_bytes() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    // Deliberately not a multiple of 3, so the base64 padding path is exercised, and
+    // deliberately containing bytes no UTF-8 decoder would survive.
+    let bytes: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe, 0x01, 0x02];
+    let outcome = backend
+        .execute(BackendRequest::Mutation(
+            MutationRequest::CommitUploadStream {
+                path: "assets/uploaded.png".to_string(),
+                expected_hash: None,
+                max_bytes: 1024,
+                // Two chunks, so the collector's concatenation is exercised rather
+                // than a single-buffer shortcut.
+                chunks: deep_obsidian_backend::UploadChunks::new(
+                    vec![Ok(bytes[..4].to_vec()), Ok(bytes[4..].to_vec())].into_iter(),
+                ),
+            },
+        ))
+        .await
+        .expect("an upload to a writable mount must land")
+        .into_upload_outcome()
+        .expect("upload outcome");
+    assert!(outcome.created);
+    assert_eq!(outcome.bytes_written, bytes.len());
+    // The canonical hash, so the endpoint's reported hash is the same string the tool
+    // layer would compute over the same bytes.
+    assert_eq!(outcome.hash, deep_obsidian_core::content_hash(&bytes));
+
+    let read_back = backend
+        .execute(BackendRequest::read_bytes("assets/uploaded.png"))
+        .await
+        .expect("read the uploaded artifact")
+        .into_bytes()
+        .expect("bytes");
+    assert_eq!(
+        read_back, bytes,
+        "an upload must round-trip byte-identically"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// A multi-megabyte upload round-trips, so the reported ceiling is a measured one.
+///
+/// # Why this test exists rather than a claim about `DEFAULT_MAX_UPLOAD_BYTES`
+///
+/// The configured cap is 100 MiB, but a CouchDB upload is not a stream: the sidecar needs
+/// the whole content to run upstream's chunker over it, so the bytes are held once in the
+/// collector and again as base64 in a single JSON-RPC line. The practical ceiling is
+/// therefore memory and Node's line handling, not the configured number — and the honest
+/// thing to report is a size that has actually been exercised end to end.
+///
+/// 4 MiB of NON-COMPRESSIBLE bytes: incompressible so the content-defined chunker
+/// produces many distinct chunks and the real `_bulk_docs` batching path runs, rather
+/// than one chunk repeated.
+#[tokio::test]
+async fn a_multi_megabyte_upload_round_trips() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    // A cheap xorshift keeps this deterministic without a dependency: the same bytes
+    // every run, so a failure is reproducible.
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let bytes: Vec<u8> = (0..4 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xff) as u8
+        })
+        .collect();
+
+    let outcome = backend
+        .execute(BackendRequest::Mutation(
+            MutationRequest::CommitUploadStream {
+                path: "assets/large.bin".to_string(),
+                expected_hash: None,
+                max_bytes: deep_obsidian_backend::UPLOAD_COLLECT_ADVISORY_BYTES,
+                // Streamed in 64 KiB chunks, as a real HTTP body pump would deliver it.
+                chunks: deep_obsidian_backend::UploadChunks::new(
+                    bytes
+                        .chunks(64 * 1024)
+                        .map(|chunk| Ok(chunk.to_vec()))
+                        .collect::<Vec<_>>()
+                        .into_iter(),
+                ),
+            },
+        ))
+        .await
+        .expect("a multi-megabyte upload must land")
+        .into_upload_outcome()
+        .expect("upload outcome");
+    assert!(outcome.created);
+    assert_eq!(outcome.bytes_written, bytes.len());
+    assert_eq!(outcome.hash, deep_obsidian_core::content_hash(&bytes));
+
+    let read_back = backend
+        .execute(BackendRequest::read_bytes("assets/large.bin"))
+        .await
+        .expect("read the large artifact")
+        .into_bytes()
+        .expect("bytes");
+    assert_eq!(
+        read_back.len(),
+        bytes.len(),
+        "the round trip must preserve the length"
+    );
+    assert_eq!(
+        read_back, bytes,
+        "a multi-megabyte upload must round-trip byte-identically"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// A stale `expectedHash` on an upload is refused with the SAME wording the filesystem
+/// backend uses, because the upload endpoint's 409 body is frozen public behaviour.
+#[tokio::test]
+async fn an_upload_with_a_stale_expected_hash_conflicts_with_the_frozen_wording() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    let existing = backend
+        .execute(BackendRequest::read_bytes("assets/logo.png"))
+        .await
+        .expect("read the fixture artifact")
+        .into_bytes()
+        .expect("bytes");
+
+    let error = backend
+        .execute(BackendRequest::Mutation(
+            MutationRequest::CommitUploadStream {
+                path: "assets/logo.png".to_string(),
+                expected_hash: Some("fnv1a64:0000000000000000".to_string()),
+                max_bytes: 1024,
+                chunks: deep_obsidian_backend::UploadChunks::new(std::iter::once(Ok(
+                    b"replacement".to_vec(),
+                ))),
+            },
+        ))
+        .await
+        .expect_err("a stale expected hash must conflict");
+    assert!(matches!(error, BackendError::HashConflict { .. }));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "hash conflict: expected fnv1a64:0000000000000000, found {}",
+            deep_obsidian_core::content_hash(&existing)
+        )
+    );
+
+    // The destination is untouched by a rejected commit.
+    let after = backend
+        .execute(BackendRequest::read_bytes("assets/logo.png"))
+        .await
+        .expect("read again")
+        .into_bytes()
+        .expect("bytes");
+    assert_eq!(after, existing);
+
+    supervisor.shutdown().await;
+}
+
+/// An oversize body is refused DURING collection, so it never reaches the remote —
+/// the same `PayloadTooLarge` (413) taxonomy a filesystem mount produces.
+#[tokio::test]
+async fn an_oversize_upload_is_refused_before_the_remote_is_touched() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    let error = backend
+        .execute(BackendRequest::Mutation(
+            MutationRequest::CommitUploadStream {
+                path: "assets/too-big.bin".to_string(),
+                expected_hash: None,
+                max_bytes: 4,
+                chunks: deep_obsidian_backend::UploadChunks::new(std::iter::once(Ok(
+                    b"12345".to_vec()
+                ))),
+            },
+        ))
+        .await
+        .expect_err("an oversize body must be rejected");
+    assert!(matches!(error, BackendError::PayloadTooLarge));
+    assert_eq!(error.to_string(), "upload exceeds maximum allowed size");
+
+    supervisor.shutdown().await;
+    assert_eq!(
+        couch.writes(),
+        Vec::<serde_json::Value>::new(),
+        "an oversize body must never reach the remote"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Conflict exposure
+// ---------------------------------------------------------------------------
+
+/// Conflicted paths come off the already-collected manifest, and the per-path
+/// enumeration works on a READ-ONLY mount — which is exactly where it matters most.
+#[tokio::test]
+async fn conflicts_are_enumerable_on_a_read_only_mount() {
+    require_prerequisites!();
+    let couch = MockCouch::start("small");
+    let (supervisor, backend) = backend(&couch);
+
+    let conflicted = backend
+        .conflicted_paths()
+        .await
+        .expect("conflicted paths must be listable");
+    assert_eq!(
+        conflicted,
+        // `Some`, not `None`: a LiveSync vault genuinely has the notion, so even an
+        // empty answer here would be a real one.
+        Some(vec!["Conflicted.md".to_string()]),
+        "the fixture has exactly one conflicted entry"
+    );
+
+    let detail = backend
+        .conflicts("Conflicted.md")
+        .await
+        .expect("per-path conflicts must be listable read-only");
+    assert!(!detail.winning.is_empty());
+    assert!(
+        !detail.conflicts.is_empty(),
+        "a conflicted entry must report its siblings: {detail:?}"
+    );
+
+    // A healthy entry reports no siblings rather than failing.
+    let healthy = backend
+        .conflicts("Beta.md")
+        .await
+        .expect("healthy conflicts");
+    assert!(healthy.conflicts.is_empty(), "{healthy:?}");
+
+    supervisor.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // Watch
 // ---------------------------------------------------------------------------
 
@@ -668,6 +1318,7 @@ async fn a_real_couchdb_is_classified_rather_than_crashed_on() {
             e2ee_passphrase: None,
             e2ee_obfuscate_passphrase: None,
         },
+        mode: SidecarMode::ReadOnly,
         options: None,
         request_timeout: Duration::from_secs(30),
         restart_backoff_base: Duration::from_millis(50),

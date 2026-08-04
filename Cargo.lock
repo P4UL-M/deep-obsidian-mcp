@@ -604,6 +604,7 @@ dependencies = [
  "clap",
  "deep-obsidian-backend",
  "deep-obsidian-config",
+ "deep-obsidian-core",
  "deep-obsidian-server",
  "deep-obsidian-types",
  "reqwest",

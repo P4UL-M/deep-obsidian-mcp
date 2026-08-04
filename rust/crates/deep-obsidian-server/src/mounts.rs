@@ -30,7 +30,7 @@
 
 use std::sync::Arc;
 
-use deep_obsidian_backend::sidecar::{SidecarCredentials, SidecarSupervisor};
+use deep_obsidian_backend::sidecar::{SidecarCredentials, SidecarMode, SidecarSupervisor};
 use deep_obsidian_backend::{
     CouchDbVaultBackend, FilesystemVaultBackend, Mount, VaultBackend, VaultRouter,
 };
@@ -81,9 +81,12 @@ impl MountBackendEntry {
             // index and serve whatever happens to be there under the configured
             // prefix. Failing closed is the only safe answer.
             (MountBackendConfig::Couchdb { .. }, None) => {
+                // Deliberately does NOT say READ-ONLY: a mount that opted in to
+                // writes and then failed to start is not read-only, it is absent, and
+                // naming the wrong reason sends the reader looking in the wrong place.
                 let message = format!(
-                    "mount '{}' is an EXPERIMENTAL, READ-ONLY CouchDB (Self-hosted LiveSync) \
-vault that could not be initialized, so it has no index",
+                    "mount '{}' is an EXPERIMENTAL CouchDB (Self-hosted LiveSync) vault that \
+could not be initialized, so it has no index",
                     self.mount.id
                 );
                 IndexTarget::from_factory("couchdb-unavailable", &self.index_dir, move || {
@@ -219,6 +222,7 @@ fn build_entry(
             e2ee,
             sidecar_path,
             options,
+            writable,
             ..
         } => {
             let credentials = match resolve_credentials(
@@ -242,8 +246,8 @@ readiness reports the server as degraded",
                     );
                     return MountBackendEntry {
                         backend: Arc::new(crate::mounts::UnavailableBackend::new(format!(
-                            "mount '{}' is an EXPERIMENTAL, READ-ONLY CouchDB (Self-hosted \
-LiveSync) vault that could not be initialized: {error}",
+                            "mount '{}' is an EXPERIMENTAL CouchDB (Self-hosted LiveSync) vault \
+that could not be initialized: {error}",
                             mount.id
                         ))),
                         supervisor: None,
@@ -269,9 +273,26 @@ LiveSync) vault that could not be initialized: {error}",
                         .max(deep_obsidian_backend::sidecar::DEFAULT_REQUEST_TIMEOUT)
                 });
 
+            // The ONE place a read-write sidecar can come into being, and it needs the
+            // mount to have said so explicitly. `writable` defaults to false, so every
+            // pre-existing config produces exactly the read-only sidecar it produced
+            // before — and a mount that does opt in gets a child process whose own
+            // mode enforces it, rather than a Rust-side flag the sidecar knows nothing
+            // about.
+            let mode = if *writable {
+                warn!(
+                    "mount '{}' is a WRITABLE CouchDB (Self-hosted LiveSync) vault: the agent can \
+edit this vault, and its writes replicate to every device syncing it",
+                    mount.id
+                );
+                SidecarMode::ReadWrite
+            } else {
+                SidecarMode::ReadOnly
+            };
             match CouchDbVaultBackend::spawn(
                 sidecar_path.as_deref(),
                 credentials,
+                mode,
                 options,
                 request_timeout,
             ) {
@@ -289,8 +310,8 @@ readiness reports the server as degraded",
                     );
                     MountBackendEntry {
                         backend: Arc::new(UnavailableBackend::new(format!(
-                            "mount '{}' is an EXPERIMENTAL, READ-ONLY CouchDB (Self-hosted \
-LiveSync) vault that could not be started: {error}",
+                            "mount '{}' is an EXPERIMENTAL CouchDB (Self-hosted LiveSync) vault \
+that could not be started: {error}",
                             mount.id
                         ))),
                         supervisor: None,
@@ -500,6 +521,7 @@ mod tests {
                 sidecar_path: None,
                 index_dir: None,
                 options: None,
+                writable: false,
             },
         }
     }

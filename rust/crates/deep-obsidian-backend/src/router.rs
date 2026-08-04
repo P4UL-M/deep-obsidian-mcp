@@ -173,6 +173,20 @@ pub enum RouterError {
     },
 }
 
+impl RouterError {
+    /// The `io::ErrorKind` behind this failure, when a backend produced one.
+    ///
+    /// Exists so a caller can keep branching on "destination absent" versus every
+    /// other failure after the router was inserted underneath it — the same
+    /// distinction [`BackendError::io_kind`] exists for, which `Display` erases.
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            RouterError::Backend(error) => error.io_kind(),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Path helpers
 // ---------------------------------------------------------------------------
@@ -511,14 +525,23 @@ impl VaultRouter {
         request: MutationRequest,
     ) -> Result<BackendResponse, RouterError> {
         match request {
-            MutationRequest::WriteText { path, content } => {
+            MutationRequest::WriteText {
+                path,
+                content,
+                base_version,
+            } => {
                 let resolved = self.resolve(&path)?;
+                // `base_version` must be forwarded, not rebuilt: it is the caller's
+                // observation of THIS destination, and dropping it here would
+                // silently downgrade every write on a multi-mount vault to an
+                // unguarded one while every single-mount test still passed.
                 Ok(resolved
                     .mount
                     .backend
-                    .execute(BackendRequest::write_text(
+                    .execute(BackendRequest::write_text_guarded(
                         resolved.backend_relative_path.clone(),
                         content,
+                        base_version,
                     ))
                     .await?)
             }

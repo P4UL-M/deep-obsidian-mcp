@@ -95,7 +95,11 @@ pub enum ConfigError {
     /// would fire. The couchdb message is the more specific and more actionable
     /// of the two, and it names the flag the user has actually not set yet for
     /// the feature they were trying to use.
-    #[error("couchdb (Self-hosted LiveSync) vaults are EXPERIMENTAL and READ-ONLY: set {{\"experimental\": {{\"couchdbVaults\": true}}}} in the config to resolve mount {id:?}")]
+    /// The wording says EXPERIMENTAL but no longer says READ-ONLY: a couchdb mount is
+    /// read-only unless it sets `writable`, so the flag this error is about gates the
+    /// mount existing, not the mount being written. Saying otherwise would tell a user
+    /// that enabling the flag cannot give them writes, which is not true.
+    #[error("couchdb (Self-hosted LiveSync) vaults are EXPERIMENTAL: set {{\"experimental\": {{\"couchdbVaults\": true}}}} in the config to resolve mount {id:?} (the mount is read-only unless it also sets \"writable\": true)")]
     CouchdbVaultsNotEnabled { id: String },
     /// A `couchdb` mount at the vault root.
     ///
@@ -337,6 +341,7 @@ fn expand_mount_backend_paths(backend: MountBackendConfig) -> MountBackendConfig
             sidecar_path,
             index_dir,
             options,
+            writable,
         } => MountBackendConfig::Couchdb {
             url,
             database,
@@ -346,6 +351,7 @@ fn expand_mount_backend_paths(backend: MountBackendConfig) -> MountBackendConfig
             sidecar_path: sidecar_path.map(expand_home_path),
             index_dir: index_dir.map(expand_home_path),
             options,
+            writable,
         },
     }
 }
@@ -1360,6 +1366,7 @@ mod tests {
                 sidecar_path: None,
                 index_dir: None,
                 options: None,
+                writable: false,
             },
         }
     }
@@ -1416,7 +1423,14 @@ mod tests {
         ));
         assert!(error.to_string().contains("couchdbVaults"));
         assert!(error.to_string().contains("EXPERIMENTAL"));
-        assert!(error.to_string().contains("READ-ONLY"));
+        // This gate is about the mount EXISTING, so it must not claim the mount can
+        // only ever be read-only — `writable` is what decides that, and telling a user
+        // otherwise would say the flag they are being asked to set cannot get them
+        // what they want.
+        assert!(
+            error.to_string().contains("\"writable\": true"),
+            "the gate must point at how writes are enabled: {error}"
+        );
 
         // Neither flag set: still the couchdb error, not the multi-vault one.
         let error = normalize_service_config(couchdb_input(

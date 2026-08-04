@@ -73,6 +73,36 @@ pub fn supported_triple() -> SupportedTriple {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mode
+// ---------------------------------------------------------------------------
+
+/// What the sidecar is allowed to do to the remote.
+///
+/// Mirrors the protocol's `SidecarMode`. There is deliberately **no `Default`**:
+/// [`SidecarConfig`] names it as a required field, so a read-write sidecar cannot
+/// come into being by a struct literal that forgot to think about it. The only way
+/// to get [`SidecarMode::ReadWrite`] is for a caller to type it, which is what makes
+/// "writes are opt-in" structural rather than conventional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl SidecarMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SidecarMode::ReadOnly => "read-only",
+            SidecarMode::ReadWrite => "read-write",
+        }
+    }
+
+    pub fn is_writable(self) -> bool {
+        matches!(self, SidecarMode::ReadWrite)
+    }
+}
+
 /// Environment variable naming the built sidecar bundle.
 pub const SIDECAR_BUNDLE_ENV: &str = "DEEP_OBSIDIAN_LIVESYNC_SIDECAR";
 
@@ -233,6 +263,12 @@ pub enum SidecarErrorKind {
     RemoteError,
     DecryptFailed,
     CorruptedDocument,
+    /// A guarded write lost: the remote's winning revision is not the one the
+    /// caller's precondition named. Carries a [`ConflictDetail`].
+    Conflict,
+    /// A write method was called on a sidecar initialized `mode: "read-only"`.
+    /// A configuration-level refusal, never a remote condition.
+    ReadOnly,
     /// A kind this build has never heard of. A newer sidecar must degrade, not panic.
     #[serde(other)]
     Unknown,
@@ -254,9 +290,36 @@ impl SidecarErrorKind {
             SidecarErrorKind::RemoteError => "remote-error",
             SidecarErrorKind::DecryptFailed => "decrypt-failed",
             SidecarErrorKind::CorruptedDocument => "corrupted-document",
+            SidecarErrorKind::Conflict => "conflict",
+            SidecarErrorKind::ReadOnly => "read-only",
             SidecarErrorKind::Unknown => "unknown",
         }
     }
+}
+
+/// Why a guarded write lost, straight off `error.data.conflict`.
+///
+/// `current_rev` is the winning revision at the moment the conflict was detected. It
+/// is absent only when no document exists at the path at all, which for a guarded
+/// update means the entry was purged between the read and the write.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictDetail {
+    #[serde(default)]
+    pub current_rev: Option<String>,
+    /// What the caller asked for. `Some(None)` is create-only.
+    #[serde(default)]
+    pub expected: Option<String>,
+    /// The remote entry is soft-deleted, not absent.
+    #[serde(default)]
+    pub deleted: bool,
+    /// The remote entry already had sibling conflict revisions.
+    #[serde(default)]
+    pub conflicted: bool,
+    #[serde(default)]
+    pub mtime_ms: Option<u64>,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// A failure talking to (or about) the sidecar.
@@ -272,6 +335,9 @@ pub enum SidecarError {
         kind: SidecarErrorKind,
         detail: String,
         status: Option<CompatibilityStatus>,
+        /// Present iff `kind` is [`SidecarErrorKind::Conflict`]. Boxed so the
+        /// common (non-conflict) error stays small.
+        conflict: Option<Box<ConflictDetail>>,
     },
     /// The bundle could not be located or the child could not be spawned.
     #[error("{0}")]
@@ -310,6 +376,46 @@ impl SidecarError {
         matches!(
             self,
             SidecarError::Transport(_) | SidecarError::Launch(_) | SidecarError::Protocol(_)
+        )
+    }
+
+    /// The typed RPC kind behind this error, when it is one.
+    pub fn rpc_kind(&self) -> Option<SidecarErrorKind> {
+        match self {
+            SidecarError::Rpc { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// The conflict detail a lost compare-and-swap carries.
+    pub fn conflict(&self) -> Option<&ConflictDetail> {
+        match self {
+            SidecarError::Rpc {
+                conflict: Some(conflict),
+                ..
+            } => Some(conflict),
+            _ => None,
+        }
+    }
+
+    /// True when this failure is worth retrying once with the SAME precondition.
+    ///
+    /// `remote-error` only: a CouchDB/transport hiccup *inside* the sidecar, which
+    /// 4a documented as retry-safe (chunks are content-addressed, so re-publishing
+    /// is idempotent, and the entry root is written last so an interrupted write
+    /// cannot leave a dangling root). Every other kind is a decision the remote
+    /// already made — retrying a `conflict`, a `not-found` or a `read-only` would
+    /// just ask the same question twice.
+    ///
+    /// Transport failures are deliberately NOT here: [`SidecarSupervisor::call`]
+    /// already restarts the child and retries those one level down.
+    pub fn is_retryable_remote(&self) -> bool {
+        matches!(
+            self,
+            SidecarError::Rpc {
+                kind: SidecarErrorKind::RemoteError,
+                ..
+            }
         )
     }
 }
@@ -470,6 +576,9 @@ impl std::fmt::Debug for SidecarCredentials {
 pub struct SidecarConfig {
     pub launch: SidecarLaunch,
     pub credentials: SidecarCredentials,
+    /// What this sidecar may do to the remote. Required, and required to be typed
+    /// out: see [`SidecarMode`] for why there is no default.
+    pub mode: SidecarMode,
     /// Forwarded verbatim as `initialize.options`. A `Value::Object`, or `None`.
     pub options: Option<Value>,
     /// Per-request ceiling on the whole round trip.
@@ -498,6 +607,7 @@ impl SidecarConfig {
     pub fn resolve(
         sidecar_path: Option<&Path>,
         credentials: SidecarCredentials,
+        mode: SidecarMode,
         options: Option<Value>,
         request_timeout: Option<Duration>,
     ) -> Result<Self, SidecarError> {
@@ -507,6 +617,7 @@ impl SidecarConfig {
                 bundle: locate_sidecar_bundle(sidecar_path)?,
             },
             credentials,
+            mode,
             options,
             request_timeout: request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             restart_backoff_base: DEFAULT_RESTART_BACKOFF_BASE,
@@ -610,10 +721,25 @@ fn decode_error_body(error: &Value) -> SidecarError {
     let status = data
         .and_then(|data| data.get("status"))
         .and_then(|status| serde_json::from_value::<CompatibilityStatus>(status.clone()).ok());
+    // Only read for a `conflict`: the protocol states the field is present iff the
+    // kind is `conflict`, so decoding it for any other kind would be inventing
+    // structure the sidecar did not send.
+    let conflict = (kind == SidecarErrorKind::Conflict)
+        .then(|| {
+            data.and_then(|data| data.get("conflict"))
+                .and_then(|conflict| {
+                    serde_json::from_value::<ConflictDetail>(conflict.clone()).ok()
+                })
+                // A conflict with an unreadable or missing detail is still a
+                // conflict: default rather than silently downgrade the kind.
+                .unwrap_or_default()
+        })
+        .map(Box::new);
     SidecarError::Rpc {
         kind,
         detail,
         status,
+        conflict,
     }
 }
 
@@ -633,6 +759,8 @@ fn kind_from_code(code: i64) -> SidecarErrorKind {
         -32005 => SidecarErrorKind::RemoteError,
         -32006 => SidecarErrorKind::DecryptFailed,
         -32007 => SidecarErrorKind::CorruptedDocument,
+        -32008 => SidecarErrorKind::Conflict,
+        -32009 => SidecarErrorKind::ReadOnly,
         _ => SidecarErrorKind::Unknown,
     }
 }
@@ -968,6 +1096,13 @@ pub struct ReadResult {
     pub size: u64,
     pub deleted: bool,
     pub conflicted: bool,
+    /// The winning revision this content came from.
+    ///
+    /// This is the token that closes the read-then-write race: a write guarded by
+    /// the revision a read returned cannot land on top of an edit that arrived in
+    /// between. Empty only if a sidecar omitted it, which is treated as "no
+    /// observation" rather than as a revision.
+    pub rev: String,
 }
 
 /// Metadata for one entry, with no chunk fetch.
@@ -983,6 +1118,121 @@ pub struct StatResult {
     #[serde(default)]
     pub conflicted: bool,
     pub kind: EntryKind,
+    /// The winning revision. See [`ReadResult::rev`].
+    #[serde(default)]
+    pub rev: String,
+}
+
+/// What a `write` landed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteResult {
+    pub path: String,
+    pub rev: String,
+    /// A PRE-EXISTING conflict. A rev-guarded write extends the winning branch
+    /// only, so it neither creates nor resolves conflict branches.
+    #[serde(default)]
+    pub conflicted: bool,
+    pub size: u64,
+    #[serde(default)]
+    pub mtime_ms: u64,
+    #[serde(default)]
+    pub ctime_ms: u64,
+    pub created: bool,
+    /// The write replaced a soft-deleted entry, bringing it back.
+    #[serde(default)]
+    pub resurrected: bool,
+}
+
+/// One sibling revision of a conflicted entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictRevision {
+    pub rev: String,
+    #[serde(default)]
+    pub mtime_ms: u64,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub deleted: bool,
+    /// The revision's body could not be fetched (CouchDB compacted it away). The
+    /// sidecar reports it rather than dropping it, so a host never silently
+    /// under-reports a conflict.
+    #[serde(default)]
+    pub unavailable: bool,
+}
+
+/// The winning revision and every sibling, for one path.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictsResult {
+    pub path: String,
+    pub winning: String,
+    pub conflicts: Vec<ConflictRevision>,
+}
+
+/// What a write's compare-and-swap precondition is.
+///
+/// The three variants are the sidecar's three `baseRev` cases, named rather than
+/// encoded as a nullable string, so a call site cannot express "create-only" and
+/// "no precondition" with the same value by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteGuard {
+    /// `baseRev` absent: the caller states no precondition. The sidecar still
+    /// guards against the revision it observed a moment earlier, so this can never
+    /// fork the revision tree — it only loses a genuinely concurrent race.
+    Unguarded,
+    /// `baseRev: null`: create-only. Fails if ANY document exists at the path,
+    /// including a soft-deleted one.
+    CreateOnly,
+    /// `baseRev: "<rev>"`: the remote's winning revision must be exactly this.
+    Revision(String),
+}
+
+impl WriteGuard {
+    /// The `baseRev` JSON this guard sends. `None` means "omit the key".
+    fn base_rev(&self) -> Option<Value> {
+        match self {
+            WriteGuard::Unguarded => None,
+            WriteGuard::CreateOnly => Some(Value::Null),
+            WriteGuard::Revision(rev) => Some(json!(rev)),
+        }
+    }
+
+    /// How this guard reads in an operator-facing message.
+    pub fn describe(&self) -> String {
+        match self {
+            WriteGuard::Unguarded => "no precondition".to_string(),
+            WriteGuard::CreateOnly => "create-only (no document may exist)".to_string(),
+            WriteGuard::Revision(rev) => format!("revision {rev}"),
+        }
+    }
+}
+
+/// The outcome of one `write`, plus whether it is ambiguous.
+#[derive(Debug)]
+pub struct WriteAttempt {
+    pub outcome: Result<WriteResult, SidecarError>,
+    /// True when at least one attempt was issued whose outcome was never observed —
+    /// a transport failure that killed the child mid-request, or a `remote-error`
+    /// that could have come from the entry root's own response.
+    ///
+    /// This is the ONLY circumstance under which a `conflict` may be reporting the
+    /// caller's own earlier write rather than a competing one, and therefore the only
+    /// circumstance under which a caller may legitimately look at the current content
+    /// before deciding what the conflict means. Without it, "the revision moved" and
+    /// "my write landed and I never heard" are indistinguishable, and treating the
+    /// second as the first would report a spurious failure for a write that succeeded.
+    pub outcome_unknown: bool,
+}
+
+/// Content for a `write`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritePayload {
+    Text(String),
+    /// Already base64-encoded, because the caller is the one holding the bytes and
+    /// re-encoding them here would mean buffering them twice.
+    Base64(String),
 }
 
 /// One change from `changesSince` or a `change` notification.
@@ -1066,6 +1316,12 @@ impl SidecarSupervisor {
     /// The argv the child is spawned with. Used by the "no secret in argv" test.
     pub fn command_line(&self) -> Vec<OsString> {
         self.config.launch.command_line()
+    }
+
+    /// What this supervisor's child was allowed to do to the remote. Fixed at
+    /// construction: a restart re-hand-shakes with the same mode.
+    pub fn mode(&self) -> SidecarMode {
+        self.config.mode
     }
 
     pub fn health(&self) -> SupervisorHealth {
@@ -1254,6 +1510,11 @@ impl SidecarSupervisor {
         let credentials = &self.config.credentials;
         let mut params = Map::new();
         params.insert("protocolVersion".to_string(), json!(PROTOCOL_VERSION));
+        // Always sent explicitly, including `read-only`. The protocol defaults an
+        // omitted `mode` to `read-only`, so sending it changes nothing on the wire —
+        // but it means a reader of a captured handshake never has to know the
+        // default to know what the process was allowed to do.
+        params.insert("mode".to_string(), json!(self.config.mode.as_str()));
         params.insert(
             "couchdb".to_string(),
             json!({
@@ -1397,22 +1658,52 @@ impl SidecarSupervisor {
     /// exited between two calls", and a second failure is a real problem the caller
     /// must see rather than something to keep hammering.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, SidecarError> {
-        let connection = self.ready_connection().await?;
+        self.call_tracked(method, params).await.0
+    }
+
+    /// [`Self::call`], also reporting whether the first attempt's outcome was never
+    /// observed.
+    ///
+    /// The flag exists for exactly one caller: a write. When a transport failure
+    /// kills the child mid-request, the request may or may not have taken effect
+    /// remotely, and the retry cannot tell. For a read that does not matter. For a
+    /// compare-and-swap write it is the difference between "somebody else changed
+    /// this" and "my own first attempt landed and I never heard about it", and only
+    /// the caller — which knows what it was trying to write — can tell those apart.
+    /// So the fact is reported rather than swallowed here.
+    pub async fn call_tracked(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> (Result<Value, SidecarError>, bool) {
+        let connection = match self.ready_connection().await {
+            Ok(connection) => connection,
+            // Never reached the child, so nothing can have taken effect.
+            Err(error) => return (Err(error), false),
+        };
         let outcome = connection
             .request(method, params.clone(), self.config.request_timeout)
             .await;
         let Err(error) = outcome else {
-            return outcome;
+            return (outcome, false);
         };
         if !error.is_transport() {
-            return Err(error);
+            return (Err(error), false);
         }
         warn!("livesync sidecar {method} failed ({error}); restarting and retrying once");
         self.mark_connection_dead();
-        let connection = self.ready_connection().await?;
-        connection
-            .request(method, params, self.config.request_timeout)
-            .await
+        let connection = match self.ready_connection().await {
+            Ok(connection) => connection,
+            // The first attempt's outcome is STILL unknown even though the retry
+            // never got off the ground.
+            Err(error) => return (Err(error), true),
+        };
+        (
+            connection
+                .request(method, params, self.config.request_timeout)
+                .await,
+            true,
+        )
     }
 
     fn mark_connection_dead(&self) {
@@ -1544,17 +1835,96 @@ impl SidecarSupervisor {
                 )));
             }
         };
+        let rev = result
+            .get("rev")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         Ok(ReadResult {
             payload,
             size,
             deleted,
             conflicted,
+            rev,
         })
     }
 
     /// One entry's metadata.
     pub async fn stat(&self, path: &str) -> Result<StatResult, SidecarError> {
         self.call_typed("stat", json!({ "path": path })).await
+    }
+
+    /// Compare-and-swap write of one entry.
+    ///
+    /// Refused with [`SidecarErrorKind::ReadOnly`] by the sidecar unless it was
+    /// initialized `read-write`; that refusal is left to the sidecar rather than
+    /// pre-empted here, so the process that owns the mode is the one that enforces
+    /// it. `mtime_ms`/`ctime_ms` are left to the sidecar's defaults (now, and the
+    /// existing entry's ctime), which is what the plugin itself does.
+    ///
+    /// Retries ONCE on [`SidecarError::is_retryable_remote`], with the SAME guard.
+    /// That is safe by 4a's construction and never double-writes: chunks are
+    /// content-addressed so republishing is idempotent, and a retry whose first
+    /// attempt actually landed loses the compare-and-swap and comes back as a
+    /// conflict carrying the current revision — never as a second write.
+    ///
+    /// Whether such a retry happened is REPORTED rather than hidden, because a
+    /// conflict after one is ambiguous in a way a conflict without one is not. See
+    /// [`WriteAttempt::outcome_unknown`].
+    pub async fn write(
+        &self,
+        path: &str,
+        payload: &WritePayload,
+        guard: &WriteGuard,
+    ) -> WriteAttempt {
+        let mut params = Map::new();
+        params.insert("path".to_string(), json!(path));
+        params.insert(
+            "content".to_string(),
+            match payload {
+                WritePayload::Text(text) => json!({ "kind": "text", "text": text }),
+                WritePayload::Base64(base64) => json!({ "kind": "binary", "base64": base64 }),
+            },
+        );
+        if let Some(base_rev) = guard.base_rev() {
+            params.insert("baseRev".to_string(), base_rev);
+        }
+        let params = Value::Object(params);
+
+        let (raw, retried) = self.call_tracked("write", params.clone()).await;
+        let mut outcome_unknown = retried;
+        let raw = match raw {
+            // A `remote-error` from a write is itself an unobserved outcome: chunks
+            // go out before the entry root, so the failure may have come from the
+            // root's own response and the write may already have landed.
+            Err(error) if error.is_retryable_remote() => {
+                warn!(
+                    "livesync write of {path} failed with a retryable remote error ({error}); \
+                     retrying once under the same precondition ({})",
+                    guard.describe()
+                );
+                outcome_unknown = true;
+                self.call_tracked("write", params).await.0
+            }
+            other => other,
+        };
+        WriteAttempt {
+            outcome: raw.and_then(|value| {
+                serde_json::from_value(value).map_err(|error| {
+                    SidecarError::Protocol(format!("could not read the write result: {error}"))
+                })
+            }),
+            outcome_unknown,
+        }
+    }
+
+    /// The winning revision and every sibling conflict revision for one path.
+    ///
+    /// Read-only, so it works on a read-only sidecar too — which is the point: a
+    /// read-only mount is exactly where a caller most needs to know that the content
+    /// it was served has a losing sibling.
+    pub async fn conflicts(&self, path: &str) -> Result<ConflictsResult, SidecarError> {
+        self.call_typed("conflicts", json!({ "path": path })).await
     }
 
     /// Subscribe to live changes, resuming from `after` when given.
@@ -1780,6 +2150,9 @@ mod tests {
                 bundle: PathBuf::from(bundle),
             },
             credentials: credentials(),
+            // The unit tests never write; a read-write literal here would make the
+            // supervision tests silently exercise a mode nothing configures.
+            mode: SidecarMode::ReadOnly,
             options: None,
             request_timeout: Duration::from_secs(5),
             restart_backoff_base: Duration::from_millis(1),
