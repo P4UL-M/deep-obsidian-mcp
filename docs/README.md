@@ -9,7 +9,6 @@ the top-level guides instead:** [README](../README.md) ·
 - [mcp-reference.md](./mcp-reference.md) — MCP tools, resources, and prompts.
 - [architecture.md](./architecture.md) — indexing model, semantic backends, roadmap.
 - [agent-workflows.md](./agent-workflows.md) — agent workflow patterns.
-- [writing-conventions-pattern.md](./writing-conventions-pattern.md) — snippet-backed writing conventions.
 
 ## Service & packaging
 
