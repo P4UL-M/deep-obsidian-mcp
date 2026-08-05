@@ -32,8 +32,7 @@ use deep_obsidian_backend::sidecar::{
 };
 use deep_obsidian_backend::{
     BackendError, BackendRequest, BaseVersion, Capability, CouchDbVaultBackend, ManifestRequest,
-    MutationRequest, RecallRequest, VaultBackend, COUCHDB_GREP_UNSUPPORTED_MESSAGE,
-    COUCHDB_READ_ONLY_MESSAGE,
+    MutationRequest, RecallRequest, VaultBackend, COUCHDB_READ_ONLY_MESSAGE,
 };
 use secrecy::SecretString;
 
@@ -467,8 +466,11 @@ async fn reads_and_stats_return_the_fixture_content() {
 // ---------------------------------------------------------------------------
 
 /// The capability set, and the refusals that follow from it.
+///
+/// `GrepSearch` is present on a READ-ONLY mount, which is the point of asserting it
+/// here: line search is a read, so it is not one of the things `writable` gates.
 #[tokio::test]
-async fn writes_and_grep_are_refused_with_the_experimental_read_only_message() {
+async fn writes_are_refused_with_the_experimental_read_only_message_but_grep_is_served() {
     require_prerequisites!();
     let mut couch = MockCouch::start("small");
     let (supervisor, backend) = backend(&couch);
@@ -476,7 +478,7 @@ async fn writes_and_grep_are_refused_with_the_experimental_read_only_message() {
     let descriptor = backend.descriptor();
     assert!(descriptor.supports(Capability::BinaryRead));
     assert!(descriptor.supports(Capability::Watch));
-    assert!(!descriptor.supports(Capability::GrepSearch));
+    assert!(descriptor.supports(Capability::GrepSearch));
     assert!(!descriptor.supports(Capability::BinaryWrite));
     assert!(!descriptor.supports(Capability::Upload));
 
@@ -499,7 +501,9 @@ async fn writes_and_grep_are_refused_with_the_experimental_read_only_message() {
         .expect_err("uploads must be refused");
     assert_eq!(upload.to_string(), COUCHDB_READ_ONLY_MESSAGE);
 
-    let grep = backend
+    // Grep is SERVED, not refused: the fixture's `# Alpha` heading comes back with its
+    // vault-relative path and its line number, from a mount with no files on disk.
+    let outcome = backend
         .execute(BackendRequest::Recall(RecallRequest::Grep {
             query: "Alpha".to_string(),
             regex: false,
@@ -509,8 +513,24 @@ async fn writes_and_grep_are_refused_with_the_experimental_read_only_message() {
             limit: 10,
         }))
         .await
-        .expect_err("grep must be refused");
-    assert_eq!(grep.to_string(), COUCHDB_GREP_UNSUPPORTED_MESSAGE);
+        .expect("grep must be served")
+        .into_grep_outcome()
+        .expect("grep outcome");
+    assert_eq!(
+        outcome
+            .matches
+            .iter()
+            .map(|item| (
+                item.path.as_str(),
+                item.line_number,
+                item.line_text.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("Notes/Alpha.md", 1, "# Alpha")]
+    );
+    // A full scan, so it carries ripgrep's own honesty shape.
+    assert!(outcome.exhausted);
+    assert_eq!(outcome.candidate_count, None);
 
     // The decisive proof, at the transport: after all of the above plus the reads,
     // the remote saw NOT ONE mutating request. The sidecar is read-only
@@ -583,10 +603,12 @@ async fn write_capabilities_follow_the_mounts_mode() {
     let descriptor = writable.descriptor();
     assert!(descriptor.supports(Capability::BinaryWrite));
     assert!(descriptor.supports(Capability::Upload));
-    // Reads are unchanged by the mode, and grep is still absent: writability says
-    // nothing about ripgrep.
+    // Reads are unchanged by the mode, and so is grep: both are reads, and `writable`
+    // gates writes. A mount that lost line search by staying read-only would be a
+    // capability set that describes the wrong axis.
     assert!(descriptor.supports(Capability::BinaryRead));
-    assert!(!descriptor.supports(Capability::GrepSearch));
+    assert!(descriptor.supports(Capability::GrepSearch));
+    assert!(read_only.descriptor().supports(Capability::GrepSearch));
 
     read_only_supervisor.shutdown().await;
     writable_supervisor.shutdown().await;
@@ -1467,7 +1489,10 @@ async fn a_child_killed_outright_is_restarted_by_the_next_call() {
     let couch = MockCouch::start("small");
     let (supervisor, backend) = backend(&couch);
 
-    supervisor.ensure_ready().await.expect("the first handshake");
+    supervisor
+        .ensure_ready()
+        .await
+        .expect("the first handshake");
     let first_pid = supervisor.child_pid().expect("a running child has a pid");
     assert_eq!(supervisor.health().starts, 1);
 
@@ -1501,10 +1526,7 @@ async fn a_child_killed_outright_is_restarted_by_the_next_call() {
     // Health REPORTS the restart rather than hiding it: an operator looking at a mount
     // that keeps restarting has to be able to see that it is.
     let health = supervisor.health();
-    assert_eq!(
-        health.starts, 2,
-        "the restart must be counted: {health:?}"
-    );
+    assert_eq!(health.starts, 2, "the restart must be counted: {health:?}");
     assert_eq!(
         health.consecutive_failures, 0,
         "a SUCCESSFUL restart clears the failure count: {health:?}"
@@ -1533,7 +1555,10 @@ async fn an_edit_made_while_the_child_was_down_arrives_through_the_catch_up() {
     let mut couch = MockCouch::start("small");
     let (supervisor, backend) = backend(&couch);
 
-    supervisor.ensure_ready().await.expect("the first handshake");
+    supervisor
+        .ensure_ready()
+        .await
+        .expect("the first handshake");
     let mut stream = backend.changes(None);
     // Arm the feed before the outage: an unarmed feed would make the catch-up below
     // trivially explainable by "it was never watching".
@@ -1867,11 +1892,7 @@ async fn a_remote_down_at_handshake_time_recovers_when_the_child_restarts_and_no
         !degraded.is_ready(),
         "a remote answering 500 to everything must not be reported serveable: {degraded:?}"
     );
-    let status = degraded
-        .compatibility
-        .as_ref()
-        .expect("a verdict")
-        .status;
+    let status = degraded.compatibility.as_ref().expect("a verdict").status;
     assert_eq!(
         status,
         CompatibilityStatus::Unreachable,
@@ -1910,9 +1931,10 @@ async fn a_remote_down_at_handshake_time_recovers_when_the_child_restarts_and_no
     let pid = supervisor.child_pid().expect("a running child has a pid");
     kill_child(pid);
 
-    let text = poll_until_ok("a read after the child re-handshook a recovered remote", || {
-        backend.execute(BackendRequest::read_text("Notes/Alpha.md"))
-    })
+    let text = poll_until_ok(
+        "a read after the child re-handshook a recovered remote",
+        || backend.execute(BackendRequest::read_text("Notes/Alpha.md")),
+    )
     .await
     .into_text()
     .expect("text");
@@ -1924,6 +1946,724 @@ async fn a_remote_down_at_handshake_time_recovers_when_the_child_restarts_and_no
         recovered.starts, 2,
         "the recovery is the RESTART, and health says so: {recovered:?}"
     );
+
+    supervisor.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Virtual grep: differential parity against REAL ripgrep
+// ---------------------------------------------------------------------------
+
+// The centrepiece of the CouchDB grep. Everything below seeds ONE corpus into two
+// vaults — a temporary directory and the mock CouchDB — and asserts that the same
+// `RecallRequest::Grep` produces IDENTICAL `GrepMatch`es through
+// `FilesystemVaultBackend` (which spawns the real `rg`) and through
+// `CouchDbVaultBackend` (which imitates it).
+//
+// A divergence here is a bug in the imitation, never a reason to weaken the
+// comparison. The two accommodations that ARE made are documented at their use:
+// results are sorted before comparison (ripgrep's inter-file order is parallel-walk
+// nondeterministic), and no compared case truncates at `limit` (a truncated set under
+// a nondeterministic order is an arbitrary set). The globs compared all lack a path
+// separator, because ripgrep anchors those at the process CWD rather than at the
+// searched tree — see `virtual_grep::GlobFilter`.
+
+/// The three markdown notes `smallVault` already holds, with their exact bodies.
+///
+/// Duplicated from `test/fixtures.mjs` rather than derived, because the filesystem
+/// half of the differential has to hold BYTE-IDENTICAL content and the fixture is the
+/// definition of it. If the fixture changes, this test fails loudly on the corpus
+/// comparison below rather than silently comparing two different vaults.
+const FIXTURE_NOTES: &[(&str, &str)] = &[
+    ("Notes/Alpha.md", "# Alpha\n\nFirst note body.\n"),
+    ("Beta.md", "Beta note, single chunk.\n"),
+    ("Conflicted.md", "Winning revision content.\n"),
+    // The pre-chunking entry: whole content inline in `data`, no children. It is part
+    // of the corpus a grep sees, so it is part of the filesystem half too.
+    ("Legacy.md", "Legacy inline note body.\n"),
+];
+
+/// The notes pushed on top, each one present to exercise something specific.
+const DIFFERENTIAL_NOTES: &[(&str, &str)] = &[
+    // Several matches in one note, on NON-adjacent lines.
+    (
+        "Scan/Multiple.md",
+        "needle one\nfiller\nneedle two\nfiller\nneedle three\n",
+    ),
+    // Matches on ADJACENT lines: every context window overlaps its neighbours, which
+    // is where a "smart" deduplicating context would diverge.
+    (
+        "Scan/Adjacent.md",
+        "before\nneedle A\nneedle B\nneedle C\nafter\n",
+    ),
+    // Unicode, so byte offsets and case folding are both exercised.
+    (
+        "Scan/Unicode.md",
+        "éà café needle 你好 needle\nsecond café line\n",
+    ),
+    // A literal `.*`, which a fixed-string search must find and a regex search must
+    // not confuse with "any characters".
+    ("Scan/Regexish.md", "literal .* needle\nregex ab needle\n"),
+    // Case variants of the pattern, for the case-sensitive/insensitive pair.
+    (
+        "Scan/Casing.md",
+        "NEEDLE upper\nNeedle title\nneedle lower\n",
+    ),
+    // Excluded by the default `*.md` glob and included by `*.txt` — the corpus-scoping
+    // half of the comparison.
+    ("Scan/Excluded.txt", "needle in a text file\n"),
+    // CRLF: the `\r` stays in `line_text` and in a submatch, and leaves the context
+    // lines. Both halves are asserted separately below as well.
+    (
+        "Scan/Crlf.md",
+        "first line\r\ncrlf needle here\r\nthird line\r\n",
+    ),
+    // Blank lines and a trailing terminator, so line NUMBERING is compared and not
+    // just line content.
+    ("Scan/Blank.md", "needle top\n\n\nneedle bottom\n\n"),
+    // No trailing newline at all: the last line still counts, on both paths.
+    ("Scan/NoTrailer.md", "first\nneedle last"),
+    // Nested deeper than one level, so `**` and basename globbing are exercised.
+    ("Scan/Deep/Nested.md", "deep needle nested\n"),
+    // An EMPTY note. Ripgrep opens it and reports nothing (not even for an empty
+    // pattern); so must the imitation, which is why it does not skip a `size == 0`
+    // manifest entry. Both sides must agree that it contributes no match.
+    ("Scan/Empty.md", ""),
+];
+
+/// The comparison key: unique per match, because every submatch on one line arrives
+/// as a single event on both paths.
+fn sort_matches(matches: &mut [deep_obsidian_backend::GrepMatch]) {
+    matches.sort_by(|left, right| {
+        (left.path.as_str(), left.line_number).cmp(&(right.path.as_str(), right.line_number))
+    });
+}
+
+/// Render a match so an assertion failure names the exact field that diverged.
+fn render(matches: &[deep_obsidian_backend::GrepMatch]) -> Vec<String> {
+    matches
+        .iter()
+        .map(|item| {
+            format!(
+                "{}:{} text={:?} submatches={:?} before={:?} after={:?}",
+                item.path,
+                item.line_number,
+                item.line_text,
+                item.submatches
+                    .iter()
+                    .map(|sub| (sub.start, sub.end, sub.text.as_str()))
+                    .collect::<Vec<_>>(),
+                item.context_before
+                    .iter()
+                    .map(|line| (line.line_number, line.line_text.as_str()))
+                    .collect::<Vec<_>>(),
+                item.context_after
+                    .iter()
+                    .map(|line| (line.line_number, line.line_text.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+/// A temp directory holding the whole corpus, for the ripgrep half.
+fn seed_filesystem_corpus() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "couchdb-grep-parity-{}-{nanos}",
+        std::process::id()
+    ));
+    for (path, text) in FIXTURE_NOTES.iter().chain(DIFFERENTIAL_NOTES.iter()) {
+        let absolute = root.join(path);
+        std::fs::create_dir_all(absolute.parent().expect("note parent")).expect("mkdir");
+        std::fs::write(&absolute, text.as_bytes()).expect("seed a note");
+    }
+    root
+}
+
+/// One grep case, named so a failure says which case diverged.
+struct Case {
+    name: &'static str,
+    query: &'static str,
+    regex: bool,
+    case_sensitive: bool,
+    glob: Option<&'static str>,
+    context_lines: usize,
+}
+
+/// Run one case against one backend.
+async fn grep_case(
+    backend: &dyn VaultBackend,
+    case: &Case,
+    limit: usize,
+) -> Vec<deep_obsidian_backend::GrepMatch> {
+    let mut matches = backend
+        .execute(BackendRequest::Recall(RecallRequest::Grep {
+            query: case.query.to_string(),
+            regex: case.regex,
+            case_sensitive: case.case_sensitive,
+            glob: case.glob.map(str::to_string),
+            context_lines: case.context_lines,
+            limit,
+        }))
+        .await
+        .unwrap_or_else(|error| panic!("[{}] grep failed: {error}", case.name))
+        .into_grep_outcome()
+        .expect("grep outcome")
+        .matches;
+    sort_matches(&mut matches);
+    matches
+}
+
+/// **The differential parity test.** Same corpus, same params, two backends, byte-equal
+/// matches.
+#[tokio::test]
+async fn the_virtual_grep_is_byte_identical_to_real_ripgrep_over_the_same_corpus() {
+    require_prerequisites!();
+    let ripgrep = deep_obsidian_backend::resolve_ripgrep();
+    if !ripgrep.is_file() {
+        eprintln!(
+            "skipping: ripgrep (rg) was not resolved to a real binary, so there is no \
+             reference implementation to compare against; install ripgrep or set \
+             DEEP_OBSIDIAN_RIPGREP"
+        );
+        return;
+    }
+
+    let root = seed_filesystem_corpus();
+    let filesystem = deep_obsidian_backend::FilesystemVaultBackend::with_ripgrep(&root, &ripgrep);
+
+    let mut couch = MockCouch::start("small");
+    for (path, text) in DIFFERENTIAL_NOTES {
+        couch.push_note(path, text);
+    }
+    let (supervisor, couchdb) = backend(&couch);
+
+    // Gate zero: the two vaults hold the SAME corpus. Without this the comparison
+    // below could pass by both sides finding nothing.
+    let mut fixture_paths: Vec<String> = FIXTURE_NOTES
+        .iter()
+        .chain(DIFFERENTIAL_NOTES.iter())
+        .map(|(path, _)| (*path).to_string())
+        .filter(|path| path.ends_with(".md"))
+        .collect();
+    fixture_paths.sort();
+    let mut walked = couchdb
+        .execute(BackendRequest::walk_markdown())
+        .await
+        .expect("walk the couchdb corpus")
+        .into_markdown_files()
+        .expect("markdown files");
+    walked.sort();
+    assert_eq!(
+        walked, fixture_paths,
+        "the couchdb vault must hold exactly the corpus the filesystem vault holds"
+    );
+
+    // `limit` is far above the match count of every case, so nothing truncates: a
+    // truncated comparison would be comparing two arbitrary subsets, because ripgrep's
+    // inter-file order is nondeterministic.
+    const NO_TRUNCATION: usize = 500;
+    let cases = [
+        Case {
+            name: "fixed string, default glob, no context",
+            query: "needle",
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 0,
+        },
+        Case {
+            name: "fixed string with one context line either side",
+            query: "needle",
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 1,
+        },
+        Case {
+            name: "fixed string with a context window wider than the notes",
+            query: "needle",
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 4,
+        },
+        Case {
+            name: "case sensitive",
+            query: "NEEDLE",
+            regex: false,
+            case_sensitive: true,
+            glob: None,
+            context_lines: 1,
+        },
+        Case {
+            name: "case insensitive over the same variants",
+            query: "NEEDLE",
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 0,
+        },
+        Case {
+            name: "fixed string of regex metacharacters",
+            query: ".*",
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 1,
+        },
+        Case {
+            name: "regex with a quantifier",
+            query: "needle .*",
+            regex: true,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 0,
+        },
+        Case {
+            name: "regex anchored at the line start",
+            query: "^needle",
+            regex: true,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 1,
+        },
+        Case {
+            name: "regex anchored at the line end, which CRLF defeats",
+            query: "needle$",
+            regex: true,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 0,
+        },
+        Case {
+            name: "regex matching the carriage return of a CRLF line",
+            query: "here\\r$",
+            regex: true,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 1,
+        },
+        Case {
+            name: "regex word boundary",
+            query: "\\bneedle\\b",
+            regex: true,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 0,
+        },
+        Case {
+            name: "unicode literal with case folding",
+            query: "CAFÉ",
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 1,
+        },
+        Case {
+            name: "explicit **/*.md glob",
+            query: "needle",
+            regex: false,
+            case_sensitive: false,
+            glob: Some("**/*.md"),
+            context_lines: 1,
+        },
+        Case {
+            name: "a non-markdown glob reaches the text file",
+            query: "needle",
+            regex: false,
+            case_sensitive: false,
+            glob: Some("*.txt"),
+            context_lines: 1,
+        },
+        Case {
+            name: "a basename glob",
+            query: "needle",
+            regex: false,
+            case_sensitive: false,
+            glob: Some("Adjacent.md"),
+            context_lines: 2,
+        },
+        Case {
+            name: "a brace-alternation glob",
+            query: "needle",
+            regex: false,
+            case_sensitive: false,
+            glob: Some("{Adjacent,Casing}.md"),
+            context_lines: 0,
+        },
+        Case {
+            name: "a character-class glob",
+            query: "needle",
+            regex: false,
+            case_sensitive: false,
+            glob: Some("[BN]*.md"),
+            context_lines: 0,
+        },
+        Case {
+            name: "a pattern with no match anywhere",
+            query: "haystack-that-is-absent",
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 2,
+        },
+    ];
+
+    for case in &cases {
+        let expected = grep_case(&filesystem, case, NO_TRUNCATION).await;
+        let actual = grep_case(&couchdb, case, NO_TRUNCATION).await;
+        assert_eq!(
+            render(&actual),
+            render(&expected),
+            "[{}] the virtual grep diverged from ripgrep",
+            case.name
+        );
+        assert_eq!(
+            actual, expected,
+            "[{}] the virtual grep diverged from ripgrep",
+            case.name
+        );
+    }
+
+    // Every case above must actually have exercised something: a suite of eighteen
+    // empty comparisons would pass.
+    let hits = grep_case(&couchdb, &cases[1], NO_TRUNCATION).await;
+    assert!(
+        hits.len() >= 12,
+        "the corpus must produce a substantial match set: {}",
+        hits.len()
+    );
+
+    supervisor.shutdown().await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The `\r` asymmetry, pinned on the CouchDB path with real content flowing through
+/// the sidecar.
+///
+/// `line_text` keeps the carriage return (it is ripgrep's `lines.text` minus the `\n`)
+/// while the CONTEXT lines have it stripped, because context has never come from
+/// ripgrep — the rg path slices the note itself. The differential test above compares
+/// the two implementations; this one states the fact, so a future reader who
+/// "normalizes" either half is told what they broke rather than left to infer it from
+/// a parity failure.
+#[tokio::test]
+async fn crlf_survives_in_the_matched_line_and_is_stripped_from_context() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start("small");
+    couch.push_note("Crlf.md", "before\r\ncrlf needle here\r\nafter\r\n");
+    let (supervisor, backend) = backend(&couch);
+
+    let outcome = backend
+        .execute(BackendRequest::Recall(RecallRequest::Grep {
+            query: "needle".to_string(),
+            regex: false,
+            case_sensitive: false,
+            glob: Some("Crlf.md".to_string()),
+            context_lines: 1,
+            limit: 10,
+        }))
+        .await
+        .expect("grep")
+        .into_grep_outcome()
+        .expect("grep outcome");
+    assert_eq!(outcome.matches.len(), 1);
+    let found = &outcome.matches[0];
+    assert_eq!(found.line_text, "crlf needle here\r");
+    assert_eq!(found.context_before[0].line_text, "before");
+    assert_eq!(found.context_after[0].line_text, "after");
+
+    supervisor.shutdown().await;
+}
+
+/// `limit` truncates the OUTPUT without the outcome claiming the search was bounded —
+/// the same shape the ripgrep path has always had, where `limit` breaks out of the
+/// event loop and the outcome is still `exhaustive`.
+///
+/// Asserted on the CouchDB side only, deliberately: ripgrep's file order is
+/// nondeterministic, so WHICH matches survive a truncation is not comparable. Here it
+/// is: the scan runs in sorted path order, so the survivors are the alphabetically
+/// first ones, every run.
+#[tokio::test]
+async fn the_limit_truncates_deterministically_without_claiming_to_be_bounded() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start("small");
+    couch.push_note("AAA.md", "needle 1\nneedle 2\nneedle 3\n");
+    couch.push_note("ZZZ.md", "needle 4\n");
+    let (supervisor, backend) = backend(&couch);
+
+    let outcome = backend
+        .execute(BackendRequest::Recall(RecallRequest::Grep {
+            query: "needle".to_string(),
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 0,
+            limit: 2,
+        }))
+        .await
+        .expect("grep")
+        .into_grep_outcome()
+        .expect("grep outcome");
+    assert_eq!(
+        outcome
+            .matches
+            .iter()
+            .map(|item| (item.path.as_str(), item.line_number))
+            .collect::<Vec<_>>(),
+        vec![("AAA.md", 1), ("AAA.md", 2)],
+        "the first note in path order fills the budget"
+    );
+    // Truncated, and still not candidate-bounded: `exhausted` is about the SHORTLIST,
+    // and there was none. The ripgrep path reports exactly this under a limit.
+    assert!(outcome.exhausted);
+    assert_eq!(outcome.candidate_count, None);
+
+    supervisor.shutdown().await;
+}
+
+/// A grep is a full corpus read, and this measures it: the notes/second the scan
+/// achieves through the sidecar, printed so the cost documented on
+/// `CouchDbVaultBackend::grep` is a measured figure rather than a claim.
+///
+/// Not a performance ASSERTION — a threshold would be a flake on a loaded CI box. The
+/// assertion is on correctness (every note was scanned); the timing is reported.
+#[tokio::test]
+async fn a_grep_reads_the_whole_corpus_and_reports_its_throughput() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start("small");
+    const PUSHED: usize = 40;
+    for index in 0..PUSHED {
+        couch.push_note(
+            &format!("Bulk/Note{index:03}.md"),
+            &format!("line one\nneedle in note {index}\nline three\n"),
+        );
+    }
+    let (supervisor, backend) = backend(&couch);
+    // Warm the handshake so the measurement is the scan, not the child's startup.
+    backend
+        .execute(BackendRequest::read_text("Beta.md"))
+        .await
+        .expect("warm read");
+
+    let started = std::time::Instant::now();
+    let outcome = backend
+        .execute(BackendRequest::Recall(RecallRequest::Grep {
+            query: "needle in note".to_string(),
+            regex: false,
+            case_sensitive: false,
+            glob: Some("Bulk/**/*.md".to_string()),
+            context_lines: 1,
+            limit: 500,
+        }))
+        .await
+        .expect("grep")
+        .into_grep_outcome()
+        .expect("grep outcome");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        outcome.matches.len(),
+        PUSHED,
+        "every pushed note must be scanned"
+    );
+    eprintln!(
+        "virtual grep: {PUSHED} notes read and matched in {elapsed:?} ({:.0} notes/sec through the sidecar)",
+        PUSHED as f64 / elapsed.as_secs_f64()
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// The passphrase the committed E2EE fixture was generated with.
+///
+/// Part of the DATA, not a configuration choice: HKDF derives the content key from
+/// passphrase + salt, so this value and `test/fixtures/e2ee-written-vault.json` are
+/// generated together (`npm run fixtures:e2ee`). See `test/e2ee-fixture.mjs`.
+const E2EE_PASSPHRASE: &str = "correct-horse-battery-staple";
+
+/// Grep over a REAL end-to-end-encrypted vault.
+///
+/// # Why this is not redundant with the parity test
+///
+/// The parity test proves the MATCHER is ripgrep's. This proves the matcher composes with
+/// the READ PATH: the corpus it searches exists only as `h:+` chunks of genuine ciphertext
+/// (produced by upstream's own key schedule), so every line it matches was decrypted
+/// inside the sidecar on the way out. A virtual grep that had quietly special-cased
+/// plaintext chunks — or that read a manifest field instead of the content — would pass
+/// every other test in this file and fail this one.
+///
+/// The fixture note spans many chunks (300 lines), so chunk REASSEMBLY is exercised too:
+/// a match on a line that straddles a chunk boundary in the wrong assembly order would
+/// land on the wrong line number, and the line numbers are asserted exactly.
+#[tokio::test]
+async fn grep_reads_through_the_decrypting_read_path_on_an_e2ee_vault() {
+    require_prerequisites!();
+    let couch = MockCouch::start("e2ee");
+    let mut config = config(&couch);
+    config.credentials.e2ee_passphrase = Some(SecretString::new(E2EE_PASSPHRASE.to_string()));
+    let supervisor = SidecarSupervisor::new(config);
+    let backend = CouchDbVaultBackend::from_supervisor(supervisor.clone());
+
+    // `secret line 42` is line 43 of the fixture's encrypted note (its lines are
+    // generated `secret line {index}` for index 0..300).
+    let outcome = backend
+        .execute(BackendRequest::Recall(RecallRequest::Grep {
+            query: "secret line 42:".to_string(),
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 1,
+            limit: 10,
+        }))
+        .await
+        .expect("grep must be served over an encrypted vault")
+        .into_grep_outcome()
+        .expect("grep outcome");
+    assert_eq!(
+        outcome
+            .matches
+            .iter()
+            .map(|item| (item.path.as_str(), item.line_number))
+            .collect::<Vec<_>>(),
+        vec![("Notes/Encrypted.md", 43)],
+        "the encrypted note's line 43 must be found at its real line number"
+    );
+    let found = &outcome.matches[0];
+    assert!(
+        found
+            .line_text
+            .starts_with("secret line 42: the quick brown fox"),
+        "the decrypted line text must be the plaintext: {:?}",
+        found.line_text
+    );
+    // Context came from the same decrypted body, at the neighbouring line numbers.
+    assert_eq!(found.context_before[0].line_number, 42);
+    assert!(found.context_before[0]
+        .line_text
+        .starts_with("secret line 41:"));
+    assert_eq!(found.context_after[0].line_number, 44);
+    assert!(found.context_after[0]
+        .line_text
+        .starts_with("secret line 43:"));
+    assert!(outcome.exhausted);
+
+    // A regex over the same encrypted corpus, to show the whole pattern surface works
+    // through decryption rather than only a literal.
+    let regexed = backend
+        .execute(BackendRequest::Recall(RecallRequest::Grep {
+            query: r"^secret line 29\d: ".to_string(),
+            regex: true,
+            case_sensitive: true,
+            glob: Some("Encrypted.md".to_string()),
+            context_lines: 0,
+            limit: 50,
+        }))
+        .await
+        .expect("regex grep over an encrypted vault")
+        .into_grep_outcome()
+        .expect("grep outcome");
+    assert_eq!(
+        regexed.matches.len(),
+        10,
+        "lines 290..299 inclusive: {:?}",
+        regexed
+            .matches
+            .iter()
+            .map(|item| item.line_number)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(regexed.matches[0].line_number, 291);
+    assert_eq!(regexed.matches[9].line_number, 300);
+
+    // The binary attachment in the same vault is never a grep candidate: it is stored as
+    // a `newnote`, and ripgrep would report no line matches for a binary file either.
+    assert!(
+        !outcome
+            .matches
+            .iter()
+            .any(|item| item.path.contains("encrypted.bin")),
+        "an encrypted binary attachment must not be scanned as text"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// A note written a moment ago is found by the very next grep.
+///
+/// # The bug this pins, and how it was found
+///
+/// The manifest has a two-second reuse window, and grep uses the manifest to decide what
+/// "everywhere" means. Served from that cache, a grep issued right after a write scanned a
+/// corpus snapshot that predated the write and reported NO MATCHES — while claiming
+/// `exhausted: true`, i.e. that it had looked everywhere. The write had landed and a
+/// `read_file` of the same path returned the new content, so nothing else was wrong.
+///
+/// Found by `scripts/demo-multi-backend.sh`, which writes a note through MCP and then
+/// greps for a line in it. This test is the same sequence with no sleep anywhere: a
+/// tolerance would have hidden exactly the defect it exists to catch.
+#[tokio::test]
+async fn a_grep_issued_immediately_after_a_write_sees_the_new_note() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    // Warm the manifest cache the way the server does — a listing right before the write
+    // is what put a stale snapshot in it.
+    let before = backend
+        .execute(BackendRequest::walk_markdown())
+        .await
+        .expect("walk before the write")
+        .into_markdown_files()
+        .expect("markdown files");
+    assert!(!before.contains(&"Team/Standup.md".to_string()));
+
+    backend
+        .execute(BackendRequest::write_text(
+            "Team/Standup.md",
+            "# Standup\n\nFederation status for the team. Owner: demo.\n",
+        ))
+        .await
+        .expect("the write must land");
+
+    // No sleep: the manifest cache is still well inside its window here, which is the
+    // whole point.
+    let outcome = backend
+        .execute(BackendRequest::Recall(RecallRequest::Grep {
+            query: "Owner".to_string(),
+            regex: false,
+            case_sensitive: false,
+            glob: Some("Team/**/*.md".to_string()),
+            context_lines: 1,
+            limit: 10,
+        }))
+        .await
+        .expect("grep")
+        .into_grep_outcome()
+        .expect("grep outcome");
+    assert_eq!(
+        outcome
+            .matches
+            .iter()
+            .map(|item| (
+                item.path.as_str(),
+                item.line_number,
+                item.line_text.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            "Team/Standup.md",
+            3,
+            "Federation status for the team. Owner: demo."
+        )],
+        "a grep that claims to be exhaustive must see a note written a moment ago"
+    );
+    assert!(outcome.exhausted);
 
     supervisor.shutdown().await;
 }

@@ -32,6 +32,7 @@ pub mod filesystem;
 pub mod grep;
 pub mod router;
 pub mod sidecar;
+pub mod virtual_grep;
 pub mod watch;
 
 #[cfg(test)]
@@ -45,10 +46,9 @@ pub use algolia::{
     ALGOLIA_NO_BINARY_MESSAGE, ALGOLIA_NO_UPLOAD_MESSAGE, ALGOLIA_READ_ONLY_MESSAGE,
 };
 pub use couchdb::{
-    CouchDbVaultBackend, EntryContent, COUCHDB_GREP_UNSUPPORTED_MESSAGE,
-    COUCHDB_NATIVE_RECALL_UNSUPPORTED_MESSAGE, COUCHDB_READ_ONLY_MESSAGE,
-    COUCHDB_SOFT_DELETE_UNSUPPORTED_MESSAGE, COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE,
-    UPLOAD_COLLECT_ADVISORY_BYTES,
+    CouchDbVaultBackend, EntryContent, COUCHDB_NATIVE_RECALL_UNSUPPORTED_MESSAGE,
+    COUCHDB_READ_ONLY_MESSAGE, COUCHDB_SOFT_DELETE_UNSUPPORTED_MESSAGE,
+    COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE, UPLOAD_COLLECT_ADVISORY_BYTES,
 };
 pub use deep_obsidian_core::vault::{VaultChildEntry, VaultEntryKind, VaultError};
 pub use filesystem::{

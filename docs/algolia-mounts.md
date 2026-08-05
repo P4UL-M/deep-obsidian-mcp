@@ -184,6 +184,13 @@ no filter anyone can forget.
   match in a chunk the index ranked below the cap is not reported. The response says
   `exhaustive: false` with a `candidateCount`, and a pattern with no literal anchor is
   refused rather than answered misleadingly.
+
+  This is the one mount kind where that is true. A **CouchDB** mount serves `grep_search`
+  with an exhaustive virtual scan — it reads every candidate note and reports no
+  `exhaustive` key, like ripgrep — because a document store can hand over the whole corpus
+  and a ranked search API cannot. It pays for that in a full corpus read per query. See
+  [behavior-contract.md](./behavior-contract.md#line-search-per-backend) for the three-way
+  comparison.
 - **There are no directories.** Folders are synthesized from hierarchical `folders.lvlN`
   facets, so an empty folder does not exist. Algolia caps facet enumeration at 100 values
   and answers `400` rather than clamping, so a folder with more than 100 direct subfolders

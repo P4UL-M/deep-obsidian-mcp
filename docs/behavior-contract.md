@@ -110,9 +110,18 @@ Conditionally advertised (see "Tool availability" below): `grep_search`, `delete
 `tools/list` is computed once per process. Three inputs, and only these three, may change
 what it contains. Everything else about it is frozen.
 
-1. **Environment — ripgrep.** `grep_search` is advertised if and only if a working `rg` was
-   resolved. "rg works or `grep_search` does not exist": it is omitted rather than
+1. **Environment — ripgrep.** `grep_search` is advertised if and only if the ROOT mount
+   declares `grep-search`, which on a filesystem root means a working `rg` was resolved.
+   "rg works or `grep_search` does not exist": it is omitted rather than
    advertised-and-failing.
+
+   Keyed on the root deliberately. A non-root mount may declare `grep-search` without any
+   `rg` on the host — a CouchDB mount serves line search by imitating ripgrep in-process
+   over note text it reads back (see "Line search per backend" below) — but `tools/list` is
+   computed once per process and cannot say "available for some paths". Advertising the tool
+   because a non-root mount can serve it would advertise a tool that then fails on the rest
+   of the vault. Per-mount truth is in `vault_info.mounts[].capabilities`; a caller that has
+   read `grep-search` there can scope a grep to that mount.
 2. **Configuration — multiple mounts.** A multi-mount vault adds an OPTIONAL `scope`
    argument to the recall tools that rank (`hybrid_search`, `load_knowledge`,
    `search_artifacts`). It adds no tool and removes none. A single-mount vault's list is
@@ -139,6 +148,38 @@ This surface must never gain deletion of local vault files. `delete_note` exists
 backend whose removal is observable to other participants and recoverable from the note's
 own version history; a filesystem mount refuses it, and a single-mount vault does not
 advertise it at all.
+
+### Line search per backend
+
+`grep_search` means the same thing to a caller on every mount — the same match shape, the
+same context, the same line numbers — but it is served three different ways, and only the
+honesty carriers in the payload distinguish them.
+
+| Mount | How line search is served | Exhaustive? | Cost |
+| --- | --- | --- | --- |
+| Filesystem | `rg` is spawned over the vault directory | Yes | One process, one tree walk |
+| CouchDB (LiveSync) | An **exhaustive virtual scan**: the manifest supplies the corpus, the `glob` pre-filters it by path, then every surviving note is read back through the sidecar and matched line by line in-process, imitating ripgrep's own semantics | Yes | **One full corpus read per query** — a round trip per candidate note, decrypting on an E2EE vault. Narrow the `glob` or lower the `limit` to narrow the scan; there is no content cache |
+| Algolia | **Candidate-bounded**: a lexical prefilter pulls the top-200 chunks, then the pattern runs over those | No | One search request; a match the index ranked below the cap is not found |
+
+Consequences a caller can rely on:
+
+- A CouchDB-served grep emits NO `exhaustive` key, exactly like a ripgrep-served one,
+  because it did look everywhere. An Algolia-served one emits `exhaustive: false` plus
+  `candidateCount`.
+- The CouchDB scan runs in sorted path order, so a `limit`-truncated result is
+  deterministic. Ripgrep walks in parallel, so which matches survive a truncation there is
+  not. Neither claims to have stopped looking: `limit` truncates OUTPUT, and `exhaustive`
+  is about whether there was a candidate shortlist.
+- A federated (unscoped) grep concatenates every mount's matches in config order,
+  CouchDB mounts included. A mount whose grep FAILS is named in `missingBackends` with
+  `degraded: true` and `exhaustive: false`.
+- A CouchDB grep applies the same visibility rules as everything else on that mount:
+  tombstones, binary attachments, hidden paths and ignored directories are excluded.
+  Ripgrep is run with
+  `--hidden` and so does search hidden and ignored directories on a filesystem mount; it
+  also honours `.ignore`/`.gitignore` files, which have no equivalent in a LiveSync vault.
+  The `glob` — not the `.md` extension — decides which of the remaining entries are read,
+  so `glob: "*.txt"` reaches text notes on both kinds of mount.
 
 ### Payload additions are conditional on being true
 

@@ -1317,8 +1317,10 @@ fn tool_definitions(
             ),
         },
     ];
-    // "rg works or grep_search doesn't exist." When ripgrep is not available we
-    // omit the tool entirely so it never appears in `tools/list`.
+    // "rg works or grep_search doesn't exist." When the ROOT mount cannot serve line
+    // search we omit the tool entirely so it never appears in `tools/list`. Keyed on the
+    // root even though a non-root CouchDB mount can serve grep without any `rg` on the
+    // host — see `AppState::rg_available` for why.
     if !rg_available {
         definitions.retain(|definition| definition.name != "grep_search");
     }

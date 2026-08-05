@@ -19,6 +19,14 @@ deep-obsidian-core = { path = "../deep-obsidian-core" }
 # crate depends only on core), at the cost of pulling the index's native deps
 # (rusqlite, sqlite-vec) into this crate's build.
 deep-obsidian-index = { path = "../deep-obsidian-index" }
+# The virtual grep reads its candidate notes with bounded concurrency
+# (`buffered`, which preserves order so the scan stays deterministic). Already a
+# workspace dependency of the server crate; no new external crate.
+futures-util.workspace = true
+# The CouchDB backend's virtual grep imitates ripgrep, so it compiles `--glob`
+# patterns with ripgrep's own glob engine rather than a lookalike. See the
+# workspace manifest for why `ignore` was not used instead.
+globset.workspace = true
 notify.workspace = true
 rand.workspace = true
 # The algolia backend's candidate-bounded grep evaluates the caller's pattern

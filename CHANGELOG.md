@@ -28,7 +28,15 @@ All notable changes to deep-obsidian-mcp are documented here.
     library triple it was built against so a schema drift fails closed instead of
     reassembling notes wrong. Reads, listings, live change feed, revision-guarded
     writes, soft deletes, conflict enumeration, binary uploads, and export/restore.
-    E2EE and path obfuscation supported.
+    E2EE and path obfuscation supported. **`grep_search` works on a LiveSync
+    mount**: with no files for ripgrep to open, the backend imitates ripgrep
+    in-process over note text read back through the sidecar — same pattern
+    semantics (`regex`/`fixedStrings`/`caseSensitive`, ripgrep's own glob engine),
+    same match shape, same context lines. It is exhaustive in the same sense
+    ripgrep is, so its payload carries no `exhaustive` key, and a differential test
+    asserts its output is byte-identical to real ripgrep's over the same corpus.
+    The cost is stated rather than hidden: one full corpus read per query, so
+    narrow the `glob` or lower the `limit` on a large vault.
   - **Algolia mounts** (`experimental.algoliaVaults`). Mount a **shared,
     Markdown-only** corpus that a whole team can mount at once, with per-note
     version history, guarded fork-on-stale writes, divergence recording and

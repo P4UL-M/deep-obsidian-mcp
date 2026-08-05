@@ -50,11 +50,24 @@ pub struct AppState {
     /// on the ROOT mount at construction; drives both conditional `grep_search`
     /// registration and the defensive call guard.
     ///
-    /// Keyed on the root mount deliberately this slice: `tools/list` is computed
-    /// once per process and cannot say "available for some paths", and a
-    /// multi-mount grep must be scoped to a single mount anyway. A future slice
-    /// that reports per-mount capabilities should surface them through
-    /// `vault_info.mounts[].capabilities`, which already carries them.
+    /// # Still keyed on the ROOT mount, now that a non-root mount can also serve grep
+    ///
+    /// A CouchDB mount advertises `GrepSearch` (it imitates ripgrep in-process rather
+    /// than spawning one), so "the root supports grep" and "some mount supports grep"
+    /// are no longer the same predicate. This deliberately stays the former:
+    ///
+    /// * A mount is never the root unless it is the vault root, and a CouchDB or
+    ///   Algolia mount is required to have a non-empty prefix — so on every
+    ///   configuration that can exist, the root mount IS a filesystem one and this flag
+    ///   means exactly what it has always meant. Nothing changes for any real config.
+    /// * `tools/list` is computed once per process and cannot say "available for some
+    ///   paths". Registering `grep_search` because a NON-root mount can serve it would
+    ///   advertise a tool that then fails on most of the vault, on a host with no `rg`
+    ///   — which is the capability lie the conditional registration exists to prevent.
+    ///
+    /// Per-mount truth is already reachable: `vault_info.mounts[].capabilities` carries
+    /// each mount's own `grep-search`, and a caller can scope a grep to a mount whose
+    /// capability it has read there.
     pub rg_available: bool,
     /// Shared store of pending out-of-band uploads. Both the `request_vault_upload`
     /// tool handler (mint) and the `PUT /upload/{token}` endpoint (consume) share it.
