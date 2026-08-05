@@ -202,9 +202,11 @@ impl Fixture {
     /// A two-mount config: a filesystem root plus the couchdb mount under test.
     fn config(&self, couch: &MockCouch, writable: bool) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            federated_rerank: true,
             vault_path: self.base.join("root-vault"),
             mounts: vec![
                 MountConfig {
+                    recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
                     backend: MountBackendConfig::Filesystem {
@@ -213,6 +215,7 @@ impl Fixture {
                     },
                 },
                 MountConfig {
+                    recall_weight: None,
                     id: MOUNT_ID.to_string(),
                     mount_at: "LiveSync".to_string(),
                     backend: MountBackendConfig::Couchdb {

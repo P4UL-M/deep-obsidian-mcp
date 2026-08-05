@@ -99,9 +99,11 @@ impl Fixture {
 
     fn config(&self, writable: bool) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            federated_rerank: true,
             vault_path: self.vault(),
             mounts: vec![
                 MountConfig {
+                    recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
                     backend: MountBackendConfig::Filesystem {
@@ -110,6 +112,7 @@ impl Fixture {
                     },
                 },
                 MountConfig {
+                    recall_weight: None,
                     id: MOUNT_ID.to_string(),
                     mount_at: MOUNT_AT.to_string(),
                     backend: MountBackendConfig::Algolia {

@@ -635,6 +635,9 @@ impl VaultBackend for AlgoliaVaultBackend {
                     matches,
                     exhausted: false,
                     candidate_count: Some(candidate_count),
+                    // One backend answering one request: there is no other mount for it
+                    // to be missing. The router fills this in when it federates.
+                    missing_mounts: Vec::new(),
                 }))
             }),
             BackendRequest::Recall(RecallRequest::Search(request)) => {

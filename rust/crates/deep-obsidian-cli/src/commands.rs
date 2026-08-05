@@ -2082,6 +2082,7 @@ fn ensure_service_transport_http(config: ResolvedServiceConfig) -> Result<Resolv
     }
 
     deep_obsidian_config::ensure_http_service_config(ResolvedServiceConfig {
+        federated_rerank: true,
         transport: TransportMode::Http,
         ..config
     })
@@ -3417,6 +3418,7 @@ mod tests {
 
     fn resolved_config(vault_path: &Path, index_dir: &Path) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            federated_rerank: true,
             vault_path: vault_path.to_path_buf(),
             index_dir: index_dir.to_path_buf(),
             mounts: Vec::new(),
@@ -3834,6 +3836,7 @@ mod tests {
 
     fn filesystem_mount(id: &str, mount_at: &str, index_dir: Option<&str>) -> MountConfig {
         MountConfig {
+            recall_weight: None,
             id: id.to_string(),
             mount_at: mount_at.to_string(),
             backend: MountBackendConfig::Filesystem {

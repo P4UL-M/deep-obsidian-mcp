@@ -840,6 +840,7 @@ fn mount_runtime_config(
     }
     let (vault_path, index_dir) = filesystem_mount_paths(config, mount);
     ResolvedServiceConfig {
+        federated_rerank: true,
         vault_path,
         index_dir,
         ..config.clone()
@@ -1322,6 +1323,7 @@ mod tests {
 
     fn test_config(vault_path: PathBuf, index_dir: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            federated_rerank: true,
             vault_path,
             index_dir,
             mounts: Vec::new(),
@@ -1350,8 +1352,10 @@ mod tests {
     fn two_mount_config(root_vault: PathBuf, team_vault: PathBuf) -> ResolvedServiceConfig {
         let index_dir = temp_path("two_mount_index");
         ResolvedServiceConfig {
+            federated_rerank: true,
             mounts: vec![
                 MountConfig {
+                    recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
                     backend: MountBackendConfig::Filesystem {
@@ -1360,6 +1364,7 @@ mod tests {
                     },
                 },
                 MountConfig {
+                    recall_weight: None,
                     id: "team".to_string(),
                     mount_at: "Team".to_string(),
                     backend: MountBackendConfig::Filesystem {

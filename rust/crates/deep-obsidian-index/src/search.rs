@@ -4,8 +4,8 @@ use crate::graph::resolve_wiki_link_target;
 use crate::index::{
     artifact_embedding_runtime_config, average, bm25_score, cosine_similarity, count_terms,
     embedding_runtime_config, enclosing_heading_section, matches_pattern, normalize_dense_vector,
-    open_index_connection_for_index, query_vector_blob, vector_norm, IndexError,
-    Result, SearchIndex, SearchNote, SemanticBackend,
+    open_index_connection_for_index, query_vector_blob, vector_norm, IndexError, Result,
+    SearchIndex, SearchNote, SemanticBackend,
 };
 use rusqlite::{params, params_from_iter, OptionalExtension};
 
@@ -232,6 +232,163 @@ fn semantic_search_with_query_vector_sql(
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| IndexError::Embedding(error.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-index scoring primitives, for FEDERATED recall's final rerank
+// ---------------------------------------------------------------------------
+
+/// The query's dense vector, for a caller that must compare ONE query against SEVERAL
+/// independently built indexes.
+///
+/// # Why this is public when `semantic_search` already embeds internally
+///
+/// Federated recall reranks candidates drawn from several mounts. Every mount's index is
+/// built from the same configured embedding model, so ONE query vector is valid against all
+/// of them — but embedding the query once per mount would issue N identical HTTP calls and,
+/// worse, would let a flaky backend hand two mounts different vectors and silently make
+/// their scores incomparable. So the caller embeds once, here, and passes the vector down.
+///
+/// Errors exactly as the internal path does, including
+/// [`IndexError::EmbeddingBackendUnavailable`] for a transient failure, so a caller can
+/// degrade rather than fail.
+pub fn embed_query_vector(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
+    embed_query(index, query)
+}
+
+/// Embed arbitrary texts with THIS index's configured note-embedding model.
+///
+/// For federated candidates that have no stored vector — a hit from a backend that ranks
+/// for itself, where the server holds a snippet and nothing else. Using the index's own
+/// config rather than a separately resolved one is what keeps those vectors in the same
+/// space as [`embed_query_vector`]'s and as the stored chunk vectors; a different model
+/// would produce numbers that compare but do not mean anything.
+pub fn embed_texts_for_index(index: &SearchIndex, texts: &[String]) -> Result<Vec<Vec<f64>>> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config = embedding_runtime_config(index).ok_or(IndexError::MissingEmbeddingConfig)?;
+    let result =
+        crate::embeddings::embed_texts(texts, &config).map_err(map_query_embedding_error)?;
+    Ok(result
+        .vectors
+        .iter()
+        .map(|vector| normalize_dense_vector(vector))
+        .collect())
+}
+
+/// The semantic score of a `(query, document)` vector pair, on the SAME scale
+/// [`semantic_search`] reports.
+///
+/// # Why cosine is computed explicitly rather than read off an L2 distance
+///
+/// The stored vectors are L2-normalized at index time, and for unit vectors the euclidean
+/// distance is `sqrt(2 - 2·cos)` — monotone in cosine, so either would rank identically.
+/// But `normalize_dense_vector` passes a zero vector through unchanged, so "every stored
+/// vector is unit" is very nearly true rather than true. Computing cosine from the norms
+/// makes the ranking correct for the exception too, and mapping it back through the
+/// euclidean form keeps the number numerically identical to what `semantic_search` reports
+/// for the overwhelmingly common unit case — so a caller can compare a reranked score with a
+/// scoped search's score and not be lied to.
+pub fn semantic_score_for_vectors(query: &[f64], document: &[f64]) -> f64 {
+    let cosine = dense_cosine(query, document);
+    // `sqrt` of a value clamped at 0: floating error can push `2 - 2cos` a hair below zero
+    // for two identical vectors, and `NaN` here would make the rerank's comparator
+    // non-total and its sort order unspecified.
+    let distance = (2.0 - 2.0 * cosine).max(0.0).sqrt();
+    sql_distance_score(distance)
+}
+
+/// Semantic scores for NAMED chunks of this index, parallel to `chunks`.
+///
+/// `None` for a chunk this index does not hold, or holds without a vector (a note that
+/// failed to embed in a partial index). The caller treats that as "absent from the semantic
+/// list", which under Reciprocal Rank Fusion contributes nothing — the same rule a document
+/// missing from either retriever's list already gets.
+///
+/// Takes MOUNT-RELATIVE paths: this reads one mount's own index, which has never heard of
+/// the logical namespace.
+///
+/// # Ordering is the contract, not the absolute value
+///
+/// The rerank consumes these as a RANKED LIST, so what must hold is that ordering by this
+/// function agrees with ordering by [`semantic_search`] over the same chunks. That is
+/// asserted directly in `semantic_scores_for_chunks_order_matches_semantic_search`, because
+/// it depends on how sqlite-vec defines the distance behind `MATCH` — a property of a C
+/// extension rather than of this file, and therefore worth checking rather than assuming.
+pub fn semantic_scores_for_chunks(
+    index: &SearchIndex,
+    query_embedding: &[f64],
+    chunks: &[(String, usize)],
+) -> Result<Vec<Option<f64>>> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    if index.semantic_backend != SemanticBackend::Embedding {
+        return Ok(vec![None; chunks.len()]);
+    }
+    let connection = open_index_connection_for_index(index, true)?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT v.embedding
+            FROM chunk_embeddings_vec v
+            JOIN chunks c ON c.id = v.rowid
+            WHERE c.path = ?1 AND c.chunk_index = ?2
+            "#,
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+
+    let mut scores = Vec::with_capacity(chunks.len());
+    for (path, chunk_index) in chunks {
+        let blob: Option<Vec<u8>> = statement
+            .query_row(params![path, *chunk_index as i64], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .optional()
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        scores.push(
+            blob.and_then(|blob| decode_embedding_blob(&blob))
+                .map(|document| semantic_score_for_vectors(query_embedding, &document)),
+        );
+    }
+    Ok(scores)
+}
+
+/// Cosine similarity of two DENSE vectors.
+///
+/// Distinct from `index::cosine_similarity`, which is the sparse term-count similarity used
+/// by the lexical path; these two never meet, and sharing a name for both would be the kind
+/// of collision that produces a plausible wrong number.
+fn dense_cosine(left: &[f64], right: &[f64]) -> f64 {
+    let length = left.len().min(right.len());
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    for position in 0..length {
+        dot += left[position] * right[position];
+        left_norm += left[position] * left[position];
+        right_norm += right[position] * right[position];
+    }
+    let denominator = left_norm.sqrt() * right_norm.sqrt();
+    if denominator <= 0.0 {
+        return 0.0;
+    }
+    (dot / denominator).clamp(-1.0, 1.0)
+}
+
+/// Decode a `vec0` `float[N]` blob: little-endian `f32`, tightly packed. `None` for a blob
+/// whose length is not a whole number of floats, which would mean a corrupt row rather than
+/// a missing one.
+fn decode_embedding_blob(blob: &[u8]) -> Option<Vec<f64>> {
+    if blob.is_empty() || !blob.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        blob.chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64)
+            .collect(),
+    )
 }
 
 /// Bounded per-source-chunk KNN used for late-interaction (max-sim) note relatedness.
@@ -597,11 +754,9 @@ fn expand_chunk_matches_to_sections(index: &SearchIndex, matches: &mut [SearchMa
         let section = section_cache
             .entry(key)
             .or_insert_with(|| {
-                index
-                    .note(&match_item.path)
-                    .and_then(|note| {
-                        enclosing_heading_section(&note.content, match_item.start_line)
-                    })
+                index.note(&match_item.path).and_then(|note| {
+                    enclosing_heading_section(&note.content, match_item.start_line)
+                })
             })
             .clone();
         if let Some((start_line, end_line, text)) = section {
@@ -982,11 +1137,17 @@ fn hybrid_search_with_candidate_limit(
     // the public API / display) and set `score` to the fused RRF value.
     let mut semantic_by_key: HashMap<(String, usize), SearchMatch> = HashMap::new();
     for match_item in semantic_matches {
-        semantic_by_key.insert((match_item.path.clone(), match_item.chunk_index), match_item);
+        semantic_by_key.insert(
+            (match_item.path.clone(), match_item.chunk_index),
+            match_item,
+        );
     }
     let mut bm25_by_key: HashMap<(String, usize), SearchMatch> = HashMap::new();
     for match_item in bm25_matches {
-        bm25_by_key.insert((match_item.path.clone(), match_item.chunk_index), match_item);
+        bm25_by_key.insert(
+            (match_item.path.clone(), match_item.chunk_index),
+            match_item,
+        );
     }
 
     let mut matches = fused
@@ -1022,7 +1183,12 @@ fn hybrid_search_with_candidate_limit(
     // The re-rank runs over the full oversampled candidate set BEFORE truncation, so a
     // 1-hop neighbor that fusion left just outside `requested_limit` can still surface.
     sort_by_fused_score(&mut matches);
-    apply_graph_proximity_rerank(index, &mut matches, GRAPH_RERANK_TOP_N, GRAPH_PROXIMITY_BONUS);
+    apply_graph_proximity_rerank(
+        index,
+        &mut matches,
+        GRAPH_RERANK_TOP_N,
+        GRAPH_PROXIMITY_BONUS,
+    );
     sort_by_fused_score(&mut matches);
     matches.truncate(requested_limit);
     Ok(HybridSearchOutcome {
@@ -1123,9 +1289,7 @@ pub fn related_notes_with_options(
             // Embedding-backend index with no dense vector for this note. Rather than
             // failing the whole call, degrade to the sparse term-overlap path for this
             // note — the same graceful per-query degradation `search` already relies on.
-            Err(IndexError::MissingNoteEmbedding(_)) => {
-                related_notes_sparse(index, note)
-            }
+            Err(IndexError::MissingNoteEmbedding(_)) => related_notes_sparse(index, note),
             Err(error) => return Err(error),
         }
     } else {
@@ -1353,7 +1517,9 @@ mod tests {
         let beta_subchunks = index
             .chunks
             .iter()
-            .filter(|chunk| chunk.text.contains("marker_betahead") || chunk.text.contains("gizmotron"))
+            .filter(|chunk| {
+                chunk.text.contains("marker_betahead") || chunk.text.contains("gizmotron")
+            })
             .count();
         assert!(beta_subchunks >= 2, "Beta must split: {beta_subchunks}");
 
@@ -1376,11 +1542,20 @@ mod tests {
             .find(|item| item.text.contains("gizmotron"))
             .expect("beta hit");
         assert!(hit.text.contains("## Beta"), "heading line included");
-        assert!(hit.text.contains("marker_betahead"), "sibling sub-chunk included");
-        assert!(!hit.text.contains("marker_gamma"), "adjacent section excluded");
+        assert!(
+            hit.text.contains("marker_betahead"),
+            "sibling sub-chunk included"
+        );
+        assert!(
+            !hit.text.contains("marker_gamma"),
+            "adjacent section excluded"
+        );
         assert!(!hit.text.contains("## Alpha"), "previous section excluded");
         // Expansion grew the returned text beyond the matched sub-chunk's own text.
-        assert!(hit.text.len() > matched_chunk.text.len(), "returned text expanded");
+        assert!(
+            hit.text.len() > matched_chunk.text.len(),
+            "returned text expanded"
+        );
     }
 
     #[test]
@@ -1409,7 +1584,10 @@ mod tests {
             .expect("plain chunk");
         // No expansion: text and range are exactly the chunk's own.
         assert_eq!(hit.text, chunk.text);
-        assert_eq!((hit.start_line, hit.end_line), (chunk.start_line, chunk.end_line));
+        assert_eq!(
+            (hit.start_line, hit.end_line),
+            (chunk.start_line, chunk.end_line)
+        );
     }
 
     /// Build a minimal SearchMatch keyed only by path (chunk_index 0); the score field
@@ -1481,7 +1659,10 @@ mod tests {
         assert!((order[0].1 - leader_score).abs() < 1e-12);
         assert!((order[1].1 - leader_score).abs() < 1e-12);
         // The top two slots are exactly the two single-retriever leaders.
-        assert_eq!(&ranks[0..2].iter().copied().collect::<BTreeSet<_>>(), &BTreeSet::from(["top_bm25", "top_dense"]));
+        assert_eq!(
+            &ranks[0..2].iter().copied().collect::<BTreeSet<_>>(),
+            &BTreeSet::from(["top_bm25", "top_dense"])
+        );
         // ...and they outrank both docs that were only ever mid-pack.
         let pos = |name: &str| ranks.iter().position(|item| *item == name).unwrap();
         assert!(pos("top_bm25") < pos("mid_both_a"));
@@ -1796,6 +1977,113 @@ mod tests {
         (index, root)
     }
 
+    /// `semantic_scores_for_chunks` must ORDER chunks exactly as `semantic_search` does.
+    ///
+    /// # Why this is checked rather than argued
+    ///
+    /// The two read the same stored vectors by different routes: `semantic_search` asks
+    /// sqlite-vec for a KNN and uses the `distance` the extension reports, while
+    /// `semantic_scores_for_chunks` fetches the raw blob and computes cosine in Rust. Whether
+    /// those agree depends on which metric `vec0(embedding float[N])` defaults to — a property
+    /// of a C extension, not of this file, and not something a reader of this code can verify.
+    /// Federated recall's rerank consumes these as a ranked list, so agreement on ORDER is
+    /// exactly the invariant it needs; if a sqlite-vec upgrade ever changed the default metric,
+    /// this test is what would catch it instead of every federated answer quietly degrading.
+    #[test]
+    fn semantic_scores_for_chunks_order_matches_semantic_search() {
+        let (index, root) = embedding_backed_index();
+        let query = "install runtime";
+        let ranked = semantic_search_with_options(
+            &index,
+            query,
+            RankingOptions {
+                limit: 50,
+                ..RankingOptions::default()
+            },
+        )
+        .expect("semantic search");
+        assert!(
+            ranked.len() >= 2,
+            "the fixture must produce at least two ranked chunks for an ordering claim"
+        );
+
+        let keys: Vec<(String, usize)> = ranked
+            .iter()
+            .map(|item| (item.path.clone(), item.chunk_index))
+            .collect();
+        let query_vector = embed_query_vector(&index, query).expect("query vector");
+        let scores = semantic_scores_for_chunks(&index, &query_vector, &keys).expect("scores");
+        assert_eq!(scores.len(), keys.len());
+        assert!(
+            scores.iter().all(Option::is_some),
+            "every chunk that sqlite-vec ranked must have a readable stored vector"
+        );
+
+        // Same order: `ranked` is descending by score, so the recomputed scores must be
+        // descending too.
+        let recomputed: Vec<f64> = scores.into_iter().map(Option::unwrap).collect();
+        for window in recomputed.windows(2) {
+            assert!(
+                window[0] >= window[1] - 1e-9,
+                "recomputed scores must be descending in the KNN order: {recomputed:?}"
+            );
+        }
+        // And numerically the same as what `semantic_search` reported, which is what lets a
+        // reranked score be compared with a scoped search's score.
+        for (item, recomputed) in ranked.iter().zip(&recomputed) {
+            assert!(
+                (item.semantic_score - recomputed).abs() < 1e-6,
+                "{} chunk {} : semantic_search {} vs recomputed {recomputed}",
+                item.path,
+                item.chunk_index,
+                item.semantic_score
+            );
+        }
+
+        // A chunk this index does not hold scores `None` rather than 0.0 -- the caller has to
+        // be able to tell "absent from the semantic list" from "scored badly".
+        let absent = semantic_scores_for_chunks(
+            &index,
+            &query_vector,
+            &[("No/Such Note.md".to_string(), 0)],
+        )
+        .expect("absent lookup");
+        assert_eq!(absent, vec![None]);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A zero-length or ragged blob is a corrupt row, not a missing one, and decodes to
+    /// `None` rather than to a vector of the wrong dimension.
+    #[test]
+    fn embedding_blob_decoding_rejects_ragged_input() {
+        assert_eq!(decode_embedding_blob(&[]), None);
+        assert_eq!(decode_embedding_blob(&[1, 2, 3]), None);
+        let one = 1.5_f32.to_le_bytes();
+        assert_eq!(decode_embedding_blob(&one), Some(vec![1.5]));
+    }
+
+    /// Two identical vectors score the maximum, and floating error never produces a NaN --
+    /// which would make the rerank's comparator non-total and its sort order unspecified.
+    #[test]
+    fn semantic_score_for_identical_vectors_is_finite_and_maximal() {
+        let vector = normalize_dense_vector(&[0.3, -0.7, 0.2, 0.6]);
+        let same = semantic_score_for_vectors(&vector, &vector);
+        assert!(same.is_finite(), "{same}");
+        assert!(
+            (same - 1.0).abs() < 1e-9,
+            "cos 1 => distance 0 => score 1: {same}"
+        );
+        let opposite: Vec<f64> = vector.iter().map(|value| -value).collect();
+        let flipped = semantic_score_for_vectors(&vector, &opposite);
+        assert!(flipped.is_finite() && flipped < same, "{flipped} vs {same}");
+        // A zero vector cannot divide by zero into a NaN.
+        assert_eq!(
+            semantic_score_for_vectors(&vector, &[0.0, 0.0, 0.0, 0.0]),
+            sql_distance_score((2.0_f64).sqrt())
+        );
+    }
+
     /// An unroutable base URL: the discard/zero port refuses connections immediately, so a
     /// query-time embed fails fast with a connection error (classified transient).
     const DEAD_BACKEND_URL: &str = "http://127.0.0.1:1";
@@ -1893,12 +2181,9 @@ mod tests {
         index.artifact_embedding_base_url = Some(DEAD_BACKEND_URL.to_string());
         index.artifact_embedding_dimensions = Some(3);
 
-        let error = artifact_semantic_search_with_options(
-            &index,
-            "diagram",
-            RankingOptions::default(),
-        )
-        .expect_err("artifact search must error when its backend is down");
+        let error =
+            artifact_semantic_search_with_options(&index, "diagram", RankingOptions::default())
+                .expect_err("artifact search must error when its backend is down");
         assert!(
             matches!(error, IndexError::EmbeddingBackendUnavailable(_)),
             "expected EmbeddingBackendUnavailable, got {error:?}"
@@ -1909,10 +2194,9 @@ mod tests {
     // --- Query-side instruction wrapping (asymmetric query encoding) ---
 
     use crate::embeddings::{
-        EmbeddingConfig, EmbeddingProvider, DEFAULT_CHARS_PER_TOKEN,
-        DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_CONTEXT_TOKENS,
-        DEFAULT_EMBEDDING_MAX_CHARS, DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
-        DEFAULT_SEARCH_QUERY_INSTRUCTION,
+        EmbeddingConfig, EmbeddingProvider, DEFAULT_CHARS_PER_TOKEN, DEFAULT_EMBEDDING_BATCH_SIZE,
+        DEFAULT_EMBEDDING_CONTEXT_TOKENS, DEFAULT_EMBEDDING_MAX_CHARS,
+        DEFAULT_EMBEDDING_MAX_INPUT_TOKENS, DEFAULT_SEARCH_QUERY_INSTRUCTION,
     };
 
     fn embedding_config_with_instruction(instruction: Option<&str>) -> EmbeddingConfig {
@@ -1936,9 +2220,7 @@ mod tests {
         let input = query_embedding_input(&config, "how do embeddings work");
         assert_eq!(
             input,
-            format!(
-                "Instruct: {DEFAULT_SEARCH_QUERY_INSTRUCTION}\nQuery: how do embeddings work"
-            )
+            format!("Instruct: {DEFAULT_SEARCH_QUERY_INSTRUCTION}\nQuery: how do embeddings work")
         );
     }
 
@@ -1980,8 +2262,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_thread = Arc::clone(&captured);
         let handle = thread::spawn(move || {
-            let mut stream: TcpStream =
-                listener.incoming().next().unwrap().expect("accept");
+            let mut stream: TcpStream = listener.incoming().next().unwrap().expect("accept");
             let mut request = Vec::new();
             let mut buffer = [0u8; 1024];
             loop {
@@ -1995,8 +2276,7 @@ mod tests {
                 }
             }
             let body = request_body(&request).expect("body");
-            let payload: serde_json::Value =
-                serde_json::from_slice(body).expect("parse body");
+            let payload: serde_json::Value = serde_json::from_slice(body).expect("parse body");
             let inputs = payload
                 .get("input")
                 .and_then(serde_json::Value::as_array)
@@ -2017,8 +2297,7 @@ mod tests {
             stream.write_all(response.as_bytes()).expect("write");
         });
 
-        let mut config =
-            embedding_config_with_instruction(Some(DEFAULT_SEARCH_QUERY_INSTRUCTION));
+        let mut config = embedding_config_with_instruction(Some(DEFAULT_SEARCH_QUERY_INSTRUCTION));
         config.base_url = Some(format!("http://{address}"));
         let input = query_embedding_input(&config, "ranking signals");
         crate::embeddings::embed_texts(&[input], &config).expect("embed");

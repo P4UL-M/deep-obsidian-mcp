@@ -155,12 +155,26 @@ pub enum RouterError {
         destination_path: String,
         destination_mount: String,
     },
-    /// The operation would have to read every mount to answer correctly, and this
-    /// slice cannot. Deliberately an error rather than a partial answer.
-    #[error("{operation} cannot span multiple vault mounts yet: {remediation}")]
+    /// The operation would have to read every mount to answer correctly, and cannot.
+    /// Deliberately an error rather than a partial answer.
+    #[error("{operation} cannot span multiple vault mounts: {remediation}")]
     FederationUnsupported {
         operation: &'static str,
         remediation: &'static str,
+    },
+    /// One mount could not be enumerated during a whole-vault manifest.
+    ///
+    /// Fatal to the listing, by design. An enumeration that quietly omits a mount tells a
+    /// client those notes do not exist, and a `Vec<String>` has nowhere to carry "one mount
+    /// is missing" — so the failure names the mount instead of hiding inside a short list.
+    /// Contrast a federated grep, whose result type CAN carry the shortfall
+    /// ([`GrepOutcome::missing_mounts`]) and therefore degrades rather than fails.
+    #[error("{operation} failed because mount '{mount}' could not be read: {source}. A listing that silently omitted it would report those notes as nonexistent.")]
+    MountEnumerationFailed {
+        operation: &'static str,
+        mount: String,
+        #[source]
+        source: BackendError,
     },
     /// Two mounts claim the identical prefix, so a path under it has no unique
     /// owner. Config validation reports this with a friendlier message; the check
@@ -450,18 +464,18 @@ impl VaultRouter {
                     ))
                     .await?)
             }
-            // Whole-vault manifests would need every mount to be correct.
+            // Whole-vault manifests read every mount and concatenate. Both are
+            // ENUMERATIONS, not rankings, so a merge is the same answer a single vault
+            // would give — there is nothing to re-score.
             BackendRequest::Manifest(ManifestRequest::WalkMarkdown) => {
-                Err(RouterError::FederationUnsupported {
-                    operation: "listing every markdown file",
-                    remediation: "it would have to read every mount, which is not implemented yet",
-                })
+                Ok(BackendResponse::Manifest(ManifestResponse::MarkdownFiles(
+                    self.walk_markdown().await?,
+                )))
             }
             BackendRequest::Manifest(ManifestRequest::TopLevelFolders) => {
-                Err(RouterError::FederationUnsupported {
-                    operation: "listing top-level folders",
-                    remediation: "it would have to read every mount, which is not implemented yet",
-                })
+                Ok(BackendResponse::Manifest(ManifestResponse::Folders(
+                    self.top_level_folders().await?,
+                )))
             }
             BackendRequest::Content(request) => self.route_content(request).await,
             BackendRequest::Mutation(MutationRequest::SweepOrphanStagingFiles) => {
@@ -761,7 +775,81 @@ impl VaultRouter {
             .collect()
     }
 
-    /// Line search, scoped to the single mount the caller's glob narrows to.
+    /// Every markdown note in the logical vault, from every mount, sorted.
+    ///
+    /// # Why a failure is fatal rather than partial
+    ///
+    /// This is an ENUMERATION, and the one thing an enumeration must never do is quietly
+    /// omit part of itself: a caller reading a short list concludes those notes do not
+    /// exist. There is no field on `Vec<String>` that could carry "one mount is missing",
+    /// and inventing one would still leave every existing caller ignoring it. So the whole
+    /// listing fails, naming the mount — the same stance `resources::list_resources` already
+    /// takes for the same reason.
+    async fn walk_markdown(&self) -> Result<Vec<String>, RouterError> {
+        let mut notes: Vec<String> = Vec::new();
+        for mount in &self.mounts {
+            let own = mount
+                .backend
+                .execute(BackendRequest::walk_markdown())
+                .await
+                .and_then(BackendResponse::into_markdown_files)
+                .map_err(|source| RouterError::MountEnumerationFailed {
+                    operation: "listing every markdown file",
+                    mount: mount.id.clone(),
+                    source,
+                })?;
+            notes.extend(own.iter().map(|note| mount.to_logical(note)));
+        }
+        // Sorted, because the single-mount answer is (every backend sorts its own walk) and
+        // callers downstream depend on it — `find_files` truncates to `limit`, and an
+        // unstable order there would make the same query return different notes run to run.
+        notes.sort_unstable();
+        // Two mounts cannot own the same logical path, so this only ever collapses a
+        // duplicate WITHIN one mount's answer.
+        notes.dedup();
+        Ok(notes)
+    }
+
+    /// The logical vault's top-level folders: the root mount's own, plus the first path
+    /// segment of every other mount.
+    ///
+    /// # Why a nested mount's own folders are not in here
+    ///
+    /// "Top level" is a property of the LOGICAL namespace. A mount at `Team` contributes the
+    /// folder `Team` and nothing else — its internal `Team/Alpha` is one level down, exactly
+    /// as `Notes/Deep` is for the root mount. That is the same synthesis
+    /// [`Self::child_listing`] performs when listing the vault root, and using the same
+    /// helper is what stops the two from disagreeing about which folders exist.
+    async fn top_level_folders(&self) -> Result<Vec<String>, RouterError> {
+        let mut folders: Vec<String> = self
+            .synthesized_child_folders("")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        // The root mount is the only one whose own folders are top-level.
+        if let Some(root) = self.root() {
+            let own = root
+                .backend
+                .execute(BackendRequest::top_level_folders())
+                .await
+                .and_then(BackendResponse::into_folders)
+                .map_err(|source| RouterError::MountEnumerationFailed {
+                    operation: "listing top-level folders",
+                    mount: root.id.clone(),
+                    source,
+                })?;
+            // Shadowing, consistently with `child_listing`: a mount grafted onto a name the
+            // root mount also has as a physical directory wins, and the folder is listed
+            // once. Reads under that prefix already go to the nested mount.
+            folders.extend(own);
+        }
+        folders.sort_unstable();
+        folders.dedup();
+        Ok(folders)
+    }
+
+    /// Line search: federated across every mount when nothing narrows it to one, routed to
+    /// the single mount a literal glob prefix names when one does.
     async fn grep(
         &self,
         query: String,
@@ -771,23 +859,46 @@ impl VaultRouter {
         context_lines: usize,
         limit: usize,
     ) -> Result<BackendResponse, RouterError> {
-        const UNSCOPED: RouterError = RouterError::FederationUnsupported {
-            operation: "grep_search",
-            remediation:
-                "scope it to one mount by passing a 'glob' that starts with that mount's folder (for example \"Team/**/*.md\")",
-        };
-
+        // A glob that names no literal folder — absent, `*.md`, `**/*.md` — is a filter with
+        // no subtree in it, so the SAME glob is correct against every mount and the search
+        // federates. That is what replaced the old "unscoped grep is refused" behaviour:
+        // answering from one mount would have reported zero matches for text that exists in
+        // the vault, but running every mount and concatenating is the same answer one vault
+        // would give, because grep produces MATCHES rather than a ranking.
         let Some(glob) = glob else {
-            return Err(UNSCOPED);
+            return self
+                .federated_grep(query, regex, case_sensitive, None, context_lines, limit)
+                .await;
         };
         let Some(prefix) = literal_glob_prefix(&glob) else {
-            return Err(UNSCOPED);
+            return self
+                .federated_grep(
+                    query,
+                    regex,
+                    case_sensitive,
+                    Some(glob),
+                    context_lines,
+                    limit,
+                )
+                .await;
         };
         let resolved = self.resolve(&prefix)?;
-        // The scoped subtree must contain no OTHER mount, or the single-mount run
-        // below would silently skip part of it.
+        // A glob WITH a literal prefix is a subtree filter, and a subtree that straddles two
+        // mounts cannot be federated by passing the same glob to each: the glob is written in
+        // the LOGICAL namespace, and rewriting it per mount is not generally sound (a mount at
+        // `Team/Alpha` would need `Team/**/*.md` turned into a pattern relative to its own
+        // root, which the pattern's structure does not always permit). Running it against the
+        // resolved mount alone would silently skip the nested one, so this stays a refusal —
+        // and the remedy names the two things that DO work.
         if self.scope_contains_other_mount(&resolved.mount.id, &prefix) {
-            return Err(UNSCOPED);
+            return Err(RouterError::FederationUnsupported {
+                operation: "grep_search",
+                remediation:
+                    "the folder it names contains a second mount, and a subtree glob cannot be \
+                     rewritten for each of them. Either narrow the 'glob' until it is inside one \
+                     mount (for example \"Team/Alpha/**/*.md\"), or drop the folder from it \
+                     (\"**/*.md\") to search every mount",
+            });
         }
 
         let mount = resolved.mount;
@@ -827,6 +938,92 @@ impl VaultRouter {
                 })
                 .collect(),
             ..outcome
+        })))
+    }
+
+    /// Line search across EVERY mount, concatenated.
+    ///
+    /// # Why concatenation is the whole algorithm
+    ///
+    /// Grep produces matches, not a ranking. There is no score to make comparable and no
+    /// order to blend: a line either contains the pattern or it does not. So the mounts are
+    /// searched in config order and their matches appended, which is the same set a single
+    /// vault would have produced.
+    ///
+    /// # The `limit` is a whole-vault budget, spent in mount order
+    ///
+    /// Each mount is asked for the REMAINING budget rather than the full `limit`, so the
+    /// total is exactly `limit` and no work is done for matches that would be discarded. The
+    /// cost is that mount order decides whose matches survive truncation, which is why
+    /// `exhausted` goes to `false` the moment the budget runs out with mounts left to search:
+    /// a truncated concatenation is precisely "I did not look everywhere".
+    ///
+    /// # A failed mount is partial, not fatal
+    ///
+    /// Unlike [`Self::walk_markdown`], a grep result has somewhere to put the shortfall —
+    /// [`GrepOutcome::missing_mounts`] plus `exhausted: false` — so one unreachable mount
+    /// degrades the answer instead of destroying it.
+    async fn federated_grep(
+        &self,
+        query: String,
+        regex: bool,
+        case_sensitive: bool,
+        glob: Option<String>,
+        context_lines: usize,
+        limit: usize,
+    ) -> Result<BackendResponse, RouterError> {
+        let mut matches: Vec<GrepMatch> = Vec::new();
+        let mut exhausted = true;
+        let mut candidate_count: Option<usize> = None;
+        let mut missing_mounts: Vec<String> = Vec::new();
+
+        for mount in &self.mounts {
+            let remaining = limit.saturating_sub(matches.len());
+            if remaining == 0 {
+                // The budget is spent and there are mounts left, so the answer is short by
+                // construction. Saying otherwise would claim the vault has no more matches.
+                exhausted = false;
+                break;
+            }
+            let outcome = mount
+                .backend
+                .execute(BackendRequest::Recall(RecallRequest::Grep {
+                    query: query.clone(),
+                    regex,
+                    case_sensitive,
+                    glob: glob.clone(),
+                    context_lines,
+                    limit: remaining,
+                }))
+                .await
+                .and_then(BackendResponse::into_grep_outcome);
+            match outcome {
+                Ok(outcome) => {
+                    // A mount that could not read everything makes the WHOLE answer
+                    // non-exhaustive; its candidate count is summed so the number still
+                    // describes the search the caller actually got.
+                    exhausted &= outcome.exhausted;
+                    if let Some(count) = outcome.candidate_count {
+                        candidate_count = Some(candidate_count.unwrap_or(0) + count);
+                    }
+                    matches.extend(outcome.matches.into_iter().map(|item| GrepMatch {
+                        path: mount.to_logical(&item.path),
+                        ..item
+                    }));
+                }
+                Err(_) => {
+                    exhausted = false;
+                    missing_mounts.push(mount.id.clone());
+                }
+            }
+        }
+
+        matches.truncate(limit);
+        Ok(BackendResponse::Recall(RecallResponse::Grep(GrepOutcome {
+            matches,
+            exhausted,
+            candidate_count,
+            missing_mounts,
         })))
     }
 }
@@ -1097,17 +1294,62 @@ mod tests {
         assert!(!vaults.root.join("root/Team").exists());
     }
 
+    /// Whole-vault manifests read every mount and merge. Both are enumerations, so a merge
+    /// is the same answer one vault would give.
     #[tokio::test]
-    async fn whole_vault_manifests_are_refused_on_a_multi_mount_router() {
+    async fn whole_vault_manifests_federate_across_every_mount() {
         let vaults = Vaults::new("manifests");
         let router = two_mounts(&vaults);
-        for request in [
-            BackendRequest::walk_markdown(),
-            BackendRequest::top_level_folders(),
-        ] {
-            let error = router.execute(request).await.expect_err("federated");
-            assert!(matches!(error, RouterError::FederationUnsupported { .. }));
-        }
+
+        let notes = router
+            .execute(BackendRequest::walk_markdown())
+            .await
+            .unwrap()
+            .into_markdown_files()
+            .unwrap();
+        // Every mount's notes, in the LOGICAL namespace, sorted -- `find_files` truncates to
+        // a limit, so an unstable order would make one query answer differently run to run.
+        assert_eq!(notes, vec!["Notes/Deep.md", "Root.md", "Team/Charter.md"]);
+
+        let folders = router
+            .execute(BackendRequest::top_level_folders())
+            .await
+            .unwrap()
+            .into_folders()
+            .unwrap();
+        // The root mount's own folder plus the nested mount's prefix. `Team` appears because
+        // the mount makes it exist logically, exactly as it does in a root `list_children`.
+        assert_eq!(folders, vec!["Notes", "Team"]);
+    }
+
+    /// A mount that cannot be enumerated fails the whole listing, by name.
+    ///
+    /// The alternative -- returning the mounts that DID answer -- would tell a client the
+    /// missing mount's notes do not exist, and a `Vec<String>` has nowhere to say otherwise.
+    #[tokio::test]
+    async fn a_mount_that_cannot_be_enumerated_fails_the_whole_manifest_by_name() {
+        let vaults = Vaults::new("manifest-broken");
+        let router = VaultRouter::new(vec![
+            Mount::new("vault", "", vaults.vault("root", &[("Root.md", "root")])),
+            Mount::new(
+                "team",
+                "Team",
+                Arc::new(FilesystemVaultBackend::new(vaults.absent("gone"))),
+            ),
+        ])
+        .expect("router");
+
+        let error = router
+            .execute(BackendRequest::walk_markdown())
+            .await
+            .expect_err("a missing mount must not be silently dropped");
+        assert!(matches!(
+            error,
+            RouterError::MountEnumerationFailed { ref mount, .. } if mount == "team"
+        ));
+        let message = error.to_string();
+        assert!(message.contains("'team'"), "{message}");
+        assert!(message.contains("nonexistent"), "{message}");
     }
 
     #[tokio::test]
@@ -1345,24 +1587,84 @@ mod tests {
         }
     }
 
+    /// A grep that names no folder searches EVERY mount and concatenates.
+    ///
+    /// This replaced a refusal. A glob with no literal prefix (absent, `*.md`, `**/*.md`) is a
+    /// filter with no subtree in it, so the same glob is correct against every mount; and grep
+    /// produces matches rather than a ranking, so appending them is the answer one vault would
+    /// have given.
     #[tokio::test]
-    async fn an_unscoped_grep_is_refused_on_a_multi_mount_router() {
+    async fn an_unscoped_grep_federates_across_every_mount() {
         let vaults = Vaults::new("grep-unscoped");
         let router = two_mounts(&vaults);
-        // No glob at all, and globs that filter by basename across the whole walk:
-        // none of them narrow to a mount, so answering from one would present
-        // partial results as complete.
-        for request in [grep(None), grep(Some("*.md")), grep(Some("**/*.md"))] {
-            let error = router.execute(request).await.expect_err("unscoped");
-            assert!(matches!(
-                error,
-                RouterError::FederationUnsupported {
-                    operation: "grep_search",
-                    ..
-                }
-            ));
-            assert!(error.to_string().contains("glob"));
+        if !grep_available(&router) {
+            return;
         }
+        for request in [grep(None), grep(Some("*.md")), grep(Some("**/*.md"))] {
+            let outcome = router
+                .execute(request)
+                .await
+                .unwrap()
+                .into_grep_outcome()
+                .unwrap();
+            let paths: Vec<&str> = outcome
+                .matches
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect();
+            // The match lives on the TEAM mount. Before federation this query returned an
+            // error; answering it from the root mount would have returned zero matches for
+            // text that is in the vault.
+            assert_eq!(paths, vec!["Team/Charter.md"]);
+            assert!(outcome.exhausted, "every mount read everything");
+            assert!(outcome.missing_mounts.is_empty());
+        }
+    }
+
+    /// A mount that fails degrades a federated grep instead of destroying it.
+    ///
+    /// Unlike a whole-vault manifest, a grep result HAS somewhere to put the shortfall, so the
+    /// surviving mounts' matches are returned with the failure named.
+    #[tokio::test]
+    async fn a_failed_mount_degrades_a_federated_grep_and_is_named() {
+        let vaults = Vaults::new("grep-broken");
+        let router = VaultRouter::new(vec![
+            Mount::new("vault", "", vaults.vault("root", &[("Root.md", "charter")])),
+            Mount::new(
+                "team",
+                "Team",
+                Arc::new(FilesystemVaultBackend::new(vaults.absent("gone"))),
+            ),
+        ])
+        .expect("router");
+        if !router.mounts()[0]
+            .backend
+            .descriptor()
+            .supports(Capability::GrepSearch)
+        {
+            return;
+        }
+
+        let outcome = router
+            .execute(grep(None))
+            .await
+            .unwrap()
+            .into_grep_outcome()
+            .unwrap();
+        assert_eq!(
+            outcome
+                .matches
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Root.md"],
+            "the healthy mount's matches survive"
+        );
+        assert_eq!(outcome.missing_mounts, vec!["team"]);
+        assert!(
+            !outcome.exhausted,
+            "a lost mount means the search did not look everywhere"
+        );
     }
 
     #[tokio::test]
@@ -1401,12 +1703,18 @@ mod tests {
         .expect("router");
 
         // "Team/**" resolves to the root mount, but the Team/Alpha mount lives
-        // inside that scope, so a single-mount run would silently miss it.
+        // inside that scope, so a single-mount run would silently miss it. Federating it is
+        // not available either: the glob is written in the LOGICAL namespace and rewriting a
+        // subtree pattern per mount is not generally sound, so this stays a refusal -- and
+        // the remedy names both things that do work.
         let error = router
             .execute(grep(Some("Team/**/*.md")))
             .await
             .expect_err("nested mount in scope");
         assert!(matches!(error, RouterError::FederationUnsupported { .. }));
+        let message = error.to_string();
+        assert!(message.contains("Team/Alpha"), "{message}");
+        assert!(message.contains("**/*.md"), "{message}");
 
         // Scoping tightly enough to name exactly one mount does work.
         if !grep_available(&router) {

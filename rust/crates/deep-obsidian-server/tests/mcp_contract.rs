@@ -108,6 +108,7 @@ impl Fixture {
 
     fn config(&self) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            federated_rerank: true,
             vault_path: self.vault_path.clone(),
             index_dir: self.index_dir.clone(),
             // Legacy shape: no declared mounts, so the router synthesizes the one
