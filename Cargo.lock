@@ -622,6 +622,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "deep-obsidian-algolia",
  "deep-obsidian-backend",
  "deep-obsidian-config",
  "deep-obsidian-core",

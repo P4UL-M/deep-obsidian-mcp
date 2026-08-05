@@ -894,6 +894,25 @@ pub trait VaultBackend: Send + Sync {
     fn as_couchdb(&self) -> Option<&couchdb::CouchDbVaultBackend> {
         None
     }
+
+    /// This backend as an Algolia vault, when it is one.
+    ///
+    /// The same bargain as [`VaultBackend::as_couchdb`], for the same reason. The
+    /// `algolia` CLI family is provider-specific by definition: `seed` imports a local
+    /// folder into an index, `dump`/`restore` are the backup-and-exit story for a corpus
+    /// whose only copy lives in a search index, `retract` purges a note's history, and
+    /// `key` derives a secured API key. Every one of those speaks Algolia — index names,
+    /// version records, ACLs — and none of them means anything on a filesystem mount, so
+    /// none of them belongs on the trait as a request family.
+    ///
+    /// What is NOT behind this accessor matters as much: everything the SERVER does with
+    /// an Algolia mount still goes through `execute`, so the boundary stays the only way
+    /// the MCP surface reaches any storage. This is the CLI's admission that it is
+    /// talking to one specific provider, and the `None` default means a new backend gets
+    /// the right answer for free.
+    fn as_algolia(&self) -> Option<&algolia::AlgoliaVaultBackend> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

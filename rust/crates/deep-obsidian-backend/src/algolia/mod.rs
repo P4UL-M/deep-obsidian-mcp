@@ -674,6 +674,146 @@ impl VaultBackend for AlgoliaVaultBackend {
     fn changes(&self, _after: Option<OpaqueCursor>) -> ChangeStream {
         ChangeStream::empty()
     }
+
+    fn as_algolia(&self) -> Option<&AlgoliaVaultBackend> {
+        Some(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The CLI's window
+// ---------------------------------------------------------------------------
+
+/// What `algolia status` reports about one mount.
+///
+/// Every field is OBSERVED against the account when the report is built. That rules out
+/// the tempting shortcut of reading the backend's own `main_provisioned` /
+/// `history_provisioned` flags: those are per-process latches that say "this process has
+/// already applied the settings", so in a freshly-started CLI they are always `false` and
+/// reporting them would tell an operator their index is unprovisioned when it is fine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlgoliaMountStatus {
+    /// The main index answered a request. False for an unreachable account, a rejected
+    /// key, and an index that does not exist yet — the three are distinguished by
+    /// `main_provisioned` and `notes` below rather than collapsed here.
+    pub reachable: bool,
+    /// The main index exists and carries faceting settings, i.e. the corpus has been
+    /// written to at least once and provisioning succeeded. An index with records but no
+    /// settings is a real state (a failed settings call is non-fatal by design), and it
+    /// is worth naming because facet queries — every folder listing — fail in it.
+    pub main_provisioned: bool,
+    /// Same for the `_history` index, which does not exist until a note is first
+    /// superseded. `false` on a young corpus is normal, not a fault.
+    pub history_provisioned: bool,
+    /// Live (non-tombstoned) notes in the main index.
+    pub notes: usize,
+    /// Superseded versions in the history index. Not a total: the head of each note is
+    /// in the main index and is not counted here.
+    pub superseded_versions: usize,
+    /// Notes whose head records a divergence, sorted. Same list `vault_info` reports.
+    pub divergent_paths: Vec<String>,
+    /// `(min_versions, max_age_days)` — the retention keep-set rule this mount applies
+    /// when it purges history.
+    pub retention: (usize, u64),
+    /// `(entries, bytes)` in the local hydrated-note cache.
+    pub cache: (usize, u64),
+}
+
+impl AlgoliaVaultBackend {
+    /// Observe everything `algolia status` prints.
+    ///
+    /// One method rather than a handful of accessors because the fields are only
+    /// meaningful together — "0 notes" means something different on an unreachable mount
+    /// than on a provisioned one — and because it keeps [`AlgoliaVaultBackend::client`]
+    /// `pub(crate)`. A CLI that could reach the raw client could also reach the API key.
+    ///
+    /// Never fails: every probe degrades to a reported absence, because the whole point
+    /// of a status command is to describe a broken mount rather than to fail like one.
+    pub async fn status(&self) -> AlgoliaMountStatus {
+        let reachable = reads::probe_reachable(self).await;
+        let notes = reads::walk_markdown(self)
+            .await
+            .map(|files| files.len())
+            .unwrap_or(0);
+        let superseded_versions = empty_if_missing_index(
+            // `recordType:note` only: a history record set also holds one CHUNK record
+            // per chunk of every superseded version, and counting those would report a
+            // number an order of magnitude larger than "versions kept".
+            self.client
+                .browse_all(&self.history_index, Some("recordType:note"))
+                .await,
+            Vec::new(),
+        )
+        .map(|records| records.len())
+        .unwrap_or(0);
+        AlgoliaMountStatus {
+            reachable,
+            main_provisioned: index_has_faceting(&self.client, &self.index_name).await,
+            history_provisioned: index_has_faceting(&self.client, &self.history_index).await,
+            notes,
+            superseded_versions,
+            divergent_paths: reads::divergent_paths(self).await.unwrap_or_default(),
+            retention: self.retention,
+            cache: self.cache.stats(),
+        }
+    }
+
+    /// Permanently remove a note: its head, its chunks, and its ENTIRE history.
+    ///
+    /// # Why this is not a `BackendRequest`
+    ///
+    /// Deliberately unreachable through [`VaultBackend::execute`], which is what keeps it
+    /// off the MCP surface. Every other removal on this mount is a soft delete: the
+    /// content survives in history and a versioned read can bring it back. This one
+    /// destroys it, and no amount of tool-description wording makes that safe to hand an
+    /// agent — the agent cannot judge whether the human wanted the history gone. PR #40
+    /// drew the same line and it is worth restating: `retract` exists because a mistaken
+    /// push into a SHARED corpus must be withdrawable by a person, and only by a person.
+    ///
+    /// Gated on `writable` like every other mutation. Two delete-by-query calls, main
+    /// then history, both keyed on `noteId` so the note record and every chunk record of
+    /// every version go together — a purge that removed the head and left the chunks
+    /// would leave orphaned text that search still matches.
+    pub async fn retract_note(&self, remote_path: &str) -> Result<(), BackendError> {
+        self.ensure_writable()?;
+        ensure_vault_relative(remote_path)?;
+        let filter = format!("noteId:{}", quote_filter_value(remote_path));
+        // The main index first. If the second call fails, what is left behind is history
+        // for a note that no longer exists — inert, and reported. The other order would
+        // leave a live head whose history had been destroyed, which is worse.
+        empty_if_missing_index(
+            self.client.delete_by_query(&self.index_name, &filter).await,
+            serde_json::Value::Null,
+        )?;
+        empty_if_missing_index(
+            self.client
+                .delete_by_query(&self.history_index, &filter)
+                .await,
+            serde_json::Value::Null,
+        )?;
+        self.cache.remove(remote_path);
+        Ok(())
+    }
+}
+
+/// Whether an index exists AND carries faceting settings.
+///
+/// The same test [`ensure_index_settings`] uses to decide an index is already configured,
+/// so `status` cannot disagree with the code that does the provisioning. A missing index
+/// and an unreachable account both answer `false`; the caller distinguishes them with
+/// `reachable`.
+async fn index_has_faceting(client: &AlgoliaClient, index: &str) -> bool {
+    client
+        .get_settings(index)
+        .await
+        .map(|current| {
+            current
+                .get("attributesForFaceting")
+                .and_then(|value| value.as_array())
+                .map(|list| !list.is_empty())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------

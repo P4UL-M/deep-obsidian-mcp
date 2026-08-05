@@ -1,3 +1,4 @@
+pub mod algolia_cmd;
 pub mod cli;
 pub mod commands;
 pub mod config;
