@@ -49,6 +49,30 @@ class DeepObsidianMcp < Formula
       setup-service --skills copies them into Codex and Claude Code skill directories.
       setup-service --mcp configures Codex and Claude Code MCP client entries.
       setup-service --vault-snippets copies packaged Obsidian snippets into the vault and enables them.
+
+      EXPERIMENTAL multi-backend mounts (couchdb, algolia) are opt-in per mount and are
+      configured by editing config.json by hand — setup-service deliberately does not
+      rewrite a mount table. `deep-obsidian-mcp print-config` shows what this build reads.
+
+      A couchdb (Self-hosted LiveSync) mount additionally needs the LiveSync sidecar,
+      which this formula does NOT install: the bundle is a build artifact that is not in
+      the release tarball, and building it needs network access during `brew install`.
+      To use a couchdb mount, install Node 20 or newer and build the bundle from a source
+      checkout:
+        brew install node
+        git clone https://github.com/P4UL-M/deep-obsidian-mcp
+        cd deep-obsidian-mcp/sidecar/livesync-sidecar && npm ci && npm run build
+      Then point the mount at it, either per mount with "sidecarPath" in config.json, or
+      globally:
+        export DEEP_OBSIDIAN_LIVESYNC_SIDECAR=/path/to/dist/sidecar.mjs
+
+      Alternatively, copy the built bundle into the location the binary probes for on its
+      own, which needs no configuration at all:
+        #{opt_pkgshare}/sidecar/livesync-sidecar/dist/sidecar.mjs
+
+      `deep-obsidian-mcp doctor` reports, per mount, whether the bundle and a suitable
+      Node were found. Every other mount kind — including the default filesystem vault —
+      needs no Node at all.
     EOS
   end
 

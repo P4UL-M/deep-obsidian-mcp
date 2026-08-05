@@ -686,6 +686,7 @@ mod tests {
 
     fn couchdb_mount(id: &str, mount_at: &str) -> MountConfig {
         MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: id.to_string(),
             mount_at: mount_at.to_string(),
@@ -733,6 +734,7 @@ mod tests {
         let config = config_with(
             vec![
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
@@ -772,6 +774,7 @@ mod tests {
         let config = config_with(vec![], index_dir.clone());
 
         let root = MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: "vault".to_string(),
             mount_at: String::new(),

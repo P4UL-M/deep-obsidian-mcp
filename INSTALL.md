@@ -6,11 +6,17 @@ Pick the method for your platform. After installing, continue with the
 - [macOS (Homebrew)](#macos-homebrew)
 - [Debian / Ubuntu (apt)](#debian--ubuntu-apt)
 - [From source](#from-source)
+- [Optional: CouchDB mounts](#optional-couchdb-mounts)
 - [Updating](#updating)
 - [Uninstalling](#uninstalling)
 
 Runtime dependency: [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`).
 The Homebrew and apt packages install it automatically.
+
+**Optional: Node.js 20+**, and only for the experimental `couchdb` (Self-hosted LiveSync)
+mount kind, which runs a small Node sidecar. A filesystem vault — the default and the only
+non-experimental configuration — needs no Node at all, which is why no package makes it a
+hard dependency. See [Optional: CouchDB mounts](#optional-couchdb-mounts).
 
 ## macOS (Homebrew)
 
@@ -58,6 +64,12 @@ The package installs the binary to `/usr/bin`, packaged templates to
 `/usr/lib/systemd/user/`. Deeper detail (systemd, building the `.deb`, the APT
 repo internals): [docs/debian-package.md](./docs/debian-package.md).
 
+The `.deb` also ships the LiveSync sidecar bundle at
+`/usr/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs`, and `Recommends:
+nodejs (>= 20)` rather than depending on it. Debian 12's archive has nodejs 18, so on
+bookworm apt will skip that recommendation — install Node 20+ from backports or NodeSource
+only if you want a `couchdb` mount.
+
 ## From source
 
 Requires a [Rust toolchain](https://rustup.rs) and `ripgrep` on your `PATH`.
@@ -82,6 +94,60 @@ Workspace commands:
 cargo check --workspace
 cargo test --workspace
 ```
+
+## Optional: CouchDB mounts
+
+Needed only if you configure an **experimental** `couchdb` (Self-hosted LiveSync) mount.
+Such a mount reads the vault through a small Node sidecar, so it needs two things: the
+built sidecar bundle, and Node 20 or newer.
+
+**Where the bundle has to be.** The binary finds it relative to its own location: from
+`<prefix>/bin/deep-obsidian-mcp` it looks for
+`<prefix>/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs`. No
+environment variable is involved in a packaged install — neither the systemd unit nor the
+`brew services` plist sets one.
+
+| Install method | Bundle | What you need to do |
+|---|---|---|
+| apt / `.deb` | **Shipped** at `/usr/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs` | Install Node 20+ (`Recommends`, so apt may have skipped it) |
+| Homebrew | **Not shipped** — it is a build artifact absent from the release tarball, and building it needs network access `brew install` restricts | Install Node 20+ and build the bundle (below) |
+| From source | Built by you | `npm ci && npm run build` (below) |
+
+Build the bundle from a source checkout:
+
+```bash
+cd sidecar/livesync-sidecar
+npm ci && npm run build      # writes dist/sidecar.mjs
+```
+
+A source checkout is found automatically. For a Homebrew install, either copy the bundle
+into the probed location:
+
+```bash
+mkdir -p "$(brew --prefix)/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist"
+cp dist/sidecar.mjs "$(brew --prefix)/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/"
+```
+
+...or point at it explicitly, per mount with `"sidecarPath"` in `config.json`, or globally:
+
+```bash
+export DEEP_OBSIDIAN_LIVESYNC_SIDECAR=/path/to/dist/sidecar.mjs
+export DEEP_OBSIDIAN_NODE=/path/to/node     # only if `node` is not on the service's PATH
+```
+
+Verify — this contacts no CouchDB and needs no credentials:
+
+```bash
+deep-obsidian-mcp doctor
+```
+
+It prints, per couchdb mount, whether the bundle was located and whether Node satisfies
+the `>= 20` floor. Neither is reported as a failure: a couchdb mount is experimental and
+cannot be the vault root, so the root vault keeps serving without it. Add
+`--probe-remote` to also contact the remote read-only once credentials are configured.
+
+Moving notes onto — and back off — a remote mount:
+[docs/migration-and-rollback.md](./docs/migration-and-rollback.md).
 
 ## Updating
 

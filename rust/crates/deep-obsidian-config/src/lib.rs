@@ -2,7 +2,7 @@ use deep_obsidian_types::{
     AuthConfig, AuthConfigInput, AutoReindexConfig, AutoReindexConfigInput, EmbeddingConfig,
     EmbeddingConfigInput, EmbeddingProvider, HttpConfig, HttpConfigInput, MountBackendConfig,
     MountConfig, PersistedServiceConfig, ResolvedServiceConfig, ServiceConfigInput, StdioMode,
-    TransportMode,
+    TransportMode, UnknownFields,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -576,6 +576,11 @@ fn normalize_mounts(mounts: Vec<MountConfig>) -> Result<(Vec<MountConfig>, usize
             mount_at,
             backend: expand_mount_backend_paths(mount.backend),
             recall_weight: mount.recall_weight,
+            // Carried, not defaulted: this is the one place a mount is rebuilt field
+            // by field, so dropping the retained keys here would make the retention on
+            // `MountConfig` a no-op for every config that actually goes through the
+            // loader — i.e. all of them.
+            unknown: mount.unknown,
         });
     }
 
@@ -718,6 +723,9 @@ pub fn is_loopback_host(host: &str) -> bool {
 pub fn normalize_persisted_config(
     input: PersistedServiceConfig,
 ) -> Result<PersistedServiceConfig, ConfigError> {
+    // Persisted in, persisted out: this is the one transform where retention is
+    // unambiguous, so it is applied here rather than left to the caller.
+    let retained = input.unknown.clone();
     let resolved = normalize_service_config(ServiceConfigInput {
         vault_path: input.vault_path,
         mounts: input.mounts,
@@ -734,7 +742,9 @@ pub fn normalize_persisted_config(
         config_file_path: None,
     })?;
 
-    Ok(to_persisted_config(&resolved))
+    let mut persisted = to_persisted_config(&resolved);
+    persisted.unknown = retained;
+    Ok(persisted)
 }
 
 pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceConfig {
@@ -825,6 +835,43 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
         } else {
             Some(false)
         },
+        // Empty here because a `ResolvedServiceConfig` does not carry them: the
+        // resolved form is the SERVER's view, and threading a bag of keys it cannot
+        // interpret through every one of its construction sites would buy nothing.
+        // The writer restores them from the file it is about to replace — see
+        // [`carry_unknown_fields`], which every config writer must call.
+        unknown: UnknownFields::new(),
+    }
+}
+
+/// Restore into `config` the unknown keys `previous` carried, so writing `config`
+/// back does not delete them.
+///
+/// # Why this is a separate step rather than part of `to_persisted_config`
+///
+/// [`to_persisted_config`] takes a [`ResolvedServiceConfig`], which is the server's
+/// interpreted view and deliberately holds no uninterpretable keys. The retained keys
+/// only exist on the [`PersistedServiceConfig`] that `read_config_file` produced, so
+/// only a caller holding BOTH — i.e. a writer that loaded the file it is replacing —
+/// can reunite them. `setup-service` and the wizard are those callers.
+///
+/// # Precedence
+///
+/// A key this build DOES understand always wins: `config` was built from the resolved
+/// configuration, so anything already present there is the user's current intent.
+/// Only keys absent from `config` are taken from `previous`. Mount-level unknowns need
+/// no help here — [`MountConfig`] carries its own through the loader.
+///
+/// A no-op when `previous` is `None` (first write) or carries nothing unknown.
+pub fn carry_unknown_fields(
+    config: &mut PersistedServiceConfig,
+    previous: Option<&PersistedServiceConfig>,
+) {
+    let Some(previous) = previous else { return };
+    for (key, value) in &previous.unknown {
+        if !config.unknown.contains_key(key) {
+            config.unknown.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -1011,8 +1058,9 @@ pub mod secrets;
 #[cfg(test)]
 mod tests {
     use super::{
-        default_mount_index_dir, default_packaged_index_dir, expand_home_path, is_loopback_host,
-        normalize_persisted_config, normalize_service_config, to_persisted_config, ConfigError,
+        carry_unknown_fields, default_mount_index_dir, default_packaged_index_dir,
+        expand_home_path, is_loopback_host, normalize_persisted_config, normalize_service_config,
+        read_config_file, to_persisted_config, write_config_file, ConfigError,
         DEFAULT_CONFIG_APP_DIR,
     };
     use deep_obsidian_types::{
@@ -1021,12 +1069,28 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    /// A process- and test-unique scratch directory. The config crate has no
+    /// `tempfile` dependency and does not need one: nothing here races on a name that
+    /// carries both the pid and a per-call counter.
+    fn temp_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "deep-obsidian-config-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
     // -----------------------------------------------------------------------
     // Mount table helpers
     // -----------------------------------------------------------------------
 
     fn filesystem_mount(id: &str, mount_at: &str, vault_path: &str) -> MountConfig {
         MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: id.to_string(),
             mount_at: mount_at.to_string(),
@@ -1292,6 +1356,7 @@ mod tests {
         let resolved = normalize_service_config(mounts_input(
             vec![
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
@@ -1302,6 +1367,7 @@ mod tests {
                 },
                 // A non-root mount's indexDir is accepted but not consumed yet.
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: "team".to_string(),
                     mount_at: "Team".to_string(),
@@ -1322,6 +1388,7 @@ mod tests {
             index_dir: Some(PathBuf::from("/tmp/top-level")),
             ..mounts_input(
                 vec![MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
@@ -1533,6 +1600,7 @@ mod tests {
 
     fn couchdb_mount(id: &str, mount_at: &str) -> MountConfig {
         MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: id.to_string(),
             mount_at: mount_at.to_string(),
@@ -1714,6 +1782,7 @@ mod tests {
 
     fn algolia_mount(id: &str, mount_at: &str) -> MountConfig {
         MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: id.to_string(),
             mount_at: mount_at.to_string(),
@@ -2072,5 +2141,205 @@ mod tests {
         )
         .expect_err("an unknown provider must be refused");
         assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Unknown-field retention across a load -> save round trip
+    // -----------------------------------------------------------------------
+
+    /// The discriminating test for config upgrade safety, and it is deliberately at
+    /// FILE level rather than serde level: a `PersistedServiceConfig -> JSON ->
+    /// PersistedServiceConfig` round trip would pass while the real path
+    /// (`read_config_file` -> normalize -> `to_persisted_config` ->
+    /// `write_config_file`) still dropped everything in the middle.
+    ///
+    /// The failure this pins: a config written by a NEWER build, rewritten by an OLDER
+    /// binary, must not silently lose the newer build's settings.
+    #[test]
+    fn unknown_fields_survive_a_real_load_normalize_save_round_trip() {
+        for extension in ["json", "toml"] {
+            let root = temp_dir(&format!("unknown-{extension}"));
+            let vault = root.join("vault");
+            std::fs::create_dir_all(&vault).expect("vault dir");
+            let config_path = root.join(format!("config.{extension}"));
+
+            // Hand-written as JSON regardless of the target format, then re-rendered
+            // through the crate's own writer so both formats are produced by the code
+            // under test rather than by a hand-built fixture.
+            let seeded: PersistedServiceConfig = serde_json::from_value(serde_json::json!({
+                "indexDir": root.join("index"),
+                "transport": "http",
+                "futureTopLevelKnob": {"nested": {"deeper": [1, 2, 3]}, "flag": true},
+                // A SCALAR unknown next to the nested one, deliberately: a flattened
+                // map serializes after the struct's own fields, several of which are
+                // TOML tables (`http`, `autoReindex`), and a TOML serializer rejects a
+                // bare value emitted after a table (`ValueAfterTable`). This is the
+                // case that would make the `.toml` branch fail while the `.json` one
+                // passed.
+                "futureFlag": true,
+                "experimental": {"multiVault": true},
+                "mounts": [
+                    {
+                        "id": "vault",
+                        "mountAt": "",
+                        "backend": {"kind": "filesystem", "vaultPath": vault},
+                        "futureMountKnob": "keep me"
+                    },
+                    {
+                        "id": "team",
+                        "mountAt": "Team",
+                        "backend": {"kind": "filesystem", "vaultPath": vault},
+                        "recallWeight": 2.0
+                    }
+                ]
+            }))
+            .expect("seed config parses");
+            // Retention on the way IN: the keys reached the struct rather than being
+            // dropped by the deserializer.
+            assert!(
+                seeded.unknown.contains_key("futureTopLevelKnob"),
+                "{extension}: top-level unknown must be captured on read"
+            );
+            write_config_file(&config_path, &seeded).expect("seed written");
+
+            // ...and it is still in the FILE, not just in the struct.
+            let text = std::fs::read_to_string(&config_path).expect("seed text");
+            assert!(
+                text.contains("futureTopLevelKnob") && text.contains("futureMountKnob"),
+                "{extension}: seeded file must carry both unknown keys: {text}"
+            );
+
+            // The real load path.
+            let loaded = read_config_file(&config_path)
+                .expect("load")
+                .expect("config exists");
+            let resolved = normalize_service_config(ServiceConfigInput {
+                mounts: loaded.mounts.clone(),
+                experimental: loaded.experimental.clone(),
+                index_dir: loaded.index_dir.clone(),
+                transport: loaded.transport,
+                ..ServiceConfigInput::default()
+            })
+            .expect("normalize");
+
+            // The real save path, exactly as a writer performs it.
+            let mut persisted = to_persisted_config(&resolved);
+            carry_unknown_fields(&mut persisted, Some(&loaded));
+            write_config_file(&config_path, &persisted).expect("rewrite");
+
+            // Re-read the FILE: both keys are still there, with their values intact.
+            let reloaded = read_config_file(&config_path)
+                .expect("reload")
+                .expect("config exists");
+            assert_eq!(
+                reloaded.unknown.get("futureTopLevelKnob"),
+                Some(&serde_json::json!({"nested": {"deeper": [1, 2, 3]}, "flag": true})),
+                "{extension}: a nested top-level unknown must survive verbatim"
+            );
+            assert_eq!(
+                reloaded.unknown.get("futureFlag"),
+                Some(&serde_json::json!(true)),
+                "{extension}: a SCALAR top-level unknown must survive too — this is the \
+                 value-after-table case for TOML"
+            );
+            let mounts = reloaded.mounts.expect("mounts round-tripped");
+            assert_eq!(
+                mounts[0].unknown.get("futureMountKnob"),
+                Some(&serde_json::json!("keep me")),
+                "{extension}: a mount-level unknown must survive verbatim"
+            );
+            // A mount that had none must not acquire one.
+            assert!(
+                mounts[1].unknown.is_empty(),
+                "{extension}: retention must not invent keys: {:?}",
+                mounts[1].unknown
+            );
+            // Known fields are untouched by the retention machinery.
+            assert_eq!(mounts[1].recall_weight, Some(2.0));
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A config with no unknown keys serializes byte-identically to before retention
+    /// existed: the flattened map is skipped when empty, so no `"unknown": {}` key and
+    /// no reordering appears in anybody's file.
+    #[test]
+    fn retention_adds_nothing_to_a_config_that_has_no_unknown_keys() {
+        // The label deliberately avoids the word this test greps for: it lands in the
+        // temp path, which is written into the file as `vaultPath`.
+        let root = temp_dir("no-extra-keys");
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("vault dir");
+        let config_path = root.join("config.json");
+
+        let mut config = PersistedServiceConfig {
+            vault_path: Some(vault.clone()),
+            ..PersistedServiceConfig::default()
+        };
+        carry_unknown_fields(&mut config, None);
+        write_config_file(&config_path, &config).expect("write");
+
+        // Asserted on the parsed KEY SET rather than on the text, so a path or value
+        // that happens to contain the word cannot make this pass or fail by accident.
+        // (`serde_json::Map` is a `BTreeMap` here — no `preserve_order` feature — so
+        // the set comes back sorted; the set is what matters, not the file's order.)
+        let keys: Vec<String> = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            &std::fs::read_to_string(&config_path).expect("read"),
+        )
+        .expect("valid json object")
+        .keys()
+        .cloned()
+        .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "artifactEmbedding",
+                "autoReindex",
+                "embedding",
+                "http",
+                "indexDir",
+                "stdioMode",
+                "transport",
+                "vaultPath"
+            ],
+            "retention must add no key"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Pins the KNOWN LIMIT of the retention policy rather than a desirable property:
+    /// a key inside a backend variant is still dropped.
+    ///
+    /// `MountBackendConfig` is internally tagged (`kind`) and every variant has a
+    /// `#[serde(default)]` field, and serde supports neither `flatten` nor
+    /// `deny_unknown_fields` on such a variant — verified, not assumed: adding
+    /// `deny_unknown_fields` to the `filesystem` variant fails to compile
+    /// (`missing_field` requires `Deserialize`, which the generated content path
+    /// cannot satisfy). So this level can be neither retained nor failed closed
+    /// without making the enum externally tagged, which is a breaking config change.
+    ///
+    /// The test exists so the gap is recorded where someone extending a backend's
+    /// options will see it, instead of being discovered by a user whose downgraded
+    /// install quietly deleted a `couchdb` setting.
+    #[test]
+    fn a_backend_level_unknown_key_is_still_dropped_a_documented_gap() {
+        let mount: MountConfig = serde_json::from_value(serde_json::json!({
+            "id": "vault",
+            "mountAt": "",
+            "backend": {"kind": "filesystem", "vaultPath": "/vault", "futureBackendKnob": 1}
+        }))
+        .expect("a backend-level unknown parses (it is dropped, not refused)");
+        // Not hoisted into the mount's retained map either: the key belonged to the
+        // nested object, and inventing a top-level home for it would write a config
+        // that means something different from the one that was read.
+        assert!(mount.unknown.is_empty());
+        let text = serde_json::to_string(&mount).expect("serialize");
+        assert!(
+            !text.contains("futureBackendKnob"),
+            "if this now round-trips, the gap closed and this test should assert that \
+             instead: {text}"
+        );
     }
 }

@@ -11,8 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use deep_obsidian_config::{
-    build_service_endpoints, default_mount_index_dir, default_packaged_index_dir,
-    render_config_text, secrets::SecretResolver, to_persisted_config, write_config_file,
+    build_service_endpoints, carry_unknown_fields, default_mount_index_dir,
+    default_packaged_index_dir, render_config_text, secrets::SecretResolver, to_persisted_config,
+    write_config_file,
 };
 use deep_obsidian_server::{run_http_service, run_stdio_service};
 use deep_obsidian_types::{
@@ -36,7 +37,7 @@ Usage:
   deep-obsidian-mcp [serve] [--config <path>] [--vault <path>] [--transport stdio|http] [--packaged]
   deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--auth|--no-auth] [--dry-run]
   deep-obsidian-mcp setup-service --wizard [--config <path>] [--dry-run]
-  deep-obsidian-mcp doctor [--config <path>] [--json]
+  deep-obsidian-mcp doctor [--config <path>] [--json] [--probe-remote]
   deep-obsidian-mcp print-config [--config <path>]
   deep-obsidian-mcp probe [--config <path>] [--json]
   deep-obsidian-mcp couchdb export --mount <id> --out <dir> [--config <path>] [--json]
@@ -58,6 +59,19 @@ Commands:
   algolia        Seed, dump, restore, inspect and scope an Algolia-backed shared corpus.
   help           Show this help.
   version        Print the current version.
+
+doctor prints one block of checks per declared mount. The local ones always run and
+contact nothing: a filesystem mount's directory, and for a couchdb mount whether the
+LiveSync sidecar bundle was located and whether a Node >= 20 is present. --probe-remote
+additionally contacts each couchdb and algolia mount READ-ONLY -- one handshake or one
+getSettings, no data method -- which is opt-in because it needs credentials and network.
+A remote-backed mount that cannot be reached is a warn, never a fail: those mounts are
+experimental and non-root, so the vault root keeps serving without them.
+
+setup-service does NOT rewrite a config that declares a mount table, with or without
+--overwrite, and refuses an auth change on one. Edit such a file by hand; --mcp,
+--skills and --vault-snippets still work. A content-changing write of an ordinary config
+leaves the previous file at config.json.bak.
 
 couchdb export writes every entry of one mount to a directory, plus a manifest.json
 recording each entry's revision, content hash and storage kind. Two exports of an
@@ -345,9 +359,12 @@ pub async fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Doctor { probe_timeout_ms } => {
+        Command::Doctor {
+            probe_timeout_ms,
+            probe_remote,
+        } => {
             let resolved = crate::config::resolve_runtime_config(&cli.options)?;
-            let report = doctor(&resolved, probe_timeout_ms).await?;
+            let report = doctor(&resolved, probe_timeout_ms, probe_remote).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -935,31 +952,91 @@ pub fn setup_service(
     interactive_auth: bool,
 ) -> Result<SetupServiceReport> {
     let mut service = ensure_service_transport_http(resolved.service.clone())?;
-    // Refused rather than half-handled. `setup-service` rewrites the vault path to
-    // an absolute one, derives the packaged index dir from it, and runs the macOS
-    // TCC preflight against it -- all through `service.vault_path`, which is only
-    // the ROOT mount. For a declared mount table that would silently absolutize
-    // nothing (`to_persisted_config` omits `vaultPath` when `mounts` is set, so the
-    // rewrite would be discarded) and would preflight only one of the vaults.
-    // Making it per-mount means making the packaged index dir per-mount too, which
-    // is the per-mount-index slice.
-    if !service.mounts.is_empty() {
-        anyhow::bail!(
-            "setup-service does not support a multi-mount config yet: it would absolutize and preflight only the root mount's vault. Edit {} by hand, or use a single top-level vaultPath.",
-            resolved.config_path.display()
-        );
-    }
-    service.vault_path = absolute_path(&service.vault_path)?;
-    if matches!(resolved.sources.index_dir, ResolvedSource::Default) {
-        service.index_dir = default_packaged_index_dir(&service.vault_path);
-    }
+    // A DECLARED mount table is never rewritten — but the command no longer refuses
+    // outright either, because refusing took `--mcp`, `--skills` and `--vault-snippets`
+    // down with it and left the operator of a multi-mount install with no supported way
+    // to register the server with their agent.
+    //
+    // What is skipped, and why it must be:
+    //
+    // * The config WRITE. `to_persisted_config` omits `vaultPath` when `mounts` is set,
+    //   so the vault-path rewrite below would be silently discarded; worse, a write
+    //   would re-render the mount table from this build's understanding of it, which is
+    //   exactly the clobber the `.bak` logic exists to make recoverable. Not writing at
+    //   all is stronger than writing recoverably.
+    // * The vault-path ABSOLUTIZE and the packaged index-dir derivation. Both act on
+    //   `service.vault_path`, which for a mount table is only the ROOT mount, and
+    //   per-mount index dirs are derived by the runtime rather than persisted here.
+    // * The macOS TCC PREFLIGHT, which would prompt for one vault and leave the others
+    //   silently unapproved — a worse outcome than saying so.
+    //
+    // Everything that is NOT config — MCP client entries, agent skills, vault snippets,
+    // the endpoint report — proceeds normally.
+    let declared_mounts = !service.mounts.is_empty();
     let config_path = absolute_path(&resolved.config_path)?;
-    validate_vault(&service)?;
-    let vault_access_messages = macos_vault_access_preflight(&service.vault_path, dry_run)?;
+    let mut vault_access_messages = Vec::new();
+    if declared_mounts {
+        vault_access_messages.push(format!(
+            "mounts config detected ({} mounts): leaving {} untouched. setup-service does not \
+             rewrite a declared mount table — edit the file by hand to change mounts, index \
+             directories or per-mount settings.",
+            service.mounts.len(),
+            config_path.display()
+        ));
+        vault_access_messages.push(
+            "skipped: vault-path absolutization, the packaged index-dir default and the macOS \
+             vault-access preflight. Each acts on the root mount only, so applying them to a \
+             mount table would be misleading; give every mount an absolute vaultPath in the \
+             config, and approve vault access per mount if macOS prompts."
+                .to_string(),
+        );
+        if service
+            .mounts
+            .iter()
+            .any(|mount| matches!(mount.backend, MountBackendConfig::Couchdb { .. }))
+        {
+            // Stated because the obvious expectation is the opposite: most tools that
+            // package a helper runtime need an environment variable pointing at it.
+            vault_access_messages.push(format!(
+                "a couchdb mount is configured: the LiveSync sidecar bundle is found relative to \
+                 the installed binary, so no {} is set in any service unit. Run `deep-obsidian-mcp \
+                 doctor` to confirm the bundle and a Node >= 20 are present.",
+                deep_obsidian_backend::sidecar::SIDECAR_BUNDLE_ENV
+            ));
+        }
+    } else {
+        service.vault_path = absolute_path(&service.vault_path)?;
+        if matches!(resolved.sources.index_dir, ResolvedSource::Default) {
+            service.index_dir = default_packaged_index_dir(&service.vault_path);
+        }
+        validate_vault(&service)?;
+        vault_access_messages = macos_vault_access_preflight(&service.vault_path, dry_run)?;
+    }
     let config_dir = config_path
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| config_path.clone());
+
+    // An auth change on a mounts config is REFUSED rather than half-applied. Nothing
+    // below writes the config for such a table, so provisioning would store a bearer
+    // token in the secret store and leave nothing referencing it: `auth.enabled` and
+    // `tokenRef` would stay whatever the file already said. The user would come away
+    // believing authentication was just turned on (or off) when it was not — a silent
+    // security-relevant lie, which is worse than a refusal even though a message is
+    // printed either way. `--no-auth` is refused for the mirror-image reason: it would
+    // deprovision the stored token while the config kept requiring one, breaking every
+    // client with no explanation in the file.
+    if declared_mounts && enable_auth.is_some() {
+        anyhow::bail!(
+            "setup-service cannot change auth on a config that declares a mount table: it does \
+             not rewrite such a file, so the token would be stored with nothing referencing it. \
+             Edit the `auth` section of {} by hand — `deep-obsidian-mcp print-config` shows the \
+             current shape — and put the token in the OS keyring or the encrypted secrets file \
+             at {} under the id the `tokenRef` names.",
+            config_path.display(),
+            deep_obsidian_config::default_secrets_path().display()
+        );
+    }
 
     // Apply the auth choice before building the persisted config so it is
     // reflected in both the dry-run preview and the written file. A change here
@@ -971,7 +1048,11 @@ pub fn setup_service(
     }
     let auth_changed = enable_auth.is_some();
 
-    let config = to_persisted_config(&service);
+    let mut config = to_persisted_config(&service);
+    // A newer build's config keys survive being rewritten by an older binary. Without
+    // this, one `setup-service --overwrite` under a downgraded install silently
+    // deletes every setting this build has never heard of.
+    carry_unknown_fields(&mut config, resolved.config_file.as_ref());
     let mut messages = vec![
         format!("vault: {}", service.vault_path.display()),
         format!("index: {}", service.index_dir.display()),
@@ -979,7 +1060,9 @@ pub fn setup_service(
     ];
     messages.extend(vault_access_messages);
     if dry_run {
-        assert_creatable_directory(&service.index_dir)?;
+        if !declared_mounts {
+            assert_creatable_directory(&service.index_dir)?;
+        }
         assert_creatable_directory(&config_dir)?;
         let endpoints = endpoint_report(&build_service_endpoints(&service));
         let mcp = if install_mcp {
@@ -1014,11 +1097,28 @@ pub fn setup_service(
         });
     }
 
-    ensure_writable_directory(&service.index_dir)?;
+    if !declared_mounts {
+        ensure_writable_directory(&service.index_dir)?;
+    }
     ensure_writable_directory(&config_dir)?;
     let mut wrote_config = false;
     let mut final_messages = messages.clone();
-    if config_path.exists() && !overwrite && !auth_changed {
+    if declared_mounts {
+        // The one path that writes NOTHING to the config, whatever the flags. `--overwrite`
+        // is honoured for the MCP/skills/snippets installers below but deliberately not
+        // here: an operator asking to overwrite their agent config has not asked to have
+        // their mount table regenerated, and a mount table is the one thing in this file
+        // that this command cannot reproduce faithfully.
+        final_messages.push(format!(
+            "config not written: {} declares a mount table, which setup-service does not \
+             rewrite (--overwrite does not apply). Edit it by hand; `deep-obsidian-mcp \
+             print-config` shows what this build reads from it.",
+            config_path.display()
+        ));
+        // `auth_changed` cannot be true here: an auth change on a mounts config is
+        // refused above, precisely so no token is ever stored without a reference.
+        debug_assert!(!auth_changed);
+    } else if config_path.exists() && !overwrite && !auth_changed {
         if !(install_mcp || install_skills || install_vault_snippets) {
             return Err(anyhow!(
                 "config file already exists: {}",
@@ -1085,6 +1185,37 @@ pub fn setup_service(
     })
 }
 
+/// Refuse the wizard on a config that declares a mount table, before the first prompt.
+///
+/// The wizard exists to write a config, and `setup_service` never writes one that declares
+/// a mount table. Left to fall through, the wizard would ask every question and then fail
+/// on the auth guard — the wizard passes `Some(...)` for auth unconditionally — reporting
+/// an *auth* problem for what is really "this command does not edit this kind of file", and
+/// reading as though a different answer could have worked.
+///
+/// Checked on the FILE rather than on the resolved config, because the file is what the
+/// wizard prefills from and what it would overwrite. Split out from the wizard so it is
+/// testable without a stdin.
+fn refuse_wizard_on_a_mounts_config(
+    config_path: &Path,
+    existing: Option<&PersistedServiceConfig>,
+) -> Result<()> {
+    let declares_mounts = existing
+        .and_then(|config| config.mounts.as_ref())
+        .is_some_and(|mounts| !mounts.is_empty());
+    if !declares_mounts {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "the setup wizard cannot edit {}: it declares a mount table, and setup-service does not \
+         rewrite one (a mount table is the one thing in this file it cannot reproduce \
+         faithfully). Edit the file by hand — `deep-obsidian-mcp print-config` shows what this \
+         build reads from it, and `deep-obsidian-mcp doctor` checks each mount. The non-config \
+         installers still work: `setup-service --mcp --skills --vault-snippets`.",
+        config_path.display()
+    ))
+}
+
 fn setup_service_wizard(
     options: &ServiceOptions,
     dry_run: bool,
@@ -1097,14 +1228,26 @@ fn setup_service_wizard(
     // Prefill every prompt from the existing config file so re-running the
     // wizard is an edit, not a from-scratch rewrite: pressing Enter keeps the
     // current value instead of replacing it.
-    let existing = deep_obsidian_config::read_config_file(
-        options
-            .config
-            .clone()
-            .unwrap_or_else(deep_obsidian_config::default_config_path),
-    )
-    .ok()
-    .flatten();
+    let config_path = options
+        .config
+        .clone()
+        .unwrap_or_else(deep_obsidian_config::default_config_path);
+    let existing = deep_obsidian_config::read_config_file(&config_path)
+        .ok()
+        .flatten();
+
+    // Refused HERE, before the first prompt, rather than after the last one.
+    //
+    // The wizard exists to write a config, and `setup_service` never writes one that
+    // declares a mount table. Left to fall through, the wizard would ask every question,
+    // provision nothing, and then fail on the auth guard — reporting an auth problem for
+    // what is really "this command does not edit this kind of file". Worse, it would have
+    // read as though answering differently could work.
+    //
+    // Checked on the FILE rather than on the resolved config because that is what the
+    // wizard prefills from and what it would overwrite.
+    refuse_wizard_on_a_mounts_config(&config_path, existing.as_ref())?;
+
     if options.vault_path.is_none() {
         let existing_vault = existing
             .as_ref()
@@ -1883,6 +2026,7 @@ fn home_dir() -> Result<PathBuf> {
 pub async fn doctor(
     resolved: &ResolvedRuntimeConfig,
     probe_timeout_ms: u64,
+    probe_remote: bool,
 ) -> Result<DoctorReport> {
     let service = resolved.service.clone();
     let endpoints = build_service_endpoints(&service);
@@ -1894,6 +2038,29 @@ pub async fn doctor(
         check_index_file(&index),
         check_rg(),
     ];
+
+    // Per-mount checks, and ONLY for a config that declared a mount table — the same
+    // gate the mount LINES use. A legacy `vaultPath` install's `doctor` output stays
+    // byte-identical: its single implicit root mount is already covered by `vault`,
+    // `index-dir` and `index sqlite`, so adding a `mount.vault` duplicate of `vault`
+    // would be noise.
+    if !service.mounts.is_empty() {
+        for mount in &service.mounts {
+            checks.extend(check_mount_local(mount));
+            if probe_remote {
+                checks.push(probe_mount_remote(&service, mount).await);
+            }
+        }
+    } else if probe_remote {
+        checks.push(CheckReport {
+            name: "mounts.remote".into(),
+            status: "skip".into(),
+            message: "--probe-remote had nothing to probe: this config declares no mounts, so \
+                      its only vault is the local root"
+                .into(),
+            details: None,
+        });
+    }
     let mut health_payload = None;
     let mut readiness_payload = None;
 
@@ -1985,7 +2152,11 @@ pub async fn doctor(
 }
 
 pub fn print_config(resolved: &ResolvedRuntimeConfig, redact: bool) -> Result<PrintConfigReport> {
-    let config = to_persisted_config(&resolved.service);
+    let mut config = to_persisted_config(&resolved.service);
+    // `print-config` is what an operator uses to see what a write would produce, so it
+    // must show the retained keys too — otherwise it would report a file this build is
+    // about to write as if those keys were already gone.
+    carry_unknown_fields(&mut config, resolved.config_file.as_ref());
     let printable = if redact {
         redact_config(&config)
     } else {
@@ -2897,6 +3068,317 @@ fn check_vault(config: &ResolvedServiceConfig) -> CheckReport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-mount doctor checks
+// ---------------------------------------------------------------------------
+
+/// The minimum Node major version the LiveSync sidecar runs on.
+///
+/// Mirrors `sidecar/livesync-sidecar/package.json`'s `engines.node`, and the esbuild
+/// `target: "node20"` the bundle is compiled against — so this is a real floor, not a
+/// conservative guess: the bundle can contain syntax an older Node cannot parse.
+const SIDECAR_NODE_MIN_MAJOR: u64 = 20;
+
+/// Every check for one mount, in a fixed order so `doctor` output is stable.
+///
+/// # What runs when
+///
+/// The LOCAL checks always run: they need no credentials, no network, and no child
+/// process, so there is no reason to make an operator ask for them. For a couchdb mount
+/// that means "is the sidecar bundle present" and "is there a Node that can run it" —
+/// the two failures that make the mount unstartable and that a `.deb` or Homebrew
+/// install can plausibly get wrong.
+///
+/// The REMOTE probe runs only under `--probe-remote`; see [`probe_mount_remote`].
+///
+/// # Redaction
+///
+/// Unchanged from the rest of `doctor`: nothing here resolves a secret except the
+/// remote probe (which needs one to connect and never reports it), and a
+/// [`SecretRef`] is reported by its identifier only, exactly as
+/// [`secret_reference_check`] does for the top-level refs.
+fn check_mount_local(mount: &MountConfig) -> Vec<CheckReport> {
+    let scope = mount_check_scope(mount);
+    match &mount.backend {
+        // Nothing to add: the root filesystem mount is already covered by `vault`, and
+        // a non-root one is a plain directory whose reachability the same code answers.
+        MountBackendConfig::Filesystem { vault_path, .. } => {
+            vec![check_mount_directory(&scope, vault_path)]
+        }
+        MountBackendConfig::Couchdb { sidecar_path, .. } => {
+            vec![
+                // The mount's OWN `sidecarPath` is honoured, not ignored: a mount that
+                // names a hand-built bundle starts fine, and a doctor that probed only
+                // the default locations would report it as missing — the exact
+                // disagreement between doctor and startup this check exists to prevent.
+                check_sidecar_bundle(&scope, sidecar_path.as_deref()),
+                check_sidecar_node(&scope),
+            ]
+        }
+        // An algolia mount has no local runtime at all — no child process, no bundle,
+        // no index. Everything about it that can be wrong is either in the config
+        // (validated at load) or on the remote (`--probe-remote`). Saying so is better
+        // than emitting no line, which reads as "not checked".
+        MountBackendConfig::Algolia { .. } => vec![CheckReport {
+            name: format!("{scope}.local"),
+            status: "ok".into(),
+            message: "an algolia mount has no local runtime to check; use --probe-remote to \
+                      contact the index"
+                .into(),
+            details: None,
+        }],
+    }
+}
+
+/// The check-name prefix for one mount: `mount.<id>`. Keyed by id rather than by
+/// `mountAt` because the id is what every other diagnostic and error message names,
+/// and because the root mount's `mountAt` is the empty string.
+fn mount_check_scope(mount: &MountConfig) -> String {
+    format!("mount.{}", mount.id)
+}
+
+fn check_mount_directory(scope: &str, vault_path: &Path) -> CheckReport {
+    let name = format!("{scope}.vault");
+    match fs::metadata(vault_path) {
+        Ok(metadata) if metadata.is_dir() => match fs::read_dir(vault_path) {
+            Ok(_) => CheckReport {
+                name,
+                status: "ok".into(),
+                message: "mount directory is readable".into(),
+                details: Some(serde_json::json!({ "path": vault_path })),
+            },
+            Err(error) => CheckReport {
+                name,
+                status: "fail".into(),
+                message: if is_permission_denied(&error) {
+                    macos_vault_access_guidance(vault_path, false)
+                } else {
+                    error.to_string()
+                },
+                details: None,
+            },
+        },
+        _ => CheckReport {
+            name,
+            status: "fail".into(),
+            message: format!(
+                "mount directory does not exist or is not a directory: {}",
+                vault_path.display()
+            ),
+            details: None,
+        },
+    }
+}
+
+/// Can the LiveSync sidecar bundle be found at all?
+///
+/// Reuses the SERVER's own probe rather than re-deriving the paths, so a `doctor` that
+/// says "located" cannot disagree with a startup that says "could not locate". This is
+/// the check the Linux package smoke test asserts on: it proves the packaged bundle
+/// landed where the binary looks for it, with no CouchDB anywhere in sight.
+///
+/// A `warn` rather than a `fail`, for the same reason [`check_sidecar_node`] is: a
+/// couchdb mount is experimental and non-root, so an absent bundle degrades that mount
+/// while the vault root keeps serving. Making it a `fail` would send `doctor` to exit 1
+/// for every Homebrew install with a couchdb mount, because the formula deliberately does
+/// not ship the bundle — see `docs/release-checklist.md`.
+fn check_sidecar_bundle(scope: &str, sidecar_path: Option<&Path>) -> CheckReport {
+    let name = format!("{scope}.sidecar-bundle");
+    match deep_obsidian_backend::sidecar::locate_sidecar_bundle(sidecar_path) {
+        Ok(path) => CheckReport {
+            name,
+            status: "ok".into(),
+            message: "livesync sidecar bundle located".into(),
+            details: Some(serde_json::json!({ "path": path })),
+        },
+        Err(error) => CheckReport {
+            name,
+            status: "warn".into(),
+            message: error.to_string(),
+            details: None,
+        },
+    }
+}
+
+/// Is there a Node the sidecar can run on?
+///
+/// A `warn`, never a `fail`, when Node is absent or too old: the mount cannot start,
+/// but `doctor`'s exit code gates on `fail` and a couchdb mount is EXPERIMENTAL and
+/// non-root — the vault root keeps serving without it. Exiting non-zero would make
+/// `doctor` unusable as a health gate on a host that deliberately has no Node, which is
+/// the default the `.deb` ships (Node is a Recommends).
+fn check_sidecar_node(scope: &str) -> CheckReport {
+    let name = format!("{scope}.sidecar-node");
+    let node = deep_obsidian_backend::sidecar::sidecar_node_command();
+    let output = ProcessCommand::new(&node).arg("--version").output();
+    let version = match output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => {
+            return CheckReport {
+                name,
+                status: "warn".into(),
+                message: format!(
+                    "`{} --version` failed with status {}; a couchdb mount cannot start without \
+                     Node >= {SIDECAR_NODE_MIN_MAJOR}",
+                    node.to_string_lossy(),
+                    output.status
+                ),
+                details: None,
+            }
+        }
+        Err(_) => {
+            return CheckReport {
+                name,
+                status: "warn".into(),
+                message: format!(
+                    "node was not found (looked for `{}`); a couchdb mount needs Node >= \
+                     {SIDECAR_NODE_MIN_MAJOR}. Install it, or set {} to the executable. Every \
+                     other mount kind works without Node.",
+                    node.to_string_lossy(),
+                    deep_obsidian_backend::sidecar::SIDECAR_NODE_ENV
+                ),
+                details: None,
+            }
+        }
+    };
+    match node_major_version(&version) {
+        Some(major) if major >= SIDECAR_NODE_MIN_MAJOR => CheckReport {
+            name,
+            status: "ok".into(),
+            message: format!("node {version} satisfies the sidecar's >= {SIDECAR_NODE_MIN_MAJOR}"),
+            details: Some(serde_json::json!({ "version": version })),
+        },
+        Some(major) => CheckReport {
+            name,
+            status: "warn".into(),
+            message: format!(
+                "node {version} is below the sidecar's floor: major {major} < \
+                 {SIDECAR_NODE_MIN_MAJOR}. The bundle is compiled for node20 and may not even \
+                 parse on an older runtime."
+            ),
+            details: Some(serde_json::json!({ "version": version })),
+        },
+        None => CheckReport {
+            name,
+            status: "warn".into(),
+            message: format!("could not parse a major version from node's output: {version:?}"),
+            details: Some(serde_json::json!({ "version": version })),
+        },
+    }
+}
+
+/// The leading integer of a `v20.11.1`-style version string.
+///
+/// Tolerates a missing `v` and any suffix, and refuses anything with no leading digits
+/// rather than guessing — a mis-parse here would report a too-old Node as acceptable.
+fn node_major_version(version: &str) -> Option<u64> {
+    let digits: String = version
+        .trim()
+        .trim_start_matches('v')
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// Contact one remote-backed mount, READ-ONLY, and report what it said.
+///
+/// # Why this is opt-in
+///
+/// It is the only part of `doctor` that needs credentials and network. It resolves the
+/// mount's secret through the shared store (which on macOS can prompt for keychain
+/// access), opens a connection, and — for couchdb — starts the sidecar child process.
+/// A diagnostic command must not do any of that unless asked.
+///
+/// # Why read-only, structurally
+///
+/// A couchdb mount is probed through a supervisor built in [`SidecarMode::ReadOnly`]
+/// regardless of the mount's configured mode, and an algolia mount through its
+/// `status()`, which issues `getSettings` and reads counts. Neither path has a write in
+/// it, so `--probe-remote` cannot mutate a shared corpus even when the mount is
+/// writable.
+///
+/// # Why a failure is a `warn`
+///
+/// An unreachable remote-backed mount does not make the INSTALL unhealthy: these mounts
+/// are experimental and non-root, and the server starts degraded rather than failing
+/// when one cannot be served. `doctor` exits non-zero on `fail` only, so a laptop off
+/// the VPN must not make it report a broken install.
+async fn probe_mount_remote(config: &ResolvedServiceConfig, mount: &MountConfig) -> CheckReport {
+    let scope = mount_check_scope(mount);
+    let name = format!("{scope}.remote");
+    match &mount.backend {
+        MountBackendConfig::Filesystem { .. } => CheckReport {
+            name,
+            status: "skip".into(),
+            message: "a filesystem mount has no remote to probe".into(),
+            details: None,
+        },
+        MountBackendConfig::Couchdb { .. } => {
+            match crate::couchdb_transfer::probe_compatibility(config, &mount.id).await {
+                Ok(status) => {
+                    // A non-`ok` compatibility status arrives from a SUCCESSFUL
+                    // handshake — it is the sidecar's diagnosis, not a transport
+                    // failure — so it is reported as the answer it is.
+                    let ok = status == "ok";
+                    CheckReport {
+                        name,
+                        status: if ok { "ok".into() } else { "warn".into() },
+                        message: format!("couchdb handshake reported compatibility: {status}"),
+                        details: Some(serde_json::json!({ "compatibility": status })),
+                    }
+                }
+                Err(error) => CheckReport {
+                    name,
+                    status: "warn".into(),
+                    message: format!("couchdb probe failed: {error}"),
+                    details: None,
+                },
+            }
+        }
+        MountBackendConfig::Algolia { .. } => {
+            match crate::algolia_cmd::status(config, &mount.id).await {
+                Ok(status) => CheckReport {
+                    name,
+                    status: if status.reachable {
+                        "ok".into()
+                    } else {
+                        "warn".into()
+                    },
+                    message: format!(
+                        "algolia index {}: reachable={} notes={}",
+                        if status.main_provisioned {
+                            "provisioned"
+                        } else {
+                            "not provisioned"
+                        },
+                        status.reachable,
+                        status.notes
+                    ),
+                    // The same fields `algolia status` prints, and for the same reason
+                    // they are safe there: counts and provisioning state, never the key
+                    // and never the resolved credential.
+                    details: Some(serde_json::json!({
+                        "reachable": status.reachable,
+                        "mainProvisioned": status.main_provisioned,
+                        "historyProvisioned": status.history_provisioned,
+                        "notes": status.notes,
+                        "writable": status.writable,
+                    })),
+                },
+                Err(error) => CheckReport {
+                    name,
+                    status: "warn".into(),
+                    message: format!("algolia probe failed: {error}"),
+                    details: None,
+                },
+            }
+        }
+    }
+}
+
 fn check_index_dir(config: &ResolvedServiceConfig) -> CheckReport {
     match assert_creatable_directory(&config.index_dir) {
         Ok(_) => CheckReport {
@@ -3416,6 +3898,22 @@ mod tests {
         path
     }
 
+    /// A filesystem mount over a REAL directory, for the checks that touch the disk.
+    /// [`filesystem_mount`] points at a fixed `/vaults/<id>` that does not exist, which
+    /// is what makes it suitable for the pure string-rendering tests and unsuitable here.
+    fn filesystem_mount_at(id: &str, mount_at: &str, vault_path: &Path) -> MountConfig {
+        MountConfig {
+            id: id.to_string(),
+            mount_at: mount_at.to_string(),
+            backend: MountBackendConfig::Filesystem {
+                vault_path: vault_path.to_path_buf(),
+                index_dir: None,
+            },
+            recall_weight: None,
+            unknown: Default::default(),
+        }
+    }
+
     fn resolved_config(vault_path: &Path, index_dir: &Path) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
             federated_rerank: true,
@@ -3836,6 +4334,7 @@ mod tests {
 
     fn filesystem_mount(id: &str, mount_at: &str, index_dir: Option<&str>) -> MountConfig {
         MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: id.to_string(),
             mount_at: mount_at.to_string(),
@@ -3953,5 +4452,506 @@ mod tests {
             render_mount_line(&filesystem_mount("team", "Team", None), None),
             "mount team at /Team (filesystem): /vaults/team"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // setup-service against a declared mount table
+    // -----------------------------------------------------------------------
+
+    /// A mounts config is never rewritten — not even with `--overwrite`, which is the
+    /// footgun this pins. `--overwrite` means "replace my agent config"; it does not
+    /// mean "regenerate my mount table", and a mount table is the one thing in the file
+    /// this command cannot reproduce faithfully.
+    #[test]
+    fn setup_service_never_rewrites_a_declared_mount_table() {
+        let root = unique_temp_dir("setup-mounts");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).expect("vault dir");
+        let config_path = root.join("config.json");
+        let backup_path = config_path.with_extension("json.bak");
+
+        // A hand-written mounts config, byte-for-byte what must survive.
+        let handwritten = r#"{
+  "experimental": { "multiVault": true },
+  "mounts": [
+    { "id": "vault", "mountAt": "", "backend": { "kind": "filesystem", "vaultPath": "VAULT" } },
+    { "id": "team", "mountAt": "Team", "backend": { "kind": "filesystem", "vaultPath": "VAULT" } }
+  ]
+}
+"#
+        .replace("VAULT", vault.to_str().expect("utf-8 vault path"));
+        fs::write(&config_path, &handwritten).expect("seed config");
+
+        let mut service = resolved_config(&vault, &root.join("index"));
+        service.mounts = vec![
+            filesystem_mount("vault", "", None),
+            filesystem_mount("team", "Team", None),
+        ];
+
+        let report = setup_service(
+            &resolved_runtime(config_path.clone(), service),
+            false,
+            // --overwrite, deliberately: the point is that it does NOT apply here.
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .expect("setup-service must succeed on a mounts config, not refuse it");
+
+        assert!(!report.written, "a mount table must never be rewritten");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("config still there"),
+            handwritten,
+            "the hand-written config must be untouched, byte for byte"
+        );
+        assert!(
+            !backup_path.exists(),
+            "nothing was written, so there is nothing to back up"
+        );
+        assert!(
+            report.messages.iter().any(|message| {
+                message.contains("config not written") && message.contains("mount table")
+            }),
+            "the operator must be told why, and pointed at manual editing: {:?}",
+            report.messages
+        );
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|message| message.contains("skipped: vault-path absolutization")),
+            "the skipped rewrites must be named rather than silently omitted: {:?}",
+            report.messages
+        );
+        // Still useful: the endpoint report is produced, which is what `--mcp` writes
+        // into an agent's client config.
+        assert!(report.endpoints.mcp.contains("/mcp"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Changing auth on a mounts config is REFUSED, and nothing is provisioned.
+    ///
+    /// The failure this prevents: the config is not rewritten for a mount table, so a
+    /// provisioned token would sit in the secret store with nothing referencing it, and
+    /// the operator would believe auth was on when the file still said otherwise.
+    #[test]
+    fn setup_service_refuses_an_auth_change_on_a_mounts_config() {
+        let root = unique_temp_dir("setup-mounts-auth");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).expect("vault dir");
+        let config_path = root.join("config.json");
+        fs::write(&config_path, "{}\n").expect("seed config");
+
+        let mut service = resolved_config(&vault, &root.join("index"));
+        service.mounts = vec![filesystem_mount_at("vault", "", &vault)];
+
+        for choice in [Some(true), Some(false)] {
+            let error = setup_service(
+                &resolved_runtime(config_path.clone(), service.clone()),
+                false,
+                true,
+                false,
+                false,
+                false,
+                choice,
+                false,
+            )
+            .expect_err("an auth change on a mount table must be refused");
+            let message = error.to_string();
+            assert!(message.contains("cannot change auth"), "{message}");
+            // The remedy is named, not just the refusal.
+            assert!(message.contains("by hand"), "{message}");
+        }
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("config"),
+            "{}\n",
+            "a refused run must not have touched the file"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The wizard refuses a mounts config UP FRONT, and the refusal names the mount table
+    /// rather than auth.
+    ///
+    /// The wizard passes `Some(...)` for auth unconditionally, so without this guard its
+    /// first error on such a file would be the auth refusal — after every prompt had been
+    /// answered, and blaming the wrong thing.
+    #[test]
+    fn the_wizard_refuses_a_mounts_config_before_prompting() {
+        let path = Path::new("/config/config.json");
+
+        // No file, and a file with no mount table: nothing to refuse.
+        super::refuse_wizard_on_a_mounts_config(path, None).expect("no config is fine");
+        let legacy = PersistedServiceConfig {
+            vault_path: Some(PathBuf::from("/vault")),
+            ..PersistedServiceConfig::default()
+        };
+        super::refuse_wizard_on_a_mounts_config(path, Some(&legacy))
+            .expect("a legacy config is fine");
+        // An EMPTY mounts array carries no table, matching the loader's own reading of it.
+        let empty = PersistedServiceConfig {
+            mounts: Some(Vec::new()),
+            ..PersistedServiceConfig::default()
+        };
+        super::refuse_wizard_on_a_mounts_config(path, Some(&empty))
+            .expect("an empty mounts array is not a table");
+
+        let with_mounts = PersistedServiceConfig {
+            mounts: Some(vec![filesystem_mount("vault", "", None)]),
+            ..PersistedServiceConfig::default()
+        };
+        let error = super::refuse_wizard_on_a_mounts_config(path, Some(&with_mounts))
+            .expect_err("a mount table must be refused");
+        let message = error.to_string();
+        assert!(message.contains("mount table"), "{message}");
+        assert!(message.contains("/config/config.json"), "{message}");
+        // Blames the right thing, and points at the remedies.
+        assert!(!message.contains("auth"), "must not blame auth: {message}");
+        assert!(message.contains("print-config"), "{message}");
+        assert!(message.contains("--mcp"), "{message}");
+    }
+
+    /// A couchdb mount makes `setup-service` say where the sidecar comes from — and
+    /// specifically that NO environment variable is involved, because the opposite is
+    /// what a reader expects from a packaged helper runtime.
+    #[test]
+    fn setup_service_explains_the_sidecar_contract_for_a_couchdb_mount() {
+        let root = unique_temp_dir("setup-mounts-couchdb");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).expect("vault dir");
+        let config_path = root.join("config.json");
+        fs::write(&config_path, "{}\n").expect("seed config");
+
+        let mut service = resolved_config(&vault, &root.join("index"));
+        service.mounts = vec![
+            filesystem_mount("vault", "", None),
+            MountConfig {
+                id: "live".to_string(),
+                mount_at: "Live".to_string(),
+                backend: MountBackendConfig::Couchdb {
+                    url: "http://couch.invalid:5984".to_string(),
+                    database: "vault".to_string(),
+                    username: Some("user".to_string()),
+                    password_ref: SecretRef::EncryptedFile {
+                        id: "live-password".to_string(),
+                    },
+                    index_dir: None,
+                    options: Default::default(),
+                    e2ee: None,
+                    sidecar_path: None,
+                    writable: false,
+                },
+                recall_weight: None,
+                unknown: Default::default(),
+            },
+        ];
+
+        let report = setup_service(
+            &resolved_runtime(config_path.clone(), service),
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .expect("setup");
+
+        assert!(
+            report.messages.iter().any(|message| {
+                message.contains("DEEP_OBSIDIAN_LIVESYNC_SIDECAR")
+                    && message.contains("relative to the installed binary")
+            }),
+            "the sidecar location contract must be stated: {:?}",
+            report.messages
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // doctor: per-mount checks
+    // -----------------------------------------------------------------------
+
+    /// `doctor` reports the sidecar bundle and the Node runtime for a couchdb mount
+    /// WITHOUT `--probe-remote`, and never contacts the remote — the config below points
+    /// at a host that does not resolve, so a probe would show up as a timeout.
+    ///
+    /// It also pins that neither missing piece is a `fail`: a couchdb mount is
+    /// experimental and non-root, so `doctor`'s exit code must not depend on it.
+    #[tokio::test]
+    async fn doctor_checks_the_sidecar_locally_and_does_not_contact_the_remote() {
+        let root = unique_temp_dir("doctor-mounts");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).expect("vault dir");
+        fs::write(vault.join("Home.md"), "# Home\n").expect("seed note");
+
+        let mut service = resolved_config(&vault, &root.join("index"));
+        service.mounts = vec![
+            filesystem_mount_at("vault", "", &vault),
+            MountConfig {
+                id: "live".to_string(),
+                mount_at: "Live".to_string(),
+                backend: MountBackendConfig::Couchdb {
+                    url: "http://couchdb.invalid:5984".to_string(),
+                    database: "vault".to_string(),
+                    username: Some("user".to_string()),
+                    password_ref: SecretRef::EncryptedFile {
+                        id: "live-password".to_string(),
+                    },
+                    index_dir: None,
+                    options: Default::default(),
+                    e2ee: None,
+                    sidecar_path: None,
+                    writable: false,
+                },
+                recall_weight: None,
+                unknown: Default::default(),
+            },
+        ];
+        // stdio so the HTTP port/health probes are skipped and the test needs no socket.
+        service.transport = TransportMode::Stdio;
+
+        let report = super::doctor(
+            &resolved_runtime(root.join("config.json"), service),
+            50,
+            false,
+        )
+        .await
+        .expect("doctor");
+
+        let named = |name: &str| {
+            report
+                .checks
+                .iter()
+                .find(|check| check.name == name)
+                .unwrap_or_else(|| panic!("missing check {name}; got {:?}", report.checks))
+        };
+
+        // The root filesystem mount gets a readable-directory line.
+        assert_eq!(named("mount.vault.vault").status, "ok");
+        // The couchdb mount gets both local checks, always — and NEITHER may be a
+        // `fail`, because `doctor`'s exit code gates on `fail` and an experimental,
+        // non-root mount must not decide whether the install is healthy.
+        for name in ["mount.live.sidecar-bundle", "mount.live.sidecar-node"] {
+            let check = named(name);
+            assert!(
+                check.status == "ok" || check.status == "warn",
+                "{name} must be ok or warn, never fail: {check:?}"
+            );
+        }
+        assert!(
+            report.ok,
+            "a couchdb mount with no bundle and no Node must not make doctor report a \
+             broken install: {:?}",
+            report.checks
+        );
+
+        // And nothing probed the remote.
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|check| check.name == "mount.live.remote"),
+            "no remote check may appear without --probe-remote: {:?}",
+            report.checks
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A legacy `vaultPath` config gains no mount checks at all, so `doctor`'s output for
+    /// every existing install is unchanged.
+    #[tokio::test]
+    async fn doctor_adds_no_mount_checks_to_a_legacy_config() {
+        let root = unique_temp_dir("doctor-legacy");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).expect("vault dir");
+        let mut service = resolved_config(&vault, &root.join("index"));
+        service.transport = TransportMode::Stdio;
+
+        let report = super::doctor(
+            &resolved_runtime(root.join("config.json"), service),
+            50,
+            // Even asked for: there is nothing to probe, and saying so beats silence.
+            true,
+        )
+        .await
+        .expect("doctor");
+
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|check| check.name.starts_with("mount.")),
+            "a legacy config must gain no per-mount check: {:?}",
+            report.checks
+        );
+        let skipped = report
+            .checks
+            .iter()
+            .find(|check| check.name == "mounts.remote")
+            .expect("--probe-remote with no mounts must report why");
+        assert_eq!(skipped.status, "skip");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn node_major_version_parses_and_refuses() {
+        assert_eq!(super::node_major_version("v20.11.1"), Some(20));
+        assert_eq!(super::node_major_version("22.0.0"), Some(22));
+        assert_eq!(super::node_major_version(" v18.19.0\n"), Some(18));
+        // Refused rather than guessed: reading a too-old Node as acceptable would be
+        // worse than reporting that the version could not be parsed.
+        assert_eq!(super::node_major_version("node v20"), None);
+        assert_eq!(super::node_major_version(""), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // print-config
+    // -----------------------------------------------------------------------
+
+    /// `print-config` on a full three-kind mounts config prints no resolved secret.
+    ///
+    /// Redaction here is expected to be the IDENTITY: a config stores secret
+    /// REFERENCES, never secrets, so there is nothing to redact and the redacted and
+    /// unredacted renderings are the same document. That is the property worth pinning —
+    /// if it ever stops holding, a plaintext credential has appeared in the config model.
+    #[test]
+    fn print_config_round_trips_every_mount_kind_and_leaks_no_secret() {
+        let root = unique_temp_dir("print-config-mounts");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).expect("vault dir");
+
+        let mut service = resolved_config(&vault, &root.join("index"));
+        service.experimental = deep_obsidian_types::ExperimentalConfig {
+            multi_vault: true,
+            couchdb_vaults: true,
+            algolia_vaults: true,
+        };
+        service.mounts = vec![
+            filesystem_mount("vault", "", None),
+            MountConfig {
+                id: "live".to_string(),
+                mount_at: "Live".to_string(),
+                backend: MountBackendConfig::Couchdb {
+                    url: "http://couch.invalid:5984".to_string(),
+                    database: "vault".to_string(),
+                    username: Some("couch-user".to_string()),
+                    password_ref: SecretRef::OsKeyring {
+                        service: "deep-obsidian-mcp".to_string(),
+                        account: "live-password".to_string(),
+                    },
+                    index_dir: None,
+                    options: Default::default(),
+                    e2ee: None,
+                    sidecar_path: None,
+                    writable: false,
+                },
+                recall_weight: Some(1.5),
+                unknown: Default::default(),
+            },
+            MountConfig {
+                id: "wiki".to_string(),
+                mount_at: "Wiki".to_string(),
+                backend: MountBackendConfig::Algolia {
+                    app_id: "APPID".to_string(),
+                    index_name: "wiki".to_string(),
+                    api_key_ref: SecretRef::EncryptedFile {
+                        id: "wiki-key".to_string(),
+                    },
+                    base_url: None,
+                    writable: false,
+                    participant_id: None,
+                    cache: None,
+                    retention: None,
+                    index_dir: None,
+                },
+                recall_weight: None,
+                unknown: Default::default(),
+            },
+        ];
+
+        let runtime = resolved_runtime(root.join("config.json"), service);
+        let redacted = super::print_config(&runtime, true).expect("print-config redacted");
+        let plain = super::print_config(&runtime, false).expect("print-config plain");
+
+        // Identity: a config carries refs, so redaction has nothing to remove.
+        assert_eq!(
+            redacted.text, plain.text,
+            "redaction must be the identity on a config that stores only secret refs"
+        );
+
+        // Every mount round-tripped, keyed by id, with its kind intact.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&redacted.text).expect("print-config emits valid json");
+        let mounts = parsed["mounts"]
+            .as_array()
+            .expect("mounts array")
+            .iter()
+            .map(|mount| {
+                (
+                    mount["id"].as_str().expect("id").to_string(),
+                    mount["backend"]["kind"].as_str().expect("kind").to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mounts,
+            vec![
+                ("vault".to_string(), "filesystem".to_string()),
+                ("live".to_string(), "couchdb".to_string()),
+                ("wiki".to_string(), "algolia".to_string()),
+            ]
+        );
+        // The refs are printed as refs — the identifier, never a resolved value.
+        assert!(redacted.text.contains("passwordRef"), "{}", redacted.text);
+        assert!(redacted.text.contains("apiKeyRef"), "{}", redacted.text);
+        // And no plaintext credential field exists to print in the first place.
+        for forbidden in ["\"password\"", "\"apiKey\"", "\"token\"", "\"passphrase\""] {
+            assert!(
+                !redacted.text.contains(forbidden),
+                "{forbidden} must not appear: {}",
+                redacted.text
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An unknown top-level key in the config file survives what `print-config` shows,
+    /// so an operator diagnosing a version skew sees the key that is actually in their
+    /// file rather than a rendering that has already dropped it.
+    #[test]
+    fn print_config_shows_retained_unknown_fields() {
+        let root = unique_temp_dir("print-config-unknown");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).expect("vault dir");
+
+        let mut runtime = resolved_runtime(
+            root.join("config.json"),
+            resolved_config(&vault, &root.join("index")),
+        );
+        let mut loaded = PersistedServiceConfig {
+            vault_path: Some(vault.clone()),
+            ..PersistedServiceConfig::default()
+        };
+        loaded
+            .unknown
+            .insert("futureKnob".to_string(), serde_json::json!(["a", "b"]));
+        runtime.config_file = Some(loaded);
+
+        let report = super::print_config(&runtime, true).expect("print-config");
+        let parsed: serde_json::Value = serde_json::from_str(&report.text).expect("valid json");
+        assert_eq!(parsed["futureKnob"], serde_json::json!(["a", "b"]));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -127,6 +127,15 @@ pub enum Command {
     Doctor {
         #[arg(long = "probe-timeout-ms", default_value_t = 5_000)]
         probe_timeout_ms: u64,
+        /// Also contact each remote-backed mount (couchdb, algolia) read-only.
+        ///
+        /// Off by default because it is the one part of `doctor` that needs
+        /// credentials and network: it resolves each mount's secret, opens a
+        /// READ-ONLY connection, and reports what the remote said. Without it
+        /// `doctor` still checks everything local — including the sidecar bundle
+        /// and the Node runtime a couchdb mount needs.
+        #[arg(long = "probe-remote")]
+        probe_remote: bool,
     },
     PrintConfig {
         #[arg(long)]

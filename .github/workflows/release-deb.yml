@@ -17,6 +17,8 @@ on:
       - "skills/**"
       - "obsidian-snippets/**"
       - "assets/**"
+      # The .deb ships the sidecar bundle, so a sidecar change changes the package.
+      - "sidecar/**"
       - "packaging/**"
       - "scripts/build-deb.sh"
       - "scripts/build-apt-repo.sh"
@@ -50,6 +52,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # The .deb ships the LiveSync sidecar bundle, whose build needs Node >= 20
+      # (sidecar/livesync-sidecar/package.json: engines.node). The rust:1-bookworm
+      # container has NO node, and bookworm's apt `nodejs` is 18 — below the floor — so
+      # the toolchain action is used rather than apt. `scripts/build-deb.sh` fails loudly
+      # if this step is ever removed, instead of publishing a .deb whose couchdb mounts
+      # cannot start.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sidecar/livesync-sidecar/package-lock.json
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
       - name: Derive .deb version from tag
@@ -69,9 +82,21 @@ jobs:
           echo "Installing $deb"
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y systemd "./$deb"
+          # --no-install-recommends is deliberate: the package Recommends
+          # `nodejs (>= 20)`, which bookworm's archive cannot satisfy (it ships 18).
+          # Declining it is also the realistic default install on Debian 12, so this is
+          # the configuration the smoke test should exercise — the sidecar bundle must
+          # be installed and locatable even with no Node from apt.
+          apt-get install -y --no-install-recommends systemd "./$deb"
           deb_depends=$(dpkg-deb -f "$deb" Depends)
           echo "Depends: $deb_depends"
+          echo "Recommends: $(dpkg-deb -f "$deb" Recommends)"
+          # Node must NOT have become a hard dependency: it would pull a ~30 MB runtime
+          # onto every install for a feature behind an experimental flag.
+          if echo "$deb_depends" | grep -q 'nodejs'; then
+            echo "nodejs must be a Recommends, not a Depends" >&2
+            exit 1
+          fi
           # Guard the glibc floor: INSTALL.md promises Debian 12 (glibc 2.36)
           # and Ubuntu 22.04 (glibc 2.35), so the stamped requirement must not
           # exceed 2.35.

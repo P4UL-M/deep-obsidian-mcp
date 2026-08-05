@@ -112,9 +112,7 @@ impl UploadStore {
         // explicitly so an expired-but-present token reports `Expired` (410)
         // rather than `Unknown` (403). Orphan temp files (from a crashed
         // mid-stream process) are swept separately by the backend's staging sweep.
-        map.retain(|key, pending| {
-            key == token || pending.in_flight || !pending.is_expired(now)
-        });
+        map.retain(|key, pending| key == token || pending.in_flight || !pending.is_expired(now));
         let pending = map.get_mut(token).ok_or(ClaimError::Unknown)?;
         if pending.is_expired(now) {
             map.remove(token);

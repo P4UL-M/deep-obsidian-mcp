@@ -28,6 +28,40 @@ Do **all** of these — the two Homebrew formula copies and the apt tap are easy
 - [ ] Confirm the formula knows where to find the executable, support files, and service wrapper.
 - [ ] Confirm `rg` and any native dependencies are either bundled or declared explicitly.
 
+## The LiveSync Sidecar Bundle
+
+Needed only by the **experimental `couchdb` mount kind**. Every other mount — including
+the default filesystem vault — runs with no Node and no bundle.
+
+**The one contract, for every channel.** The binary finds the bundle relative to its own
+location: from `<prefix>/bin/deep-obsidian-mcp` it walks up to `<prefix>` and looks for
+`share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs`
+(`PACKAGED_BUNDLE_PREFIX` in `rust/crates/deep-obsidian-backend/src/sidecar.rs`). That
+path is Homebrew's `pkgshare` and the `.deb`'s `/usr/share/deep-obsidian-mcp` at the same
+time, so **no channel sets `DEEP_OBSIDIAN_LIVESYNC_SIDECAR`** — not the systemd unit, not
+the `brew services` plist. The env var stays a user-facing override.
+
+- [ ] **`.deb` — automatic.** `scripts/build-deb.sh` runs `npm ci && npm run build` in
+      `sidecar/livesync-sidecar` before invoking cargo-deb, which declares the bundle as
+      an asset. The script **fails loudly** if Node is absent or older than 20 rather
+      than producing a package whose couchdb mounts cannot start. In CI,
+      `actions/setup-node@v4` supplies Node 20 — `rust:1-bookworm` has none, and
+      bookworm's apt `nodejs` is 18, below the floor.
+- [ ] **`.deb` — verify** the `release-deb` run shows `Recommends: nodejs (>= 20)` and
+      **not** a `Depends` on nodejs, and that `scripts/linux-smoke-test.sh` passes its
+      "Sidecar bundle is discoverable by the binary's own probe" step. That step runs
+      `doctor` from `/` against a hand-written couchdb mount config, so it proves the
+      probe finds the *packaged* copy rather than a source-checkout one.
+- [ ] **Homebrew — NOT shipped, deliberately.** `sidecar/livesync-sidecar/dist/` is
+      gitignored, so the release tarball has no bundle, and building it needs `npm ci`
+      network access that Homebrew's install sandbox restricts. The formula's caveats tell
+      a couchdb user how to build it and where to drop it. Confirm the caveats survive any
+      formula edit.
+  - **Follow-up (not done):** have the release workflow build the bundle, attach it to the
+    GitHub Release, and add a `resource` block to both formula copies. This cannot be done
+    in the same commit that introduces it — a formula needs the asset's `sha256`, which
+    does not exist until the release is cut.
+
 ## Homebrew Smoke Test
 
 - [ ] `brew install <formula>`
@@ -36,12 +70,34 @@ Do **all** of these — the two Homebrew formula copies and the apt tap are easy
 - [ ] `deep-obsidian-mcp doctor`
 - [ ] `deep-obsidian-mcp probe`
 
+## Multi-Backend Status: EXPERIMENTAL
+
+The `couchdb` and `algolia` mount kinds, and multi-mount configs generally, are gated
+behind per-risk `experimental` flags (`multiVault`, `couchdbVaults`, `algoliaVaults`) and
+must be described as experimental in release notes.
+
+- [ ] Release notes state that multi-backend mounts are experimental and configured by
+      hand: `setup-service` **refuses to rewrite a declared mount table** (and refuses an
+      auth change on one, because it cannot write the reference the token would need).
+- [ ] Release notes point at [migration-and-rollback.md](./migration-and-rollback.md) for
+      how to move a folder onto a remote backend **and how to get back off it**.
+- [ ] An `algolia` mount sends note bodies to a hosted third-party service; a `writable`
+      one is a corpus several people write concurrently. Both are worth naming in notes.
+
 ## Upgrade Checks
 
 - [ ] Service restarts cleanly after formula upgrade.
 - [ ] Config file is preserved across upgrades.
 - [ ] Index directory survives upgrade and restart.
 - [ ] Health endpoint and MCP endpoint remain stable.
+- [ ] **Downgrade safety.** A config written by a newer build, rewritten by this one,
+      keeps its unknown top-level and per-mount keys (`UnknownFields` in
+      `deep-obsidian-types`). Known gap: keys inside a `backend` object are still dropped —
+      see the policy doc on `UnknownFields`. Adding a backend option is therefore a
+      forward-incompatible change to guard in release notes.
+- [ ] **Config rollback.** A content-changing `setup-service` write leaves the previous
+      file at `config.json.bak`. Restoring it is the documented rollback; see
+      [migration-and-rollback.md](./migration-and-rollback.md).
 
 ## Notes
 

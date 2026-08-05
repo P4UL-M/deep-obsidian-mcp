@@ -44,6 +44,15 @@ section = "utils"
 priority = "optional"
 # ripgrep powers grep_search; $auto pulls in detected shared-library deps (glibc).
 depends = "$auto, ripgrep"
+# Node runs the LiveSync sidecar, which is needed ONLY by the experimental couchdb
+# mount kind. Recommends rather than Depends: a Recommends is installed by default by
+# apt but can be declined, and every other mount kind works with no Node at all —
+# making it a hard dependency would pull a ~30 MB runtime onto every install for a
+# feature behind an experimental flag. The floor is the sidecar's own
+# (`sidecar/livesync-sidecar/package.json`: `engines.node >= 20`); Debian 12 ships
+# nodejs 18, so on bookworm this resolves only with nodejs from backports or
+# NodeSource, which is exactly the "declined" case the fallback below covers.
+recommends = "nodejs (>= 20)"
 extended-description = """\
 Deep Obsidian MCP is a filesystem-first Model Context Protocol server that gives \
 agents deep, indexed access to an Obsidian vault (search, graph traversal, \
@@ -54,6 +63,16 @@ assets = [
     ["../../../skills/**/*", "usr/share/deep-obsidian-mcp/skills/", "644"],
     ["../../../obsidian-snippets/**/*", "usr/share/deep-obsidian-mcp/obsidian-snippets/", "644"],
     ["../../../assets/**/*", "usr/share/deep-obsidian-mcp/assets/", "644"],
+    # The LiveSync sidecar bundle, at the ONE path the binary's probe derives from its
+    # own location: the exe is /usr/bin/deep-obsidian-mcp, so the walk up reaches /usr
+    # and appends `share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs`
+    # (`PACKAGED_BUNDLE_PREFIX` in deep-obsidian-backend/src/sidecar.rs). No
+    # environment variable and no systemd `Environment=` line is involved.
+    #
+    # `scripts/build-deb.sh` builds this before invoking cargo-deb, because cargo-deb
+    # FAILS on a missing asset path — which is the desired behaviour: a .deb whose
+    # couchdb mounts cannot start must not be publishable by accident.
+    ["../../../sidecar/livesync-sidecar/dist/sidecar.mjs", "usr/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs", "644"],
     ["../../../README.md", "usr/share/doc/deep-obsidian-mcp/README.md", "644"],
     ["../../../docs/debian-package.md", "usr/share/doc/deep-obsidian-mcp/debian-package.md", "644"],
     ["../../../packaging/systemd/deep-obsidian-mcp.service", "usr/lib/systemd/user/deep-obsidian-mcp.service", "644"],

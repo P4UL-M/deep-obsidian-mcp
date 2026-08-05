@@ -261,6 +261,57 @@ fn require_couchdb<'backend>(
 // ---------------------------------------------------------------------------
 
 /// Walk the whole mount and write every entry to `out_dir`.
+/// Handshake with one couchdb mount and report the compatibility verdict, then stop the
+/// child process again.
+///
+/// Backs `doctor --probe-remote`. Two properties make it safe to run against a
+/// production vault:
+///
+/// * **`initialize` and nothing else.** `ensure_started` performs the handshake and
+///   stops there — the data methods stay locked whatever the verdict, and no read, write
+///   or delete method is ever issued. So this cannot mutate a vault even when the mount
+///   is configured writable, and it costs the remote exactly one handshake.
+/// * **The child does not outlive the probe.** The supervisor is shut down before
+///   returning, including on the error path, so a `doctor` run never leaves a Node
+///   process behind.
+///
+/// A non-`ok` verdict is a successful RESULT, not an error: it is the sidecar's own
+/// already-redacted diagnosis (locked, auth-failed, unreachable, ...) and it is exactly
+/// what an operator ran the probe to see. Only a failure to complete a handshake at all
+/// is an `Err`.
+pub async fn probe_compatibility(config: &ResolvedServiceConfig, mount_id: &str) -> Result<String> {
+    probe_compatibility_with_resolver(config, mount_id, &SecretResolver::new()).await
+}
+
+/// [`probe_compatibility`] against an explicit secret store.
+pub async fn probe_compatibility_with_resolver(
+    config: &ResolvedServiceConfig,
+    mount_id: &str,
+    resolver: &SecretResolver,
+) -> Result<String> {
+    let backend = couchdb_backend_for_mount(config, mount_id, resolver)?;
+    let couchdb = require_couchdb(&backend, mount_id)?;
+    let supervisor = couchdb.supervisor().clone();
+
+    let started = supervisor.ensure_started().await;
+    // Read the verdict BEFORE shutting down: `health()` is the supervisor's record of
+    // the last handshake, and shutdown does not clear it, but reading first keeps the
+    // ordering obvious rather than relying on that.
+    let compatibility = supervisor.health().compatibility;
+    supervisor.shutdown().await;
+
+    started.with_context(|| format!("could not start the sidecar for mount {mount_id:?}"))?;
+    match compatibility {
+        Some(compatibility) => Ok(compatibility.status.as_str().to_string()),
+        // A completed `ensure_started` always records one, so this is a contract
+        // violation rather than a remote problem — named as such instead of reported as
+        // an unreachable vault, which would send the reader to the wrong place.
+        None => bail!(
+            "the sidecar for mount {mount_id:?} started but recorded no compatibility verdict"
+        ),
+    }
+}
+
 pub async fn export(
     config: &ResolvedServiceConfig,
     mount_id: &str,

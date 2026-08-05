@@ -2113,6 +2113,7 @@ mod tests {
     #[test]
     fn the_default_seed_source_is_the_folder_the_mount_shadows() {
         let mount = MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: "wiki".to_string(),
             mount_at: "_Wiki".to_string(),

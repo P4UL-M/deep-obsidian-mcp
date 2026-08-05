@@ -113,6 +113,31 @@ pub const SIDECAR_NODE_ENV: &str = "DEEP_OBSIDIAN_NODE";
 /// source-checkout fallback.
 const BUNDLE_RELATIVE_PATH: &str = "sidecar/livesync-sidecar/dist/sidecar.mjs";
 
+/// Prefix under an install prefix where a PACKAGED bundle lives, joined with
+/// [`BUNDLE_RELATIVE_PATH`].
+///
+/// # The packaging contract, in one constant
+///
+/// An installed binary is at `<prefix>/bin/deep-obsidian-mcp`, so a walk up from the
+/// executable reaches `<prefix>` but never `<prefix>/share`. This is the bridge, and
+/// it is deliberately the SAME path for every packaging channel:
+///
+/// * `.deb` — binary `/usr/bin/deep-obsidian-mcp`, bundle
+///   `/usr/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs`, which
+///   is also where the package already installs `skills/`, `assets/` and
+///   `obsidian-snippets/`.
+/// * Homebrew — `<prefix>/share/deep-obsidian-mcp` is exactly Homebrew's `pkgshare`,
+///   so `pkgshare.install "sidecar"` lands on the same path with no formula-specific
+///   probe and no environment variable.
+///
+/// `share` rather than `lib` because the bundle is a single architecture-independent
+/// JavaScript file, and because it keeps every packaged data directory in one place.
+///
+/// Consequence worth stating: **no packaging channel needs to set
+/// [`SIDECAR_BUNDLE_ENV`]**. The service unit and the `brew services` plist carry no
+/// sidecar variable; the env var stays a user-facing override for a hand-built bundle.
+const PACKAGED_BUNDLE_PREFIX: &str = "share/deep-obsidian-mcp";
+
 // ---------------------------------------------------------------------------
 // Compatibility status
 // ---------------------------------------------------------------------------
@@ -484,8 +509,7 @@ pub fn locate_sidecar_bundle(explicit: Option<&Path>) -> Result<PathBuf, Sidecar
         )));
     }
 
-    for base in bundle_search_roots() {
-        let candidate = base.join(BUNDLE_RELATIVE_PATH);
+    for candidate in bundle_candidates(bundle_search_roots()) {
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -498,8 +522,29 @@ pub fn locate_sidecar_bundle(explicit: Option<&Path>) -> Result<PathBuf, Sidecar
     )))
 }
 
-/// Directories to try [`BUNDLE_RELATIVE_PATH`] under: the executable's directory
-/// and each of its ancestors, then the current working directory and its ancestors.
+/// Every bundle path to try, in order, for the given search roots.
+///
+/// Two forms per root: the source-checkout layout (`<root>/sidecar/...`, which is what
+/// makes a `cargo run` from anywhere in the workspace work) and the packaged layout
+/// (`<root>/share/deep-obsidian-mcp/sidecar/...`, see [`PACKAGED_BUNDLE_PREFIX`]).
+///
+/// Split out from [`bundle_search_roots`] so the candidate LIST is testable without a
+/// real install tree: the ancestor arithmetic that makes `/usr/bin/deep-obsidian-mcp`
+/// reach `/usr/share/deep-obsidian-mcp` is the part that would silently stop working.
+fn bundle_candidates(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots
+        .into_iter()
+        .flat_map(|root| {
+            [
+                root.join(BUNDLE_RELATIVE_PATH),
+                root.join(PACKAGED_BUNDLE_PREFIX).join(BUNDLE_RELATIVE_PATH),
+            ]
+        })
+        .collect()
+}
+
+/// Directories to try a bundle under: the executable's directory and each of its
+/// ancestors, then the current working directory and its ancestors.
 ///
 /// The cwd chain is what makes `cargo test` work from any crate directory in the
 /// workspace; the executable chain is what makes an installed layout work when the
@@ -530,7 +575,11 @@ fn bundle_search_roots() -> Vec<PathBuf> {
 ///
 /// Not resolved to an absolute path: `Command` performs the `PATH` lookup, and
 /// hard-coding a resolved path would break a service whose Node install moves.
-fn locate_node() -> PathBuf {
+///
+/// Public so `doctor` can check the SAME executable the supervisor would spawn. A
+/// separate re-derivation there could report a healthy Node while the sidecar spawns a
+/// different (or missing) one.
+pub fn sidecar_node_command() -> PathBuf {
     std::env::var_os(SIDECAR_NODE_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("node"))
@@ -613,7 +662,7 @@ impl SidecarConfig {
     ) -> Result<Self, SidecarError> {
         Ok(Self {
             launch: SidecarLaunch {
-                node: locate_node(),
+                node: sidecar_node_command(),
                 bundle: locate_sidecar_bundle(sidecar_path)?,
             },
             credentials,
@@ -2464,6 +2513,59 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The packaging contract, asserted on the generated candidate list rather than on
+    /// a real install tree — which is the only way to check it from a `cargo test` on
+    /// any host.
+    ///
+    /// What would otherwise break silently: an installed binary lives at
+    /// `<prefix>/bin/`, and walking up from there reaches `<prefix>` but NOT
+    /// `<prefix>/share`. If the packaged arm were dropped, a `.deb` install would ship
+    /// the bundle and the probe would still report "could not locate the livesync
+    /// sidecar bundle" — a failure nothing in the Rust test suite would catch.
+    #[test]
+    fn the_candidate_list_reaches_a_packaged_bundle_from_an_installed_binary() {
+        // The ancestor chain `bundle_search_roots` produces for /usr/bin/<exe>.
+        let deb_roots = vec![
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/usr"),
+            PathBuf::from("/"),
+        ];
+        let candidates = bundle_candidates(deb_roots);
+        assert!(
+            candidates.contains(&PathBuf::from(
+                "/usr/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs"
+            )),
+            "the .deb layout must be reachable: {candidates:?}"
+        );
+
+        // Homebrew: the binary is inside the Cellar keg, whose own directory IS the
+        // prefix `pkgshare` hangs off.
+        let brew_roots = vec![
+            PathBuf::from("/opt/homebrew/Cellar/deep-obsidian-mcp/0.1.0/bin"),
+            PathBuf::from("/opt/homebrew/Cellar/deep-obsidian-mcp/0.1.0"),
+        ];
+        assert!(
+            bundle_candidates(brew_roots).contains(&PathBuf::from(
+                "/opt/homebrew/Cellar/deep-obsidian-mcp/0.1.0/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs"
+            )),
+            "the Homebrew pkgshare layout must be reachable"
+        );
+
+        // The source-checkout arm is unchanged and still tried FIRST for each root, so
+        // a developer's freshly built `dist/sidecar.mjs` still wins over a stale
+        // installed copy under the same prefix.
+        let repo = vec![PathBuf::from("/work/deep-obsidian-mcp")];
+        assert_eq!(
+            bundle_candidates(repo),
+            vec![
+                PathBuf::from("/work/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs"),
+                PathBuf::from(
+                    "/work/deep-obsidian-mcp/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs"
+                ),
+            ]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // base64
     // -----------------------------------------------------------------------
@@ -2518,7 +2620,7 @@ mod tests {
     /// True when `node` can be started. These tests are hermetic but do need a Node
     /// runtime, exactly like `rg_available` gates the ripgrep tests.
     fn node_available() -> bool {
-        std::process::Command::new(locate_node())
+        std::process::Command::new(sidecar_node_command())
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
