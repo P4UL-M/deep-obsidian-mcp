@@ -208,7 +208,11 @@ pub async fn handle_request(
             serde_json::to_value(json_response(
                 id,
                 ToolListResult {
-                    tools: tools::list_tools(state.rg_available, state.router.is_multi_mount()),
+                    tools: tools::list_tools(
+                        state.rg_available,
+                        state.router.is_multi_mount(),
+                        tools::CapabilitySet::of(&state.router),
+                    ),
                 },
             ))
             .expect("tool list response to serialize"),

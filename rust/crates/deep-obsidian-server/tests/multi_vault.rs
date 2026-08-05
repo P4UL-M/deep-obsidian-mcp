@@ -2372,10 +2372,16 @@ async fn every_binary_path_on_an_algolia_mount_is_refused_as_markdown_only() {
     );
 }
 
-/// Scoped index recall on an algolia mount is refused, and the refusal explains that
-/// the mount has no LOCAL index rather than implying something is broken.
+/// GRAPH-shaped recall on an algolia mount is still refused, and the refusal now also
+/// names the recall that DOES work there.
+///
+/// The split is the point of this slice: a ranked list is something the shared index can
+/// produce, while a link graph, a similarity neighbourhood and an artifact embedding table
+/// are not things a remote corpus exposes at all. So these three keep refusing — and the
+/// refusal must point AT the native recall rather than away from it, or the feature stays
+/// undiscovered by exactly the user who hit the wall.
 #[tokio::test]
-async fn scoped_index_recall_on_an_algolia_mount_is_refused_honestly() {
+async fn graph_shaped_recall_on_an_algolia_mount_is_refused_honestly() {
     let fixture = AlgoliaFixture::new("algolia-recall").await;
     let state = fixture.state_writable(true).await;
     tool_call(
@@ -2386,12 +2392,12 @@ async fn scoped_index_recall_on_an_algolia_mount_is_refused_honestly() {
     .await;
 
     for (tool, arguments) in [
-        (
-            "hybrid_search",
-            json!({"query": "shared", "scope": "_Shared"}),
-        ),
         ("related_notes", json!({"path": "_Shared/A.md"})),
         ("graph_traverse", json!({"path": "_Shared/A.md"})),
+        (
+            "search_artifacts",
+            json!({"query": "shared", "scope": "_Shared"}),
+        ),
     ] {
         let response = tool_call(&state, tool, arguments).await;
         let message = error_message(&response);
@@ -2410,29 +2416,200 @@ async fn scoped_index_recall_on_an_algolia_mount_is_refused_honestly() {
             !message.contains("has no index."),
             "{tool} must not use the old bare wording: {message}"
         );
-        // The enumerated scopes must EXCLUDE the mount that was just refused. Naming it
-        // would tell the user to retry the exact call that failed.
+        // It DOES point at the recall this mount serves natively, and says what the
+        // missing piece actually is.
         assert!(
-            message.contains("'/'"),
-            "{tool} must name the root mount as a usable scope: {message}"
+            message.contains("hybrid_search") && message.contains("load_knowledge"),
+            "{tool} must name the recall this mount DOES serve: {message}"
         );
         assert!(
-            !message.contains("'_Shared'"),
-            "{tool} must not suggest the mount it just refused: {message}"
+            message.contains("link graph"),
+            "{tool} must say what is genuinely absent: {message}"
+        );
+        // The index-backed scope list still excludes this mount: for THESE tools it
+        // really cannot serve, so naming it would be telling the user to retry the exact
+        // call that failed.
+        assert!(
+            message.contains("index: '/'"),
+            "{tool} must name the root mount as the index-backed scope: {message}"
         );
     }
 
-    // Scoping the SAME tool to the filesystem root still works, so the refusal is
+    // Scoping an index-backed tool to the filesystem root still works, so the refusal is
     // per-mount rather than a global loss of the tool.
-    let root = tool_call(
-        &state,
-        "hybrid_search",
-        json!({"query": "root", "scope": "/"}),
-    )
-    .await;
+    let root = tool_call(&state, "related_notes", json!({"path": "Root.md"})).await;
     assert!(
         root.get("result").is_some(),
         "recall on the filesystem root must still work: {root}"
+    );
+}
+
+/// Scoped `hybrid_search` and `load_knowledge` on an algolia mount are SERVED, by that
+/// mount's own index, in the logical namespace — and the payload says so.
+#[tokio::test]
+async fn scoped_recall_on_an_algolia_mount_is_served_by_the_mounts_own_index() {
+    let fixture = AlgoliaFixture::new("algolia-native-recall").await;
+    let state = fixture.state_writable(true).await;
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "_Shared/Decisions/Retention.md",
+            "content": "# Retention\n\nThe retention policy keeps five versions of every note.\n",
+        }),
+    )
+    .await;
+    // A root-mount note with the SAME vocabulary. Nothing served from the shared mount may
+    // include it, and nothing served from the root may include the shared note: native
+    // recall answers for its own mount only.
+    fs::write(
+        fixture.inner.root_vault.join("Retention.md"),
+        "# Local Retention\n\nA local note about the retention policy.\n",
+    )
+    .expect("write the root-mount note");
+
+    let response = tool_call(
+        &state,
+        "hybrid_search",
+        json!({"query": "retention policy", "scope": "_Shared"}),
+    )
+    .await;
+    let payload = structured(&response);
+    // Provenance, stated rather than implied.
+    assert_eq!(payload["nativeRecall"], json!(true), "{payload}");
+    assert_eq!(payload["mountId"], json!("shared"), "{payload}");
+    assert_eq!(payload["recallMode"], json!("lexical"), "{payload}");
+    assert!(payload["exhausted"].is_boolean(), "{payload}");
+    // A local hybrid search reports the local embedding backend; a natively-served one
+    // must not claim one it never used.
+    assert!(
+        payload.get("semanticBackend").is_none() && payload.get("degraded").is_none(),
+        "a natively-served payload must not report the LOCAL embedding backend: {payload}"
+    );
+
+    let matches = payload["matches"].as_array().expect("matches");
+    assert!(!matches.is_empty(), "{payload}");
+    let paths: Vec<&str> = matches
+        .iter()
+        .filter_map(|item| item["path"].as_str())
+        .collect();
+    // LOGICAL paths: the mount prefix is put back on.
+    assert!(
+        paths.contains(&"_Shared/Decisions/Retention.md"),
+        "{paths:?}"
+    );
+    // No cross-mount content flow: the root mount's note is not in this mount's answer.
+    assert!(
+        !paths.contains(&"Retention.md"),
+        "native recall must serve only its own mount: {paths:?}"
+    );
+    let hit = &matches[0];
+    assert_eq!(
+        hit["resourceUri"],
+        json!("obsidian://note?path=_Shared%2FDecisions%2FRetention.md"),
+        "the resource URI moves with the logical path: {hit}"
+    );
+    assert!(hit["score"].as_f64().expect("a score") > 0.0, "{hit}");
+    assert!(hit["text"]
+        .as_str()
+        .expect("snippet text")
+        .contains("retention policy"));
+    // The two local ranker signals are ABSENT rather than fabricated: a remote index
+    // reports one ranking, not a decomposition into semantic and BM25 halves.
+    assert!(
+        hit.get("semanticScore").is_none() && hit.get("bm25Score").is_none(),
+        "a native hit must not invent the local ranker's input signals: {hit}"
+    );
+
+    // `load_knowledge` serves the chunks and notes, and is explicit that the graph is
+    // empty because none was traversed rather than because none was found.
+    let response = tool_call(
+        &state,
+        "load_knowledge",
+        json!({"subject": "retention policy", "scope": "_Shared"}),
+    )
+    .await;
+    let payload = structured(&response);
+    assert_eq!(payload["nativeRecall"], json!(true), "{payload}");
+    assert_eq!(payload["recallMode"], json!("lexical"), "{payload}");
+    let notes: Vec<&str> = payload["notes"]
+        .as_array()
+        .expect("notes")
+        .iter()
+        .filter_map(|note| note["path"].as_str())
+        .collect();
+    assert_eq!(notes, vec!["_Shared/Decisions/Retention.md"], "{payload}");
+    assert!(!payload["chunks"].as_array().expect("chunks").is_empty());
+    assert_eq!(payload["graph"]["nodes"], json!([]), "{payload}");
+    let reason = payload["graphUnavailableReason"]
+        .as_str()
+        .expect("a graph reason");
+    assert!(
+        reason.contains("no local link graph") && reason.contains("none was traversed"),
+        "an empty graph must distinguish itself from a graph with no results: {reason}"
+    );
+
+    // The ROOT mount's own recall is unaffected and does not see the shared note.
+    let response = tool_call(
+        &state,
+        "hybrid_search",
+        json!({"query": "retention policy", "scope": "/"}),
+    )
+    .await;
+    let payload = structured(&response);
+    assert!(
+        payload.get("nativeRecall").is_none(),
+        "the filesystem root is served by its LOCAL index: {payload}"
+    );
+    let paths: Vec<&str> = payload["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .filter_map(|item| item["path"].as_str())
+        .collect();
+    assert!(
+        !paths.iter().any(|path| path.starts_with("_Shared/")),
+        "the root mount's index must not contain the shared mount's notes: {paths:?}"
+    );
+}
+
+/// The unscoped-recall refusal names the mounts that could serve THAT tool.
+///
+/// Two different lists, because two different sets of mounts can answer: `hybrid_search`
+/// can be served by the shared mount, `related_notes` cannot. One list would be wrong for
+/// one of them — and wrong in the worse direction for `hybrid_search`, where it would
+/// hide a mount that works.
+#[tokio::test]
+async fn the_unscoped_refusal_names_only_the_mounts_that_can_serve_that_tool() {
+    let fixture = AlgoliaFixture::new("algolia-scope-hint").await;
+    let state = fixture.state_writable(true).await;
+
+    for tool in ["hybrid_search", "load_knowledge"] {
+        let arguments = if tool == "hybrid_search" {
+            json!({"query": "shared"})
+        } else {
+            json!({"subject": "shared"})
+        };
+        let message = error_message(&tool_call(&state, tool, arguments).await).to_string();
+        assert!(message.contains("requires a 'scope'"), "{tool}: {message}");
+        assert!(
+            message.contains("'_Shared'"),
+            "{tool} CAN be served by the shared mount, so the hint must name it: {message}"
+        );
+        assert!(message.contains("'/'"), "{tool}: {message}");
+    }
+
+    // `search_artifacts` needs the local artifact table, which the shared mount has not
+    // got, so its hint must NOT name it.
+    let message =
+        error_message(&tool_call(&state, "search_artifacts", json!({"query": "x"})).await)
+            .to_string();
+    assert!(message.contains("requires a 'scope'"), "{message}");
+    assert!(message.contains("'/'"), "{message}");
+    assert!(
+        !message.contains("'_Shared'"),
+        "search_artifacts cannot be served by the shared mount, so its hint must not offer it: \
+         {message}"
     );
 }
 
@@ -2460,9 +2637,19 @@ async fn vault_info_describes_the_algolia_mount_and_never_calls_it_degraded() {
 
     assert_eq!(shared["backendKind"], json!("algolia"));
     assert_eq!(shared["mountAt"], json!("_Shared"));
-    // Capabilities are the backend's own, and they are honest: a bounded grep, and
-    // nothing binary.
-    assert_eq!(shared["capabilities"], json!(["grep-search"]));
+    // Capabilities are the backend's own, and they are honest: a bounded grep, its own
+    // ranked recall, a version history, a soft delete (this mount is writable) — and
+    // nothing binary. The ORDER is the `Capability` enum's declaration order, which is
+    // what reaches a client, so this pins it too.
+    assert_eq!(
+        shared["capabilities"],
+        json!([
+            "grep-search",
+            "native-recall",
+            "version-history",
+            "soft-delete"
+        ])
+    );
     // No local index, said in a way a client can branch on, plus a note saying why.
     assert_eq!(shared["localIndex"], json!(false));
     assert_eq!(shared["indexStatus"], json!("none"));
@@ -2585,4 +2772,724 @@ async fn grep_scoped_to_an_algolia_mount_runs_and_refuses_honestly() {
         !message.contains("ripgrep"),
         "the refusal must not blame a missing binary: {message}"
     );
+}
+
+/// A grep served by a mount that cannot read every file SAYS SO, in the payload.
+///
+/// `grep_search` has always meant ripgrep, so a caller treats an empty or short result as
+/// proof of absence. On this mount it is not, and 5b could only say so in a log line
+/// nobody reads. Both halves are asserted: the shared mount reports itself bounded, and
+/// the filesystem root's payload is UNCHANGED — the keys simply do not appear, which is
+/// what keeps the frozen grep behaviour frozen.
+#[tokio::test]
+async fn grep_on_an_algolia_mount_reports_that_it_is_not_exhaustive() {
+    let fixture = AlgoliaFixture::new("algolia-grep-honesty").await;
+    let state = fixture.state_writable(true).await;
+    if !state.rg_available {
+        eprintln!("skipping: ripgrep is not available, so grep_search is not advertised");
+        return;
+    }
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "_Shared/Decisions/Retention.md",
+            "content": "# Retention\n\nThe retention policy keeps five versions.\n",
+        }),
+    )
+    .await;
+
+    let shared = tool_call(
+        &state,
+        "grep_search",
+        json!({"query": "retention policy", "glob": "_Shared/**/*.md"}),
+    )
+    .await;
+    let payload = structured(&shared);
+    assert_eq!(payload["exhaustive"], json!(false), "{payload}");
+    // The number that tells a caller whether raising the bound would help.
+    assert!(
+        payload["candidateCount"]
+            .as_u64()
+            .expect("a candidate count")
+            >= 1,
+        "{payload}"
+    );
+    let note = payload["exhaustiveNote"].as_str().expect("a note");
+    assert!(
+        note.contains("NOT proof of absence") && note.contains("hybrid_search"),
+        "the note must say what a short result does not prove, and what to use instead: {note}"
+    );
+
+    // A FILESYSTEM-served grep's payload is byte-for-byte the one it always had: no
+    // `exhaustive`, no `candidateCount`, no note. That asymmetry is what keeps the frozen
+    // grep behaviour frozen, and it is asserted on a filesystem mount rather than on this
+    // fixture's root because a root-mount grep cannot be glob-scoped on a multi-mount
+    // vault (the root's subtree contains every other mount, so the router refuses it).
+    let plain = Fixture::new("grep-exhaustive-unchanged");
+    let plain_state = plain.state().await;
+    let response = tool_call(
+        &plain_state,
+        "grep_search",
+        json!({"query": "charter", "glob": "Team/**/*.md"}),
+    )
+    .await;
+    let payload = structured(&response);
+    assert!(
+        !payload["matches"].as_array().expect("matches").is_empty(),
+        "{payload}"
+    );
+    for absent in ["exhaustive", "candidateCount", "exhaustiveNote"] {
+        assert!(
+            payload.get(absent).is_none(),
+            "an exhaustive grep's payload must be unchanged, but it carries {absent}: {payload}"
+        );
+    }
+}
+
+/// A folder listing whose SUBFOLDERS were cut short by the provider's facet cap says so,
+/// and says which half is short.
+///
+/// Algolia refuses more than 100 facet values outright, so a folder with more direct
+/// subfolders than that cannot be enumerated. 5b could only `warn!` it. Staged with 101
+/// sibling folders, which is the smallest corpus that crosses the cap.
+#[tokio::test]
+async fn a_truncated_folder_listing_says_so_in_the_payload() {
+    let fixture = AlgoliaFixture::new("algolia-folders-truncated").await;
+    let state = fixture.state_writable(true).await;
+    // 101 top-level folders inside the mount. Written through the backend directly rather
+    // than through 101 `upsert_note` round trips: this test is about the LISTING, and the
+    // write path is covered elsewhere.
+    let mount = state
+        .router
+        .mounts()
+        .iter()
+        .find(|mount| mount.id == "shared")
+        .expect("the algolia mount");
+    for index in 0..101 {
+        mount
+            .backend
+            .execute(deep_obsidian_backend::BackendRequest::write_text(
+                format!("F{index:03}/Note.md"),
+                format!("# Note {index}\n\nbody {index}\n"),
+            ))
+            .await
+            .expect("seed a folder");
+    }
+
+    let response = tool_call(&state, "list_children", json!({"path": "_Shared"})).await;
+    let payload = structured(&response);
+    assert_eq!(payload["foldersTruncated"], json!(true), "{payload}");
+    let reason = payload["foldersTruncatedReason"]
+        .as_str()
+        .expect("a reason");
+    assert!(
+        reason.contains("SUBFOLDERS") && reason.contains("FILES listed here are complete"),
+        "the reason must say which half of the listing is short: {reason}"
+    );
+    assert!(
+        reason.contains("100"),
+        "the reason must name the cap: {reason}"
+    );
+    // `foldersOnly` carries it too: that caller is the one a short folder list misleads
+    // most.
+    let folders_only = tool_call(
+        &state,
+        "list_children",
+        json!({"path": "_Shared", "foldersOnly": true}),
+    )
+    .await;
+    assert_eq!(
+        structured(&folders_only)["foldersTruncated"],
+        json!(true),
+        "{folders_only}"
+    );
+
+    // The filesystem root's listing is unchanged: a real directory enumerates every
+    // subfolder, so the key never appears.
+    let root = tool_call(&state, "list_children", json!({})).await;
+    let payload = structured(&root);
+    assert!(
+        payload.get("foldersTruncated").is_none()
+            && payload.get("foldersTruncatedReason").is_none(),
+        "a real directory listing must be unchanged: {payload}"
+    );
+}
+
+/// `resources/list` includes the notes of a mount with NO local index.
+///
+/// The enumeration federates where recall cannot: concatenating each mount's note list is
+/// a COMPLETE answer, so omitting an index-less mount would tell a client those notes do
+/// not exist — the one failure mode a manifest must not have.
+#[tokio::test]
+async fn resources_list_includes_an_index_less_mounts_notes() {
+    let fixture = AlgoliaFixture::new("algolia-resources").await;
+    let state = fixture.state_writable(true).await;
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": "_Shared/Decisions/Retention.md", "content": "# Retention\n\nbody\n"}),
+    )
+    .await;
+
+    let response = request(&state, "resources/list", json!({})).await;
+    let uris: Vec<&str> = response["result"]["resources"]
+        .as_array()
+        .expect("resources")
+        .iter()
+        .filter_map(|resource| resource["uri"].as_str())
+        .collect();
+    let shared_uri = "obsidian://note?path=_Shared%2FDecisions%2FRetention.md";
+    assert!(
+        uris.contains(&shared_uri),
+        "the shared mount's note must be listed: {uris:?}"
+    );
+    // ...alongside the root mount's, in one globally sorted list.
+    assert!(uris.contains(&"obsidian://note?path=Root.md"), "{uris:?}");
+
+    // Advertising a resource and being able to READ it are two facts. Before this slice no
+    // index-less mount's note was ever listed, so nobody would have called `resources/read`
+    // on one; now a client that walks the listing will, and a listing full of unreadable
+    // URIs would be worse than the omission it replaced.
+    let read = request(&state, "resources/read", json!({"uri": shared_uri})).await;
+    assert_eq!(
+        read["result"]["contents"][0]["text"],
+        json!("# Retention\n\nbody\n"),
+        "every advertised resource must be readable: {read}"
+    );
+    assert_eq!(read["result"]["contents"][0]["uri"], json!(shared_uri));
+
+    // The compact manifest agrees with the listing.
+    let manifest = request(
+        &state,
+        "resources/read",
+        json!({"uri": "obsidian://vault/notes-index"}),
+    )
+    .await;
+    let text = manifest["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("manifest text");
+    assert!(
+        text.contains("_Shared/Decisions/Retention.md"),
+        "the notes index must agree with resources/list: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The capability-gated tools
+// ---------------------------------------------------------------------------
+
+fn tool_names(response: &Value) -> Vec<String> {
+    response["result"]["tools"]
+        .as_array()
+        .expect("a tools array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The four tools exist only when a mount can serve them, and `delete_note` tracks
+/// `writable` separately from the three read-only history tools.
+///
+/// This is the `grep_search` discipline applied to a capability: a tool that is advertised
+/// and can only ever refuse costs an agent a round trip and a wrong conclusion about the
+/// vault.
+#[tokio::test]
+async fn the_capability_tools_appear_only_for_a_mount_that_can_serve_them() {
+    const HISTORY_TOOLS: [&str; 3] = ["note_history", "read_version", "resolve_divergence"];
+
+    // Two FILESYSTEM mounts: none of the four, and no `resolveDivergence` argument.
+    let plain = Fixture::new("no-capability-tools");
+    let names = tool_names(&request(&plain.state().await, "tools/list", json!({})).await);
+    for absent in HISTORY_TOOLS.iter().chain(["delete_note"].iter()) {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "{absent} must not be advertised when no mount can serve it: {names:?}"
+        );
+    }
+
+    let fixture = AlgoliaFixture::new("capability-tools").await;
+
+    // A WRITABLE algolia mount: all four.
+    let response = request(&fixture.state_writable(true).await, "tools/list", json!({})).await;
+    let names = tool_names(&response);
+    for present in HISTORY_TOOLS.iter().chain(["delete_note"].iter()) {
+        assert!(
+            names.contains(&present.to_string()),
+            "{present} must be advertised for a capable mount: {names:?}"
+        );
+    }
+    // ...and `upsert_note` gains the one argument that can clear a divergence.
+    let upsert = response["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == json!("upsert_note"))
+        .expect("upsert_note");
+    let description = upsert["inputSchema"]["properties"]["resolveDivergence"]["description"]
+        .as_str()
+        .expect("a resolveDivergence description");
+    assert!(
+        description.contains("never merges"),
+        "the argument must say the server does not merge: {description}"
+    );
+    // `update_note_section` does NOT gain it: a reconciliation is a whole-note decision.
+    let section = response["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == json!("update_note_section"))
+        .expect("update_note_section");
+    assert!(
+        section["inputSchema"]["properties"]
+            .get("resolveDivergence")
+            .is_none(),
+        "a section replacement cannot assert a whole-note reconciliation: {section}"
+    );
+
+    // A READ-ONLY algolia mount: the history tools, but NOT `delete_note`. Reading history
+    // is a read; deleting is a write.
+    let names = tool_names(
+        &request(
+            &fixture.state_writable(false).await,
+            "tools/list",
+            json!({}),
+        )
+        .await,
+    );
+    for present in HISTORY_TOOLS {
+        assert!(
+            names.contains(&present.to_string()),
+            "{present} is a READ and must survive a read-only mount: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"delete_note".to_string()),
+        "delete_note must not be advertised for a read-only mount: {names:?}"
+    );
+}
+
+/// `note_history`, `read_version` and `delete_note` round-trip: versions accumulate, an
+/// old one is still readable, a delete hides the note everywhere, and the content is
+/// recoverable from the version the delete named.
+#[tokio::test]
+async fn version_history_and_soft_delete_round_trip_through_mcp() {
+    let fixture = AlgoliaFixture::new("algolia-history").await;
+    let state = fixture.state_writable(true).await;
+    let path = "_Shared/Decisions/Deletable.md";
+    let first = "# Deletable\n\nthe first body\n";
+    let second = "# Deletable\n\nthe second body\n";
+
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": path, "content": first}),
+    )
+    .await;
+    let history =
+        structured(&tool_call(&state, "note_history", json!({"path": path})).await).clone();
+    assert_eq!(history["count"], json!(1), "{history}");
+    assert_eq!(history["hasDivergence"], json!(false), "{history}");
+    let v1 = history["versions"][0]["versionId"]
+        .as_str()
+        .expect("a version id")
+        .to_string();
+    assert_eq!(history["versions"][0]["current"], json!(true));
+    // Every key is present on every entry, `null` where the link does not exist — so a
+    // client walking `versions[]` needs no branch.
+    for key in [
+        "versionId",
+        "participantId",
+        "updatedAtMs",
+        "parentVersionId",
+        "forkedFrom",
+        "supersededBy",
+        "current",
+    ] {
+        assert!(
+            history["versions"][0].get(key).is_some(),
+            "{key} must be present (null when absent): {history}"
+        );
+    }
+
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": path, "content": second}),
+    )
+    .await;
+    let history =
+        structured(&tool_call(&state, "note_history", json!({"path": path})).await).clone();
+    assert_eq!(history["count"], json!(2), "{history}");
+    // Newest first, and the current version is first.
+    assert_eq!(history["versions"][0]["current"], json!(true), "{history}");
+    assert_eq!(history["versions"][1]["versionId"], json!(v1), "{history}");
+    assert!(
+        history["versions"][1]["supersededBy"].is_string(),
+        "an archived version names what replaced it: {history}"
+    );
+
+    // The superseded version is still readable, byte-exact, with its own hash.
+    let old = structured(
+        &tool_call(
+            &state,
+            "read_version",
+            json!({"path": path, "versionId": v1}),
+        )
+        .await,
+    )
+    .clone();
+    assert_eq!(old["text"], json!(first), "{old}");
+    assert!(old["hash"]
+        .as_str()
+        .expect("a hash")
+        .starts_with("fnv1a64:"));
+
+    // Delete: the note leaves every read.
+    let deleted =
+        structured(&tool_call(&state, "delete_note", json!({"path": path})).await).clone();
+    assert_eq!(deleted["deleted"], json!(true), "{deleted}");
+    assert_eq!(deleted["alreadyDeleted"], json!(false), "{deleted}");
+    let recoverable = deleted["recoverableFrom"]
+        .as_str()
+        .expect("recoverableFrom")
+        .to_string();
+    assert!(deleted["howToRecover"]
+        .as_str()
+        .expect("recovery guidance")
+        .contains("read_version"));
+
+    assert!(
+        tool_call(&state, "read_file", json!({"path": path}))
+            .await
+            .get("error")
+            .is_some(),
+        "a deleted note must not be readable"
+    );
+    let listed = tool_call(
+        &state,
+        "list_children",
+        json!({"path": "_Shared/Decisions"}),
+    )
+    .await;
+    let names: Vec<&str> = structured(&listed)["children"]
+        .as_array()
+        .expect("children")
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Deletable.md"),
+        "a tombstone must not appear in listings: {names:?}"
+    );
+    // ...and it leaves the mount's own recall too, because the delete removed its chunks.
+    let recall = tool_call(
+        &state,
+        "hybrid_search",
+        json!({"query": "second body", "scope": "_Shared"}),
+    )
+    .await;
+    let paths: Vec<&str> = structured(&recall)["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .filter_map(|item| item["path"].as_str())
+        .collect();
+    assert!(
+        !paths.contains(&path),
+        "a deleted note must not be findable: {paths:?}"
+    );
+
+    // Deleting it again is a successful no-op, not an error.
+    let again = structured(&tool_call(&state, "delete_note", json!({"path": path})).await).clone();
+    assert_eq!(again["alreadyDeleted"], json!(true), "{again}");
+
+    // The content is still there, and writing it back undeletes the note.
+    let recovered = structured(
+        &tool_call(
+            &state,
+            "read_version",
+            json!({"path": path, "versionId": recoverable}),
+        )
+        .await,
+    )
+    .clone();
+    assert_eq!(recovered["text"], json!(second), "{recovered}");
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": path, "content": second}),
+    )
+    .await;
+    assert_eq!(
+        structured(&tool_call(&state, "read_file", json!({"path": path})).await)["text"],
+        json!(second)
+    );
+    // The resurrection is NOT recorded as a divergence: a read reports a tombstone as
+    // absent, so the writer's observation was correct.
+    assert_eq!(
+        structured(&tool_call(&state, "note_history", json!({"path": path})).await)
+            ["hasDivergence"],
+        json!(false)
+    );
+}
+
+/// `delete_note` refuses a LOCAL path and leaves the file exactly where it was.
+///
+/// The assertion PR #40 pinned, and the one that matters most in this slice: MCP has never
+/// exposed local file deletion, and adding `delete_note` must not grant it by side effect.
+#[tokio::test]
+async fn delete_note_refuses_a_local_path_and_leaves_the_file() {
+    let fixture = AlgoliaFixture::new("algolia-delete-local").await;
+    let state = fixture.state_writable(true).await;
+
+    let message =
+        error_message(&tool_call(&state, "delete_note", json!({"path": "Root.md"})).await)
+            .to_string();
+    assert!(
+        message.contains("mount 'vault'") && message.contains("filesystem"),
+        "the refusal must name the mount and its backend: {message}"
+    );
+    assert!(
+        message.contains("no deletion of local vault files"),
+        "the refusal must say the omission is deliberate: {message}"
+    );
+    assert!(
+        message.contains("'_Shared/'"),
+        "the refusal must name the mounts that DO support it: {message}"
+    );
+    // The file is still there.
+    assert!(
+        fixture.inner.root_vault.join("Root.md").exists(),
+        "a refused delete must not have removed anything"
+    );
+
+    // The same shape for the history tools on a filesystem path.
+    for tool in ["note_history", "resolve_divergence"] {
+        let message =
+            error_message(&tool_call(&state, tool, json!({"path": "Root.md"})).await).to_string();
+        assert!(
+            message.contains("one content per note"),
+            "{tool} must explain the storage model rather than report a failure: {message}"
+        );
+    }
+}
+
+/// The divergence loop, end to end: a fork is recorded, `resolve_divergence` hands back
+/// all three corners of the merge, and a write asserting the reconciliation clears the
+/// mark.
+///
+/// The fork is staged through the BACKEND rather than through MCP, and it has to be: the
+/// tool layer's `expectedHash` guard rejects a stale caller ABOVE the boundary, so the only
+/// way to reach the fork path is the TOCTOU window between that check and the write — which
+/// is exactly what writing directly with a stale `BaseVersion` reproduces.
+#[tokio::test]
+async fn a_recorded_divergence_is_resolvable_and_only_an_asserted_merge_clears_it() {
+    use deep_obsidian_backend::{BackendRequest, BaseVersion};
+
+    let fixture = AlgoliaFixture::new("algolia-divergence").await;
+    let state = fixture.state_writable(true).await;
+    let logical = "_Shared/Decisions/Contested.md";
+    // Mount-relative: the backend is addressed directly below, without the router.
+    let remote = "Decisions/Contested.md";
+
+    let backend = state
+        .router
+        .mounts()
+        .iter()
+        .find(|mount| mount.id == "shared")
+        .expect("the algolia mount")
+        .backend
+        .clone();
+
+    // v1, the common ancestor.
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": logical, "content": "# Contested\n\nthe ancestor body\n"}),
+    )
+    .await;
+    let v1 = structured(&tool_call(&state, "note_history", json!({"path": logical})).await)
+        ["versions"][0]["versionId"]
+        .as_str()
+        .expect("v1")
+        .to_string();
+
+    // v2, a continuation of v1 by another participant. Not a fork: the base IS the head.
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            remote,
+            "# Contested\n\nthe overtaking body\n",
+            BaseVersion::Version(v1.clone()),
+        ))
+        .await
+        .expect("the second write lands");
+    let history =
+        structured(&tool_call(&state, "note_history", json!({"path": logical})).await).clone();
+    assert_eq!(
+        history["hasDivergence"],
+        json!(false),
+        "a head-based write is not a fork: {history}"
+    );
+    let v2 = history["versions"][0]["versionId"]
+        .as_str()
+        .expect("v2")
+        .to_string();
+
+    // v3, written from the STALE v1 base: the head has moved to v2, so this forks.
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            remote,
+            "# Contested\n\nthe forked body\n",
+            BaseVersion::Version(v1.clone()),
+        ))
+        .await
+        .expect("a stale-based write lands as a fork rather than failing");
+
+    let history =
+        structured(&tool_call(&state, "note_history", json!({"path": logical})).await).clone();
+    assert_eq!(
+        history["hasDivergence"],
+        json!(true),
+        "a stale-based write records a divergence: {history}"
+    );
+    assert_eq!(
+        history["versions"][0]["forkedFrom"],
+        json!(v2),
+        "the fork names the head it displaced: {history}"
+    );
+    assert_eq!(
+        history["versions"][0]["parentVersionId"],
+        json!(v1),
+        "...and the version its content came from: {history}"
+    );
+    // `vault_info` reports it too, in the logical namespace.
+    let info = structured(&tool_call(&state, "vault_info", json!({})).await).clone();
+    let shared = info["mounts"]
+        .as_array()
+        .expect("mounts")
+        .iter()
+        .find(|mount| mount["id"] == json!("shared"))
+        .expect("the shared mount")
+        .clone();
+    assert_eq!(shared["conflictedCount"], json!(1), "{shared}");
+    assert_eq!(shared["conflictedPaths"], json!([logical]), "{shared}");
+
+    // All three corners of the merge, and no merge.
+    let divergence =
+        structured(&tool_call(&state, "resolve_divergence", json!({"path": logical})).await)
+            .clone();
+    assert_eq!(divergence["hasDivergence"], json!(true), "{divergence}");
+    assert!(divergence["head"]["text"]
+        .as_str()
+        .expect("head text")
+        .contains("the forked body"));
+    // The head block carries no hash: `read_file` already reports the current hash, and a
+    // second one here would invite a client to feed the wrong value back as expectedHash.
+    assert!(divergence["head"].get("hash").is_none(), "{divergence}");
+    assert!(divergence["overtaken"]["text"]
+        .as_str()
+        .expect("overtaken text")
+        .contains("the overtaking body"));
+    assert_eq!(divergence["overtaken"]["versionId"], json!(v2));
+    assert!(divergence["overtaken"]["hash"].is_string());
+    assert!(divergence["commonAncestor"]["text"]
+        .as_str()
+        .expect("ancestor text")
+        .contains("the ancestor body"));
+    assert_eq!(divergence["commonAncestor"]["versionId"], json!(v1));
+    assert!(divergence["howToResolve"]
+        .as_str()
+        .expect("guidance")
+        .contains("resolveDivergence: true"));
+
+    // A plain write does NOT clear the mark: divergence is sticky until something asserts
+    // the reconciliation.
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": logical, "content": "# Contested\n\njust another edit\n"}),
+    )
+    .await;
+    assert_eq!(
+        structured(&tool_call(&state, "note_history", json!({"path": logical})).await)
+            ["hasDivergence"],
+        json!(true),
+        "an ordinary write must not clear a divergence it did not reconcile"
+    );
+
+    // The asserted merge clears it.
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": logical,
+            "content": "# Contested\n\nthe forked body\n\nthe overtaking body\n",
+            "resolveDivergence": true,
+        }),
+    )
+    .await;
+    let history =
+        structured(&tool_call(&state, "note_history", json!({"path": logical})).await).clone();
+    assert_eq!(
+        history["hasDivergence"],
+        json!(false),
+        "an asserted reconciliation clears the mark: {history}"
+    );
+    // ...and `resolve_divergence` now says there is nothing to resolve, rather than
+    // erroring.
+    let resolved =
+        structured(&tool_call(&state, "resolve_divergence", json!({"path": logical})).await)
+            .clone();
+    assert_eq!(resolved["hasDivergence"], json!(false), "{resolved}");
+    assert_eq!(
+        resolved["note"],
+        json!("no divergence recorded on this note"),
+        "{resolved}"
+    );
+    // The mount is no longer reporting a conflicted path.
+    let info = structured(&tool_call(&state, "vault_info", json!({})).await).clone();
+    let shared = info["mounts"]
+        .as_array()
+        .expect("mounts")
+        .iter()
+        .find(|mount| mount["id"] == json!("shared"))
+        .expect("the shared mount")
+        .clone();
+    assert_eq!(shared["conflictedCount"], json!(0), "{shared}");
+    assert!(shared.get("conflictedPaths").is_none(), "{shared}");
+}
+
+/// On a READ-ONLY algolia mount `delete_note` is not advertised, and calling it anyway is
+/// refused by the SAME capability check — so the registration gate and the call guard
+/// cannot disagree.
+///
+/// Two gates rather than one is deliberate: registration keeps the tool off `tools/list`,
+/// and the call guard means a client working from a cached tool list, or one that guesses,
+/// gets an explanation instead of a delete.
+#[tokio::test]
+async fn a_read_only_algolia_mount_refuses_a_delete_it_never_advertised() {
+    let fixture = AlgoliaFixture::new("algolia-read-only-delete").await;
+    let state = fixture.state_writable(false).await;
+
+    let message =
+        error_message(&tool_call(&state, "delete_note", json!({"path": "_Shared/A.md"})).await)
+            .to_string();
+    assert!(
+        message.contains("mount 'shared'") && message.contains("algolia"),
+        "the refusal must name the mount and its backend: {message}"
+    );
+    assert!(
+        message.contains("No mount in this vault supports it."),
+        "with no capable mount there is nothing to suggest: {message}"
+    );
+
+    // The history tools, which are READS, still work on the same mount.
+    tool_call(
+        &state,
+        "note_history",
+        json!({"path": "_Shared/Missing.md"}),
+    )
+    .await;
 }

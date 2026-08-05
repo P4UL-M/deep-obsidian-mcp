@@ -18,10 +18,49 @@ use crate::grep::{self, GrepParams};
 use crate::watch::{watch_reason, ChangeEvent, ChangeStream};
 use crate::{
     BackendDescriptor, BackendError, BackendKind, BackendRequest, BackendResponse, Capability,
-    ContentRequest, ContentResponse, HealthRequest, HealthResponse, ManifestRequest,
-    ManifestResponse, MutationRequest, MutationResponse, OpaqueCursor, RecallRequest,
-    RecallResponse, VaultBackend,
+    ChildListing, ContentRequest, ContentResponse, GrepOutcome, HealthRequest, HealthResponse,
+    ManifestRequest, ManifestResponse, MutationRequest, MutationResponse, OpaqueCursor,
+    RecallRequest, RecallResponse, VaultBackend,
 };
+
+/// Refusal for a ranked search asked of a filesystem mount.
+///
+/// A filesystem vault has no index of its own: the SERVER builds one over it and ranks
+/// there, which is the arrangement every recall tool already uses. So this is not a
+/// missing feature to be implemented later — answering it here would mean a second,
+/// worse ranker underneath the real one. The message says which layer owns the answer,
+/// because a reader who sees "unsupported" from the backend will otherwise conclude
+/// recall is broken on their vault.
+pub const FILESYSTEM_NATIVE_RECALL_UNSUPPORTED_MESSAGE: &str = "a filesystem vault does not \
+perform its own ranked search: the server builds a local search index over it and ranks there, \
+which is what hybrid_search, load_knowledge, related_notes and graph_traverse already use. This \
+request exists for a backend whose storage IS a search index (a shared corpus that has no local \
+copy), and asking a filesystem mount for it would put a second, weaker ranker underneath the real \
+one. Nothing is missing — use the index-backed recall tools.";
+
+/// Refusal for a versioned read or a history listing on a filesystem mount.
+///
+/// Names the storage model rather than an unimplemented feature, and points at what a
+/// user actually wants (their own version control), because "not supported" invites the
+/// question this answers: could it be?
+pub const FILESYSTEM_VERSION_HISTORY_UNSUPPORTED_MESSAGE: &str = "a filesystem vault keeps no \
+version history: a file has exactly one content by construction, and an overwrite replaces it, so \
+there is no superseded version to list or to read back. This is the storage model, not a missing \
+feature — a previous version can only come from something that kept one (git, Obsidian's own file \
+recovery, or a Time Machine/backup snapshot).";
+
+/// Refusal for deleting a note on a filesystem mount.
+///
+/// The most important refusal in this file. MCP has never exposed local file deletion,
+/// and a `delete_note` tool reaching a filesystem mount by accident would be a far
+/// larger capability than anything else on the surface — so the refusal is
+/// unconditional and says out loud that the omission is deliberate.
+pub const FILESYSTEM_SOFT_DELETE_UNSUPPORTED_MESSAGE: &str = "this MCP surface exposes no \
+deletion of local vault files, deliberately: every other write here creates or replaces a note, \
+and an agent that can also remove files is a materially larger capability than the one you \
+granted. Delete the file yourself (in Obsidian, or in your file manager). Soft delete exists only \
+for a backend whose removal is observable and recoverable — a shared corpus where the note becomes \
+a tombstone other participants see and the content stays readable from its version history.";
 
 /// Prefix used for in-progress upload staging files.
 ///
@@ -82,17 +121,23 @@ impl FilesystemVaultBackend {
                 path,
                 include_hidden,
                 include_ignored,
-            } => Ok(ManifestResponse::Children(vault::list_children(
-                &self.vault_path,
-                path.as_deref(),
-                include_hidden,
-                include_ignored,
-            )?)),
+            } => Ok(ManifestResponse::Children(ChildListing::exhaustive(
+                vault::list_children(
+                    &self.vault_path,
+                    path.as_deref(),
+                    include_hidden,
+                    include_ignored,
+                )?,
+            ))),
             ManifestRequest::WalkMarkdown => Ok(ManifestResponse::MarkdownFiles(
                 vault::list_markdown_files(&self.vault_path)?,
             )),
             ManifestRequest::TopLevelFolders => Ok(ManifestResponse::Folders(
                 vault::list_top_level_folders(&self.vault_path)?,
+            )),
+            // The directory HAS no history. See the constant.
+            ManifestRequest::Versions { .. } => Err(BackendError::Unsupported(
+                FILESYSTEM_VERSION_HISTORY_UNSUPPORTED_MESSAGE.to_string(),
             )),
         }
     }
@@ -101,7 +146,15 @@ impl FilesystemVaultBackend {
         match request {
             // Vault-flavoured: core enriches IO failures with the path and, for
             // permission errors, the remediation. Frozen by `error_missing_file`.
-            ContentRequest::ReadText { path } => Ok(ContentResponse::Text {
+            // A versioned read is refused BEFORE the file is opened: answering with the
+            // current content would silently serve something other than the version
+            // that was asked for, which is worse than refusing.
+            ContentRequest::ReadText {
+                version: Some(_), ..
+            } => Err(BackendError::Unsupported(
+                FILESYSTEM_VERSION_HISTORY_UNSUPPORTED_MESSAGE.to_string(),
+            )),
+            ContentRequest::ReadText { path, .. } => Ok(ContentResponse::Text {
                 text: vault::read_text_file(&self.vault_path, &path)?.text,
                 // The filesystem mints no version token. A caller therefore gets
                 // `BaseVersion::Unobserved` back and the read-then-write window
@@ -156,20 +209,29 @@ impl FilesystemVaultBackend {
                         grep::RIPGREP_UNAVAILABLE_MESSAGE.to_string(),
                     ));
                 }
-                Ok(RecallResponse::Grep(grep::run_grep(
-                    &self.ripgrep_path,
-                    &self.vault_path,
-                    self.index_dir.as_deref(),
-                    GrepParams {
-                        query,
-                        regex,
-                        case_sensitive,
-                        glob,
-                        context_lines,
-                        limit,
-                    },
-                )?))
+                // EXHAUSTIVE, and it is ripgrep that makes it so: it opens every file
+                // in scope. This is the only backend that can claim it, and the claim
+                // is what makes the server's `exhaustive` field meaningful when
+                // another backend cannot.
+                Ok(RecallResponse::Grep(GrepOutcome::exhaustive(
+                    grep::run_grep(
+                        &self.ripgrep_path,
+                        &self.vault_path,
+                        self.index_dir.as_deref(),
+                        GrepParams {
+                            query,
+                            regex,
+                            case_sensitive,
+                            glob,
+                            context_lines,
+                            limit,
+                        },
+                    )?,
+                )))
             }
+            RecallRequest::Search(_) => Err(BackendError::Unsupported(
+                FILESYSTEM_NATIVE_RECALL_UNSUPPORTED_MESSAGE.to_string(),
+            )),
         }
     }
 
@@ -236,10 +298,17 @@ impl VaultBackend for FilesystemVaultBackend {
             }
             // `base_version` is deliberately ignored: this backend mints no version
             // tokens, so it never receives one, and its write is an atomic rename
-            // that has no precondition to attach. See `BaseVersion`.
+            // that has no precondition to attach. See `BaseVersion`. `resolve_divergence`
+            // is ignored for the matching reason: nothing here can record a divergence,
+            // so there is none to clear and honouring the flag would be theatre.
             BackendRequest::Mutation(MutationRequest::WriteText { path, content, .. }) => self
                 .write_text(&path, &content)
                 .map(BackendResponse::Mutation),
+            // Refused, and NOT by falling back to `remove_file`. See the constant: the
+            // absence of local deletion from this surface is the contract.
+            BackendRequest::Mutation(MutationRequest::SoftDelete { .. }) => Err(
+                BackendError::Unsupported(FILESYSTEM_SOFT_DELETE_UNSUPPORTED_MESSAGE.to_string()),
+            ),
             BackendRequest::Mutation(MutationRequest::SweepOrphanStagingFiles) => {
                 sweep_orphan_temp_files_at(&self.vault_path, std::time::SystemTime::now());
                 Ok(BackendResponse::Mutation(MutationResponse::Swept))

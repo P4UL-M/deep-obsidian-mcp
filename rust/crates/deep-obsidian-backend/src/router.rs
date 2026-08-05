@@ -22,11 +22,11 @@
 //! holds one index runtime per mount), but an operation whose ANSWER spans mounts
 //! still has to merge and re-rank independently built result sets, and that is not
 //! implemented. So whole-vault manifest requests
-//! ([`ManifestRequest::WalkMarkdown`], [`ManifestRequest::TopLevelFolders`]) and
-//! unscoped [`RecallRequest::Grep`] are refused on a multi-mount router with
-//! [`RouterError::FederationUnsupported`] rather than answered from a single mount.
-//! Presenting one mount's results as the whole vault's would be a wrong answer, not
-//! a partial one.
+//! ([`ManifestRequest::WalkMarkdown`], [`ManifestRequest::TopLevelFolders`]), unscoped
+//! [`RecallRequest::Grep`] and every [`RecallRequest::Search`] are refused on a
+//! multi-mount router with [`RouterError::FederationUnsupported`] rather than answered
+//! from a single mount. Presenting one mount's results as the whole vault's would be a
+//! wrong answer, not a partial one.
 //!
 //! Requests that CAN name one mount do route: a `glob`-scoped grep here, and every
 //! path- or scope-bearing recall tool in the server, which uses
@@ -38,9 +38,9 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    BackendError, BackendRequest, BackendResponse, ContentRequest, GrepMatch, HealthRequest,
-    HealthResponse, ManifestRequest, ManifestResponse, MutationRequest, MutationResponse,
-    RecallRequest, RecallResponse, VaultBackend, VaultChildEntry, VaultEntryKind,
+    BackendError, BackendRequest, BackendResponse, ChildListing, ContentRequest, GrepMatch,
+    GrepOutcome, HealthRequest, HealthResponse, ManifestRequest, ManifestResponse, MutationRequest,
+    MutationResponse, RecallRequest, RecallResponse, VaultBackend, VaultChildEntry, VaultEntryKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -435,9 +435,21 @@ impl VaultRouter {
                 include_hidden,
                 include_ignored,
             }) => Ok(BackendResponse::Manifest(ManifestResponse::Children(
-                self.list_children(path.as_deref(), include_hidden, include_ignored)
+                self.child_listing(path.as_deref(), include_hidden, include_ignored)
                     .await?,
             ))),
+            // Path-bearing, so it routes like a read rather than needing federation:
+            // one note lives on exactly one mount, and its history is that mount's.
+            BackendRequest::Manifest(ManifestRequest::Versions { path }) => {
+                let resolved = self.resolve(&path)?;
+                Ok(resolved
+                    .mount
+                    .backend
+                    .execute(BackendRequest::note_versions(
+                        resolved.backend_relative_path.clone(),
+                    ))
+                    .await?)
+            }
             // Whole-vault manifests would need every mount to be correct.
             BackendRequest::Manifest(ManifestRequest::WalkMarkdown) => {
                 Err(RouterError::FederationUnsupported {
@@ -475,6 +487,20 @@ impl VaultRouter {
                 self.grep(query, regex, case_sensitive, glob, context_lines, limit)
                     .await
             }
+            // A ranked search across mounts is the federation problem in its purest
+            // form: each mount's index scores on its own scale, so merging the
+            // orderings needs comparable scores. Refused rather than answered from one
+            // mount. The server does NOT reach this — it selects the mount itself and
+            // calls that backend directly, exactly as it selects one mount's local
+            // index — so this arm is the honest answer for a caller that did not.
+            BackendRequest::Recall(RecallRequest::Search(_)) => {
+                Err(RouterError::FederationUnsupported {
+                    operation: "ranked search across mounts",
+                    remediation:
+                        "each mount ranks on its own scale, so a merged ordering needs comparable \
+                         scores, which is not implemented; scope the search to one mount",
+                })
+            }
             BackendRequest::Health(HealthRequest::Overview) => {
                 // A startup gate: every mount must be reachable, and the first
                 // failure is reported with that backend's own wording.
@@ -493,15 +519,19 @@ impl VaultRouter {
 
     async fn route_content(&self, request: ContentRequest) -> Result<BackendResponse, RouterError> {
         let path = match &request {
-            ContentRequest::ReadText { path }
+            ContentRequest::ReadText { path, .. }
             | ContentRequest::ReadBytes { path }
             | ContentRequest::Stat { path }
             | ContentRequest::ResolvePath { path } => path.clone(),
         };
         let resolved = self.resolve(&path)?;
         let routed = match request {
-            ContentRequest::ReadText { .. } => ContentRequest::ReadText {
+            // `version` is forwarded, not dropped: dropping it would turn a request for
+            // a superseded version into a request for the current one, and the caller
+            // would be handed the wrong content with no error at all.
+            ContentRequest::ReadText { version, .. } => ContentRequest::ReadText {
                 path: resolved.backend_relative_path,
+                version,
             },
             ContentRequest::ReadBytes { .. } => ContentRequest::ReadBytes {
                 path: resolved.backend_relative_path,
@@ -529,19 +559,33 @@ impl VaultRouter {
                 path,
                 content,
                 base_version,
+                resolve_divergence,
             } => {
                 let resolved = self.resolve(&path)?;
                 // `base_version` must be forwarded, not rebuilt: it is the caller's
                 // observation of THIS destination, and dropping it here would
                 // silently downgrade every write on a multi-mount vault to an
-                // unguarded one while every single-mount test still passed.
+                // unguarded one while every single-mount test still passed. The same
+                // argument covers `resolve_divergence`: dropping it would make every
+                // divergence permanently unresolvable on a multi-mount vault.
                 Ok(resolved
                     .mount
                     .backend
-                    .execute(BackendRequest::write_text_guarded(
+                    .execute(BackendRequest::write_text_full(
                         resolved.backend_relative_path.clone(),
                         content,
                         base_version,
+                        resolve_divergence,
+                    ))
+                    .await?)
+            }
+            MutationRequest::SoftDelete { path } => {
+                let resolved = self.resolve(&path)?;
+                Ok(resolved
+                    .mount
+                    .backend
+                    .execute(BackendRequest::soft_delete(
+                        resolved.backend_relative_path.clone(),
                     ))
                     .await?)
             }
@@ -590,6 +634,29 @@ impl VaultRouter {
         include_hidden: bool,
         include_ignored: bool,
     ) -> Result<Vec<VaultChildEntry>, RouterError> {
+        self.child_listing(logical_folder, include_hidden, include_ignored)
+            .await
+            .map(|listing| listing.entries)
+    }
+
+    /// [`Self::list_children`] plus whether the owning mount could name every
+    /// subfolder.
+    ///
+    /// # What the flag means after a merge
+    ///
+    /// It is the OWNING mount's flag, unchanged. The synthesized mount folders added
+    /// here are derived from the router's own mount table, which is complete by
+    /// construction, so they can never be the missing part — merging them in neither
+    /// clears a shortfall nor introduces one. And when the owning mount's listing
+    /// FAILED and only synthesized folders remain, the flag is `false`: nothing was
+    /// enumerated, so nothing was truncated, and claiming truncation there would
+    /// misattribute an outright failure to a cap.
+    pub async fn child_listing(
+        &self,
+        logical_folder: Option<&str>,
+        include_hidden: bool,
+        include_ignored: bool,
+    ) -> Result<ChildListing, RouterError> {
         let raw = logical_folder.unwrap_or("");
         let folder = normalize_prefix(raw);
         let synthesized = self.synthesized_child_folders(&folder);
@@ -609,18 +676,22 @@ impl VaultRouter {
                 include_ignored,
             ))
             .await
-            .and_then(BackendResponse::into_children);
+            .and_then(BackendResponse::into_child_listing);
 
-        let mut entries = match own {
-            Ok(entries) => entries
-                .into_iter()
-                .map(|entry| VaultChildEntry {
-                    path: resolved.mount.to_logical(&entry.path),
-                    ..entry
-                })
-                // Shadowing: a mount grafted onto this name wins.
-                .filter(|entry| !synthesized.iter().any(|folder| folder.path == entry.path))
-                .collect::<Vec<_>>(),
+        let (mut entries, folders_truncated) = match own {
+            Ok(listing) => (
+                listing
+                    .entries
+                    .into_iter()
+                    .map(|entry| VaultChildEntry {
+                        path: resolved.mount.to_logical(&entry.path),
+                        ..entry
+                    })
+                    // Shadowing: a mount grafted onto this name wins.
+                    .filter(|entry| !synthesized.iter().any(|folder| folder.path == entry.path))
+                    .collect::<Vec<_>>(),
+                listing.folders_truncated,
+            ),
             // The folder may exist only as a synthetic ancestor of a nested mount
             // (nothing physical under the owning mount). Reporting the owning
             // mount's "not found" would then hide a folder the user really can
@@ -630,13 +701,16 @@ impl VaultRouter {
                 if synthesized.is_empty() {
                     return Err(error.into());
                 }
-                Vec::new()
+                (Vec::new(), false)
             }
         };
 
         entries.extend(synthesized);
         sort_children(&mut entries);
-        Ok(entries)
+        Ok(ChildListing {
+            entries,
+            folders_truncated,
+        })
     }
 
     /// One directory entry per distinct immediate child of `folder` that leads to
@@ -726,7 +800,7 @@ impl VaultRouter {
                 .to_string()
         };
 
-        let matches = mount
+        let outcome = mount
             .backend
             .execute(BackendRequest::Recall(RecallRequest::Grep {
                 query,
@@ -737,14 +811,23 @@ impl VaultRouter {
                 limit,
             }))
             .await
-            .and_then(BackendResponse::into_grep_matches)?
-            .into_iter()
-            .map(|item| GrepMatch {
-                path: mount.to_logical(&item.path),
-                ..item
-            })
-            .collect::<Vec<_>>();
-        Ok(BackendResponse::Recall(RecallResponse::Grep(matches)))
+            .and_then(BackendResponse::into_grep_outcome)?;
+        // Only the PATHS are rewritten. The exhaustiveness report travels through
+        // untouched: it is the serving mount's own statement about its own search, and
+        // re-deriving or defaulting it here would turn a candidate-bounded backend's
+        // "I did not look everywhere" into silence — which is exactly the honesty
+        // failure the field exists to prevent.
+        Ok(BackendResponse::Recall(RecallResponse::Grep(GrepOutcome {
+            matches: outcome
+                .matches
+                .into_iter()
+                .map(|item| GrepMatch {
+                    path: mount.to_logical(&item.path),
+                    ..item
+                })
+                .collect(),
+            ..outcome
+        })))
     }
 }
 

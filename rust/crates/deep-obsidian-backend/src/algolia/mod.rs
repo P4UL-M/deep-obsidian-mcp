@@ -35,6 +35,7 @@
 pub mod cache;
 pub mod grep;
 pub mod reads;
+pub mod recall;
 pub mod records_build;
 pub mod versioning;
 
@@ -49,9 +50,9 @@ use tracing::warn;
 use crate::watch::ChangeStream;
 use crate::{
     BackendDescriptor, BackendError, BackendKind, BackendRequest, BackendResponse, BaseVersion,
-    Capability, ContentRequest, ContentResponse, HealthRequest, HealthResponse, ManifestRequest,
-    ManifestResponse, MutationRequest, MutationResponse, OpaqueCursor, RecallRequest,
-    RecallResponse, VaultBackend,
+    Capability, ChildListing, ContentRequest, ContentResponse, GrepOutcome, HealthRequest,
+    HealthResponse, ManifestRequest, ManifestResponse, MutationRequest, MutationResponse,
+    OpaqueCursor, RecallRequest, RecallResponse, VaultBackend,
 };
 
 // ---------------------------------------------------------------------------
@@ -197,6 +198,12 @@ pub struct AlgoliaVaultBackend {
     /// Same, for the history index — which exists only after a note is first
     /// superseded, so provisioning is necessarily lazier still.
     history_provisioned: AtomicBool,
+    /// Set once a search has confirmed the index runs Algolia NeuralSearch.
+    ///
+    /// Deliberately one-way, and deliberately not the inverse: see
+    /// [`recall::recall_mode`] for why a confirmed neural stage is cached while a
+    /// lexical one is re-detected every time.
+    pub(crate) neural_recall_confirmed: AtomicBool,
 }
 
 /// Hand-written so no credential can be printed, even transitively.
@@ -260,6 +267,7 @@ impl AlgoliaVaultBackend {
             ),
             main_provisioned: AtomicBool::new(false),
             history_provisioned: AtomicBool::new(false),
+            neural_recall_confirmed: AtomicBool::new(false),
         })
     }
 
@@ -331,14 +339,15 @@ impl AlgoliaVaultBackend {
                 include_hidden,
                 include_ignored,
             } => {
-                let (children, folders_truncated) =
+                let (entries, folders_truncated) =
                     reads::list_children(self, path.as_deref(), include_hidden, include_ignored)
                         .await?;
                 if folders_truncated {
-                    // No field on `ManifestResponse::Children` can carry this, and
-                    // widening it would reshape a frozen `list_children` payload for a
-                    // condition only this backend can produce. Logged loudly instead;
-                    // carrying it into the payload is a follow-up.
+                    // Still logged, and now ALSO carried: the log is for the operator
+                    // (it names the index and the cap), the flag is for the caller (it
+                    // reaches the `list_children` payload as `foldersTruncated`). Keeping
+                    // both is deliberate — an agent acting on the listing needs the flag,
+                    // and whoever has to raise the cap needs the log line.
                     warn!(
                         "listing {:?} on Algolia index '{}' hit the {}-value facet-enumeration \
                          cap, so this listing may be missing subfolders; the files listed are \
@@ -348,7 +357,10 @@ impl AlgoliaVaultBackend {
                         AlgoliaClient::MAX_FACET_HITS
                     );
                 }
-                Ok(ManifestResponse::Children(children))
+                Ok(ManifestResponse::Children(ChildListing {
+                    entries,
+                    folders_truncated,
+                }))
             }
             ManifestRequest::WalkMarkdown => Ok(ManifestResponse::MarkdownFiles(
                 reads::walk_markdown(self).await?,
@@ -356,12 +368,35 @@ impl AlgoliaVaultBackend {
             ManifestRequest::TopLevelFolders => Ok(ManifestResponse::Folders(
                 reads::top_level_folders(self).await?,
             )),
+            ManifestRequest::Versions { path } => {
+                ensure_vault_relative(&path)?;
+                Ok(ManifestResponse::Versions(
+                    versioning::note_history(self, &path).await?,
+                ))
+            }
         }
     }
 
     async fn content(&self, request: ContentRequest) -> Result<ContentResponse, BackendError> {
         match request {
-            ContentRequest::ReadText { path } => {
+            // A specific, possibly superseded version. Served from the main index first
+            // and the history index second, in that order, because the CURRENT version's
+            // chunks live in main — a caller naming the head's version id must not be
+            // told the version does not exist.
+            ContentRequest::ReadText {
+                path,
+                version: Some(version),
+            } => {
+                ensure_vault_relative(&path)?;
+                Ok(ContentResponse::Text {
+                    text: reads::read_note_version(self, &path, &version).await?,
+                    // Echoes the request: this is the version that was READ, which for a
+                    // versioned read is not the head. See `ContentRequest::ReadText` for
+                    // why that must never become a write's precondition.
+                    version: Some(version),
+                })
+            }
+            ContentRequest::ReadText { path, .. } => {
                 ensure_vault_relative(&path)?;
                 let hydrated = reads::read_note(self, &path).await?;
                 // The head's version travels out with the text. That is what lets a
@@ -415,6 +450,7 @@ impl AlgoliaVaultBackend {
         path: &str,
         content: &str,
         base_version: BaseVersion,
+        resolve_divergence: bool,
     ) -> Result<MutationResponse, BackendError> {
         self.ensure_writable()?;
         ensure_writable_path(path)?;
@@ -443,10 +479,39 @@ impl AlgoliaVaultBackend {
                 Vec::new()
             }
         };
-        let outcome =
-            versioning::push_note_version(self, path, content, &known_files, &base_version).await?;
+        let outcome = versioning::push_note_version(
+            self,
+            path,
+            content,
+            &known_files,
+            &base_version,
+            resolve_divergence,
+        )
+        .await?;
         Ok(MutationResponse::Written {
             created: outcome.created,
+        })
+    }
+
+    /// `SoftDelete`: replace the head with a tombstone. See
+    /// [`versioning::soft_delete_note`].
+    ///
+    /// Gated on `writable` like every other mutation, and on the markdown-only rule
+    /// before that — a caller asking to delete an attachment must be told the mount never
+    /// held one, not that the delete failed.
+    async fn soft_delete(&self, path: &str) -> Result<MutationResponse, BackendError> {
+        self.ensure_writable()?;
+        ensure_vault_relative(path)?;
+        if !reads::is_markdown_path(path) {
+            return Err(BackendError::Unsupported(
+                ALGOLIA_NO_BINARY_MESSAGE.to_string(),
+            ));
+        }
+        let outcome = versioning::soft_delete_note(self, path).await?;
+        Ok(MutationResponse::SoftDeleted {
+            version_id: outcome.version_id,
+            already_deleted: outcome.already_deleted,
+            recoverable_from: outcome.recoverable_from,
         })
     }
 
@@ -476,17 +541,33 @@ impl VaultBackend for AlgoliaVaultBackend {
     ///   would be a worse answer for every other mount. The bound is reported at
     ///   `warn` on every call, and a pattern with no literal anchor is refused rather
     ///   than answered misleadingly. See [`grep::ALGOLIA_GREP_NO_ANCHOR_MESSAGE`].
+    /// * `NativeRecall` — yes, and it is the whole reason the capability exists. This
+    ///   mount has no LOCAL index (the remote index is the corpus), so a scoped
+    ///   `hybrid_search` here is served by the index itself rather than refused. The
+    ///   hits carry ordinal scores and name their recall stage, so nothing claims parity
+    ///   with the local hybrid ranker. See [`recall`].
+    /// * `VersionHistory` — yes, unconditionally, including on a READ-ONLY mount:
+    ///   listing versions and reading one back are reads, and a participant who may read
+    ///   the corpus may read its history. Gating it on `writable` would hide the recovery
+    ///   path from exactly the mounts most likely to need it.
+    /// * `SoftDelete` — only when `writable`. This is the ONE capability `writable`
+    ///   gates, and it must be gated: a delete is a write, and the server registers the
+    ///   `delete_note` tool from this capability, so advertising it on a read-only mount
+    ///   would put a tool on the surface that could only ever refuse.
     /// * NO `BinaryRead`, NO `BinaryWrite`, NO `Upload` — Markdown only, by storage
     ///   design. See [`ALGOLIA_NO_BINARY_MESSAGE`].
     /// * NO `Watch` — there is no change feed. Algolia has no "tell me what changed
     ///   since" primitive, and polling the whole corpus is not one.
-    ///
-    /// Note what is NOT gated on `writable`: unlike the couchdb mount, no capability
-    /// appears when writes are enabled, because the two capabilities writes would
-    /// imply (`BinaryWrite`, `Upload`) are both refused for a reason `writable`
-    /// cannot change.
     fn descriptor(&self) -> BackendDescriptor {
-        BackendDescriptor::new(BackendKind::Algolia, [Capability::GrepSearch])
+        let mut capabilities = vec![
+            Capability::GrepSearch,
+            Capability::NativeRecall,
+            Capability::VersionHistory,
+        ];
+        if self.writable {
+            capabilities.push(Capability::SoftDelete);
+        }
+        BackendDescriptor::new(BackendKind::Algolia, capabilities)
     }
 
     async fn execute(&self, request: BackendRequest) -> Result<BackendResponse, BackendError> {
@@ -501,10 +582,14 @@ impl VaultBackend for AlgoliaVaultBackend {
                 path,
                 content,
                 base_version,
+                resolve_divergence,
             }) => self
-                .write_text(&path, &content, base_version)
+                .write_text(&path, &content, base_version, resolve_divergence)
                 .await
                 .map(BackendResponse::Mutation),
+            BackendRequest::Mutation(MutationRequest::SoftDelete { path }) => {
+                self.soft_delete(&path).await.map(BackendResponse::Mutation)
+            }
             // Refused for being BINARY rather than for the mount being read-only,
             // even on a read-only mount: `writable` can be turned on, and the reader
             // of this error must not be sent off to do that in the belief it will
@@ -542,7 +627,21 @@ impl VaultBackend for AlgoliaVaultBackend {
                 limit,
             )
             .await
-            .map(|matches| BackendResponse::Recall(RecallResponse::Grep(matches))),
+            .map(|(matches, candidate_count)| {
+                // NEVER exhaustive, and the response says so rather than leaving the
+                // caller to assume ripgrep semantics. `candidate_count` is what the
+                // lexical prefilter actually examined; see `grep::grep`.
+                BackendResponse::Recall(RecallResponse::Grep(GrepOutcome {
+                    matches,
+                    exhausted: false,
+                    candidate_count: Some(candidate_count),
+                }))
+            }),
+            BackendRequest::Recall(RecallRequest::Search(request)) => {
+                recall::search(self, &request)
+                    .await
+                    .map(|response| BackendResponse::Recall(RecallResponse::Search(response)))
+            }
             BackendRequest::Health(request) => {
                 self.health(request).await.map(BackendResponse::Health)
             }
@@ -860,13 +959,23 @@ mod tests {
         assert!(format!("{:?}", backend.client()).contains("<redacted>"));
     }
 
-    /// Exactly one capability, and it is the bounded grep. Every binary capability is
-    /// absent, so nothing advertises what the storage cannot do.
+    /// The capability set is exactly what this storage can do: a bounded grep, its own
+    /// ranked search, and a version history. Every BINARY capability is absent, so
+    /// nothing advertises what the storage cannot hold.
     #[test]
-    fn the_descriptor_advertises_only_the_bounded_grep() {
+    fn the_descriptor_advertises_recall_history_and_the_bounded_grep() {
         let descriptor = backend(true).descriptor();
         assert_eq!(descriptor.kind, BackendKind::Algolia);
-        assert!(descriptor.supports(Capability::GrepSearch));
+        for present in [
+            Capability::GrepSearch,
+            Capability::NativeRecall,
+            Capability::VersionHistory,
+        ] {
+            assert!(
+                descriptor.supports(present),
+                "{present:?} must be advertised"
+            );
+        }
         for absent in [
             Capability::BinaryRead,
             Capability::BinaryWrite,
@@ -878,8 +987,51 @@ mod tests {
                 "{absent:?} must not be advertised"
             );
         }
-        // ...and `writable` adds nothing, unlike on a couchdb mount.
-        assert_eq!(backend(false).descriptor(), backend(true).descriptor());
+    }
+
+    /// `writable` gates EXACTLY one capability, and it has to be that one: the server
+    /// registers `delete_note` from `SoftDelete`, so advertising it on a read-only mount
+    /// would put a tool on the surface whose every call is refused. Reading the history
+    /// stays available, because recovering content is a read.
+    #[test]
+    fn only_soft_delete_is_gated_on_writable() {
+        let read_only = backend(false).descriptor();
+        let writable = backend(true).descriptor();
+        assert!(!read_only.supports(Capability::SoftDelete));
+        assert!(writable.supports(Capability::SoftDelete));
+        assert!(
+            read_only.supports(Capability::VersionHistory)
+                && read_only.supports(Capability::NativeRecall),
+            "reads do not depend on `writable`: {read_only:?}"
+        );
+        let difference: Vec<Capability> = writable
+            .capabilities
+            .difference(&read_only.capabilities)
+            .copied()
+            .collect();
+        assert_eq!(difference, vec![Capability::SoftDelete]);
+    }
+
+    /// A read-only mount refuses a DELETE by naming the setting, exactly as it refuses a
+    /// write — and before anything reaches Algolia.
+    #[tokio::test]
+    async fn a_read_only_mount_refuses_a_delete_by_naming_the_setting() {
+        let error = backend(false)
+            .execute(BackendRequest::soft_delete("A.md"))
+            .await
+            .expect_err("a read-only mount refuses a delete");
+        assert_eq!(error.to_string(), ALGOLIA_READ_ONLY_MESSAGE);
+    }
+
+    /// Deleting an ATTACHMENT path is refused for being binary rather than for being
+    /// undeletable: this mount never held one, and a "delete failed" would suggest it did.
+    #[tokio::test]
+    async fn deleting_a_binary_path_is_refused_as_markdown_only() {
+        let error = backend(true)
+            .execute(BackendRequest::soft_delete("Assets/logo.png"))
+            .await
+            .expect_err("a binary path has nothing to delete");
+        assert_eq!(error.to_string(), ALGOLIA_NO_BINARY_MESSAGE);
     }
 
     /// A read-only mount refuses a write with the message that names the setting, and

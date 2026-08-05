@@ -6,8 +6,8 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use deep_obsidian_backend::{
-    BackendRequest, BaseVersion, GrepContextLine, GrepMatch, RecallRequest, VaultChildEntry,
-    VaultEntryKind, RIPGREP_UNAVAILABLE_MESSAGE,
+    BackendRequest, BaseVersion, Capability, GrepContextLine, GrepMatch, RecallRequest,
+    VaultChildEntry, VaultEntryKind, RIPGREP_UNAVAILABLE_MESSAGE,
 };
 use deep_obsidian_core::text::{
     extract_block_sections, extract_heading_sections, extract_wiki_links, normalize_heading_slug,
@@ -43,6 +43,29 @@ const TRUNCATION_NOTE: &str =
 /// unreachable at query time. Artifacts have no lexical (BM25) fallback, so the tool errors
 /// — but with this message instead of the raw upstream 400/connection error.
 const ARTIFACT_EMBEDDING_BACKEND_UNAVAILABLE_MESSAGE: &str = "artifact embedding backend unavailable — check the artifact embedding service (it may be down or restarting), then retry.";
+
+/// Why a `list_children` payload carries `foldersTruncated: true`.
+///
+/// The flag alone would leave a caller unable to act. This says which HALF of the listing
+/// is short (folders, never files) and that the cause is a hard provider ceiling rather
+/// than a setting or a failure — so nobody retries, and nobody concludes the missing
+/// folders do not exist.
+const FOLDERS_TRUNCATED_REASON: &str = "this listing's SUBFOLDERS may be incomplete: they are \
+synthesized from the shared index's folder facets, and facet-value enumeration is capped at 100 \
+values by the provider (a hard limit, not a setting). The FILES listed here are complete. Narrow \
+the listing by passing a deeper 'path', or use find_files, which walks every note.";
+
+/// Why a `grep_search` payload carries `exhaustive: false`.
+///
+/// `grep_search` has always meant ripgrep, which reads every file, so a caller reasonably
+/// treats an empty result as proof of absence. On a mount where that is not true, saying
+/// so is the entire point: this names the mechanism, says what the number next to it
+/// means, and points at the tool that IS complete for this mount.
+const NON_EXHAUSTIVE_GREP_NOTE: &str = "this line search was NOT exhaustive: the mount serving it \
+has no local files to scan, so it ran a lexical prefilter over its index and then applied your \
+pattern to the candidates that came back ('candidateCount'). A match in a chunk the index ranked \
+below the candidate cap is not reported, so an empty or short result is NOT proof of absence. Use \
+hybrid_search for ranked recall over this mount, or find_files to enumerate its notes.";
 
 #[derive(Debug, Clone)]
 struct KnowledgeNote {
@@ -814,7 +837,156 @@ fn insert_scope_argument(definitions: &mut [ToolDefinition]) {
     }
 }
 
-fn tool_definitions(rg_available: bool, multi_mount: bool) -> Vec<ToolDefinition> {
+/// The `resolveDivergence` argument, added to `upsert_note` only when a mount can record
+/// a divergence.
+///
+/// # Why it is a claim and not a command
+///
+/// The server never merges — a wrong automatic merge produces plausible text and is
+/// nearly undetectable — so clearing a divergence mark can only ever be the CALLER
+/// asserting that the content it is writing already reconciles both sides. The
+/// description says exactly that, because a client that reads this as "clear the flag"
+/// will pass it on every write and the mark will stop meaning anything.
+fn resolve_divergence_property() -> Value {
+    json!({
+        "type": "boolean",
+        "default": false,
+        "description": "Assert that this content RECONCILES a recorded divergence, clearing the note's hasDivergence mark. Only meaningful on a mount that records divergences (see vault_info.mounts[].capabilities for 'version-history'). Call resolve_divergence first to get the head, the overtaken version and their common ancestor, merge them yourself, then write the merged content with this set — the server never merges. Ignored if this write itself forks off a newer head, because that creates a divergence rather than resolving one."
+    })
+}
+
+/// Add `resolveDivergence` to `upsert_note`, for a vault where some mount records one.
+///
+/// # Why `upsert_note` only, when PR #40 also read it on `update_note_section`
+///
+/// A reconciliation is a whole-note decision: you merge two complete versions against
+/// their common ancestor and write the result. `update_note_section` replaces one section
+/// and leaves the rest of the note untouched, so a caller asserting "this reconciles the
+/// divergence" there would be asserting it about content it did not write. #40 accepted
+/// the argument at that call site but never declared it in the schema, so no client could
+/// discover it; narrowing it to the one tool where the claim is meaningful — and declaring
+/// it there — is the honest version of the same feature.
+fn insert_resolve_divergence_argument(definitions: &mut [ToolDefinition]) {
+    for definition in definitions
+        .iter_mut()
+        .filter(|definition| definition.name == "upsert_note")
+    {
+        if let Some(properties) = definition
+            .input_schema
+            .as_object_mut()
+            .and_then(|schema| schema.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+        {
+            properties.insert(
+                "resolveDivergence".to_string(),
+                resolve_divergence_property(),
+            );
+        }
+    }
+}
+
+/// The version-history and soft-delete tools, registered only for a vault that has a
+/// mount able to serve them.
+///
+/// # Why registration is capability-gated rather than always-on-and-refusing
+///
+/// The same discipline `grep_search` already follows: "rg works or `grep_search` does not
+/// exist". A tool that is advertised and can only ever refuse costs an agent a round trip
+/// and a wrong conclusion about the vault, and it costs every reader of `tools/list` the
+/// assumption that a listed tool works. So `delete_note` appears only when some mount
+/// advertises [`Capability::SoftDelete`], and the three history tools only when some mount
+/// advertises [`Capability::VersionHistory`].
+///
+/// The two capabilities are checked SEPARATELY rather than as one "shared mount" flag,
+/// because they genuinely come apart: a read-only shared mount has a version history and
+/// no soft delete, and `delete_note` must not appear for it.
+///
+/// # Why the four tools are not `scope`-routed
+///
+/// Each takes a `path`, so the mount is determined by longest-prefix match exactly as it
+/// is for `read_file` — there is nothing to choose. A `scope` would be a second, redundant
+/// way to say the same thing, and a way for the two to disagree.
+fn insert_capability_tools(definitions: &mut Vec<ToolDefinition>, capabilities: &CapabilitySet) {
+    if capabilities.soft_delete {
+        definitions.push(ToolDefinition {
+            name: "delete_note".to_string(),
+            description: "Soft-delete a note on a mount whose removal is observable and recoverable: it stops appearing in listings and search, its previous version moves to history, and the content stays readable via note_history/read_version. Only mounts advertising 'soft-delete' in vault_info.mounts[].capabilities — local vault files are NOT deletable through MCP.".to_string(),
+            annotations: Some(tool_annotations(false, Some(false), Some(true))),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema(
+                vec![("path", json!({"type":"string","description":"Logical vault-relative note path, on a mount that supports soft delete."}))],
+                vec!["path"],
+            ),
+        });
+    }
+    if !capabilities.version_history {
+        return;
+    }
+    definitions.push(ToolDefinition {
+        name: "note_history".to_string(),
+        description: "List the retained versions of a note on a mount that keeps a version history (newest first, with each version's author and timestamp). Retention keeps the most recent versions plus anything inside the mount's age window, so older versions may be absent.".to_string(),
+        annotations: Some(tool_annotations(true, None, None)),
+        execution: Some(json!({"taskSupport":"forbidden"})),
+        input_schema: object_schema(
+            vec![("path", json!({"type":"string","description":"Logical vault-relative note path, on a mount that keeps a version history."}))],
+            vec!["path"],
+        ),
+    });
+    definitions.push(ToolDefinition {
+        name: "read_version".to_string(),
+        description: "Read one specific, possibly superseded version of a note, reassembled from the mount's history. Use note_history to find a versionId.".to_string(),
+        annotations: Some(tool_annotations(true, None, None)),
+        execution: Some(json!({"taskSupport":"forbidden"})),
+        input_schema: object_schema(
+            vec![
+                ("path", json!({"type":"string","description":"Logical vault-relative note path."})),
+                ("versionId", json!({"type":"string","description":"A versionId from note_history."})),
+            ],
+            vec!["path", "versionId"],
+        ),
+    });
+    definitions.push(ToolDefinition {
+        name: "resolve_divergence".to_string(),
+        description: "Return a diverged note's current head, the version it overtook, and their common ancestor, so you can three-way merge them yourself. The server NEVER merges: a wrong automatic merge produces plausible text and is nearly undetectable. Write the merged content with upsert_note and resolveDivergence:true to clear the mark.".to_string(),
+        annotations: Some(tool_annotations(true, None, None)),
+        execution: Some(json!({"taskSupport":"forbidden"})),
+        input_schema: object_schema(
+            vec![("path", json!({"type":"string","description":"Logical vault-relative note path whose hasDivergence is set (vault_info.mounts[].conflictedPaths lists them)."}))],
+            vec!["path"],
+        ),
+    });
+}
+
+/// Which capability-gated tools this vault's mounts can serve.
+///
+/// A UNION across mounts, because `tools/list` is computed once per process and cannot say
+/// "available for some paths". The per-path answer is the refusal each tool produces when
+/// the path routes to a mount without the capability, and `vault_info.mounts[].capabilities`
+/// is where a client reads the per-mount truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CapabilitySet {
+    pub version_history: bool,
+    pub soft_delete: bool,
+}
+
+impl CapabilitySet {
+    /// The union over a router's mounts.
+    pub fn of(router: &deep_obsidian_backend::VaultRouter) -> Self {
+        let mut set = Self::default();
+        for mount in router.mounts() {
+            let descriptor = mount.backend.descriptor();
+            set.version_history |= descriptor.supports(Capability::VersionHistory);
+            set.soft_delete |= descriptor.supports(Capability::SoftDelete);
+        }
+        set
+    }
+}
+
+fn tool_definitions(
+    rg_available: bool,
+    multi_mount: bool,
+    capabilities: CapabilitySet,
+) -> Vec<ToolDefinition> {
     let mut definitions = vec![
         ToolDefinition {
             name: "load_knowledge".to_string(),
@@ -1135,11 +1307,22 @@ fn tool_definitions(rg_available: bool, multi_mount: bool) -> Vec<ToolDefinition
     if multi_mount {
         insert_scope_argument(&mut definitions);
     }
+    if capabilities.version_history {
+        insert_resolve_divergence_argument(&mut definitions);
+    }
+    // Appended AFTER the argument passes, so the four capability tools never accidentally
+    // acquire `scope` or `resolveDivergence` — each takes a `path` that determines its
+    // mount, and neither argument would mean anything on them.
+    insert_capability_tools(&mut definitions, &capabilities);
     definitions
 }
 
-pub fn list_tools(rg_available: bool, multi_mount: bool) -> Vec<ToolDefinition> {
-    tool_definitions(rg_available, multi_mount)
+pub fn list_tools(
+    rg_available: bool,
+    multi_mount: bool,
+    capabilities: CapabilitySet,
+) -> Vec<ToolDefinition> {
+    tool_definitions(rg_available, multi_mount, capabilities)
 }
 
 fn hybrid_search_match_json(
@@ -1162,6 +1345,226 @@ fn hybrid_search_match_json(
     ]);
     insert_optional_text(&mut object, "text", &match_item.text, options);
     Value::Object(object)
+}
+
+/// One hit from a mount's OWN index, rendered in the same shape as a local hit.
+///
+/// # What is here and what is deliberately not
+///
+/// Present, and identical in meaning to the local path: `path` (logical), `title`,
+/// `resourceUri`, `chunkIndex`, `startLine`, `endLine`, `score`, `text`. A client that
+/// walks `matches[]` needs no branch.
+///
+/// ABSENT: `semanticScore` and `bm25Score`. Those are the local hybrid ranker's two input
+/// signals, and there is nothing to put in them — a remote index reports one ranking, not
+/// a decomposition. Emitting `0.0` for both would be a fabricated measurement, and
+/// emitting `null` would invite a caller to average it. The mount-level `recallMode` says
+/// what produced the ranking instead.
+fn native_recall_match_json(
+    hit: &deep_obsidian_backend::RecallHit,
+    mount: &NativeRecallMount,
+    options: TextPayloadOptions,
+) -> Value {
+    let logical = mount.to_logical(&hit.path);
+    let mut object = Map::from_iter([
+        ("path".to_string(), json!(logical.clone())),
+        ("title".to_string(), json!(hit.title.clone())),
+        ("resourceUri".to_string(), json!(note_uri(&logical))),
+        ("chunkIndex".to_string(), json!(hit.chunk_index)),
+        ("startLine".to_string(), json!(hit.start_line)),
+        ("endLine".to_string(), json!(hit.end_line)),
+        ("score".to_string(), json!(hit.score)),
+    ]);
+    insert_optional_text(&mut object, "text", &hit.snippet, options);
+    Value::Object(object)
+}
+
+/// The fields every natively-served recall payload carries in addition to a local one.
+///
+/// # Why these are additive rather than replacing `semanticBackend`/`degraded`
+///
+/// A local payload reports `semanticBackend` and `degraded` because they describe the
+/// LOCAL embedding backend, which is not involved here. Rather than reuse those keys with
+/// a different meaning — the most confusing option available — a natively-served payload
+/// omits them and states its own provenance:
+///
+/// * `recallMode` — `"lexical"` or `"neural"`, from the index's own settings. This is the
+///   field that makes the `score` interpretable; see [`deep_obsidian_backend::RecallHit`].
+/// * `nativeRecall: true` — a single boolean a client can branch on without parsing
+///   `recallMode`, and the flag that says "these scores are ordinal and not comparable
+///   with a local hybrid score".
+/// * `exhausted` — `false` when the mount's index had more hits than this answer carries.
+///   Raise `limit` to see them.
+///
+/// # Why there is no `nextCursor`
+///
+/// The backend DOES paginate ([`deep_obsidian_backend::RecallSearchResponse::next_cursor`]),
+/// and this deliberately does not surface it. Neither tool declares a `cursor` argument, so
+/// a cursor in the payload would be a continuation no client could discover or take — which
+/// is precisely the defect that kept PR #40's `resolveDivergence` invisible, and it is not
+/// worth repeating for a field. `exhausted: false` carries the honest half of the fact
+/// ("there are more hits, this tool does not page"), and `limit` is the lever a caller
+/// already has. The cursor stays on the boundary, tested there, for the federation slice
+/// that will consume it.
+///
+/// # Why `exhausted` is not `grep_search`'s `exhaustive`
+///
+/// Different facts, deliberately different words. `exhaustive: false` on a grep means
+/// "I did not look everywhere, so an empty result is not proof of absence". `exhausted:
+/// false` here means "I looked everywhere and there are simply more results than you asked
+/// for". Conflating them would turn a complete-but-truncated ranking into a warning about
+/// coverage.
+///
+/// None of these can appear on a single-mount vault's payload: an index-less mount cannot
+/// be the vault root, so `hybrid_search` there is always locally served and byte-identical
+/// to what it was.
+fn insert_native_recall_provenance(
+    result: &mut Map<String, Value>,
+    response: &deep_obsidian_backend::RecallSearchResponse,
+    mount: &NativeRecallMount,
+) {
+    result.insert("nativeRecall".to_string(), json!(true));
+    result.insert("mountId".to_string(), json!(mount.id.clone()));
+    result.insert(
+        "recallMode".to_string(),
+        json!(response.recall_mode.as_str()),
+    );
+    result.insert("exhausted".to_string(), json!(response.exhausted));
+}
+
+/// Run a ranked search against one mount's own backend.
+///
+/// Deliberately NOT through the router: the router refuses a ranked search because it
+/// cannot merge two mounts' orderings, which is the right answer for a caller that named
+/// no mount. This caller HAS named one, exactly as it names one when it picks a local
+/// index, so it addresses that backend directly.
+///
+/// That is also what enforces "no cross-mount content flows": the request reaches one
+/// backend and one only, and the response's paths are re-prefixed with that same mount's
+/// prefix.
+///
+/// Always the FIRST page: no tool here declares a `cursor` argument, so there is no cursor
+/// a caller could have supplied. See [`insert_native_recall_provenance`].
+async fn native_recall_search(
+    mount: &NativeRecallMount,
+    query: &str,
+    limit: usize,
+) -> Result<deep_obsidian_backend::RecallSearchResponse, String> {
+    mount
+        .backend
+        .execute(BackendRequest::recall_search(query, limit))
+        .await
+        .map_err(|error| error.to_string())?
+        .into_recall_search()
+        .map_err(|error| error.to_string())
+}
+
+/// Reason attached to the empty `graph` of a natively-served `load_knowledge`.
+///
+/// The empty graph needs a reason for the same reason the whole slice needs honesty
+/// carriers: `{"nodes":[],"edges":[]}` is exactly what an INDEXED mount returns for a
+/// subject with no links, so without this an agent cannot tell "this corpus has no links
+/// around your subject" from "links were never looked for here".
+const NATIVE_RECALL_NO_GRAPH_REASON: &str = "this mount has no local link graph: its \
+backend serves its own ranked search but exposes no note-to-note edges, so the graph is \
+empty because none was traversed rather than because none was found. The notes and chunks \
+above are complete for this mount.";
+
+/// `load_knowledge` served by a mount that ranks for itself.
+///
+/// # What is served, and what is honestly empty
+///
+/// The tool has three parts, and this mount can supply exactly one of them:
+///
+/// * `chunks` — the ranked passages. Served natively.
+/// * `notes` — derived from the chunks, by the SAME rank-derived scoring the local path
+///   uses (`1/rank`), so the two agree about what a top chunk is worth. What the local
+///   path also does and this cannot is expand each seed through `related_notes`; there is
+///   no similarity neighbourhood here, so the note list is exactly the notes the chunks
+///   came from.
+/// * `graph` — empty, with [`NATIVE_RECALL_NO_GRAPH_REASON`] saying why.
+///
+/// `includeGraph` is deliberately not consulted: the graph is empty either way, and
+/// branching on it would produce two shapes that differ only in whether the reason is
+/// stated.
+async fn native_load_knowledge_payload(
+    mount: &NativeRecallMount,
+    subject: &str,
+    project: Option<&str>,
+    limit_notes: usize,
+    limit_chunks: usize,
+    text_options: TextPayloadOptions,
+) -> Result<Value, String> {
+    // The same query composition the local path uses, so a subject-plus-project call
+    // means the same thing on either kind of mount.
+    let query = [Some(subject.to_string()), project.map(str::to_string)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let response = native_recall_search(mount, &query, limit_chunks).await?;
+
+    let mut chunks = Vec::new();
+    let mut note_bucket = HashMap::<String, KnowledgeNote>::new();
+    for (position, hit) in response.hits.iter().enumerate() {
+        let logical = mount.to_logical(&hit.path);
+        let mut chunk_value = native_recall_match_json(hit, mount, text_options);
+        if let Some(object) = chunk_value.as_object_mut() {
+            object.insert("wikiLink".to_string(), json!(note_wiki_link(&logical)));
+        }
+        chunks.push(chunk_value);
+        merge_knowledge_note(
+            &mut note_bucket,
+            KnowledgeNote {
+                title: if hit.title.is_empty() {
+                    note_name(&logical)
+                } else {
+                    hit.title.clone()
+                },
+                wiki_link: note_wiki_link(&logical),
+                path: logical,
+                score: 1.0 / (position as f64 + 1.0),
+                reasons: vec!["top chunk match".to_string()],
+                // No link graph, so no shared links to report. An empty list rather than
+                // an omitted key, because the local payload always carries one.
+                shared_links: Vec::new(),
+            },
+        );
+    }
+    let response_truncated =
+        apply_response_text_budget(&mut chunks, "text", RESPONSE_TEXT_BUDGET_CHARS);
+
+    let mut notes = note_bucket
+        .into_values()
+        .map(knowledge_note_value)
+        .collect::<Vec<_>>();
+    notes.sort_by(|left, right| {
+        let left_score = left.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let right_score = right.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        normalize_score_order(
+            left_score,
+            right_score,
+            left.get("path").and_then(Value::as_str).unwrap_or(""),
+            right.get("path").and_then(Value::as_str).unwrap_or(""),
+        )
+    });
+    notes.truncate(limit_notes);
+
+    let mut result = Map::new();
+    result.insert("subject".to_string(), json!(subject));
+    if let Some(project) = project {
+        result.insert("project".to_string(), json!(project));
+    }
+    insert_native_recall_provenance(&mut result, &response, mount);
+    result.insert("notes".to_string(), json!(notes));
+    result.insert("chunks".to_string(), json!(chunks));
+    result.insert("graph".to_string(), json!({"nodes":[],"edges":[]}));
+    result.insert(
+        "graphUnavailableReason".to_string(),
+        json!(NATIVE_RECALL_NO_GRAPH_REASON),
+    );
+    insert_response_truncation_flags(&mut result, response_truncated);
+    Ok(Value::Object(result))
 }
 
 fn file_path_match_json(match_item: &index_search::FilePathMatch) -> Value {
@@ -1359,18 +1762,36 @@ fn require_single_mount(state: &AppState, tool: &str) -> Result<(), String> {
     ))
 }
 
-/// The mount roots an index-backed `scope` may name, rendered for an error message.
+/// The mount roots a `scope` may name, rendered for an error message.
 ///
-/// Only mounts that HAVE a local search index. Every caller is an index-backed recall
-/// tool explaining which scopes would work, so listing a mount that has no index would
-/// name it as a remedy for the very failure it causes — and in the refusal for scoping
-/// to that mount, the suggestion would be to scope to that mount.
-fn mount_scope_hint(state: &AppState) -> String {
+/// # Why this is parameterized rather than one list
+///
+/// A mount can serve recall in two different ways, and the two sets of tools that ask
+/// are not the same:
+///
+/// * `related_notes`, `graph_traverse` and `search_artifacts` need the LOCAL index —
+///   they walk a link graph, a similarity neighbourhood, or an artifact embedding table,
+///   none of which a remote corpus exposes. Only index-backed mounts can serve them.
+/// * `hybrid_search` and `load_knowledge` need a ranked list, which a mount advertising
+///   [`Capability::NativeRecall`] produces itself.
+///
+/// A single list would be wrong for one of the two, and wrong in the worse direction for
+/// the second: it would tell a caller that the shared mount cannot be searched when it
+/// can, which is how a working feature stays undiscovered. So `include_native_recall`
+/// selects the set that can actually answer the tool doing the asking.
+///
+/// Either way a mount that cannot serve the tool is EXCLUDED, because these lists are
+/// remedies: naming the mount whose refusal the reader is holding would tell them to
+/// retry the exact call that just failed.
+fn mount_scope_hint(state: &AppState, include_native_recall: bool) -> String {
     let scopes: Vec<String> = state
         .router
         .mounts()
         .iter()
-        .filter(|mount| state.runtimes.for_mount(&mount.id).is_some())
+        .filter(|mount| {
+            state.runtimes.for_mount(&mount.id).is_some()
+                || (include_native_recall && mount_serves_native_recall(mount))
+        })
         .map(|mount| {
             if mount.mount_at.is_empty() {
                 "'/'".to_string()
@@ -1386,6 +1807,14 @@ fn mount_scope_hint(state: &AppState) -> String {
         return "no mount in this vault has a local search index".to_string();
     }
     scopes.join(", ")
+}
+
+/// True when this mount answers a ranked search itself.
+fn mount_serves_native_recall(mount: &deep_obsidian_backend::Mount) -> bool {
+    mount
+        .backend
+        .descriptor()
+        .supports(Capability::NativeRecall)
 }
 
 /// Which mount's index serves a recall request, and how to render its paths.
@@ -1477,16 +1906,73 @@ fn resolve_recall_scope(
     tool: &str,
     scope: Option<&str>,
 ) -> Result<ScopedIndex, String> {
+    match resolve_recall_target(state, tool, scope, false)? {
+        RecallTarget::Local(index) => Ok(index),
+        // Unreachable: `include_native_recall: false` never produces this variant. Kept
+        // as an error rather than an `unreachable!` because a panic in a tool handler
+        // takes down the request, and a future caller that flips the flag here deserves a
+        // message rather than a crash.
+        RecallTarget::Native(_) => Err(format!("{tool} cannot be served by a mount's own index")),
+    }
+}
+
+/// Which mount, and by which mechanism, serves a scoped recall request.
+enum RecallTarget {
+    /// The server's own SQLite index for that mount.
+    Local(ScopedIndex),
+    /// The mount's backend, through [`RecallRequest::Search`].
+    Native(NativeRecallMount),
+}
+
+/// A mount that answers ranked search itself.
+struct NativeRecallMount {
+    id: String,
+    /// The logical folder this mount's paths sit under. Never empty: an index-less mount
+    /// cannot be the vault root (see the config normalizer), so a native-recall mount is
+    /// always nested and its paths always need re-prefixing.
+    mount_at: String,
+    backend: Arc<dyn deep_obsidian_backend::VaultBackend>,
+}
+
+impl NativeRecallMount {
+    /// A mount-relative hit path as a logical vault path.
+    fn to_logical(&self, mount_relative: &str) -> String {
+        if self.mount_at.is_empty() {
+            mount_relative.to_string()
+        } else {
+            format!("{}/{}", self.mount_at, mount_relative)
+        }
+    }
+}
+
+/// [`resolve_recall_scope`], but allowed to answer with a mount that ranks for itself.
+///
+/// Used by the two tools whose answer is a ranked list of note chunks —
+/// `hybrid_search` and `load_knowledge` — because that is the one question a
+/// [`Capability::NativeRecall`] backend can answer. Every other scoped recall tool goes
+/// through [`resolve_recall_scope`] and keeps the honest "no local index" refusal, since
+/// a link graph, a similarity neighbourhood and an artifact embedding table are not
+/// things a remote corpus exposes.
+///
+/// The single-mount fast path is untouched and unconditional: a mount with no local index
+/// cannot be the vault root, so a single-mount vault is always `Local` and every golden
+/// is provably unaffected by everything below.
+fn resolve_recall_target(
+    state: &AppState,
+    tool: &str,
+    scope: Option<&str>,
+    include_native_recall: bool,
+) -> Result<RecallTarget, String> {
     if !state.router.is_multi_mount() {
-        return Ok(ScopedIndex {
+        return Ok(RecallTarget::Local(ScopedIndex {
             runtime: state.runtime().clone(),
             mount_at: String::new(),
-        });
+        }));
     }
     let Some(scope) = scope else {
         return Err(format!(
             "{tool} requires a 'scope' on a multi-mount vault: every mount has its own search index, so an unscoped answer would silently omit every mount but one. Pass 'scope' naming the mount to search: {}.",
-            mount_scope_hint(state)
+            mount_scope_hint(state, include_native_recall)
         ));
     };
     let resolved = state
@@ -1497,10 +1983,24 @@ fn resolve_recall_scope(
         return Err(format!(
             "{tool} cannot scope to '{scope}': it is inside mount '{}' rather than naming a mount root, and this tool ranks results, so a narrower scope could only be honoured by filtering an already-truncated list. Pass one of: {}.",
             resolved.mount.id,
-            mount_scope_hint(state)
+            mount_scope_hint(state, include_native_recall)
         ));
     }
-    mount_index(state, tool, resolved.mount)
+    // The LOCAL index wins when a mount has one. No mount has both today, but the order
+    // matters if one ever does: the local index is the one the server built from this
+    // mount's own content, and it is the one every other recall tool already uses, so
+    // preferring it keeps a mount's tools answering from a single source.
+    if state.runtimes.for_mount(&resolved.mount.id).is_some() {
+        return mount_index(state, tool, resolved.mount).map(RecallTarget::Local);
+    }
+    if include_native_recall && mount_serves_native_recall(resolved.mount) {
+        return Ok(RecallTarget::Native(NativeRecallMount {
+            id: resolved.mount.id.clone(),
+            mount_at: resolved.mount.mount_at.clone(),
+            backend: resolved.mount.backend.clone(),
+        }));
+    }
+    mount_index(state, tool, resolved.mount).map(RecallTarget::Local)
 }
 
 /// The index serving a recall tool that takes a note `path`: the mount owning it.
@@ -1545,6 +2045,17 @@ fn resolve_recall_path(
 /// malfunction: it says WHY there is no index, and names what does work on such a
 /// mount, because a caller who reads "has no index." with no explanation will go
 /// looking for a broken build.
+///
+/// # What the refusal must now also say
+///
+/// A mount reaching this may still serve `hybrid_search` and `load_knowledge` — natively,
+/// through its own index (see [`resolve_recall_target`]). So the remedy list names those
+/// two by name for a `NativeRecall` mount. Without that, the one refusal a user hits on
+/// such a mount would point them AWAY from the recall that does work, which is a worse
+/// failure than the refusal itself.
+///
+/// What it must NOT do is suggest them for a mount that cannot serve them either — hence
+/// the capability check rather than a blanket sentence.
 fn mount_index(
     state: &AppState,
     tool: &str,
@@ -1554,6 +2065,21 @@ fn mount_index(
         .runtimes
         .for_mount(&mount.id)
         .ok_or_else(|| {
+            let native_recall = if mount_serves_native_recall(mount) {
+                format!(
+                    " This mount does answer RANKED SEARCH itself, so hybrid_search and \
+                     load_knowledge scoped to '{}' are served by its own index — what cannot be \
+                     served here is anything needing a link graph, a similarity neighbourhood or \
+                     an artifact embedding table, none of which a remote corpus exposes.",
+                    if mount.mount_at.is_empty() {
+                        "/"
+                    } else {
+                        mount.mount_at.as_str()
+                    }
+                )
+            } else {
+                String::new()
+            };
             format!(
                 "{tool} cannot be scoped to mount '{}': that mount has no local search index. Its \
                  backend ({}) serves its own content — the remote index IS the corpus — so there \
@@ -1561,10 +2087,10 @@ fn mount_index(
                  stale snapshot. Read and write notes on this mount normally (read_file, \
                  upsert_note, list_children, note_outline), use grep_search with a 'glob' under \
                  the mount for line search, and scope index-backed recall to a mount that has an \
-                 index: {}.",
+                 index: {}.{native_recall}",
                 mount.id,
                 mount.backend.descriptor().kind.as_str(),
-                mount_scope_hint(state)
+                mount_scope_hint(state, false)
             )
         })?
         .clone();
@@ -1813,6 +2339,259 @@ async fn backend_read_note_for_write(state: &AppState, path: &str) -> PriorNote 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Version history, soft delete, divergence
+// ---------------------------------------------------------------------------
+
+/// Refuse a capability-gated tool for a path whose mount cannot serve it.
+///
+/// # Why the refusal is composed here rather than left to the backend
+///
+/// Both would work — every backend refuses these requests with its own message — but the
+/// backend's refusal is about a STORAGE MODEL and cannot name the mount, and on a
+/// multi-mount vault "a filesystem vault keeps no version history" leaves a caller
+/// wondering which of their mounts that was. So this names the mount, its backend kind and
+/// the tool, and then lets the caller find the mounts that DO work through the one payload
+/// that lists them per mount.
+///
+/// The backends still refuse independently, which is not redundant: it is what makes the
+/// boundary honest for any future caller that skips this check.
+fn refuse_incapable_mount(
+    state: &AppState,
+    tool: &str,
+    path: &str,
+    capability: Capability,
+) -> Result<(), String> {
+    let resolved = state
+        .router
+        .resolve(path)
+        .map_err(|error| error.to_string())?;
+    if resolved.mount.backend.descriptor().supports(capability) {
+        return Ok(());
+    }
+    let capable: Vec<String> = state
+        .router
+        .mounts()
+        .iter()
+        .filter(|mount| mount.backend.descriptor().supports(capability))
+        .map(|mount| {
+            if mount.mount_at.is_empty() {
+                "the vault root".to_string()
+            } else {
+                format!("'{}/'", mount.mount_at)
+            }
+        })
+        .collect();
+    let alternatives = if capable.is_empty() {
+        "No mount in this vault supports it.".to_string()
+    } else {
+        format!("Mounts that do support it: {}.", capable.join(", "))
+    };
+    Err(format!(
+        "{tool} cannot be used on {path}: it is served by mount '{}' (backend: {}), which does not \
+         support this operation. {} {alternatives} See vault_info.mounts[].capabilities.",
+        resolved.mount.id,
+        resolved.mount.backend.descriptor().kind.as_str(),
+        match capability {
+            Capability::SoftDelete => {
+                "Removing a note here would be an ordinary file deletion, which is observable to \
+                 nobody and recoverable from nothing, and this MCP surface deliberately exposes \
+                 no deletion of local vault files — delete the note yourself instead."
+            }
+            Capability::VersionHistory =>
+                "This storage keeps one content per note by construction, so there is no \
+                 superseded version to list, read or reconcile.",
+            _ => "",
+        },
+    ))
+}
+
+/// `delete_note`: soft-delete a note through the router.
+///
+/// Refuses a path on a mount without [`Capability::SoftDelete`] — which is every
+/// filesystem mount, and therefore every path in a single-mount vault. That refusal is the
+/// contract PR #40 pinned as `delete_note_refuses_local_paths`, and it is why this tool
+/// gained no destructive local capability by existing.
+async fn delete_note_payload(state: &AppState, path: &str) -> Result<Value, String> {
+    refuse_incapable_mount(state, "delete_note", path, Capability::SoftDelete)?;
+    let outcome = backend_call(state, BackendRequest::soft_delete(path))
+        .await?
+        .into_soft_delete()
+        .map_err(|error| error.to_string())?;
+    let mut payload = Map::from_iter([
+        ("path".to_string(), json!(path)),
+        ("deleted".to_string(), json!(true)),
+        ("alreadyDeleted".to_string(), json!(outcome.already_deleted)),
+        ("versionId".to_string(), json!(outcome.version_id)),
+    ]);
+    if let Some(recoverable) = &outcome.recoverable_from {
+        payload.insert("recoverableFrom".to_string(), json!(recoverable));
+        payload.insert(
+            "howToRecover".to_string(),
+            json!(format!(
+                "read_version with versionId {recoverable} returns the removed content; \
+                 upsert_note it back to undelete the note."
+            )),
+        );
+    }
+    Ok(Value::Object(payload))
+}
+
+/// One version, rendered.
+///
+/// Every key is present on every entry, `null` where the link does not exist. PR #40 built
+/// history entries and the head entry from two separate `json!` literals, so an archived
+/// version carried `supersededBy` while the head carried `parentVersionId` and neither
+/// carried the other. That asymmetry was an artifact of the two literals, not a contract:
+/// a client walking `versions[]` had to know which entry it was looking at before it knew
+/// which keys existed. One shape is the additive fix — every key #40 emitted is still
+/// emitted, with the same name and meaning.
+fn note_version_json(version: &deep_obsidian_backend::NoteVersion) -> Value {
+    json!({
+        "versionId": version.version_id,
+        "participantId": version.participant_id,
+        "updatedAtMs": version.updated_at_ms,
+        "parentVersionId": version.parent_version_id,
+        "forkedFrom": version.forked_from,
+        "supersededBy": version.superseded_by,
+        "current": version.current,
+    })
+}
+
+/// `note_history`: a note's retained versions, newest first.
+async fn note_history_payload(state: &AppState, path: &str) -> Result<Value, String> {
+    refuse_incapable_mount(state, "note_history", path, Capability::VersionHistory)?;
+    let history = backend_call(state, BackendRequest::note_versions(path))
+        .await?
+        .into_note_history()
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "path": path,
+        "hasDivergence": history.has_divergence,
+        "count": history.versions.len(),
+        "versions": history.versions.iter().map(note_version_json).collect::<Vec<_>>(),
+    }))
+}
+
+/// `read_version`: one named version's text, with the hash of THAT text.
+///
+/// The hash is over the version's own bytes, computed with the same helper `read_file` and
+/// the write tools use — so it can be compared against a `read_file` hash to answer "is
+/// the note still what this version said". It is emphatically NOT usable as an
+/// `expectedHash` for a write: that guard compares against the CURRENT content, and a
+/// historical hash would never match unless the note happens to be unchanged.
+async fn read_version_payload(
+    state: &AppState,
+    path: &str,
+    version_id: &str,
+) -> Result<Value, String> {
+    refuse_incapable_mount(state, "read_version", path, Capability::VersionHistory)?;
+    let text = backend_call(state, BackendRequest::read_text_version(path, version_id))
+        .await?
+        .into_text()
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "path": path,
+        "versionId": version_id,
+        "hash": content_hash(text.as_bytes()),
+        "text": text,
+    }))
+}
+
+/// `resolve_divergence`: everything needed for a three-way merge, and no merge.
+///
+/// # What clears the divergence, and what does not
+///
+/// NOT this tool. It is read-only by construction: it returns the current head, the
+/// version that head overtook, and their common ancestor. The mark is cleared by writing
+/// the merged content with `upsert_note` and `resolveDivergence: true`, which is a claim
+/// only the caller can make — see [`resolve_divergence_property`]. Ported from PR #40
+/// unchanged, including the reason: a wrong automatic merge produces plausible text and is
+/// nearly undetectable, so the server must not produce one.
+///
+/// # Payload shape, and the asymmetry that is deliberate
+///
+/// `head` is `{versionId, participantId, text}` — it has no `hash`, because the head's
+/// hash is what `read_file` already reports for this path and duplicating it here would
+/// invite a client to feed the wrong one back as `expectedHash`. `overtaken` and
+/// `commonAncestor` are full `read_version` payloads, `{path, versionId, hash, text}`,
+/// because that is what they are: historical reads. #40 had exactly this asymmetry and it
+/// is preserved.
+///
+/// A version that retention has already purged is OMITTED rather than reported as an
+/// error: the head and whichever side survives are still useful, and failing the whole
+/// call would leave a caller with nothing at all for an old divergence.
+async fn resolve_divergence_payload(state: &AppState, path: &str) -> Result<Value, String> {
+    refuse_incapable_mount(
+        state,
+        "resolve_divergence",
+        path,
+        Capability::VersionHistory,
+    )?;
+    let history = backend_call(state, BackendRequest::note_versions(path))
+        .await?
+        .into_note_history()
+        .map_err(|error| error.to_string())?;
+    if !history.has_divergence {
+        return Ok(json!({
+            "path": path,
+            "hasDivergence": false,
+            "note": "no divergence recorded on this note",
+        }));
+    }
+    let head = history
+        .versions
+        .iter()
+        .find(|version| version.current)
+        .ok_or_else(|| {
+            format!("{path} reports a divergence but its history names no current version")
+        })?;
+    let head_text = backend_call(
+        state,
+        BackendRequest::read_text_version(path, &head.version_id),
+    )
+    .await?
+    .into_text()
+    .map_err(|error| error.to_string())?;
+
+    let mut payload = Map::from_iter([
+        ("path".to_string(), json!(path)),
+        ("hasDivergence".to_string(), json!(true)),
+        (
+            "head".to_string(),
+            json!({
+                "versionId": head.version_id,
+                "participantId": head.participant_id,
+                "text": head_text,
+            }),
+        ),
+    ]);
+    // `forkedFrom` is the head this version DISPLACED; `parentVersionId` is what its
+    // content was based on. Those are the two other corners of the merge, and they are
+    // different versions — which is exactly why the fork records both.
+    for (key, version_id) in [
+        ("overtaken", head.forked_from.as_deref()),
+        ("commonAncestor", head.parent_version_id.as_deref()),
+    ] {
+        let Some(version_id) = version_id else {
+            continue;
+        };
+        if let Ok(value) = read_version_payload(state, path, version_id).await {
+            payload.insert(key.to_string(), value);
+        }
+    }
+    payload.insert(
+        "howToResolve".to_string(),
+        json!(
+            "Merge 'head' and 'overtaken' against 'commonAncestor' yourself, then call \
+             upsert_note with the merged content and resolveDivergence: true to clear the mark. \
+             The server never merges: a wrong automatic merge produces plausible text and is \
+             nearly undetectable."
+        ),
+    );
+    Ok(Value::Object(payload))
+}
+
 /// Run hybrid search off the async runtime, surfacing the degradation signal. When the
 /// embedding backend is unavailable the core function degrades to BM25-only internally and
 /// returns `degraded = true` (never an Err for that case), so the tool layer can set a
@@ -1881,33 +2660,55 @@ pub async fn call_tool(
             let folders_only = bool_arg(arguments, "foldersOnly", false);
             let include_hidden = bool_arg(arguments, "includeHidden", false);
             let include_ignored = bool_arg(arguments, "includeIgnored", false);
-            let entries = backend_call(
+            let listing = backend_call(
                 state,
                 BackendRequest::list_children(path.clone(), include_hidden, include_ignored),
             )
             .await?
-            .into_children()
+            .into_child_listing()
             .map_err(|error| error.to_string())?;
-            if folders_only {
+            let entries = listing.entries;
+            let mut result = if folders_only {
                 let folders = entries
                     .into_iter()
                     .filter(|entry| matches!(entry.kind, VaultEntryKind::Directory))
                     .map(|entry| entry.path)
                     .collect::<Vec<_>>();
-                Ok(json_text_result(json!({
-                    "path": path,
-                    "foldersOnly": true,
-                    "count": folders.len(),
-                    "folders": folders
-                })))
+                Map::from_iter([
+                    ("path".to_string(), json!(path)),
+                    ("foldersOnly".to_string(), json!(true)),
+                    ("count".to_string(), json!(folders.len())),
+                    ("folders".to_string(), json!(folders)),
+                ])
             } else {
-                Ok(json_text_result(json!({
-                    "path": path,
-                    "foldersOnly": false,
-                    "count": entries.len(),
-                    "children": entries.into_iter().map(|entry| vault_child_entry_json(&entry)).collect::<Vec<_>>()
-                })))
+                Map::from_iter([
+                    ("path".to_string(), json!(path)),
+                    ("foldersOnly".to_string(), json!(false)),
+                    ("count".to_string(), json!(entries.len())),
+                    (
+                        "children".to_string(),
+                        json!(entries
+                            .into_iter()
+                            .map(|entry| vault_child_entry_json(&entry))
+                            .collect::<Vec<_>>()),
+                    ),
+                ])
+            };
+            // Emitted ONLY when the subfolder half of the listing was cut short, which no
+            // backend whose directories are real directories can be. That is what keeps
+            // this payload byte-identical for every filesystem and couchdb mount — the
+            // key simply never appears — while a facet-enumerated mount can say so.
+            //
+            // Both `foldersOnly` shapes carry it: a caller that asked ONLY for folders is
+            // precisely the caller a truncated folder list misleads most.
+            if listing.folders_truncated {
+                result.insert("foldersTruncated".to_string(), json!(true));
+                result.insert(
+                    "foldersTruncatedReason".to_string(),
+                    json!(FOLDERS_TRUNCATED_REASON),
+                );
             }
+            Ok(json_text_result(Value::Object(result)))
         }
         "read_file" => {
             let path = string_arg(arguments, "path")?;
@@ -2046,7 +2847,7 @@ pub async fn call_tool(
             let context_lines = clamped_usize_arg(arguments, "contextLines", 0, 0, 20);
             let limit = clamped_usize_arg(arguments, "limit", 50, 1, 500);
             let text_options = TextPayloadOptions::from_arguments(arguments, true);
-            let matches = backend_call(
+            let outcome = backend_call(
                 state,
                 BackendRequest::Recall(RecallRequest::Grep {
                     query: query.clone(),
@@ -2058,22 +2859,43 @@ pub async fn call_tool(
                 }),
             )
             .await?
-            .into_grep_matches()
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|item| grep_match_json(&item, text_options))
-            .collect::<Vec<_>>();
+            .into_grep_outcome()
+            .map_err(|error| error.to_string())?;
+            let matches = outcome
+                .matches
+                .iter()
+                .map(|item| grep_match_json(item, text_options))
+                .collect::<Vec<_>>();
+            let mut result = Map::from_iter([
+                ("query".to_string(), json!(query)),
+                ("regex".to_string(), json!(regex_mode)),
+                ("caseSensitive".to_string(), json!(case_sensitive)),
+                ("glob".to_string(), json!(glob)),
+                ("contextLines".to_string(), json!(context_lines)),
+                ("count".to_string(), json!(matches.len())),
+                ("matches".to_string(), json!(matches)),
+            ]);
+            // Emitted ONLY when the search was NOT exhaustive.
+            //
+            // The asymmetry is the point. `grep_search` has always meant ripgrep, which
+            // reads every file, so an absent `exhaustive` key keeps meaning exactly what
+            // it has always meant and every existing assertion and golden is untouched.
+            // A backend that cannot read every file says so explicitly, and says how many
+            // candidates it did examine — the number that tells a caller whether raising
+            // the bound would help.
+            if !outcome.exhausted {
+                result.insert("exhaustive".to_string(), json!(false));
+                if let Some(candidate_count) = outcome.candidate_count {
+                    result.insert("candidateCount".to_string(), json!(candidate_count));
+                }
+                result.insert(
+                    "exhaustiveNote".to_string(),
+                    json!(NON_EXHAUSTIVE_GREP_NOTE),
+                );
+            }
             Ok(json_text_result_from_arguments(
                 arguments,
-                json!({
-                    "query": query,
-                    "regex": regex_mode,
-                    "caseSensitive": case_sensitive,
-                    "glob": glob,
-                    "contextLines": context_lines,
-                    "count": matches.len(),
-                    "matches": matches
-                }),
+                Value::Object(result),
             ))
         }
         "note_outline" => {
@@ -2191,14 +3013,45 @@ pub async fn call_tool(
             Ok(json_text_result(Value::Object(result)))
         }
         "hybrid_search" => {
-            let scoped = resolve_recall_scope(
+            let target = resolve_recall_target(
                 state,
                 "hybrid_search",
                 optional_string_arg(arguments, "scope").as_deref(),
+                true,
             )?;
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
+            // A mount that ranks for itself: served by its backend, in the same payload
+            // shape, with its provenance stated. See `insert_native_recall_provenance`.
+            let scoped = match target {
+                RecallTarget::Local(scoped) => scoped,
+                RecallTarget::Native(mount) => {
+                    let text_options =
+                        TextPayloadOptions::search_snippet_from_arguments(arguments, true);
+                    let response = native_recall_search(&mount, &query, limit).await?;
+                    let mut match_values = response
+                        .hits
+                        .iter()
+                        .map(|hit| native_recall_match_json(hit, &mount, text_options))
+                        .collect::<Vec<_>>();
+                    let response_truncated = apply_response_text_budget(
+                        &mut match_values,
+                        "text",
+                        RESPONSE_TEXT_BUDGET_CHARS,
+                    );
+                    let mut result = Map::new();
+                    result.insert("query".to_string(), json!(query));
+                    insert_native_recall_provenance(&mut result, &response, &mount);
+                    result.insert("count".to_string(), json!(match_values.len()));
+                    result.insert("matches".to_string(), json!(match_values));
+                    insert_response_truncation_flags(&mut result, response_truncated);
+                    return Ok(json_text_result_from_arguments(
+                        arguments,
+                        Value::Object(result),
+                    ));
+                }
+            };
             // RRF per-list weights; default to 1.0 (unweighted, scale-free fusion).
             let semantic_weight = clamped_f64_arg(arguments, "semanticWeight", 1.0, 0.0, 1.0);
             let bm25_weight = clamped_f64_arg(arguments, "bm25Weight", 1.0, 0.0, 1.0);
@@ -2378,11 +3231,33 @@ pub async fn call_tool(
                 })).collect::<Vec<_>>()
             })))
         }
+        "delete_note" => {
+            let path = string_arg(arguments, "path")?;
+            Ok(json_text_result(delete_note_payload(state, &path).await?))
+        }
+        "note_history" => {
+            let path = string_arg(arguments, "path")?;
+            Ok(json_text_result(note_history_payload(state, &path).await?))
+        }
+        "read_version" => {
+            let path = string_arg(arguments, "path")?;
+            let version_id = string_arg(arguments, "versionId")?;
+            Ok(json_text_result(
+                read_version_payload(state, &path, &version_id).await?,
+            ))
+        }
+        "resolve_divergence" => {
+            let path = string_arg(arguments, "path")?;
+            Ok(json_text_result(
+                resolve_divergence_payload(state, &path).await?,
+            ))
+        }
         "load_knowledge" => {
-            let scoped = resolve_recall_scope(
+            let target = resolve_recall_target(
                 state,
                 "load_knowledge",
                 optional_string_arg(arguments, "scope").as_deref(),
+                true,
             )?;
             let subject = string_arg(arguments, "subject")?;
             validate_format_arg(arguments)?;
@@ -2390,6 +3265,26 @@ pub async fn call_tool(
             let limit_notes = clamped_usize_arg(arguments, "limitNotes", 6, 1, 12);
             let limit_chunks = clamped_usize_arg(arguments, "limitChunks", 8, 1, 16);
             let include_graph = bool_arg(arguments, "includeGraph", true);
+            // A mount that ranks for itself serves the CHUNKS half of this tool and
+            // nothing else. See `native_load_knowledge_payload` for why the graph comes
+            // back empty with a reason rather than absent or fabricated.
+            let scoped = match target {
+                RecallTarget::Local(scoped) => scoped,
+                RecallTarget::Native(mount) => {
+                    return Ok(json_text_result_from_arguments(
+                        arguments,
+                        native_load_knowledge_payload(
+                            &mount,
+                            &subject,
+                            project.as_deref(),
+                            limit_notes,
+                            limit_chunks,
+                            TextPayloadOptions::search_snippet_from_arguments(arguments, true),
+                        )
+                        .await?,
+                    ));
+                }
+            };
             let graph_depth = clamped_usize_arg(arguments, "graphDepth", 1, 1, 3);
             let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
             let snapshot = scoped.runtime.fresh_snapshot("load_knowledge").await?;
@@ -2671,12 +3566,22 @@ pub async fn call_tool(
                 .unwrap_or_else(|| finalize_written_content(&content));
             let new_hash = content_hash(final_content.as_bytes());
             let created = existing.is_none();
+            // A CLAIM about the content, forwarded verbatim: the caller is stating that
+            // `content` reconciles a recorded divergence. Declared in the schema only when
+            // some mount can record one, and ignored by every backend that cannot — see
+            // `resolve_divergence_property`.
+            let resolve_divergence = bool_arg(arguments, "resolveDivergence", false);
             // The dry run returns above without ever reaching the write, so no
             // backend — and therefore no remote — is touched by one.
             if !dry_run {
                 backend_call(
                     state,
-                    BackendRequest::write_text_guarded(&path, &final_content, prior.base_version),
+                    BackendRequest::write_text_full(
+                        &path,
+                        &final_content,
+                        prior.base_version,
+                        resolve_divergence,
+                    ),
                 )
                 .await?;
             }
@@ -3284,7 +4189,7 @@ mod tests {
 
     #[test]
     fn update_note_section_schema_declares_conditional_heading_requirement() {
-        let definitions = tool_definitions(true, false);
+        let definitions = tool_definitions(true, false, super::CapabilitySet::default());
         let definition = definitions
             .iter()
             .find(|definition| definition.name == "update_note_section")
@@ -3745,13 +4650,13 @@ mod tests {
 
     #[test]
     fn tool_list_omits_grep_search_when_ripgrep_unavailable() {
-        let available = super::tool_definitions(true, false);
+        let available = super::tool_definitions(true, false, super::CapabilitySet::default());
         assert!(
             available.iter().any(|tool| tool.name == "grep_search"),
             "grep_search should be present when ripgrep is available"
         );
 
-        let unavailable = super::tool_definitions(false, false);
+        let unavailable = super::tool_definitions(false, false, super::CapabilitySet::default());
         assert!(
             !unavailable.iter().any(|tool| tool.name == "grep_search"),
             "grep_search must be omitted when ripgrep is unavailable"
@@ -3762,7 +4667,7 @@ mod tests {
 
     #[test]
     fn consolidated_tool_surface() {
-        let definitions = super::tool_definitions(true, false);
+        let definitions = super::tool_definitions(true, false, super::CapabilitySet::default());
         let names: Vec<&str> = definitions.iter().map(|tool| tool.name.as_str()).collect();
         // search_artifacts re-exposes artifact semantic search (dropped with semantic_search's scope).
         assert!(names.contains(&"search_artifacts"));

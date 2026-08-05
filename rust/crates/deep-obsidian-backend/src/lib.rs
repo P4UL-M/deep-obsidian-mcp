@@ -45,11 +45,16 @@ pub use algolia::{
     ALGOLIA_NO_BINARY_MESSAGE, ALGOLIA_NO_UPLOAD_MESSAGE, ALGOLIA_READ_ONLY_MESSAGE,
 };
 pub use couchdb::{
-    CouchDbVaultBackend, EntryContent, COUCHDB_GREP_UNSUPPORTED_MESSAGE, COUCHDB_READ_ONLY_MESSAGE,
+    CouchDbVaultBackend, EntryContent, COUCHDB_GREP_UNSUPPORTED_MESSAGE,
+    COUCHDB_NATIVE_RECALL_UNSUPPORTED_MESSAGE, COUCHDB_READ_ONLY_MESSAGE,
+    COUCHDB_SOFT_DELETE_UNSUPPORTED_MESSAGE, COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE,
     UPLOAD_COLLECT_ADVISORY_BYTES,
 };
 pub use deep_obsidian_core::vault::{VaultChildEntry, VaultEntryKind, VaultError};
-pub use filesystem::FilesystemVaultBackend;
+pub use filesystem::{
+    FilesystemVaultBackend, FILESYSTEM_NATIVE_RECALL_UNSUPPORTED_MESSAGE,
+    FILESYSTEM_SOFT_DELETE_UNSUPPORTED_MESSAGE, FILESYSTEM_VERSION_HISTORY_UNSUPPORTED_MESSAGE,
+};
 pub use grep::{resolve_ripgrep, RIPGREP_UNAVAILABLE_MESSAGE};
 pub use router::{Mount, Resolved, RouterError, VaultRouter};
 pub use sidecar::{
@@ -94,6 +99,15 @@ impl BackendKind {
 ///
 /// `GrepSearch` is the capability that today's `rg_available` flag becomes: the
 /// `grep_search` tool is advertised if and only if it is present.
+///
+/// # Declaration order is serialization order
+///
+/// A [`BackendDescriptor`]'s capabilities live in a `BTreeSet`, whose ordering is this
+/// enum's derived `Ord` — i.e. declaration order. That order reaches a client verbatim
+/// through `vault_info.mounts[].capabilities`, so a variant inserted in the MIDDLE
+/// would reorder an array a test (and a reader) already depends on. New capabilities
+/// are therefore APPENDED, and the three below are grouped after the storage-shaped
+/// ones because they describe what a backend can *answer*, not what it can store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Capability {
@@ -102,6 +116,33 @@ pub enum Capability {
     BinaryWrite,
     Upload,
     Watch,
+    /// The backend answers [`RecallRequest::Search`] itself.
+    ///
+    /// Present only on a backend whose own storage IS a search index, so there is no
+    /// local index above it to rank over. The server's scoped recall tools serve such
+    /// a mount through the backend instead of refusing it for having no local index —
+    /// see the server's `tools` module.
+    ///
+    /// It is emphatically NOT a claim of parity with the local index: the hits carry
+    /// no semantic/BM25 breakdown, their scores are ordinal (see [`RecallHit::score`]),
+    /// and the response says which recall stage produced them
+    /// ([`RecallSearchResponse::recall_mode`]).
+    NativeRecall,
+    /// The backend keeps superseded versions of a note and can enumerate them
+    /// ([`ManifestRequest::Versions`]) and read one back
+    /// ([`ContentRequest::ReadText`]'s `version`).
+    ///
+    /// Absent on last-writer-wins storage, where there is exactly one version of a
+    /// note by construction and "list its history" has no answer — not an empty one.
+    VersionHistory,
+    /// The backend can remove a note in a way that is OBSERVABLE and RECOVERABLE
+    /// ([`MutationRequest::SoftDelete`]): the removal leaves a tombstone other readers
+    /// see, and the content stays reachable through the version history.
+    ///
+    /// Deliberately not "can delete": a plain unlink is not this capability. The MCP
+    /// surface has never exposed destructive local file removal and must not gain it
+    /// by a backend advertising this for a `remove_file`.
+    SoftDelete,
 }
 
 /// What a backend is and what it can do. Cheap to produce: callers may call
@@ -273,6 +314,17 @@ pub enum ManifestRequest {
     WalkMarkdown,
     /// Visible top-level folders, sorted.
     TopLevelFolders,
+    /// Every retained version of one note, newest first.
+    ///
+    /// A MANIFEST request rather than a content one: it enumerates what exists and
+    /// carries no bodies. Reading one of the versions it names is
+    /// [`ContentRequest::ReadText`] with a `version`.
+    ///
+    /// Answered only by a backend advertising [`Capability::VersionHistory`]. Every
+    /// other backend refuses, because "this note has one version" and "this storage
+    /// keeps no history" are different facts and an empty-or-single-entry list would
+    /// conflate them.
+    Versions { path: String },
 }
 
 /// Content reads.
@@ -282,7 +334,25 @@ pub enum ManifestRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentRequest {
     /// Read a note as UTF-8 text. Errors are [`BackendError::Vault`]-flavoured.
-    ReadText { path: String },
+    ///
+    /// `version` selects a specific, possibly SUPERSEDED version instead of the
+    /// current one. `None` is today's behaviour on every backend, verbatim; `Some` is
+    /// refused by every backend that does not advertise
+    /// [`Capability::VersionHistory`].
+    ///
+    /// # A versioned read must never feed a write's precondition
+    ///
+    /// [`ContentResponse::Text`]'s `version` is the version that was ACTUALLY read, so
+    /// for a versioned read it echoes the request rather than naming the head. Feeding
+    /// it into [`BaseVersion`] would tell the backend "I observed the destination at
+    /// v3" when v3 is history and the head has moved — manufacturing a stale
+    /// precondition out of a deliberate historical read. Callers that read in order to
+    /// write must use the UNVERSIONED read; the server's `backend_read_note_for_write`
+    /// does.
+    ReadText {
+        path: String,
+        version: Option<String>,
+    },
     /// Read raw bytes. IO errors are [`BackendError::Io`]-flavoured (bare).
     ReadBytes { path: String },
     /// Size metadata only. IO errors are [`BackendError::Io`]-flavoured (bare).
@@ -359,11 +429,27 @@ pub enum MutationRequest {
     /// manual-note preservation, frontmatter) happens above this boundary, as does
     /// the `expectedHash` check. `base_version` carries what that check observed;
     /// see [`BaseVersion`]. A backend with no version concept ignores it.
+    ///
+    /// `resolve_divergence` is the caller stating that `content` is the RECONCILIATION
+    /// of a recorded divergence, so a backend that marks diverged notes may clear the
+    /// mark. It is a claim about the content, which only the caller can make — the
+    /// storage cannot tell a merge from any other overwrite — and it is honoured only
+    /// when this write does not itself fork. A backend with no divergence concept
+    /// ignores it, as it ignores `base_version`.
     WriteText {
         path: String,
         content: String,
         base_version: BaseVersion,
+        resolve_divergence: bool,
     },
+    /// Remove a note OBSERVABLY and RECOVERABLY.
+    ///
+    /// Not "delete the file". The contract is that after this the note is absent from
+    /// every read and listing, that other participants can tell it was removed rather
+    /// than merely find it missing, and that its last content is still reachable
+    /// through the version history. A backend that cannot promise all three must
+    /// refuse rather than approximate it with an unlink — see [`Capability::SoftDelete`].
+    SoftDelete { path: String },
     /// Land a byte stream at `path` atomically.
     ///
     /// The backend owns the entire mechanic — staging location, incremental hashing,
@@ -429,6 +515,36 @@ pub enum RecallRequest {
         context_lines: usize,
         limit: usize,
     },
+    /// Ranked relevance search performed BY the backend.
+    ///
+    /// The one recall request whose absence is the norm: on a filesystem or couchdb
+    /// mount the server owns a local SQLite index and ranks over it, so a backend-side
+    /// search would be a second, worse answer. This exists for the inverted
+    /// arrangement — a backend whose storage already IS a search index shared by
+    /// several participants, where building a local copy would rank one participant's
+    /// stale snapshot. See [`Capability::NativeRecall`].
+    Search(SearchRequest),
+}
+
+/// A ranked search over one backend's own index.
+///
+/// # Why there is no folder filter
+///
+/// Derived from the call sites, like every other variant. The server's scoped recall
+/// tools require `scope` to name a MOUNT ROOT exactly — a narrower scope is refused
+/// above this boundary, because these tools truncate to `limit` and honouring a
+/// subtree filter after truncation would silently return fewer results than asked for.
+/// So by the time a request reaches here the mount IS the scope, and a filter field
+/// would have exactly one legal value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRequest {
+    pub query: String,
+    /// How many hits to return. A backend that groups by note (rather than by chunk)
+    /// applies it after grouping, so `limit` counts what the caller will see.
+    pub limit: usize,
+    /// Resume token from a previous [`RecallSearchResponse::next_cursor`]. `None`
+    /// starts from the most relevant hit.
+    pub cursor: Option<OpaqueCursor>,
 }
 
 /// Liveness probes.
@@ -455,9 +571,76 @@ pub enum BackendResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestResponse {
-    Children(Vec<VaultChildEntry>),
+    Children(ChildListing),
     MarkdownFiles(Vec<String>),
     Folders(Vec<String>),
+    Versions(NoteHistory),
+}
+
+/// A directory listing, plus whether the SUBFOLDER half of it is complete.
+///
+/// # Why the flag is on the listing rather than logged
+///
+/// A backend that synthesizes folders from a facet enumeration has a hard ceiling on
+/// how many it can name (Algolia answers 400 above 100 facet values rather than
+/// clamping). A listing that quietly stopped at the ceiling would tell a client those
+/// folders do not exist, which is the one failure mode a manifest must never have. 5b
+/// could only `warn!` it because this variant carried a bare `Vec`; carrying it here is
+/// what lets the MCP payload say so.
+///
+/// Only the FOLDERS can be short. Files come from a paginated record query, so
+/// `folders_truncated` never means "some files are missing" — which is what makes the
+/// flag actionable rather than a blanket "this might be wrong".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildListing {
+    pub entries: Vec<VaultChildEntry>,
+    pub folders_truncated: bool,
+}
+
+impl ChildListing {
+    /// A listing that named every subfolder. The shape every backend whose directories
+    /// are real directories returns, so the flag costs those backends nothing.
+    pub fn exhaustive(entries: Vec<VaultChildEntry>) -> Self {
+        Self {
+            entries,
+            folders_truncated: false,
+        }
+    }
+}
+
+/// One note's retained versions, newest first, plus whether the note is diverged.
+///
+/// `has_divergence` describes the NOTE (it is a property of its head), not any one
+/// version, which is why it sits here rather than on [`NoteVersion`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteHistory {
+    pub has_divergence: bool,
+    pub versions: Vec<NoteVersion>,
+}
+
+/// One version of a note, as its metadata records it.
+///
+/// Every field is `Option` except the four a version cannot exist without, because a
+/// version's place in the graph is genuinely partial: the first version has no parent,
+/// a version nobody has superseded has no successor, and only a fork has a
+/// `forked_from`. Rendering an absent link as `null` rather than omitting the key is
+/// the caller-visible contract (see the server's `note_history` payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteVersion {
+    pub version_id: String,
+    /// Who wrote it, in the corpus's own participant vocabulary.
+    pub participant_id: String,
+    pub updated_at_ms: u64,
+    /// The version this one was based on.
+    pub parent_version_id: Option<String>,
+    /// The head this version DISPLACED, when it landed as a fork. Distinct from
+    /// `parent_version_id`: the parent is where the content came from, this is what it
+    /// overtook.
+    pub forked_from: Option<String>,
+    /// The version that superseded this one. `None` on the current version.
+    pub superseded_by: Option<String>,
+    /// True for exactly one entry: the version a plain read serves.
+    pub current: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,6 +667,19 @@ pub enum MutationResponse {
     Written {
         created: bool,
     },
+    SoftDeleted {
+        /// The tombstone's own version id.
+        version_id: String,
+        /// True when the note was ALREADY a tombstone, so this call changed nothing.
+        /// Reported rather than turned into an error: deleting a deleted note is the
+        /// caller's intent already satisfied, and failing it would make the operation
+        /// non-idempotent for no gain.
+        already_deleted: bool,
+        /// The version still holding the content that was just removed. Feed it to a
+        /// versioned read to recover it. `None` only when the storage could not name
+        /// one, which is what makes the removal unrecoverable and worth surfacing.
+        recoverable_from: Option<String>,
+    },
     UploadCommitted {
         created: bool,
         bytes_written: usize,
@@ -492,9 +688,119 @@ pub enum MutationResponse {
     Swept,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `PartialEq` but NOT `Eq`, unlike its sibling response families: a
+/// [`RecallHit::score`] is an `f64`, and claiming total equality over a type that can
+/// hold a NaN would be a false promise for the sake of a derive nothing needs.
+#[derive(Debug, Clone, PartialEq)]
 pub enum RecallResponse {
-    Grep(Vec<GrepMatch>),
+    Grep(GrepOutcome),
+    Search(RecallSearchResponse),
+}
+
+/// Line matches, plus whether they are ALL of them.
+///
+/// # Why exhaustiveness is a field and not an assumption
+///
+/// `grep_search` reads as exhaustive because ripgrep is: it opens every file. A backend
+/// whose corpus lives behind a ranked query API cannot be — it prefilters candidates
+/// lexically and evaluates the pattern over those — so its short result list looks
+/// exactly like "there are no other matches" while meaning "I did not look everywhere".
+/// 5b could only `warn!` that; this carries it, and the server emits it into the
+/// payload ONLY when it is `false`, so an exhaustive backend's output is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepOutcome {
+    pub matches: Vec<GrepMatch>,
+    /// True when every line of the searched scope was examined.
+    pub exhausted: bool,
+    /// How many candidates a non-exhaustive search examined. `None` on an exhaustive
+    /// one, where the number would describe nothing a caller can act on — and where
+    /// reporting "candidates: 4021" alongside `exhausted: true` would invite the reader
+    /// to think a cap was involved.
+    pub candidate_count: Option<usize>,
+}
+
+impl GrepOutcome {
+    /// The outcome of a search that read everything. What ripgrep returns.
+    pub fn exhaustive(matches: Vec<GrepMatch>) -> Self {
+        Self {
+            matches,
+            exhausted: true,
+            candidate_count: None,
+        }
+    }
+}
+
+/// Ranked hits from a backend's own index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallSearchResponse {
+    pub hits: Vec<RecallHit>,
+    /// Resume token for the next page, when there is one.
+    pub next_cursor: Option<OpaqueCursor>,
+    /// True when this page is the last one. `false` together with a `next_cursor` is
+    /// the ordinary "there is more"; `false` with no cursor means the backend knows it
+    /// truncated but cannot offer a resume point, which is still worth saying.
+    pub exhausted: bool,
+    /// Which retrieval stage produced these hits. Reported rather than assumed: the
+    /// same request against the same backend answers differently depending on the
+    /// index's own configuration, and a caller weighing these hits against local ones
+    /// needs to know which.
+    pub recall_mode: RecallMode,
+}
+
+/// The retrieval stage a backend's index actually used.
+///
+/// Named for what the PROVIDER did, and biased towards under-claiming: a backend that
+/// cannot determine its own mode reports [`RecallMode::Lexical`], because reporting a
+/// weaker stage than was used is harmless while claiming a stronger one misleads a
+/// caller into trusting the ranking more than it should.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecallMode {
+    /// Token/keyword matching. The default claim.
+    Lexical,
+    /// A vector or hybrid neural stage, enabled on the index itself.
+    Neural,
+}
+
+impl RecallMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecallMode::Lexical => "lexical",
+            RecallMode::Neural => "neural",
+        }
+    }
+}
+
+/// One hit from a backend's own index.
+///
+/// The fields are exactly what the server's `hybrid_search` payload can render for a
+/// hit it did not produce locally — no more. In particular there is no
+/// `semantic_score`/`bm25_score` pair: those are the local hybrid ranker's two input
+/// signals, and inventing values for them would be the clearest possible lie about
+/// where a hit came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallHit {
+    /// MOUNT-relative path. The router re-prefixes it into the logical namespace, the
+    /// same way it does for a local index's paths.
+    pub path: String,
+    pub title: String,
+    /// Relevance, descending, comparable only WITHIN this response.
+    ///
+    /// # Why this is ordinal
+    ///
+    /// A ranked search API returns an order, not a calibrated score — Algolia's ranking
+    /// is a tie-break cascade with no numeric relevance in the default response. So this
+    /// is derived from the hit's RANK (`1/(rank+1)`), which is honest about being
+    /// ordinal: it preserves the order the provider chose and makes no claim of
+    /// comparability against a cosine similarity or a BM25 value.
+    /// [`RecallSearchResponse::recall_mode`] tells a caller what produced the order.
+    pub score: f64,
+    /// The matching passage. Named `snippet` rather than `text` because it is a fragment
+    /// of the note by construction, not the note.
+    pub snippet: String,
+    pub chunk_index: usize,
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -642,11 +948,26 @@ impl BackendResponse {
         }
     }
 
-    /// Entries from a [`ManifestRequest::ListChildren`].
+    /// Entries from a [`ManifestRequest::ListChildren`], discarding the completeness
+    /// flag. The shape every caller that only renders entries wants.
     pub fn into_children(self) -> Result<Vec<VaultChildEntry>, BackendError> {
+        self.into_child_listing().map(|listing| listing.entries)
+    }
+
+    /// Entries from a [`ManifestRequest::ListChildren`] together with whether the
+    /// subfolder half is complete. See [`ChildListing`].
+    pub fn into_child_listing(self) -> Result<ChildListing, BackendError> {
         match self {
-            BackendResponse::Manifest(ManifestResponse::Children(entries)) => Ok(entries),
+            BackendResponse::Manifest(ManifestResponse::Children(listing)) => Ok(listing),
             other => Err(mismatch("list-children", &other)),
+        }
+    }
+
+    /// History from a [`ManifestRequest::Versions`].
+    pub fn into_note_history(self) -> Result<NoteHistory, BackendError> {
+        match self {
+            BackendResponse::Manifest(ManifestResponse::Versions(history)) => Ok(history),
+            other => Err(mismatch("versions", &other)),
         }
     }
 
@@ -666,11 +987,41 @@ impl BackendResponse {
         }
     }
 
-    /// Matches from a [`RecallRequest::Grep`].
+    /// Matches from a [`RecallRequest::Grep`], discarding the exhaustiveness report.
     pub fn into_grep_matches(self) -> Result<Vec<GrepMatch>, BackendError> {
+        self.into_grep_outcome().map(|outcome| outcome.matches)
+    }
+
+    /// Matches from a [`RecallRequest::Grep`] together with whether they are all of
+    /// them. See [`GrepOutcome`].
+    pub fn into_grep_outcome(self) -> Result<GrepOutcome, BackendError> {
         match self {
-            BackendResponse::Recall(RecallResponse::Grep(matches)) => Ok(matches),
+            BackendResponse::Recall(RecallResponse::Grep(outcome)) => Ok(outcome),
             other => Err(mismatch("grep", &other)),
+        }
+    }
+
+    /// Hits from a [`RecallRequest::Search`].
+    pub fn into_recall_search(self) -> Result<RecallSearchResponse, BackendError> {
+        match self {
+            BackendResponse::Recall(RecallResponse::Search(response)) => Ok(response),
+            other => Err(mismatch("recall-search", &other)),
+        }
+    }
+
+    /// Outcome of a [`MutationRequest::SoftDelete`].
+    pub fn into_soft_delete(self) -> Result<SoftDeleteOutcome, BackendError> {
+        match self {
+            BackendResponse::Mutation(MutationResponse::SoftDeleted {
+                version_id,
+                already_deleted,
+                recoverable_from,
+            }) => Ok(SoftDeleteOutcome {
+                version_id,
+                already_deleted,
+                recoverable_from,
+            }),
+            other => Err(mismatch("soft-delete", &other)),
         }
     }
 
@@ -691,6 +1042,14 @@ impl BackendResponse {
     }
 }
 
+/// What a soft delete left behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftDeleteOutcome {
+    pub version_id: String,
+    pub already_deleted: bool,
+    pub recoverable_from: Option<String>,
+}
+
 /// What a committed upload landed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadOutcome {
@@ -704,8 +1063,41 @@ pub struct UploadOutcome {
 // ---------------------------------------------------------------------------
 
 impl BackendRequest {
+    /// Read the CURRENT text of a note. The shape every pre-existing call site wants,
+    /// and the only shape a caller that is about to write the note back may use — see
+    /// [`ContentRequest::ReadText`].
     pub fn read_text(path: impl Into<String>) -> Self {
-        BackendRequest::Content(ContentRequest::ReadText { path: path.into() })
+        BackendRequest::Content(ContentRequest::ReadText {
+            path: path.into(),
+            version: None,
+        })
+    }
+
+    /// Read one specific, possibly superseded version of a note.
+    pub fn read_text_version(path: impl Into<String>, version: impl Into<String>) -> Self {
+        BackendRequest::Content(ContentRequest::ReadText {
+            path: path.into(),
+            version: Some(version.into()),
+        })
+    }
+
+    /// Enumerate a note's retained versions.
+    pub fn note_versions(path: impl Into<String>) -> Self {
+        BackendRequest::Manifest(ManifestRequest::Versions { path: path.into() })
+    }
+
+    /// Remove a note observably and recoverably.
+    pub fn soft_delete(path: impl Into<String>) -> Self {
+        BackendRequest::Mutation(MutationRequest::SoftDelete { path: path.into() })
+    }
+
+    /// A ranked search served by the backend itself.
+    pub fn recall_search(query: impl Into<String>, limit: usize) -> Self {
+        BackendRequest::Recall(RecallRequest::Search(SearchRequest {
+            query: query.into(),
+            limit,
+            cursor: None,
+        }))
     }
 
     pub fn read_bytes(path: impl Into<String>) -> Self {
@@ -733,10 +1125,22 @@ impl BackendRequest {
         content: impl Into<String>,
         base_version: BaseVersion,
     ) -> Self {
+        BackendRequest::write_text_full(path, content, base_version, false)
+    }
+
+    /// A guarded write that additionally claims to RECONCILE a recorded divergence.
+    /// See [`MutationRequest::WriteText`]'s `resolve_divergence`.
+    pub fn write_text_full(
+        path: impl Into<String>,
+        content: impl Into<String>,
+        base_version: BaseVersion,
+        resolve_divergence: bool,
+    ) -> Self {
         BackendRequest::Mutation(MutationRequest::WriteText {
             path: path.into(),
             content: content.into(),
             base_version,
+            resolve_divergence,
         })
     }
 

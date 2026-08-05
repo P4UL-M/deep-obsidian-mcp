@@ -102,6 +102,68 @@ The black-box surface must preserve:
 - `request_vault_upload`
 - `upsert_session_note`
 
+Conditionally advertised (see "Tool availability" below): `grep_search`, `delete_note`,
+`note_history`, `read_version`, `resolve_divergence`.
+
+### Tool availability is environment- and capability-dependent
+
+`tools/list` is computed once per process. Three inputs, and only these three, may change
+what it contains. Everything else about it is frozen.
+
+1. **Environment — ripgrep.** `grep_search` is advertised if and only if a working `rg` was
+   resolved. "rg works or `grep_search` does not exist": it is omitted rather than
+   advertised-and-failing.
+2. **Configuration — multiple mounts.** A multi-mount vault adds a required `scope`
+   argument to the recall tools that rank (`hybrid_search`, `load_knowledge`,
+   `search_artifacts`). It adds no tool and removes none. A single-mount vault's list is
+   unchanged.
+3. **Configuration — mount capabilities.** A mount declares what its storage can do
+   (`vault_info.mounts[].capabilities`), and tools whose whole purpose depends on a
+   capability are advertised only when at least one mount has it:
+   - `version-history` adds `note_history`, `read_version` and `resolve_divergence`, and
+     adds the `resolveDivergence` argument to `upsert_note`;
+   - `soft-delete` adds `delete_note`.
+
+   The two are checked separately, because they come apart: a read-only shared mount has a
+   version history and no soft delete.
+
+The same discipline governs all three: a tool that could only ever refuse is not
+advertised. A tool that IS advertised may still refuse for a particular `path` — the mount
+that owns it may lack the capability — and that refusal names the mount, its backend, and
+the mounts that do support the operation.
+
+This surface must never gain deletion of local vault files. `delete_note` exists only for a
+backend whose removal is observable to other participants and recoverable from the note's
+own version history; a filesystem mount refuses it, and a single-mount vault does not
+advertise it at all.
+
+### Payload additions are conditional on being true
+
+An answer that is incomplete must say so, and an answer that is complete must not carry the
+apparatus for saying so. So these fields appear ONLY in the case they describe, and a
+backend that cannot produce that case emits payloads byte-identical to the ones it always
+emitted:
+
+- `list_children` gains `foldersTruncated` / `foldersTruncatedReason` only when a mount
+  could not enumerate every subfolder. A mount whose directories are real directories never
+  sets it.
+- `grep_search` gains `exhaustive: false`, `candidateCount` and `exhaustiveNote` only when
+  the search could not read every line in scope. A ripgrep-served search emits none of them,
+  so an absent `exhaustive` continues to mean what it has always meant: exhaustive.
+- `hybrid_search` and `load_knowledge` gain `nativeRecall`, `recallMode`, `mountId` and
+  `exhausted` only when the answer came from a mount's OWN index rather than from the local
+  one — and then omit `semanticBackend`, `degraded`, `semanticScore` and `bm25Score`, which
+  describe the local ranker and would be fabricated values here.
+
+`exhaustive` and `exhausted` are different facts and must not be unified. `exhaustive:
+false` (grep) means the search did not look everywhere, so an empty result is not proof of
+absence. `exhausted: false` (recall) means the search looked everywhere and there are simply
+more results than `limit` asked for.
+
+No payload may advertise a continuation a caller cannot take. A tool that reports more
+results available must either declare the argument that fetches them or offer no cursor at
+all.
+
 `upsert_note` must preserve explicit author control. If `content` is provided, it must be written as-is. If `title` or `frontmatter` are provided, they must only be written when explicitly requested. `content` and the compose fields (`body`/`title`/`frontmatter`) are mutually exclusive; as a robustness concession to clients that fill every schema property, a call providing both `content` and `body` with identical text succeeds (writing `content`, with a `warning` in the result), while diverging text is rejected.
 
 `upsert_session_note` must preserve the provided markdown body as-is, except for optional trailing `## Manual Notes` preservation when requested. It must not inject an implicit title or heading.

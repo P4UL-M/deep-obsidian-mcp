@@ -77,6 +77,11 @@ struct Candidate {
 }
 
 /// Run a candidate-bounded grep. See the module docs for what "bounded" costs.
+///
+/// Returns `(matches, candidate_count)`. The count is the honesty half of the answer and
+/// travels into the response rather than only into a log line: the caller's
+/// `grep_search` payload reports it alongside `exhaustive: false`, so an agent reading a
+/// short match list can tell "there are no more" from "I stopped looking".
 pub async fn grep(
     backend: &AlgoliaVaultBackend,
     query: &str,
@@ -85,7 +90,7 @@ pub async fn grep(
     glob: Option<&str>,
     context_lines: usize,
     limit: usize,
-) -> Result<Vec<GrepMatch>, BackendError> {
+) -> Result<(Vec<GrepMatch>, usize), BackendError> {
     if query.is_empty() {
         return Err(BackendError::Message(
             "grep_search requires a non-empty query".to_string(),
@@ -128,11 +133,10 @@ pub async fn grep(
         collect_chunk_matches(&candidate, &matcher, context_lines, limit, &mut matches);
     }
 
-    // The honesty report. `GrepMatch` carries no room for it and widening
-    // `RecallResponse` for a field only this backend populates would touch every
-    // other backend, the router and a frozen MCP payload — so it is logged, the way
-    // the couchdb backend logs a conflicted read. Carrying it into the tool payload
-    // is listed as a follow-up.
+    // The honesty report, logged AND returned. The log is for whoever has to decide
+    // whether `CANDIDATE_LIMIT` is too low; the returned count is for the caller, which
+    // reports it in the `grep_search` payload. 5b could only log it because
+    // `RecallResponse::Grep` was a bare `Vec`; it is now a `GrepOutcome`.
     warn!(
         "grep_search over Algolia index '{}' is CANDIDATE-BOUNDED, not exhaustive: the anchor \
          {anchor:?} returned {candidate_count} candidate chunks (cap {CANDIDATE_LIMIT}) and \
@@ -142,7 +146,7 @@ pub async fn grep(
         matches.len(),
         if matches.len() == 1 { "" } else { "es" }
     );
-    Ok(matches)
+    Ok((matches, candidate_count))
 }
 
 /// Evaluate `matcher` over one candidate's lines, appending hits with context.

@@ -121,6 +121,17 @@ fn note_resource(path: &str) -> ResourceDefinition {
 /// If any mount's index cannot be read the whole listing fails, naming the mount.
 /// An enumeration that quietly drops one mount's notes tells a client those notes
 /// do not exist, which is worse than telling it the listing is unavailable.
+/// # A mount with no local index still contributes its notes
+///
+/// `state.runtimes.entries()` covers only mounts the server indexes locally, so iterating
+/// it alone would silently omit every note on an index-less mount — and omission from
+/// `resources/list` is exactly the "these notes do not exist" failure this function's other
+/// invariant exists to prevent. Such a mount is asked directly, through
+/// [`ManifestRequest::WalkMarkdown`](deep_obsidian_backend::ManifestRequest::WalkMarkdown),
+/// which is an ENUMERATION and therefore something it can answer completely — unlike a
+/// ranked recall.
+///
+/// Its failure is fatal to the listing by name, on the same terms as an indexed mount's.
 async fn all_logical_note_paths(state: &AppState, reason: &str) -> Result<Vec<String>, String> {
     let mut paths: Vec<String> = Vec::new();
     for entry in state.runtimes.entries() {
@@ -150,7 +161,23 @@ async fn all_logical_note_paths(state: &AppState, reason: &str) -> Result<Vec<St
                 }),
         );
     }
+    for mount in state.router.mounts() {
+        if state.runtimes.for_mount(&mount.id).is_some() {
+            continue;
+        }
+        let notes = mount
+            .backend
+            .execute(BackendRequest::walk_markdown())
+            .await
+            .and_then(deep_obsidian_backend::BackendResponse::into_markdown_files)
+            .map_err(|error| format!("mount '{}' cannot be listed: {error}", mount.id))?;
+        paths.extend(notes.iter().map(|note| mount.to_logical(note)));
+    }
     paths.sort_unstable();
+    // Two mounts cannot own the same logical path (longest-prefix routing gives it to
+    // exactly one), so this only ever collapses a duplicate WITHIN one mount's answer.
+    // Cheap, and it keeps the 200-resource cap from being spent twice on one note.
+    paths.dedup();
     Ok(paths)
 }
 

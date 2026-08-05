@@ -38,9 +38,9 @@ use crate::sidecar::{
 use crate::watch::ChangeStream;
 use crate::{
     BackendDescriptor, BackendError, BackendKind, BackendRequest, BackendResponse, BaseVersion,
-    Capability, ContentRequest, ContentResponse, HealthRequest, HealthResponse, ManifestRequest,
-    ManifestResponse, MutationRequest, MutationResponse, OpaqueCursor, RecallRequest, VaultBackend,
-    VaultChildEntry, VaultEntryKind,
+    Capability, ChildListing, ContentRequest, ContentResponse, HealthRequest, HealthResponse,
+    ManifestRequest, ManifestResponse, MutationRequest, MutationResponse, OpaqueCursor,
+    RecallRequest, VaultBackend, VaultChildEntry, VaultEntryKind,
 };
 
 /// Refusal for every write against a READ-ONLY CouchDB mount.
@@ -70,6 +70,49 @@ pub const COUCHDB_GREP_UNSUPPORTED_MESSAGE: &str = "grep_search is unavailable o
 is an EXPERIMENTAL, READ-ONLY CouchDB (Self-hosted LiveSync) vault, and line search is served by \
 ripgrep over local files, which do not exist for a CouchDB vault. Use hybrid_search or \
 bm25_search, which are served by this mount's own index.";
+
+/// Refusal for a ranked search asked of a CouchDB mount.
+///
+/// Same shape as the filesystem's, and for the same reason: this mount HAS a local
+/// search index (the server builds one by walking the sidecar's manifest), so recall is
+/// already answered — one layer up. Saying so is what stops a reader concluding that
+/// recall is unavailable on a LiveSync vault, which is the opposite of true.
+pub const COUCHDB_NATIVE_RECALL_UNSUPPORTED_MESSAGE: &str = "this mount does not perform its own \
+ranked search: it is an EXPERIMENTAL CouchDB (Self-hosted LiveSync) vault, and the server builds a \
+local search index over its content, so hybrid_search, load_knowledge, related_notes and \
+graph_traverse are all answered from that index instead. This request exists for a backend whose \
+storage IS a search index; CouchDB is a document store with no relevance ranking. Nothing is \
+missing — use the index-backed recall tools.";
+
+/// Refusal for a versioned read or a history listing on a CouchDB mount.
+///
+/// The one refusal here that is genuinely "not implemented yet" rather than "the
+/// storage cannot", and it says so in those words. CouchDB really does keep a revision
+/// history, and its sibling revisions are already surfaced as conflicts — so a reader
+/// who was told this was impossible would be misinformed. What is missing is a sidecar
+/// protocol call to enumerate and fetch a revision, which is a real piece of work and
+/// not something a user can turn on.
+pub const COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE: &str = "listing or reading a previous \
+version of a note is NOT IMPLEMENTED for this mount yet. It is not impossible: this is an \
+EXPERIMENTAL CouchDB (Self-hosted LiveSync) vault and CouchDB does retain a revision history — but \
+the sidecar protocol has no call to enumerate or fetch a revision, so the server has nothing to \
+ask. No configuration turns this on. Until it exists, recover a previous version through Obsidian's \
+own file recovery or a CouchDB backup; vault_info reports which notes have unreconciled sibling \
+revisions.";
+
+/// Refusal for deleting a note on a CouchDB mount.
+///
+/// Honest about being unimplemented rather than impossible — LiveSync's own tombstones
+/// are exactly this mechanism — and explicit that the safe-looking fallback (writing an
+/// empty note) is not the same thing, because a reader who assumes it is would replicate
+/// an empty note to every one of their devices.
+pub const COUCHDB_SOFT_DELETE_UNSUPPORTED_MESSAGE: &str = "deleting a note is NOT IMPLEMENTED for \
+this mount yet. It is not impossible: this is an EXPERIMENTAL CouchDB (Self-hosted LiveSync) vault \
+and LiveSync represents a deletion as a tombstone entry, which is precisely what this operation \
+means — but the sidecar protocol has no delete call, so the server has nothing to ask. No \
+configuration turns this on, and writing an empty note is NOT a substitute: it would replicate an \
+empty note to every device rather than remove one. Delete the note in Obsidian and let LiveSync \
+replicate the removal.";
 
 /// How long a collected manifest may be reused.
 ///
@@ -187,17 +230,23 @@ impl CouchDbVaultBackend {
         &self,
         request: ManifestRequest,
     ) -> Result<ManifestResponse, BackendError> {
+        // Refused BEFORE the manifest walk: collecting it is N round trips to CouchDB,
+        // and a mount whose remote is down would then answer with an unreachability
+        // error instead of the honest "not implemented" — sending the reader to debug
+        // their connection over a call that could never have succeeded.
+        if matches!(request, ManifestRequest::Versions { .. }) {
+            return Err(BackendError::Unsupported(
+                COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE.to_string(),
+            ));
+        }
         let entries = self.manifest_entries().await?;
         match request {
             ManifestRequest::ListChildren {
                 path,
                 include_hidden,
                 include_ignored,
-            } => Ok(ManifestResponse::Children(list_children(
-                &entries,
-                path.as_deref(),
-                include_hidden,
-                include_ignored,
+            } => Ok(ManifestResponse::Children(ChildListing::exhaustive(
+                list_children(&entries, path.as_deref(), include_hidden, include_ignored),
             ))),
             ManifestRequest::WalkMarkdown => {
                 Ok(ManifestResponse::MarkdownFiles(walk_markdown(&entries)))
@@ -205,12 +254,23 @@ impl CouchDbVaultBackend {
             ManifestRequest::TopLevelFolders => {
                 Ok(ManifestResponse::Folders(top_level_folders(&entries)))
             }
+            // Refused above, before the manifest walk.
+            ManifestRequest::Versions { .. } => Err(BackendError::Unsupported(
+                COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE.to_string(),
+            )),
         }
     }
 
     async fn content(&self, request: ContentRequest) -> Result<ContentResponse, BackendError> {
         match request {
-            ContentRequest::ReadText { path } => {
+            // Refused before the sidecar is asked: there is no protocol call that could
+            // serve it, so a round trip could only produce a misleading error.
+            ContentRequest::ReadText {
+                version: Some(_), ..
+            } => Err(BackendError::Unsupported(
+                COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE.to_string(),
+            )),
+            ContentRequest::ReadText { path, .. } => {
                 ensure_vault_relative(&path)?;
                 let result = map_sidecar(self.supervisor.read(&path).await)?;
                 note_conflict(&path, result.conflicted);
@@ -622,14 +682,22 @@ impl VaultBackend for CouchDbVaultBackend {
             BackendRequest::Mutation(MutationRequest::SweepOrphanStagingFiles) => {
                 Ok(BackendResponse::Mutation(crate::MutationResponse::Swept))
             }
+            // `resolve_divergence` is ignored: a CouchDB conflict is unreconciled at the
+            // STORAGE level, so there is no server-side flag a caller could clear by
+            // asserting a merge — reconciliation means writing the merged revision, which
+            // is the ordinary guarded write this already is.
             BackendRequest::Mutation(MutationRequest::WriteText {
                 path,
                 content,
                 base_version,
+                ..
             }) => self
                 .write_text(&path, &content, base_version)
                 .await
                 .map(BackendResponse::Mutation),
+            BackendRequest::Mutation(MutationRequest::SoftDelete { .. }) => Err(
+                BackendError::Unsupported(COUCHDB_SOFT_DELETE_UNSUPPORTED_MESSAGE.to_string()),
+            ),
             BackendRequest::Mutation(MutationRequest::CommitUploadStream {
                 path,
                 expected_hash,
@@ -641,6 +709,9 @@ impl VaultBackend for CouchDbVaultBackend {
                 .map(BackendResponse::Mutation),
             BackendRequest::Recall(RecallRequest::Grep { .. }) => Err(BackendError::Unsupported(
                 COUCHDB_GREP_UNSUPPORTED_MESSAGE.to_string(),
+            )),
+            BackendRequest::Recall(RecallRequest::Search(_)) => Err(BackendError::Unsupported(
+                COUCHDB_NATIVE_RECALL_UNSUPPORTED_MESSAGE.to_string(),
             )),
             BackendRequest::Health(request) => {
                 self.health(request).await.map(BackendResponse::Health)
