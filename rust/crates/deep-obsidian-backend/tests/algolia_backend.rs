@@ -1178,3 +1178,738 @@ async fn hydration_needs_distinct_off_to_see_every_chunk() {
         without_distinct.hits.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Native recall
+// ---------------------------------------------------------------------------
+
+async fn search(
+    backend: &AlgoliaVaultBackend,
+    query: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> deep_obsidian_backend::RecallSearchResponse {
+    backend
+        .execute(BackendRequest::Recall(RecallRequest::Search(
+            deep_obsidian_backend::SearchRequest {
+                query: query.to_string(),
+                limit,
+                cursor: cursor.map(deep_obsidian_backend::OpaqueCursor::new),
+            },
+        )))
+        .await
+        .expect("recall search")
+        .into_recall_search()
+        .expect("a recall search response")
+}
+
+/// The mount's own ranked search returns NOTE-level hits, mount-relative, ordered, with a
+/// snippet and an honest recall mode.
+///
+/// Note-level rather than chunk-level is the property that makes `limit` mean what a caller
+/// thinks it means: the index-level `distinct` on `path` returns the best chunk per note, so
+/// asking for 5 hits gets 5 notes rather than 5 chunks of one note.
+#[tokio::test]
+async fn native_recall_returns_ranked_note_level_hits() {
+    let (base_url, _mock) = spawn_mock().await;
+    let backend = writable(&base_url, "recall-wiki");
+    write(
+        &backend,
+        "Decisions/Retention.md",
+        "# Retention\n\n## Policy\n\nThe retention policy keeps five versions of every note.\n",
+        BaseVersion::Absent,
+    )
+    .await
+    .expect("write");
+    write(
+        &backend,
+        "Syntheses/Narrative.md",
+        "# Narrative\n\nA narrative about something else entirely.\n",
+        BaseVersion::Absent,
+    )
+    .await
+    .expect("write");
+
+    let response = search(&backend, "retention policy versions", 5, None).await;
+    assert!(!response.hits.is_empty(), "{response:?}");
+    let hit = &response.hits[0];
+    assert_eq!(hit.path, "Decisions/Retention.md", "{response:?}");
+    // MOUNT-relative: the router owns the logical namespace, so nothing here is prefixed.
+    assert!(!hit.path.starts_with('/'), "{hit:?}");
+    assert_eq!(hit.title, "Retention");
+    assert!(hit.snippet.contains("retention policy"), "{hit:?}");
+    assert!(
+        hit.start_line >= 1 && hit.end_line >= hit.start_line,
+        "{hit:?}"
+    );
+    // Ordinal, descending, and the top hit is 1.0 — see `RecallHit::score`.
+    assert_eq!(hit.score, 1.0, "{hit:?}");
+    for pair in response.hits.windows(2) {
+        assert!(pair[0].score > pair[1].score, "{response:?}");
+    }
+    // Under-claimed by default: the mock index declares no `mode`, so lexical.
+    assert_eq!(
+        response.recall_mode,
+        deep_obsidian_backend::RecallMode::Lexical
+    );
+    // One hit per NOTE, so `limit` counts what a caller will see.
+    let paths: Vec<&str> = response.hits.iter().map(|hit| hit.path.as_str()).collect();
+    let mut deduped = paths.clone();
+    deduped.dedup();
+    assert_eq!(
+        paths, deduped,
+        "distinct must collapse a note's chunks: {paths:?}"
+    );
+}
+
+/// Pagination: a full page offers a cursor and reports itself unfinished; the last page
+/// reports itself exhausted and offers none.
+///
+/// A cursor pointing past the end would make a caller's loop run one pointless round trip
+/// and then read an empty page as a corpus that had shrunk.
+#[tokio::test]
+async fn native_recall_paginates_and_says_when_it_is_done() {
+    let (base_url, _mock) = spawn_mock().await;
+    let backend = writable(&base_url, "paged-wiki");
+    for index in 0..3 {
+        write(
+            &backend,
+            &format!("Notes/Retention{index}.md"),
+            &format!("# Retention {index}\n\nThe retention policy, take {index}.\n"),
+            BaseVersion::Absent,
+        )
+        .await
+        .expect("write");
+    }
+
+    let first = search(&backend, "retention policy", 2, None).await;
+    assert_eq!(first.hits.len(), 2, "{first:?}");
+    assert!(
+        !first.exhausted,
+        "a full page is not the last one: {first:?}"
+    );
+    let cursor = first.next_cursor.clone().expect("a resume cursor");
+
+    let second = search(&backend, "retention policy", 2, Some(cursor.as_str())).await;
+    assert_eq!(second.hits.len(), 1, "{second:?}");
+    assert!(second.exhausted, "a short page is the last one: {second:?}");
+    assert!(
+        second.next_cursor.is_none(),
+        "a cursor past the end would buy a pointless round trip: {second:?}"
+    );
+    // Page two continues the ranking rather than restarting it.
+    assert!(second.hits[0].score < first.hits[1].score, "{second:?}");
+    // No page repeats a note.
+    let mut all: Vec<&str> = first
+        .hits
+        .iter()
+        .chain(second.hits.iter())
+        .map(|hit| hit.path.as_str())
+        .collect();
+    all.sort();
+    let mut deduped = all.clone();
+    deduped.dedup();
+    assert_eq!(all, deduped, "{all:?}");
+
+    // A cursor this mount did not mint is an ERROR, not a silent reset to page one: a
+    // caller that mixed up two mounts' cursors would otherwise be handed the wrong corpus.
+    let error = backend
+        .execute(BackendRequest::Recall(RecallRequest::Search(
+            deep_obsidian_backend::SearchRequest {
+                query: "retention".to_string(),
+                limit: 2,
+                cursor: Some(deep_obsidian_backend::OpaqueCursor::new("not-a-page")),
+            },
+        )))
+        .await
+        .expect_err("a foreign cursor is refused");
+    assert!(error.to_string().contains("page numbers"), "{error}");
+}
+
+/// A ranked search never returns a SUPERSEDED version's orphaned chunks, and never
+/// returns a tombstoned note at all.
+///
+/// Two participants writing one note concurrently each push chunks; only one wins the head,
+/// and the loser's chunks stay in the index as orphans that a plain chunk query still
+/// matches. Deleting them would re-run the destructive race the explicit-versionId delete
+/// filter exists to avoid, so they are filtered at query time.
+#[tokio::test]
+async fn native_recall_hides_superseded_chunks_and_tombstoned_notes() {
+    let (base_url, _mock) = spawn_mock().await;
+    let backend = writable(&base_url, "orphan-recall-wiki");
+    write(
+        &backend,
+        "Decisions/Alpha.md",
+        "# Alpha\n\nthe original distinctive wording\n",
+        BaseVersion::Absent,
+    )
+    .await
+    .expect("write");
+    write(
+        &backend,
+        "Decisions/Alpha.md",
+        "# Alpha\n\nthe replacement distinctive wording\n",
+        BaseVersion::Unobserved,
+    )
+    .await
+    .expect("overwrite");
+
+    let response = search(&backend, "distinctive wording", 10, None).await;
+    let snippets: Vec<&str> = response
+        .hits
+        .iter()
+        .map(|hit| hit.snippet.as_str())
+        .collect();
+    assert!(
+        snippets.iter().any(|text| text.contains("replacement")),
+        "{snippets:?}"
+    );
+    assert!(
+        !snippets.iter().any(|text| text.contains("the original")),
+        "a superseded version's chunks must not surface: {snippets:?}"
+    );
+
+    // A soft-deleted note leaves recall entirely.
+    backend
+        .execute(BackendRequest::soft_delete("Decisions/Alpha.md"))
+        .await
+        .expect("soft delete");
+    let response = search(&backend, "distinctive wording", 10, None).await;
+    assert!(
+        response
+            .hits
+            .iter()
+            .all(|hit| hit.path != "Decisions/Alpha.md"),
+        "a tombstoned note must not surface: {response:?}"
+    );
+}
+
+/// A search against an index nobody has written is empty and EXHAUSTED, not a 404 and not
+/// an open-ended "there may be more".
+#[tokio::test]
+async fn native_recall_on_a_virgin_index_is_an_exhausted_empty_page() {
+    let (base_url, _mock) = spawn_mock().await;
+    let backend = writable(&base_url, "virgin-recall-wiki");
+    let response = search(&backend, "anything", 10, None).await;
+    assert!(response.hits.is_empty(), "{response:?}");
+    assert!(response.exhausted, "{response:?}");
+    assert!(response.next_cursor.is_none(), "{response:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Version history and soft delete
+// ---------------------------------------------------------------------------
+
+async fn note_history(
+    backend: &AlgoliaVaultBackend,
+    path: &str,
+) -> Result<deep_obsidian_backend::NoteHistory, String> {
+    backend
+        .execute(BackendRequest::note_versions(path))
+        .await
+        .map_err(|error| error.to_string())?
+        .into_note_history()
+        .map_err(|error| error.to_string())
+}
+
+/// Versions accumulate newest-first with their links intact, and each one stays readable.
+#[tokio::test]
+async fn note_history_lists_every_retained_version_newest_first() {
+    let (base_url, _mock) = spawn_mock().await;
+    let backend = writable(&base_url, "history-wiki");
+    let bodies = [
+        "# Alpha\n\nfirst body\n",
+        "# Alpha\n\nsecond body\n",
+        "# Alpha\n\nthird body\n",
+    ];
+    let mut versions = Vec::new();
+    for body in bodies {
+        write(
+            &backend,
+            "Decisions/Alpha.md",
+            body,
+            BaseVersion::Unobserved,
+        )
+        .await
+        .expect("write");
+        versions.push(
+            read(&backend, "Decisions/Alpha.md")
+                .await
+                .expect("read")
+                .1
+                .expect("a version token"),
+        );
+    }
+
+    let history = note_history(&backend, "Decisions/Alpha.md")
+        .await
+        .expect("history");
+    assert_eq!(history.versions.len(), 3, "{history:?}");
+    assert!(!history.has_divergence, "{history:?}");
+    // Newest first, and exactly one entry is current.
+    assert_eq!(history.versions[0].version_id, versions[2]);
+    assert!(history.versions[0].current);
+    assert_eq!(
+        history
+            .versions
+            .iter()
+            .filter(|entry| entry.current)
+            .count(),
+        1,
+        "{history:?}"
+    );
+    // The head is not superseded; every archived version is, and names what replaced it.
+    assert_eq!(history.versions[0].superseded_by, None);
+    assert_eq!(
+        history.versions[1].superseded_by.as_deref(),
+        Some(versions[2].as_str()),
+        "{history:?}"
+    );
+    assert_eq!(
+        history.versions[2].superseded_by.as_deref(),
+        Some(versions[1].as_str()),
+        "{history:?}"
+    );
+    assert!(history
+        .versions
+        .iter()
+        .all(|entry| entry.participant_id == "paul@test"));
+
+    // Every version reads back byte-exact, including the current one — which lives in the
+    // MAIN index, not in history, and would 404 if only history were consulted.
+    for (version, expected) in versions.iter().zip(bodies) {
+        let text = backend
+            .execute(BackendRequest::read_text_version(
+                "Decisions/Alpha.md",
+                version,
+            ))
+            .await
+            .expect("versioned read")
+            .into_text()
+            .expect("text");
+        assert_eq!(text, expected, "version {version}");
+    }
+
+    // A version id nobody minted names the retention policy rather than reporting a
+    // missing note: a purged version is the expected reason a caller cannot find one.
+    let error = backend
+        .execute(BackendRequest::read_text_version(
+            "Decisions/Alpha.md",
+            "v-never-existed",
+        ))
+        .await
+        .expect_err("an unknown version");
+    assert_eq!(error.io_kind(), Some(std::io::ErrorKind::NotFound));
+    assert!(error.to_string().contains("retention policy"), "{error}");
+    assert!(error.to_string().contains("note_history"), "{error}");
+
+    // History of a note that is not there at all is NotFound, not an empty list: "no
+    // versions" and "no note" are different answers.
+    let error = note_history(&backend, "Decisions/Absent.md")
+        .await
+        .expect_err("no such note");
+    assert!(error.contains("no note at"), "{error}");
+}
+
+/// Soft delete: the note leaves every read, the tombstone is observable, and the content
+/// is recoverable from the version the delete named.
+#[tokio::test]
+async fn a_soft_delete_hides_the_note_and_keeps_it_recoverable() {
+    let (base_url, _mock) = spawn_mock().await;
+    let backend = writable(&base_url, "delete-wiki");
+    let body = "# Deletable\n\nthe body that must survive a delete\n";
+    write(
+        &backend,
+        "Decisions/Deletable.md",
+        body,
+        BaseVersion::Absent,
+    )
+    .await
+    .expect("write");
+    write(
+        &backend,
+        "Decisions/Keeper.md",
+        "# Keeper\n\nstays\n",
+        BaseVersion::Absent,
+    )
+    .await
+    .expect("write");
+
+    let outcome = backend
+        .execute(BackendRequest::soft_delete("Decisions/Deletable.md"))
+        .await
+        .expect("soft delete")
+        .into_soft_delete()
+        .expect("a soft-delete outcome");
+    assert!(!outcome.already_deleted);
+    let recoverable = outcome.recoverable_from.clone().expect("recoverableFrom");
+
+    // Gone from reads, listings and the manifest — and the sibling is untouched.
+    let error = backend
+        .execute(BackendRequest::read_text("Decisions/Deletable.md"))
+        .await
+        .expect_err("a deleted note is absent");
+    assert_eq!(error.io_kind(), Some(std::io::ErrorKind::NotFound));
+    assert_eq!(
+        markdown_files(&backend).await,
+        vec!["Decisions/Keeper.md".to_string()]
+    );
+    let children = backend
+        .execute(BackendRequest::list_children(
+            Some("Decisions".to_string()),
+            false,
+            false,
+        ))
+        .await
+        .expect("listing")
+        .into_children()
+        .expect("children");
+    let names: Vec<&str> = children.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, vec!["Keeper.md"], "a tombstone must not be listed");
+    // A `Stat` of a tombstone is absent too, so `read_artifact` cannot size a deleted note.
+    assert_eq!(
+        backend
+            .execute(BackendRequest::stat("Decisions/Deletable.md"))
+            .await
+            .expect_err("stat of a tombstone")
+            .io_kind(),
+        Some(std::io::ErrorKind::NotFound)
+    );
+
+    // The tombstone is OBSERVABLE: the record is still there, marked deleted, so another
+    // participant can tell a removal from a sync gap.
+    let record = raw_client(&base_url)
+        .get_objects(
+            "delete-wiki",
+            &[deep_obsidian_algolia::note_object_id(
+                "Decisions/Deletable.md",
+            )],
+        )
+        .await
+        .expect("get the tombstone")
+        .pop()
+        .flatten()
+        .expect("the record survives the delete");
+    assert_eq!(record["deleted"], json!(true), "{record}");
+    assert_eq!(record["chunkCount"], json!(0), "{record}");
+    assert_eq!(record["sizeBytes"], json!(0), "{record}");
+    // A tombstone forks off nothing: carrying a `forkedFrom` forward would make a delete
+    // look like the fork that preceded it.
+    assert!(record.get("forkedFrom").is_none(), "{record}");
+
+    // ...and the content is still readable, and history still lists it.
+    let text = backend
+        .execute(BackendRequest::read_text_version(
+            "Decisions/Deletable.md",
+            &recoverable,
+        ))
+        .await
+        .expect("the removed content is recoverable")
+        .into_text()
+        .expect("text");
+    assert_eq!(text, body);
+    let history = note_history(&backend, "Decisions/Deletable.md")
+        .await
+        .expect("a tombstone still has a history");
+    assert!(
+        history.versions[0].current,
+        "the tombstone is the current version: {history:?}"
+    );
+
+    // Deleting again is a successful no-op naming the same recoverable version.
+    let repeat = backend
+        .execute(BackendRequest::soft_delete("Decisions/Deletable.md"))
+        .await
+        .expect("an idempotent delete")
+        .into_soft_delete()
+        .expect("outcome");
+    assert!(repeat.already_deleted);
+    assert_eq!(
+        repeat.recoverable_from.as_deref(),
+        Some(recoverable.as_str())
+    );
+
+    // Writing the content back resurrects the note, and does NOT record a divergence: a
+    // read reports a tombstone as absent, so the writer's observation was correct.
+    write(
+        &backend,
+        "Decisions/Deletable.md",
+        body,
+        BaseVersion::Absent,
+    )
+    .await
+    .expect("undelete");
+    assert_eq!(
+        read(&backend, "Decisions/Deletable.md")
+            .await
+            .expect("read")
+            .0,
+        body
+    );
+    assert!(
+        !note_history(&backend, "Decisions/Deletable.md")
+            .await
+            .expect("history")
+            .has_divergence,
+        "resurrecting a tombstone is not a divergence"
+    );
+
+    // Deleting a note that was never there is NotFound, not a silent success.
+    let error = backend
+        .execute(BackendRequest::soft_delete("Decisions/Absent.md"))
+        .await
+        .expect_err("nothing to delete");
+    assert_eq!(error.io_kind(), Some(std::io::ErrorKind::NotFound));
+}
+
+/// Only an ASSERTED reconciliation clears a divergence, and a write that itself forks
+/// cannot clear one.
+///
+/// The second half is the trap this guards: honouring `resolve_divergence` on a forking
+/// write would clear the mark one instruction after creating it, leaving the corpus with
+/// unmerged content and nothing pointing at it.
+#[tokio::test]
+async fn a_divergence_is_cleared_only_by_a_write_that_claims_to_reconcile_it() {
+    let (base_url, _mock) = spawn_mock().await;
+    let backend = writable(&base_url, "divergence-wiki");
+    write(
+        &backend,
+        "Contested.md",
+        "# Contested\n\nancestor\n",
+        BaseVersion::Absent,
+    )
+    .await
+    .expect("write");
+    let v1 = read(&backend, "Contested.md")
+        .await
+        .expect("read")
+        .1
+        .expect("a version");
+
+    // A head-based write: a continuation, no divergence.
+    write(
+        &backend,
+        "Contested.md",
+        "# Contested\n\novertaking\n",
+        BaseVersion::Version(v1.clone()),
+    )
+    .await
+    .expect("write");
+    assert!(
+        !note_history(&backend, "Contested.md")
+            .await
+            .expect("history")
+            .has_divergence
+    );
+
+    // A write from the STALE v1 base: it lands as a fork, and the note is marked.
+    write(
+        &backend,
+        "Contested.md",
+        "# Contested\n\nforked\n",
+        BaseVersion::Version(v1.clone()),
+    )
+    .await
+    .expect("a stale base forks rather than failing");
+    assert!(
+        note_history(&backend, "Contested.md")
+            .await
+            .expect("history")
+            .has_divergence
+    );
+    assert_eq!(
+        backend.conflicted_paths().await.expect("conflicted"),
+        Some(vec!["Contested.md".to_string()])
+    );
+
+    // An ordinary write does NOT clear it: divergence is sticky until something asserts
+    // the reconciliation.
+    backend
+        .execute(BackendRequest::write_text(
+            "Contested.md",
+            "# Contested\n\njust another edit\n",
+        ))
+        .await
+        .expect("write");
+    assert!(
+        note_history(&backend, "Contested.md")
+            .await
+            .expect("history")
+            .has_divergence
+    );
+
+    // A FORKING write that asks to resolve cannot: it created a divergence of its own.
+    let stale_head = note_history(&backend, "Contested.md")
+        .await
+        .expect("history")
+        .versions
+        .iter()
+        .find(|entry| !entry.current)
+        .expect("an archived version")
+        .version_id
+        .clone();
+    backend
+        .execute(BackendRequest::write_text_full(
+            "Contested.md",
+            "# Contested\n\na merge claimed from a stale base\n",
+            BaseVersion::Version(stale_head),
+            true,
+        ))
+        .await
+        .expect("write");
+    assert!(
+        note_history(&backend, "Contested.md")
+            .await
+            .expect("history")
+            .has_divergence,
+        "a write that forks cannot clear the divergence it just created"
+    );
+
+    // A head-based write that asserts the reconciliation clears it.
+    let head = read(&backend, "Contested.md")
+        .await
+        .expect("read")
+        .1
+        .expect("a version");
+    backend
+        .execute(BackendRequest::write_text_full(
+            "Contested.md",
+            "# Contested\n\nthe merged body\n",
+            BaseVersion::Version(head),
+            true,
+        ))
+        .await
+        .expect("write");
+    let history = note_history(&backend, "Contested.md")
+        .await
+        .expect("history");
+    assert!(!history.has_divergence, "{history:?}");
+    assert_eq!(
+        backend.conflicted_paths().await.expect("conflicted"),
+        Some(Vec::new())
+    );
+}
+
+/// A reconciliation whose result equals the current head STILL clears the mark.
+///
+/// The idempotent-push short circuit would otherwise swallow it, and the note would stay
+/// marked diverged with no write able to clear it — permanently stuck for exactly the notes
+/// a caller had already merged. PR #40 had this trap.
+#[tokio::test]
+async fn a_reconciliation_that_changes_nothing_still_clears_the_divergence() {
+    let (base_url, _mock) = spawn_mock().await;
+    let backend = writable(&base_url, "idempotent-merge-wiki");
+    write(
+        &backend,
+        "Stuck.md",
+        "# Stuck\n\nancestor\n",
+        BaseVersion::Absent,
+    )
+    .await
+    .expect("write");
+    let v1 = read(&backend, "Stuck.md")
+        .await
+        .expect("read")
+        .1
+        .expect("a version");
+    write(
+        &backend,
+        "Stuck.md",
+        "# Stuck\n\novertaking\n",
+        BaseVersion::Version(v1.clone()),
+    )
+    .await
+    .expect("write");
+    write(
+        &backend,
+        "Stuck.md",
+        "# Stuck\n\nforked\n",
+        BaseVersion::Version(v1),
+    )
+    .await
+    .expect("fork");
+    assert!(
+        note_history(&backend, "Stuck.md")
+            .await
+            .expect("history")
+            .has_divergence
+    );
+
+    // The merge concluded that the head was already right: identical content.
+    let (head_text, head_version) = read(&backend, "Stuck.md").await.expect("read");
+    backend
+        .execute(BackendRequest::write_text_full(
+            "Stuck.md",
+            &head_text,
+            BaseVersion::Version(head_version.expect("a version")),
+            true,
+        ))
+        .await
+        .expect("an identical-content reconciliation");
+    let history = note_history(&backend, "Stuck.md").await.expect("history");
+    assert!(
+        !history.has_divergence,
+        "an identical-content merge must still clear the mark: {history:?}"
+    );
+    assert_eq!(read(&backend, "Stuck.md").await.expect("read").0, head_text);
+}
+
+/// A READ-ONLY mount serves the history surface and refuses the delete.
+///
+/// The asymmetry the capability set encodes: reading a previous version is a read, and
+/// hiding it from a read-only mount would hide the recovery path from exactly the mounts
+/// most likely to need it.
+#[tokio::test]
+async fn a_read_only_mount_serves_history_and_refuses_the_delete() {
+    let (base_url, _mock) = spawn_mock().await;
+    let writer = writable(&base_url, "shared-ro-wiki");
+    write(&writer, "Alpha.md", "# Alpha\n\nv1\n", BaseVersion::Absent)
+        .await
+        .expect("write");
+    write(
+        &writer,
+        "Alpha.md",
+        "# Alpha\n\nv2\n",
+        BaseVersion::Unobserved,
+    )
+    .await
+    .expect("write");
+
+    let reader = connect(
+        &base_url,
+        "shared-ro-wiki",
+        options(false, "alice@test"),
+        &temp_dir("shared-ro-reader"),
+    );
+    let history = note_history(&reader, "Alpha.md")
+        .await
+        .expect("a read-only mount lists history");
+    assert_eq!(history.versions.len(), 2, "{history:?}");
+    let old = history
+        .versions
+        .iter()
+        .find(|entry| !entry.current)
+        .expect("an archived version");
+    let text = reader
+        .execute(BackendRequest::read_text_version(
+            "Alpha.md",
+            &old.version_id,
+        ))
+        .await
+        .expect("a read-only mount reads a previous version")
+        .into_text()
+        .expect("text");
+    assert_eq!(text, "# Alpha\n\nv1\n");
+
+    // ...but the delete is refused by naming the setting.
+    let error = reader
+        .execute(BackendRequest::soft_delete("Alpha.md"))
+        .await
+        .expect_err("a read-only mount refuses a delete");
+    assert_eq!(
+        error.to_string(),
+        deep_obsidian_backend::ALGOLIA_READ_ONLY_MESSAGE
+    );
+    // Recall is a read too, and stays available.
+    assert!(!search(&reader, "Alpha", 5, None).await.hits.is_empty());
+}

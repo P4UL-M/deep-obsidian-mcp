@@ -170,6 +170,47 @@ pub async fn read_note(
     Ok(HydratedNote { content, note })
 }
 
+/// Reassemble ONE named version of a note, current or superseded.
+///
+/// # Why both indexes are tried, in this order
+///
+/// A version's chunks live in the MAIN index while it is the head and move to the history
+/// index when something supersedes it. So "which index holds version v" is a question
+/// about time, not about the version — and a caller who names the current version's id
+/// (which is exactly what a `note_history` entry hands them) must not be told it does not
+/// exist. Main first, history second.
+///
+/// The cache is deliberately NOT consulted: it is keyed by (path, head version) and holds
+/// live content only. A superseded version is not live content, and a cache designed
+/// around the head has no business answering a historical question.
+///
+/// A version nobody can find is a real, expected outcome — retention purges old versions
+/// (see `versioning::purge_history`) — so the error says so rather than reporting a
+/// missing note.
+pub async fn read_note_version(
+    backend: &AlgoliaVaultBackend,
+    remote_path: &str,
+    version_id: &str,
+) -> Result<String, BackendError> {
+    for index in [backend.index(), backend.history_index()] {
+        let chunks = fetch_version_chunks(backend, index, remote_path, version_id).await?;
+        if !chunks.is_empty() {
+            return Ok(reassemble_chunks(chunks));
+        }
+    }
+    Err(BackendError::io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "version {version_id} of {remote_path} is not on this Algolia mount: it was either \
+             purged by the retention policy (the {} most recent versions plus anything younger \
+             than {} days are kept) or the version id is wrong. note_history lists the versions \
+             that are still readable.",
+            backend.retention().0,
+            backend.retention().1
+        ),
+    )))
+}
+
 /// The head record's declared size, for `Stat`.
 ///
 /// Deliberately the RECORD's `sizeBytes` rather than the length of a hydrated body:

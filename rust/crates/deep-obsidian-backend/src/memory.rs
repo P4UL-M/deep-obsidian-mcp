@@ -21,9 +21,20 @@ use deep_obsidian_core::vault::{VaultChildEntry, VaultEntryKind, VaultError};
 use crate::watch::ChangeStream;
 use crate::{
     BackendDescriptor, BackendError, BackendKind, BackendRequest, BackendResponse, Capability,
-    ContentRequest, ContentResponse, HealthRequest, HealthResponse, ManifestRequest,
+    ChildListing, ContentRequest, ContentResponse, HealthRequest, HealthResponse, ManifestRequest,
     ManifestResponse, MutationRequest, MutationResponse, OpaqueCursor, RecallRequest, VaultBackend,
 };
+
+/// The one refusal this backend shares across every capability it lacks.
+///
+/// Deliberately generic where the real backends' refusals are specific: this backend
+/// exists to prove the boundary is a boundary, and a bespoke message per variant would
+/// be wording nobody ever reads. What matters is that it refuses at all — an in-memory
+/// map that quietly answered "no versions" or "search found nothing" would let a
+/// contract test pass while specifying nothing.
+const IN_MEMORY_UNSUPPORTED_MESSAGE: &str =
+    "this in-memory backend keeps no version history, performs no ranked search, and has no \
+observable deletion";
 
 /// An in-memory vault. Paths are vault-relative strings; directories are implied by
 /// the path segments of the notes they contain.
@@ -132,7 +143,12 @@ impl VaultBackend for InMemoryVaultBackend {
 
     async fn execute(&self, request: BackendRequest) -> Result<BackendResponse, BackendError> {
         match request {
-            BackendRequest::Content(ContentRequest::ReadText { path }) => {
+            BackendRequest::Content(ContentRequest::ReadText {
+                version: Some(_), ..
+            }) => Err(BackendError::Unsupported(
+                IN_MEMORY_UNSUPPORTED_MESSAGE.to_string(),
+            )),
+            BackendRequest::Content(ContentRequest::ReadText { path, .. }) => {
                 let bytes = self.read(&path)?;
                 let text = String::from_utf8(bytes).map_err(|error| {
                     BackendError::io(std::io::Error::new(
@@ -174,6 +190,11 @@ impl VaultBackend for InMemoryVaultBackend {
             BackendRequest::Mutation(MutationRequest::SweepOrphanStagingFiles) => {
                 Ok(BackendResponse::Mutation(MutationResponse::Swept))
             }
+            // Removing a key from a map would be a delete, but not an OBSERVABLE and
+            // RECOVERABLE one, which is what the request means.
+            BackendRequest::Mutation(MutationRequest::SoftDelete { .. }) => Err(
+                BackendError::Unsupported(IN_MEMORY_UNSUPPORTED_MESSAGE.to_string()),
+            ),
             BackendRequest::Mutation(MutationRequest::CommitUploadStream { .. }) => Err(
                 BackendError::Unsupported("this backend does not support uploads".to_string()),
             ),
@@ -260,11 +281,17 @@ impl VaultBackend for InMemoryVaultBackend {
                 entries.sort_by(|left, right| left.path.cmp(&right.path));
                 children.extend(entries);
                 Ok(BackendResponse::Manifest(ManifestResponse::Children(
-                    children,
+                    ChildListing::exhaustive(children),
                 )))
             }
+            BackendRequest::Manifest(ManifestRequest::Versions { .. }) => Err(
+                BackendError::Unsupported(IN_MEMORY_UNSUPPORTED_MESSAGE.to_string()),
+            ),
             BackendRequest::Recall(RecallRequest::Grep { .. }) => Err(BackendError::Message(
                 crate::grep::RIPGREP_UNAVAILABLE_MESSAGE.to_string(),
+            )),
+            BackendRequest::Recall(RecallRequest::Search(_)) => Err(BackendError::Unsupported(
+                IN_MEMORY_UNSUPPORTED_MESSAGE.to_string(),
             )),
             BackendRequest::Health(HealthRequest::Overview) => {
                 Ok(BackendResponse::Health(HealthResponse::Overview {

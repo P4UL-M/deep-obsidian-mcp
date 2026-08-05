@@ -36,7 +36,7 @@ use super::records_build::{build_note_records, NoteVersionMeta};
 use super::{
     empty_if_missing_index, new_version_id, now_ms, retention_keep_set, AlgoliaVaultBackend,
 };
-use crate::{BackendError, BaseVersion};
+use crate::{BackendError, BaseVersion, SoftDeleteOutcome};
 
 #[derive(Debug)]
 pub struct VersionedWriteOutcome {
@@ -120,6 +120,32 @@ fn fork_of(base_version: &BaseVersion, head: Option<&NoteRecord>) -> Option<Stri
     }
 }
 
+/// Whether `has_divergence` should survive this write.
+///
+/// Divergence is STICKY by default: a later head-based write has still not merged the
+/// forked content sitting in history, so the flag outlives the write that recorded it.
+/// Exactly one thing clears it — a caller stating that the content it is writing IS the
+/// reconciliation (`resolve_divergence`) — and even then only when this write does not
+/// itself fork, because a write that forked has created a NEW divergence and clearing
+/// the flag would erase the fact one call after establishing it.
+///
+/// The claim can only come from the caller. The storage sees an overwrite either way and
+/// has no way to tell a merge from a fresh clobber, which is precisely why the server
+/// never merges on its own.
+fn divergence_after_write(
+    resolve_divergence: bool,
+    forked_from: Option<&str>,
+    head: Option<&NoteRecord>,
+) -> bool {
+    if forked_from.is_some() {
+        return true;
+    }
+    if resolve_divergence {
+        return false;
+    }
+    head.map(|note| note.has_divergence).unwrap_or(false)
+}
+
 /// Write one new version of `remote_path`.
 ///
 /// # Why a stale base does NOT fail here
@@ -153,6 +179,7 @@ pub async fn push_note_version(
     content: &str,
     known_files: &[String],
     base_version: &BaseVersion,
+    resolve_divergence: bool,
 ) -> Result<VersionedWriteOutcome, BackendError> {
     let head = fetch_head(backend, remote_path).await?;
     let head_version = head.as_ref().map(|note| note.version_id.clone());
@@ -164,11 +191,22 @@ pub async fn push_note_version(
     //
     // Checked BEFORE the fork check on purpose: if the bytes already match the head,
     // there is nothing to diverge about — two participants arriving at the same text
-    // have not disagreed. A tombstone is the exception: its hash is the hash of an
-    // empty body, so an empty write over one must still resurrect the note rather
-    // than be short-circuited into "already up to date".
+    // have not disagreed. Two exceptions:
+    //
+    // * a TOMBSTONE — its hash is the hash of an empty body, so an empty write over one
+    //   must still resurrect the note rather than be short-circuited into "already up
+    //   to date";
+    // * a resolve-divergence write over a DIVERGED head. A merge whose result equals
+    //   the current head is a perfectly ordinary outcome (the overtaken version added
+    //   nothing that survived), and short-circuiting it would leave the note marked
+    //   diverged with no write that could ever clear the mark — the flag would be
+    //   permanently stuck for exactly the notes a caller had already reconciled. So
+    //   this falls through to a real write whose only effect is clearing the flag.
+    //   PR #40 short-circuited here and had that trap.
     if let Some(head_note) = &head {
+        let clearing_divergence = resolve_divergence && head_note.has_divergence;
         if !head_note.deleted
+            && !clearing_divergence
             && head_note.content_hash == deep_obsidian_core::content_hash(content.as_bytes())
         {
             return Ok(VersionedWriteOutcome {
@@ -183,14 +221,17 @@ pub async fn push_note_version(
     }
 
     let forked_from = fork_of(base_version, head.as_ref());
-    // Divergence is sticky: a head-based write still has not merged the forked
-    // content sitting in history, so the flag survives until something explicitly
-    // resolves it (a 5c concern — this slice has no resolve path).
-    let has_divergence = forked_from.is_some()
-        || head
-            .as_ref()
-            .map(|note| note.has_divergence)
-            .unwrap_or(false);
+    let has_divergence =
+        divergence_after_write(resolve_divergence, forked_from.as_deref(), head.as_ref());
+    if resolve_divergence && forked_from.is_some() {
+        warn!(
+            "the write of {remote_path} on Algolia index '{}' asked to resolve the recorded \
+             divergence, but it forked off the head itself, so the note stays marked \
+             hasDivergence: resolving would have cleared a divergence this very write created. \
+             Re-read the note, merge again from the CURRENT head, and write once more.",
+            backend.index()
+        );
+    }
     if let Some(forked) = &forked_from {
         warn!(
             "write of {remote_path} on Algolia index '{}' was based on {} but the head had already \
@@ -239,48 +280,11 @@ pub async fn push_note_version(
         )?;
     }
 
-    if let (Some(prev_note), Some(prev_version)) = (&head, &head_version) {
-        // (3) Copy the superseded version to history BEFORE deleting it from main.
-        let chunk_filter = format!(
-            "recordType:chunk AND noteId:{} AND versionId:{}",
-            super::quote_filter_value(remote_path),
-            super::quote_filter_value(prev_version)
-        );
-        let prev_chunks = empty_if_missing_index(
-            backend
-                .client()
-                .browse_all(backend.index(), Some(&chunk_filter))
-                .await,
-            Vec::new(),
-        )?;
-        let mut history_records: Vec<Value> = prev_chunks;
-        let mut prev_note_value =
-            serde_json::to_value(prev_note).expect("a note record serializes");
-        // History note records get a version-scoped objectID so several versions of
-        // one note coexist there; only the MAIN index's note record is a stable head
-        // pointer.
-        prev_note_value["objectID"] = json!(format!("note:{remote_path}@{prev_version}"));
-        prev_note_value["supersededBy"] = json!(version_id.clone());
-        history_records.push(prev_note_value);
-        super::map_algolia(
-            backend
-                .client()
-                .save_objects(backend.history_index(), history_records)
-                .await,
-        )?;
-        // That write is what brought the history index into existence, so its
-        // settings can finally be applied.
-        backend.ensure_history_settings().await;
-
-        // (4) Delete the superseded chunks from main, by an EXPLICIT vPrev filter.
-        // See the module docs for why the inverse filter is forbidden.
-        empty_if_missing_index(
-            backend
-                .client()
-                .delete_by_query(backend.index(), &chunk_filter)
-                .await,
-            Value::Null,
-        )?;
+    // (3) + (4): copy the superseded version to history BEFORE deleting it from main,
+    // and delete by an EXPLICIT vPrev filter. Shared with the soft delete so the two
+    // cannot drift — see `archive_version`.
+    if let Some(prev_note) = &head {
+        archive_version(backend, remote_path, prev_note, &version_id).await?;
     }
 
     // (5) The head pointer, AWAITED. Algolia writes are asynchronous; without the
@@ -317,6 +321,228 @@ pub async fn push_note_version(
         created: head.is_none() || head.as_ref().is_some_and(|note| note.deleted),
         unchanged: false,
     })
+}
+
+/// Copy one version of a note out of the main index and into history, then remove that
+/// version's chunks from main.
+///
+/// Extracted because a normal write and a soft delete need EXACTLY this, in exactly this
+/// order, and two copies of it would be two chances to get the order wrong. The order is
+/// the whole design: the copy happens BEFORE the delete, so a crash between them
+/// duplicates rather than loses; and the delete names `versionId` explicitly, never
+/// `NOT versionId:<new>`, because two participants writing the same note at once would
+/// each delete the other's freshly-pushed chunks under the inverse filter.
+///
+/// `superseded_by` is stamped onto the archived note record so history is walkable
+/// forwards, and the archived record gets a VERSION-SCOPED objectID so several versions
+/// of one note coexist there — only the main index's note record is a stable head
+/// pointer.
+async fn archive_version(
+    backend: &AlgoliaVaultBackend,
+    remote_path: &str,
+    previous: &NoteRecord,
+    superseded_by: &str,
+) -> Result<(), BackendError> {
+    let previous_version = previous.version_id.clone();
+    let chunk_filter = format!(
+        "recordType:chunk AND noteId:{} AND versionId:{}",
+        super::quote_filter_value(remote_path),
+        super::quote_filter_value(&previous_version)
+    );
+    let previous_chunks = empty_if_missing_index(
+        backend
+            .client()
+            .browse_all(backend.index(), Some(&chunk_filter))
+            .await,
+        Vec::new(),
+    )?;
+    let mut history_records: Vec<Value> = previous_chunks;
+    let mut previous_note = serde_json::to_value(previous).expect("a note record serializes");
+    previous_note["objectID"] = json!(format!("note:{remote_path}@{previous_version}"));
+    previous_note["supersededBy"] = json!(superseded_by);
+    history_records.push(previous_note);
+    super::map_algolia(
+        backend
+            .client()
+            .save_objects(backend.history_index(), history_records)
+            .await,
+    )?;
+    // That write is what brought the history index into existence, so its settings can
+    // finally be applied.
+    backend.ensure_history_settings().await;
+
+    empty_if_missing_index(
+        backend
+            .client()
+            .delete_by_query(backend.index(), &chunk_filter)
+            .await,
+        Value::Null,
+    )?;
+    Ok(())
+}
+
+/// Remove a note by replacing its head with a TOMBSTONE.
+///
+/// Ported from PR #40. Three properties, all load-bearing, and the reason this is a soft
+/// delete rather than a purge:
+///
+/// * the note is GONE from every read and listing — every one of them filters
+///   `NOT deleted:true` ([`super::reads::LIVE_NOTES`]) and the chunks leave the main
+///   index, so search cannot match it either;
+/// * other participants can tell it was REMOVED rather than merely find it missing,
+///   because the record is still there. On a shared corpus that distinction is the
+///   difference between "someone deleted this" and "did my sync break?";
+/// * the content is still RECOVERABLE: the superseded version is in history, so
+///   `recoverable_from` names a version a versioned read can still serve, and writing
+///   it back resurrects the note (which the fork logic deliberately does not treat as a
+///   divergence — see [`fork_of`]).
+///
+/// Deleting an already-deleted note is a successful no-op rather than an error: the
+/// caller's intent is already satisfied, and failing would make the operation
+/// non-idempotent for nothing.
+pub async fn soft_delete_note(
+    backend: &AlgoliaVaultBackend,
+    remote_path: &str,
+) -> Result<SoftDeleteOutcome, BackendError> {
+    let head = fetch_head(backend, remote_path)
+        .await?
+        .ok_or_else(|| super::note_not_found(remote_path))?;
+    if head.deleted {
+        return Ok(SoftDeleteOutcome {
+            version_id: head.version_id,
+            already_deleted: true,
+            recoverable_from: head.parent_version_id,
+        });
+    }
+
+    let participant_id = backend.participant_id().to_string();
+    let version_id = new_version_id(&participant_id);
+    let previous_version = head.version_id.clone();
+
+    archive_version(backend, remote_path, &head, &version_id).await?;
+
+    // The tombstone keeps the note's IDENTITY and its folder facets — so a reader who
+    // asks for it is told the note is gone rather than told nothing — and carries no
+    // body at all.
+    let mut tombstone = head.clone();
+    tombstone.version_id = version_id.clone();
+    tombstone.parent_version_id = Some(previous_version.clone());
+    tombstone.deleted = true;
+    tombstone.chunk_count = 0;
+    tombstone.size_bytes = 0;
+    tombstone.content_hash = deep_obsidian_core::content_hash(b"");
+    tombstone.updated_at_ms = now_ms();
+    tombstone.participant_id = participant_id;
+    tombstone.superseded_by = None;
+    // A tombstone forks off nothing. Carrying the head's `forkedFrom` forward would
+    // make a delete look like the fork that preceded it.
+    tombstone.forked_from = None;
+    // AWAITED, like every head-pointer move: a caller that deletes and then lists must
+    // not still see the note.
+    super::map_algolia(
+        backend
+            .client()
+            .save_objects_awaited(
+                backend.index(),
+                vec![serde_json::to_value(&tombstone).expect("a tombstone serializes")],
+            )
+            .await,
+    )?;
+
+    // The cache is a READ cache of live content, so a removed note must leave it — or
+    // the next read on this process would serve the body from a note that no longer
+    // exists.
+    backend.cache().remove(remote_path);
+    purge_history(backend, remote_path).await?;
+
+    Ok(SoftDeleteOutcome {
+        version_id,
+        already_deleted: false,
+        recoverable_from: Some(previous_version),
+    })
+}
+
+/// Every retained version of a note, newest first.
+///
+/// Assembled from two indexes because that is where the two halves live: the head is the
+/// main index's note record, every superseded version is a history record. A note nobody
+/// has ever superseded therefore has a one-entry history and no history index at all,
+/// which [`empty_if_missing_index`] turns into an empty list rather than a 404.
+///
+/// A TOMBSTONE is included and is `current`. Reporting it as absent would make a deleted
+/// note's history unreadable, which is precisely the recovery path the soft delete exists
+/// to preserve.
+pub async fn note_history(
+    backend: &AlgoliaVaultBackend,
+    remote_path: &str,
+) -> Result<crate::NoteHistory, BackendError> {
+    let head = fetch_head(backend, remote_path)
+        .await?
+        .ok_or_else(|| super::note_not_found(remote_path))?;
+    let archived = empty_if_missing_index(
+        backend
+            .client()
+            .browse_all(
+                backend.history_index(),
+                Some(&format!(
+                    "recordType:note AND noteId:{}",
+                    super::quote_filter_value(remote_path)
+                )),
+            )
+            .await,
+        Vec::new(),
+    )?;
+
+    let mut versions: Vec<crate::NoteVersion> = archived
+        .iter()
+        .filter_map(|record| {
+            Some(crate::NoteVersion {
+                version_id: record.get("versionId")?.as_str()?.to_string(),
+                participant_id: record
+                    .get("participantId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                updated_at_ms: record
+                    .get("updatedAtMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                parent_version_id: optional_string(record, "parentVersionId"),
+                forked_from: optional_string(record, "forkedFrom"),
+                superseded_by: optional_string(record, "supersededBy"),
+                current: false,
+            })
+        })
+        .collect();
+    versions.push(crate::NoteVersion {
+        version_id: head.version_id.clone(),
+        participant_id: head.participant_id.clone(),
+        updated_at_ms: head.updated_at_ms,
+        parent_version_id: head.parent_version_id.clone(),
+        forked_from: head.forked_from.clone(),
+        // The head is by definition not superseded. It is stated rather than copied from
+        // the record, whose `supersededBy` is only ever set on the archived COPY.
+        superseded_by: None,
+        current: true,
+    });
+    // Newest first, and the head wins a tie: two writes in the same millisecond are
+    // possible (the version id carries a random salt precisely because they are), and a
+    // history whose first entry was not the current version would be read as one.
+    versions.sort_by_key(|version| (std::cmp::Reverse(version.updated_at_ms), !version.current));
+    Ok(crate::NoteHistory {
+        has_divergence: head.has_divergence,
+        versions,
+    })
+}
+
+/// A record field as an owned string, treating both an absent key and an explicit
+/// `null` as absence — which is how Algolia represents an unset optional attribute.
+fn optional_string(record: &Value, key: &str) -> Option<String> {
+    record
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
 }
 
 /// Apply the floor-union-ceiling retention rule to one note's history records.

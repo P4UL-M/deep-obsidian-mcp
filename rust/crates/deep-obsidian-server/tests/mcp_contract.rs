@@ -424,6 +424,26 @@ async fn initialized_notification_produces_no_response() {
     );
 }
 
+/// The tool list is frozen for a single-mount filesystem vault, and everything that can
+/// vary is enumerated here.
+///
+/// # The three inputs, and why the list is not simply constant
+///
+/// `tools/list` is computed per process from exactly three things:
+///
+/// 1. **`rg_available`** (environment) — adds `grep_search`. Asserted below.
+/// 2. **multi-mount** (configuration) — adds the `scope` ARGUMENT to the routed recall
+///    tools, never a tool. Asserted in `multi_vault.rs`.
+/// 3. **mount capabilities** (configuration) — a mount advertising `version-history` adds
+///    `note_history`, `read_version`, `resolve_divergence` and the `resolveDivergence`
+///    argument on `upsert_note`; one advertising `soft-delete` adds `delete_note`.
+///    Asserted below for their ABSENCE, and in `multi_vault.rs` for their presence.
+///
+/// This test owns the absence half of (3): the fixture is a single filesystem mount, which
+/// can advertise neither capability, so the four tools must not exist and the golden must
+/// not contain them. That is what makes the gating load-bearing rather than decorative —
+/// the digest includes each tool's declared property names, so an ungated
+/// `resolveDivergence` would change the frozen bytes.
 #[tokio::test]
 async fn tools_list_is_frozen() {
     let fixture = Fixture::new("tools-list");
@@ -436,8 +456,8 @@ async fn tools_list_is_frozen() {
     let repeat = request(&state, "tools/list", json!({})).await;
     assert_eq!(response, repeat, "tools/list must be deterministic");
 
-    // Ripgrep availability is the ONLY environment-dependent input to the tool
-    // list, and it may add exactly `grep_search`.
+    // Ripgrep availability is the only ENVIRONMENT-dependent input, and it may add
+    // exactly `grep_search`.
     let mut with_rg = state.clone();
     with_rg.rg_available = true;
     let rg_names = tool_names(&request(&with_rg, "tools/list", json!({})).await);
@@ -453,6 +473,39 @@ async fn tools_list_is_frozen() {
         .collect::<Vec<_>>();
     assert_eq!(added, vec!["grep_search".to_string()]);
     assert_eq!(rg_names.len(), base_names.len() + 1);
+
+    // A single filesystem mount advertises neither `version-history` nor `soft-delete`, so
+    // the four capability tools must be absent from BOTH lists — with rg and without, so
+    // the two conditional mechanisms are shown to be independent.
+    for names in [&base_names, &rg_names] {
+        for absent in [
+            "delete_note",
+            "note_history",
+            "read_version",
+            "resolve_divergence",
+        ] {
+            assert!(
+                !names.contains(&absent.to_string()),
+                "{absent} must not be advertised when no mount can serve it: {names:?}"
+            );
+        }
+    }
+
+    // ...and `upsert_note` declares no `resolveDivergence`, which is what keeps the golden
+    // digest's property list unchanged. Asserted on the payload rather than the digest so
+    // the failure names the cause instead of dumping a diff.
+    let upsert = response["result"]["tools"]
+        .as_array()
+        .expect("a tools array")
+        .iter()
+        .find(|tool| tool["name"] == json!("upsert_note"))
+        .expect("upsert_note is always registered");
+    assert!(
+        upsert["inputSchema"]["properties"]
+            .get("resolveDivergence")
+            .is_none(),
+        "no mount here can record a divergence, so the argument must not be declared: {upsert}"
+    );
 }
 
 #[tokio::test]

@@ -529,6 +529,210 @@ async fn grep_capability_is_honest() {
     }
 }
 
+/// An exhaustive grep says so, and says nothing about candidates.
+///
+/// The claim is what makes the field useful: a backend that CANNOT be exhaustive reports
+/// `exhausted: false` with a candidate count, and the server emits the pair into the
+/// `grep_search` payload only in that case. If an exhaustive backend also reported a
+/// count, the payload would have to carry it always and every caller would have to
+/// interpret it.
+#[tokio::test]
+async fn an_exhaustive_grep_reports_itself_as_exhaustive_with_no_candidate_count() {
+    for subject in backends("grep-exhaustive") {
+        if !subject
+            .backend
+            .descriptor()
+            .supports(Capability::GrepSearch)
+        {
+            continue;
+        }
+        let outcome = subject
+            .backend
+            .execute(BackendRequest::Recall(RecallRequest::Grep {
+                query: "body".to_string(),
+                regex: false,
+                case_sensitive: false,
+                glob: None,
+                context_lines: 0,
+                limit: 10,
+            }))
+            .await
+            .expect("grep")
+            .into_grep_outcome()
+            .expect("grep outcome");
+        assert!(
+            outcome.exhausted,
+            "[{}] a backend that reads every file is exhaustive",
+            subject.name
+        );
+        assert_eq!(
+            outcome.candidate_count, None,
+            "[{}] an exhaustive search examined no bounded candidate set",
+            subject.name
+        );
+    }
+}
+
+/// A listing from a backend whose directories are real directories is complete, and says
+/// so. `foldersTruncated` therefore never appears in a filesystem mount's payload.
+#[tokio::test]
+async fn a_real_directory_listing_is_never_reported_as_truncated() {
+    for subject in backends("children-complete") {
+        let listing = subject
+            .backend
+            .execute(BackendRequest::list_children(None, false, false))
+            .await
+            .expect("listing")
+            .into_child_listing()
+            .expect("child listing");
+        assert!(
+            !listing.folders_truncated,
+            "[{}] a real directory enumerates every subfolder",
+            subject.name
+        );
+        assert!(!listing.entries.is_empty(), "[{}]", subject.name);
+    }
+}
+
+/// The three capabilities added for a versioned, index-backed corpus are absent here,
+/// and every request they gate is REFUSED rather than approximated.
+///
+/// The approximations are all tempting and all wrong: a ranked search could fall back to
+/// substring matching, a version list could report the one version that exists, and a
+/// soft delete could unlink the file. Each would answer the question asked with something
+/// else, and the third would hand an agent destructive filesystem access the MCP surface
+/// has never granted. So the contract is that they refuse, and that the refusal is a
+/// sentence rather than a code.
+#[tokio::test]
+async fn absent_capabilities_are_refused_rather_than_approximated() {
+    for subject in backends("capability-refusals") {
+        let descriptor = subject.backend.descriptor();
+        for capability in [
+            Capability::NativeRecall,
+            Capability::VersionHistory,
+            Capability::SoftDelete,
+        ] {
+            assert!(
+                !descriptor.supports(capability),
+                "[{}] {capability:?} must not be advertised by a last-writer-wins vault",
+                subject.name
+            );
+        }
+
+        let refusals: Vec<(&str, BackendRequest)> = vec![
+            ("ranked search", BackendRequest::recall_search("body", 5)),
+            ("version list", BackendRequest::note_versions("Home.md")),
+            (
+                "versioned read",
+                BackendRequest::read_text_version("Home.md", "v1"),
+            ),
+            ("soft delete", BackendRequest::soft_delete("Home.md")),
+        ];
+        for (what, request) in refusals {
+            let error = subject
+                .backend
+                .execute(request)
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("[{}] {what} must be refused, not answered", subject.name)
+                });
+            let message = error.to_string();
+            // A sentence, not a code: whoever reads this has to learn WHY, and the
+            // shortest honest answer to any of these is longer than a few words.
+            assert!(
+                message.split_whitespace().count() >= 8,
+                "[{}] the {what} refusal must explain itself: {message}",
+                subject.name
+            );
+        }
+
+        // ...and the file the soft delete refused is STILL THERE. This is the assertion
+        // that matters: a refusal that had already unlinked the note would pass every
+        // check above.
+        let text = subject
+            .backend
+            .execute(BackendRequest::read_text("Home.md"))
+            .await
+            .expect("the note survives a refused delete")
+            .into_text()
+            .expect("text");
+        assert_eq!(text, "# Home\n\nhome body\n", "[{}]", subject.name);
+    }
+}
+
+/// An unversioned read is byte-identical to what it was before `version` existed, and
+/// mints no version token on storage that has none — which is what keeps
+/// [`crate::BaseVersion`] `Unobserved` and the read-then-write window exactly as wide as
+/// it always was.
+#[tokio::test]
+async fn an_unversioned_read_is_unchanged_and_mints_no_version() {
+    for subject in backends("unversioned-read") {
+        let (text, version) = subject
+            .backend
+            .execute(BackendRequest::read_text("Home.md"))
+            .await
+            .expect("read")
+            .into_versioned_text()
+            .expect("versioned text");
+        assert_eq!(text, "# Home\n\nhome body\n", "[{}]", subject.name);
+        assert_eq!(
+            version, None,
+            "[{}] a last-writer-wins vault mints no version token",
+            subject.name
+        );
+    }
+}
+
+/// A write that claims to resolve a divergence behaves EXACTLY like one that does not,
+/// on a backend with no divergence concept. Nothing here may start reporting a
+/// reconciliation it never recorded.
+#[tokio::test]
+async fn resolve_divergence_is_inert_on_a_backend_that_records_none() {
+    for subject in backends("resolve-inert") {
+        let plain = subject
+            .backend
+            .execute(BackendRequest::write_text_full(
+                "Notes/Merged.md",
+                "# Merged\n",
+                crate::BaseVersion::Unobserved,
+                false,
+            ))
+            .await
+            .expect("plain write");
+        let resolving = subject
+            .backend
+            .execute(BackendRequest::write_text_full(
+                "Notes/Merged.md",
+                "# Merged again\n",
+                crate::BaseVersion::Unobserved,
+                true,
+            ))
+            .await
+            .expect("resolving write");
+        assert!(
+            matches!(
+                plain,
+                crate::BackendResponse::Mutation(crate::MutationResponse::Written {
+                    created: true
+                })
+            ),
+            "[{}] {plain:?}",
+            subject.name
+        );
+        assert!(
+            matches!(
+                resolving,
+                crate::BackendResponse::Mutation(crate::MutationResponse::Written {
+                    created: false
+                })
+            ),
+            "[{}] a resolving write is an ordinary overwrite here: {resolving:?}",
+            subject.name
+        );
+    }
+}
+
 #[tokio::test]
 async fn descriptor_kind_matches_the_backend() {
     for subject in backends("descriptor") {
@@ -669,6 +873,7 @@ async fn responses_mirror_their_request_family() {
             .backend
             .execute(BackendRequest::Content(ContentRequest::ReadText {
                 path: "Home.md".to_string(),
+                version: None,
             }))
             .await
             .expect("read")
