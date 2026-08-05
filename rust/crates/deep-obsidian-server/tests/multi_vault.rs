@@ -102,11 +102,13 @@ impl Fixture {
     /// broken mount can be built by naming a directory that does not exist.
     fn config_with_team_vault(&self, team_vault: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            federated_rerank: true,
             // Still the ROOT mount's path: it is what `vaultPath` has always meant,
             // and the root mount's own runtime is built from this config verbatim.
             vault_path: self.root_vault.clone(),
             mounts: vec![
                 MountConfig {
+                    recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
                     backend: MountBackendConfig::Filesystem {
@@ -115,6 +117,7 @@ impl Fixture {
                     },
                 },
                 MountConfig {
+                    recall_weight: None,
                     id: "team".to_string(),
                     mount_at: "Team".to_string(),
                     backend: MountBackendConfig::Filesystem {
@@ -366,8 +369,14 @@ async fn the_root_listing_merges_the_root_mount_with_a_synthesized_mount_folder(
 // Honest refusals: what this slice does not federate
 // ---------------------------------------------------------------------------
 
+/// An unscoped `grep_search` searches EVERY mount and concatenates.
+///
+/// This replaced a refusal. Grep produces MATCHES, not a ranking, so appending each mount's
+/// matches is the same set one vault would have produced -- there is no score to make
+/// comparable. Answering from the root mount alone (the thing the refusal existed to prevent)
+/// would have reported zero matches for text that is in the vault.
 #[tokio::test]
-async fn an_unscoped_grep_is_refused_rather_than_answered_from_one_mount() {
+async fn an_unscoped_grep_federates_across_every_mount() {
     let fixture = Fixture::new("grep");
     let state = fixture.state().await;
     if !state.rg_available {
@@ -375,17 +384,20 @@ async fn an_unscoped_grep_is_refused_rather_than_answered_from_one_mount() {
     }
 
     let response = tool_call(&state, "grep_search", json!({"query": "charter"})).await;
-    let message = error_message(&response);
-    // Names the limitation AND the workaround. Answering from the root mount would
-    // report zero matches for text that exists in the vault.
-    assert!(
-        message.contains("multiple vault mounts"),
-        "message must name the limitation: {message}"
-    );
-    assert!(
-        message.contains("glob"),
-        "message must name the workaround: {message}"
-    );
+    let payload = structured(&response);
+    let paths: Vec<&str> = payload["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .map(|item| item["path"].as_str().expect("path"))
+        .collect();
+    // "charter" appears only on the TEAM mount, and the search finds it without the caller
+    // naming a mount.
+    assert!(paths.contains(&"Team/Charter.md"), "{paths:?}");
+    // Every mount was read, so the answer keeps grep's frozen "exhaustive by omission"
+    // shape: no `exhaustive` key, no degradation.
+    assert!(payload.get("exhaustive").is_none(), "{payload}");
+    assert!(payload.get("missingBackends").is_none(), "{payload}");
 
     // Scoping to a single mount works, and reports logical paths.
     let scoped = tool_call(
@@ -414,54 +426,167 @@ async fn an_unscoped_grep_is_refused_rather_than_answered_from_one_mount() {
     );
 }
 
+/// An unscoped recall on a multi-mount vault is FEDERATED, not refused.
+///
+/// This replaced a refusal. The refusal was correct while there was no way to merge two
+/// mounts' orderings -- answering from one mount would have reported "no matches" for text
+/// that exists in the vault -- but it was never the answer a caller wanted. What the payload
+/// must now carry instead of an error is the provenance: which mounts were searched, how many
+/// candidates each contributed, and which mount every hit came from.
 #[tokio::test]
-async fn unscoped_index_recall_is_refused_and_names_the_scopes_that_would_work() {
+async fn unscoped_recall_federates_every_mount_and_reports_which_answered() {
     let fixture = Fixture::new("recall-unscoped");
     let state = fixture.state().await;
 
-    for (tool, arguments) in [
-        ("hybrid_search", json!({"query": "charter"})),
-        ("load_knowledge", json!({"subject": "charter"})),
-        ("search_artifacts", json!({"query": "charter"})),
+    // `search_artifacts` is federated too, but this fixture configures no ARTIFACT embedding
+    // backend, so it cannot rank on any mount -- see the assertion at the end.
+    for (tool, arguments, collection) in [
+        ("hybrid_search", json!({"query": "charter"}), "matches"),
+        ("load_knowledge", json!({"subject": "charter"}), "chunks"),
     ] {
         let response = tool_call(&state, tool, arguments).await;
-        let message = error_message(&response);
+        let payload = structured(&response);
+        assert_eq!(payload["federated"], json!(true), "{tool}: {payload}");
+        // Both mounts are named, whether or not they had anything to contribute: a mount
+        // missing from this list would be a mount a caller cannot tell was searched.
+        let mount_ids: Vec<&str> = payload["mounts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool} must report a mounts summary: {payload}"))
+            .iter()
+            .filter_map(|mount| mount["id"].as_str())
+            .collect();
+        assert_eq!(mount_ids, vec!["team", "vault"], "{tool}: {payload}");
+        // Nothing failed, so nothing is missing and the answer is not degraded.
+        assert_eq!(payload["degraded"], json!(false), "{tool}: {payload}");
         assert!(
-            message.starts_with(tool) && message.contains("'scope'"),
-            "{tool} must name the missing argument, got: {message}"
+            payload.get("missingBackends").is_none(),
+            "{tool}: {payload}"
         );
-        // Every mount has an index now, so the refusal is about NOT MERGING them --
-        // and it lists the scopes that would work, both of them.
-        assert!(
-            message.contains("'/'") && message.contains("'Team'"),
-            "{tool} must name the usable scopes, got: {message}"
-        );
+        for mount in payload["mounts"].as_array().expect("mounts") {
+            assert_eq!(mount["source"], json!("local-index"), "{tool}: {mount}");
+            assert!(mount["candidateCount"].is_u64(), "{tool}: {mount}");
+            assert!(mount["exhausted"].is_boolean(), "{tool}: {mount}");
+            assert_eq!(mount["recallWeight"], json!(1.0), "{tool}: {mount}");
+        }
+        // Every hit says which mount answered it.
+        for hit in payload[collection].as_array().expect("a hit collection") {
+            assert!(hit["mountId"].is_string(), "{tool}: {hit}");
+        }
     }
+
+    // The whole point: "roster" exists ONLY on the team mount, and an unscoped search finds
+    // it without the caller knowing the vault's mount layout.
+    let response = tool_call(&state, "hybrid_search", json!({"query": "roster"})).await;
+    let payload = structured(&response);
+    let paths: Vec<&str> = payload["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .filter_map(|item| item["path"].as_str())
+        .collect();
+    assert!(paths.contains(&"Team/Roster.md"), "{paths:?}");
+
+    // A federated artifact search whose every index-backed mount failed is an ERROR, not an
+    // empty `matches[]`. Artifacts have no lexical fallback, so "no ranking was produced" and
+    // "there are no matching artifacts" are different facts and only one of them is true.
+    let response = tool_call(&state, "search_artifacts", json!({"query": "charter"})).await;
+    let message = error_message(&response);
+    assert!(
+        message.contains("artifact embedding") || message.contains("embedding configuration"),
+        "the failure must name the artifact embedding backend, got: {message}"
+    );
 }
 
-/// The tools with no argument that could ever name one mount. Their answer is a
-/// whole-vault ranking (a limit-truncated path match; a folder recommendation), so
-/// merging mounts is the only way to answer them and that is not this slice.
+/// `find_files` enumerates every mount, in the logical namespace.
+///
+/// It federates while `recommend_folder` refuses because it is an ENUMERATION filtered by a
+/// path match, not a ranking: the matcher is a substring or regex test over paths and the
+/// result is the first `limit` matches in walk order, so merging the mounts' walks gives the
+/// same answer one vault would.
 #[tokio::test]
-async fn tools_without_a_scope_argument_still_refuse_a_multi_mount_vault() {
+async fn find_files_enumerates_every_mount() {
+    let fixture = Fixture::new("find-files");
+    let state = fixture.state().await;
+
+    let response = tool_call(&state, "find_files", json!({"query": ".md"})).await;
+    let payload = structured(&response);
+    let paths: Vec<&str> = payload["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .map(|item| item["path"].as_str().expect("path"))
+        .collect();
+    // Both mounts' notes, at LOGICAL paths, sorted -- the index stores `Charter.md` and the
+    // client must never see that spelling.
+    assert_eq!(
+        paths,
+        vec![
+            "Notes/Deep.md",
+            "Root.md",
+            "Team/Charter.md",
+            "Team/Roster.md"
+        ],
+        "{payload}"
+    );
+    // Nothing was cut, so no truncation claim.
+    assert!(payload.get("truncated").is_none(), "{payload}");
+
+    // A mount-specific query reaches the mount that owns it.
+    let response = tool_call(&state, "find_files", json!({"query": "Roster"})).await;
+    let payload = structured(&response);
+    assert_eq!(payload["matches"][0]["path"], json!("Team/Roster.md"));
+
+    // Truncation is REPORTED on a multi-mount vault, because the merged walk is ordered by
+    // logical path: a full result set is the alphabetically first `limit` matches, and a whole
+    // mount can sit past the cut.
+    let response = tool_call(&state, "find_files", json!({"query": ".md", "limit": 2})).await;
+    let payload = structured(&response);
+    assert_eq!(payload["count"], json!(2), "{payload}");
+    assert_eq!(payload["truncated"], json!(true), "{payload}");
+    assert!(
+        payload["truncationNote"]
+            .as_str()
+            .expect("a truncation note")
+            .contains("alphabetically first"),
+        "{payload}"
+    );
+    // And the notes that survived are the alphabetically first ones -- the team mount is
+    // entirely absent, which is exactly what the note warns about.
+    let paths: Vec<&str> = payload["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .map(|item| item["path"].as_str().expect("path"))
+        .collect();
+    assert_eq!(paths, vec!["Notes/Deep.md", "Root.md"]);
+}
+
+/// `recommend_folder` is the one whole-vault tool that still refuses, and on purpose.
+///
+/// It scores each candidate folder by how much of the query's evidence lives under it, and
+/// those counts are only comparable within ONE index. Its output is also the single folder a
+/// note gets written to, so a plausible-looking arbitrary answer silently misfiles work.
+/// `find_files` is federated instead, because it is an enumeration filtered by a path match
+/// rather than a ranking -- see `find_files_enumerates_every_mount`.
+#[tokio::test]
+async fn recommend_folder_still_refuses_a_multi_mount_vault_and_says_why() {
     let fixture = Fixture::new("recall-unscopable");
     let state = fixture.state().await;
 
-    for (tool, arguments) in [
-        ("find_files", json!({"query": "Charter"})),
-        ("recommend_folder", json!({"topic": "charter"})),
-    ] {
-        let response = tool_call(&state, tool, arguments).await;
-        let message = error_message(&response);
-        assert!(
-            message.starts_with(tool) && message.contains("multi-mount"),
-            "{tool} must refuse explicitly, got: {message}"
-        );
-        assert!(
-            message.contains("merging"),
-            "{tool} must name the reason, got: {message}"
-        );
-    }
+    let response = tool_call(&state, "recommend_folder", json!({"topic": "charter"})).await;
+    let message = error_message(&response);
+    assert!(
+        message.starts_with("recommend_folder") && message.contains("multi-mount"),
+        "the refusal must be explicit, got: {message}"
+    );
+    assert!(
+        message.contains("comparable"),
+        "it must name the reason -- incomparable per-index evidence -- got: {message}"
+    );
+    assert!(
+        message.contains("list_children"),
+        "it must name what the caller can do instead, got: {message}"
+    );
 }
 
 #[tokio::test]
@@ -860,13 +985,24 @@ async fn the_scope_argument_is_declared_only_on_a_multi_mount_vault() {
             tool["inputSchema"]["properties"]["scope"].is_object(),
             "{name} must declare 'scope' on a multi-mount vault"
         );
-        // Required, because the tool genuinely cannot answer without it here.
+        // OPTIONAL, not required: omitting it now asks for the FEDERATED answer over every
+        // mount. Declaring it required would tell a client the whole-vault search does not
+        // exist, which is the opposite of true.
         assert!(
-            tool["inputSchema"]["required"]
+            !tool["inputSchema"]["required"]
                 .as_array()
                 .expect("required")
                 .contains(&json!("scope")),
-            "{name} must require 'scope' on a multi-mount vault"
+            "{name} must not require 'scope': an unscoped call federates every mount"
+        );
+        // The description has to say what omitting it does, or a client reading only the
+        // schema cannot discover the federated answer at all.
+        let description = tool["inputSchema"]["properties"]["scope"]["description"]
+            .as_str()
+            .expect("scope description");
+        assert!(
+            description.contains("Omit"),
+            "{name}'s scope description must say what omitting it does: {description}"
         );
     }
     // The tools that cannot be scoped do not grow a meaningless argument.
@@ -1277,6 +1413,7 @@ impl CouchdbFixture {
         // so the routing assertions below are about the BACKEND KIND rather than about
         // a different prefix.
         config.mounts[1] = MountConfig {
+            recall_weight: None,
             id: "live".to_string(),
             mount_at: "LiveSync".to_string(),
             backend: MountBackendConfig::Couchdb {
@@ -2016,6 +2153,7 @@ impl AlgoliaFixture {
         // so every assertion below is about the backend kind rather than about a
         // different prefix.
         config.mounts[1] = MountConfig {
+            recall_weight: None,
             id: "shared".to_string(),
             mount_at: "_Shared".to_string(),
             backend: MountBackendConfig::Algolia {
@@ -2065,6 +2203,7 @@ impl AlgoliaFixture {
 fn an_algolia_mount_requires_the_algolia_vaults_flag_and_a_non_root_prefix() {
     let mounts = vec![
         MountConfig {
+            recall_weight: None,
             id: "vault".to_string(),
             mount_at: String::new(),
             backend: MountBackendConfig::Filesystem {
@@ -2073,6 +2212,7 @@ fn an_algolia_mount_requires_the_algolia_vaults_flag_and_a_non_root_prefix() {
             },
         },
         MountConfig {
+            recall_weight: None,
             id: "shared".to_string(),
             mount_at: "_Shared".to_string(),
             backend: MountBackendConfig::Algolia {
@@ -2573,14 +2713,20 @@ async fn scoped_recall_on_an_algolia_mount_is_served_by_the_mounts_own_index() {
     );
 }
 
-/// The unscoped-recall refusal names the mounts that could serve THAT tool.
+/// A federated answer reports each mount by the mechanism that actually served it, and says
+/// honestly when a mount could not take part at all.
 ///
-/// Two different lists, because two different sets of mounts can answer: `hybrid_search`
-/// can be served by the shared mount, `related_notes` cannot. One list would be wrong for
-/// one of them — and wrong in the worse direction for `hybrid_search`, where it would
-/// hide a mount that works.
+/// The three tools split three ways over the same two-mount vault, and the differences are
+/// the contract:
+///
+/// * `hybrid_search` and `load_knowledge` — the algolia mount answers RANKED SEARCH itself,
+///   so it takes part as `native-recall` and reports its `recallMode`;
+/// * `search_artifacts` — the algolia mount has no local artifact table AND its backend
+///   cannot store a binary file, so it holds no artifacts. It is reported as SKIPPED with a
+///   reason and the answer is NOT degraded: nothing was omitted. Calling that a missing
+///   backend would train a reader to ignore `missingBackends`.
 #[tokio::test]
-async fn the_unscoped_refusal_names_only_the_mounts_that_can_serve_that_tool() {
+async fn a_federated_answer_names_each_mounts_recall_mechanism() {
     let fixture = AlgoliaFixture::new("algolia-scope-hint").await;
     let state = fixture.state_writable(true).await;
 
@@ -2590,26 +2736,42 @@ async fn the_unscoped_refusal_names_only_the_mounts_that_can_serve_that_tool() {
         } else {
             json!({"subject": "shared"})
         };
-        let message = error_message(&tool_call(&state, tool, arguments).await).to_string();
-        assert!(message.contains("requires a 'scope'"), "{tool}: {message}");
+        let response = tool_call(&state, tool, arguments).await;
+        let payload = structured(&response).clone();
+        assert_eq!(payload["federated"], json!(true), "{tool}: {payload}");
+        let mounts = payload["mounts"].as_array().expect("mounts").clone();
+        let shared = mounts
+            .iter()
+            .find(|mount| mount["id"] == json!("shared"))
+            .unwrap_or_else(|| panic!("{tool} must report the shared mount: {payload}"));
+        assert_eq!(shared["source"], json!("native-recall"), "{tool}: {shared}");
+        // The field that makes the shared mount's scores interpretable at all.
+        assert!(shared["recallMode"].is_string(), "{tool}: {shared}");
+        let root = mounts
+            .iter()
+            .find(|mount| mount["id"] == json!("vault"))
+            .expect("the root mount");
+        assert_eq!(root["source"], json!("local-index"), "{tool}: {root}");
+        // A mount that ranked for itself is not a shortfall.
+        assert_eq!(payload["degraded"], json!(false), "{tool}: {payload}");
         assert!(
-            message.contains("'_Shared'"),
-            "{tool} CAN be served by the shared mount, so the hint must name it: {message}"
+            payload.get("missingBackends").is_none(),
+            "{tool}: {payload}"
         );
-        assert!(message.contains("'/'"), "{tool}: {message}");
     }
 
-    // `search_artifacts` needs the local artifact table, which the shared mount has not
-    // got, so its hint must NOT name it.
-    let message =
-        error_message(&tool_call(&state, "search_artifacts", json!({"query": "x"})).await)
-            .to_string();
-    assert!(message.contains("requires a 'scope'"), "{message}");
-    assert!(message.contains("'/'"), "{message}");
+    // `search_artifacts` cannot use the shared mount at all. This fixture also configures no
+    // artifact embedding backend, so the ROOT mount cannot rank either and every mount that
+    // could have answered failed -- which must be an error rather than an empty `matches[]`.
+    // Artifacts have no lexical fallback, so "no ranking was produced" and "there are no
+    // matching artifacts" are different facts and reporting the second would be a lie. The
+    // SKIPPED-not-missing reporting for the algolia mount is asserted in `federation_eval.rs`,
+    // where an artifact embedding backend is available.
+    let response = tool_call(&state, "search_artifacts", json!({"query": "x"})).await;
+    let message = error_message(&response);
     assert!(
-        !message.contains("'_Shared'"),
-        "search_artifacts cannot be served by the shared mount, so its hint must not offer it: \
-         {message}"
+        message.contains("artifact embedding") || message.contains("embedding configuration"),
+        "the failure must name the artifact embedding backend, got: {message}"
     );
 }
 

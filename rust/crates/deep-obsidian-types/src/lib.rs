@@ -410,7 +410,14 @@ pub struct CouchdbOptions {
 /// and both are idempotent, so a second pass over an already-resolved mount is a
 /// no-op. That keeps `print-config` a true round trip instead of a lossy
 /// re-render.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Why this is `PartialEq` but not `Eq`
+///
+/// [`Self::recall_weight`] is an `f64`, and claiming total equality over a type that
+/// can hold a NaN would be a false promise. The same reasoning already applies to
+/// `RecallResponse` in the backend crate. Nothing keyed a config by identity, so the
+/// three config wrappers that contain a mount table dropped `Eq` with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MountConfig {
     /// Stable, user-chosen identifier. Surfaces in error messages and in
@@ -423,6 +430,23 @@ pub struct MountConfig {
     #[serde(default)]
     pub mount_at: String,
     pub backend: MountBackendConfig,
+    /// This mount's per-list weight in FEDERATED recall's weighted Reciprocal Rank
+    /// Fusion: the mount's rank-`r` candidate contributes `recallWeight / (60 + r)`
+    /// to the fused score. `None` means the default 1.0, i.e. unweighted fusion in
+    /// which every mount's rank-`r` hit is worth exactly the same.
+    ///
+    /// # What it is NOT
+    ///
+    /// It does not scale a SCOPED search's scores: a scoped query is answered by one
+    /// backend's own ranking, and multiplying that ordering by a constant changes
+    /// nothing. It only ever breaks ties BETWEEN mounts, which is the only place a
+    /// cross-mount preference has any meaning.
+    ///
+    /// Validated finite and strictly positive (see `deep-obsidian-config`): zero would
+    /// silently remove a mount from every federated answer while leaving it listed as
+    /// healthy, and a negative weight would rank a mount's best hit below its worst.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_weight: Option<f64>,
 }
 
 /// Opt-in flags for behaviour that is not yet stable.
@@ -465,7 +489,7 @@ impl ExperimentalConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceConfigInput {
     pub vault_path: Option<PathBuf>,
@@ -481,10 +505,12 @@ pub struct ServiceConfigInput {
     pub embedding: Option<EmbeddingConfigInput>,
     pub artifact_embedding: Option<EmbeddingConfigInput>,
     pub auth: Option<AuthConfigInput>,
+    /// See [`ResolvedServiceConfig::federated_rerank`]. `None` means the default (enabled).
+    pub federated_rerank: Option<bool>,
     pub config_file_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedServiceConfig {
     pub vault_path: Option<PathBuf>,
@@ -503,9 +529,13 @@ pub struct PersistedServiceConfig {
     pub artifact_embedding: Option<EmbeddingConfigInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthConfigInput>,
+    /// Omitted when unset, so a config that never mentioned it stays that way through a
+    /// save/load round trip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub federated_rerank: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedServiceConfig {
     /// The ROOT mount's vault path. Unchanged meaning: the runtime watcher, the
@@ -533,7 +563,37 @@ pub struct ResolvedServiceConfig {
     pub artifact_embedding: EmbeddingConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Whether an unscoped multi-mount recall applies the final RERANK over the fused
+    /// candidate window. Defaults to `true`.
+    ///
+    /// # Why this defaults on, and why it is switchable at all
+    ///
+    /// Rank fusion alone cannot rank across mounts. Every mount's best hit scores the same
+    /// `weight / (60 + 0)`, and because logical paths are namespaced no candidate is ever in
+    /// two mounts' lists, so nothing is ever summed and the fused order degenerates into an
+    /// interleave broken by mount id. An answer then sits at the position its own mount holds
+    /// in that order, which caps achievable MRR at `H_m/m` for `m` mounts. The rerank is what
+    /// makes a federated answer ranked rather than merely merged, so it is on by default.
+    ///
+    /// It is switchable because it is the one stage that reads candidate CONTENT and (for a
+    /// hit with no stored vector) issues an embedding call. An operator who wants a federated
+    /// answer with strictly no query-time embedding, or who needs to reproduce a pure-fusion
+    /// ordering to compare against, can turn it off — and the payload's `rerank` field says
+    /// which stage produced the order either way.
+    #[serde(default = "default_federated_rerank", skip_serializing_if = "is_true")]
+    pub federated_rerank: bool,
     pub config_file_path: Option<PathBuf>,
+}
+
+/// The default for [`ResolvedServiceConfig::federated_rerank`].
+fn default_federated_rerank() -> bool {
+    true
+}
+
+/// Serde helper: skip a `bool` that is at its default of `true`, so a config that did not set
+/// it does not grow the key when it is written back.
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,6 +618,7 @@ impl ResolvedServiceConfig {
     pub fn mount_table(&self) -> Vec<MountConfig> {
         if self.mounts.is_empty() {
             return vec![MountConfig {
+                recall_weight: None,
                 id: IMPLICIT_ROOT_MOUNT_ID.to_string(),
                 mount_at: String::new(),
                 backend: MountBackendConfig::Filesystem {

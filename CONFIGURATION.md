@@ -213,6 +213,7 @@ existing config keep serving the old vault with no signal at all. Migrating mean
 | `id` | Stable, user-chosen slug. Appears in error messages, in `vault_info.mounts[]`, and as `--mount <id>` on the CLI. |
 | `mountAt` | The logical vault-relative folder this mount appears at. `""` is the vault root. Stored without leading or trailing slashes. |
 | `backend` | One of the three kinds below, discriminated by `kind`. |
+| `recallWeight` | Optional. This mount's weight in **federated** recall's fusion stage (see below). Defaults to `1.0`. Must be a finite number greater than `0`. |
 
 Three rules the config validator enforces:
 
@@ -224,6 +225,10 @@ Three rules the config validator enforces:
 - **Ids and prefixes are unique.** Routing is longest-prefix, so `_Wiki` and
   `_Wiki/Decisions` can both be mounts and the more specific one wins; two mounts at
   the same prefix are rejected.
+- **`recallWeight` is finite and positive.** Zero would remove the mount from every
+  federated ranking while `vault_info` still reported it healthy, and a negative weight
+  would order that mount's hits worst-first. Both are silent wrong answers, so the config
+  is rejected instead of clamped.
 
 ### Backend kinds
 
@@ -293,14 +298,94 @@ An Algolia mount is the exception: it has no local search index (the remote inde
 the corpus), so its directory holds only the hydrated-note cache. The derivation is
 the same regardless, so there is one rule to remember rather than one per backend.
 
+### Federated recall: `recallWeight` and `federatedRerank`
+
+| Key | Where | Meaning |
+|---|---|---|
+| `recallWeight` | per mount | That mount's weight in the fusion stage. Default `1.0`. |
+| `federatedRerank` | top level | Whether the final rerank runs. Default `true`. Config-file only — there is no CLI flag or env var, because a per-invocation override of a retrieval-quality setting would make two runs of the same server rank differently with nothing in the config to explain it. |
+
+
+On a multi-mount vault the ranking tools (`hybrid_search`, `load_knowledge`,
+`search_artifacts`) answer an **unscoped** call by searching every mount and fusing the
+results into one ranking. Pass `scope` naming a mount root to search that mount alone
+instead.
+
+It runs in two stages.
+
+**1. Fusion** picks which candidates are worth looking at, by weighted Reciprocal Rank Fusion
+over RANKS rather than scores: a candidate the mount ranked `r`-th (0-based) contributes
+`recallWeight / (60 + r)`. Ranks are used because two independently built indexes produce
+scores on incomparable scales, and averaging them would invent a comparison that does not
+exist.
+
+`recallWeight` is the only cross-mount preference available, and it applies to this stage. It
+does **not** change a scoped search — a single backend's own ordering is unaffected by a
+constant — it only decides which mount wins when two mounts each offer an equally-ranked hit.
+Raise it above `1.0` for a mount you consider more authoritative; leave it unset for the
+default.
+
+**2. Rerank** decides the order, by rescoring the fused candidates against the query with a
+scorer that knows nothing about mounts: cosine of one query vector against each candidate's
+own stored chunk vector, fused with BM25 computed over the candidate set as its own corpus.
+Both halves are computed by the server, over content it already holds to render the response;
+no mount is ever asked to score another mount's content.
+
+The rerank is not a refinement, it is what makes the answer ranked. Fusion alone cannot order
+across mounts: every mount's best hit contributes the identical `weight / (60 + 0)`, and since
+logical paths are namespaced no candidate ever appears in two mounts' lists, so nothing is ever
+summed and the order collapses into a rank-for-rank interleave broken by mount id. An answer
+then sits at the position its own mount happens to hold. Measured on a fixed 12-query eval over
+one corpus split two and three ways, MRR against a single-vault baseline of 0.958:
+
+| | recall@20 | recall@50 | MRR | nDCG@20 |
+|---|---|---|---|---|
+| one vault (baseline) | 1.000 | 1.000 | 0.958 | 0.969 |
+| federated, fusion only | 1.000 | 1.000 | 0.600 / 0.469 | 0.703 / 0.601 |
+| federated, with rerank | 1.000 | 1.000 | **0.958** | **0.969** |
+
+Recall is identical in every row: fusion always retrieved the right notes, only their order was
+wrong. Set `federatedRerank: false` to get the fusion-only ordering — useful to reproduce a
+pure-fusion ranking, or to keep a federated query from issuing any query-time embedding — at
+the quality shown above.
+
+The response says what happened, so a partial answer is never presented as a complete one:
+
+| Field | Meaning |
+|---|---|
+| `federated` | `true` on a fused answer. Absent on a scoped or single-mount one. |
+| `mounts[]` | One entry per mount: `id`, `mountAt`, `source` (`local-index` or `native-recall`), `recallWeight`, `candidateCount`, `exhausted`, and `recallMode` for a mount that ranked for itself. |
+| `mounts[].skipped` | The mount could never have contributed — an Algolia mount holds no binary files and therefore no artifacts. Not a shortfall, and it does not set `degraded`. |
+| `mounts[].error` | The mount could have contributed and could not be reached. |
+| `degraded` | `true` when any mount errored, or any mount's own retrieval fell back to lexical-only. Always present. |
+| `missingBackends` | The mount ids behind a `degraded: true`. Emitted only when non-empty. |
+| `candidateBudgetReached` | The search stopped on its work budget. Together with `degraded` it means a better hit may exist on a mount that was not read further. |
+| `matches[].mountId` | Which mount produced this hit. |
+| `rerank` | `"semantic+lexical"` or `"none"`. Which stage produced the order. |
+| `rerankedCandidates` | How many candidates carried a semantic score, when reranked. |
+| `matches[].score` | The number that produced THIS order — the rerank score when reranked, the fused score otherwise. |
+| `matches[].rrfScore` | The fusion-stage score, kept so the ordering stays explainable. |
+
+`rerank: "none"` with `degraded: false` means this deployment has no embedding backend
+configured, so there was nothing to rerank with and nothing was lost. `rerank: "none"` with
+`degraded: true` means the query could not be embedded and the answer fell back to fusion order.
+
+Two tools stay per mount rather than federating, and both are deliberate:
+`related_notes` and `graph_traverse` answer from the mount owning the `path` they are
+given, because a wiki link from a note on one mount to a note on another is not an edge in
+either index. `recommend_folder` refuses a multi-mount vault outright: it scores folders by
+how much of the query's evidence sits under each one, and those counts are comparable only
+within a single index.
+
 ### What multi-mount changes for a client
 
 - `vault_info.mounts[]` lists each mount's id, prefix, backend kind, capabilities, and
   conflicted paths.
 - The recall tools that rank (`hybrid_search`, `load_knowledge`, `search_artifacts`)
-  gain a **required** `scope` argument, because ranking across storages with
-  incomparable scores is not something to do silently. A single-mount vault's tool
-  surface is unchanged.
+  gain an **optional** `scope` argument: omit it for the federated whole-vault answer,
+  pass it to search one mount natively. A single-mount vault's tool surface is unchanged.
+- `grep_search` and `find_files` search every mount too. Both produce matches or an
+  enumeration rather than a ranking, so merging them needs no fusion.
 - Tools whose whole purpose depends on a capability appear only when some mount has
   it. See
   [docs/mcp-reference.md](./docs/mcp-reference.md#conditionally-advertised-tools).

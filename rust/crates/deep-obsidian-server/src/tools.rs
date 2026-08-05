@@ -19,6 +19,7 @@ use deep_obsidian_index::search::{self as index_search, RankingOptions, RelatedN
 use regex::RegexBuilder;
 use serde_json::{json, Map, Value};
 
+use crate::federation;
 use crate::health::{build_vault_overview_payload, insert_mount_index_detail};
 use crate::mcp::AppState;
 use crate::protocol::{ToolCallResult, ToolContent, ToolDefinition};
@@ -230,6 +231,18 @@ impl TextPayloadOptions {
             options.max_text_chars = DEFAULT_SEARCH_SNIPPET_CHARS;
         }
         options
+    }
+
+    /// No text at all: for a payload whose hits carry no snippet in the first place.
+    ///
+    /// `search_artifacts` is the case — an artifact hit is a file's metadata, and the
+    /// artifact match renderer has never emitted a `text` field — so passing options that
+    /// would include one describes nothing.
+    fn without_text() -> Self {
+        Self {
+            include_text: false,
+            max_text_chars: 0,
+        }
     }
 }
 
@@ -800,11 +813,11 @@ const SCOPE_ROUTED_RECALL_TOOLS: [&str; 3] =
 /// A mount root rather than an arbitrary folder, because these tools RANK: a
 /// deeper scope could only be honoured by filtering an already-truncated top-`limit`
 /// list, which would silently return fewer results than asked for. Naming a mount
-/// exactly keeps the answer exact. See [`resolve_recall_scope`].
+/// exactly keeps the answer exact. See [`resolve_recall_target`].
 fn scope_property() -> Value {
     json!({
         "type": "string",
-        "description": "Which mount to search, on a multi-mount vault. Must name a mount root exactly ('/' for the mount at the vault root; see vault_info.mounts[].mountAt for the rest). That mount's index serves the whole request and results are reported as logical vault paths. Selecting a mount does NOT include content grafted under it by another mount: search each mount in turn to cover the whole vault."
+        "description": "Optional. Which SINGLE mount to search, on a multi-mount vault. Omit it to search every mount and receive one fused ranking (the payload then carries federated:true, a per-mount mounts[] summary, and mountId on each hit). Pass it to search one mount natively, with that backend's own ranking and no fusion: it must name a mount root exactly ('/' for the mount at the vault root; see vault_info.mounts[].mountAt for the rest). Either way results are reported as logical vault paths. Naming a mount does NOT include content grafted under it by another mount."
     })
 }
 
@@ -814,6 +827,20 @@ fn scope_property() -> Value {
 /// choose between, so its `tools/list` is byte-identical to the frozen golden —
 /// the same reason `grep_search` is registered conditionally and
 /// `vault_info.mounts` is emitted conditionally.
+///
+/// # `scope` is OPTIONAL, and used to be required
+///
+/// While an unscoped question could not be answered at all, declaring `scope` required was
+/// the honest schema: a client discovering the limitation from the schema beats discovering
+/// it from an error. Now that an unscoped call federates every mount, required would be a
+/// LIE — it would tell a client the whole-vault search does not exist.
+///
+/// The frozen `tools_list` golden survives this, and the reason is worth stating because
+/// the digest genuinely does freeze `required`
+/// (see `tool_list_digest` in `tests/mcp_contract.rs`): the golden is captured for a
+/// SINGLE-mount vault, where this function never runs and `scope` is not a property at all.
+/// Both the property list and the required list in the golden are therefore untouched by
+/// anything here.
 fn insert_scope_argument(definitions: &mut [ToolDefinition]) {
     for definition in definitions
         .iter_mut()
@@ -824,15 +851,6 @@ fn insert_scope_argument(definitions: &mut [ToolDefinition]) {
         };
         if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
             properties.insert("scope".to_string(), scope_property());
-        }
-        // Required, not optional: these tools cannot answer an unscoped question on
-        // a multi-mount vault at all, so the schema says so rather than letting a
-        // client discover it through an error.
-        match schema.get_mut("required").and_then(Value::as_array_mut) {
-            Some(required) => required.push(json!("scope")),
-            None => {
-                schema.insert("required".to_string(), json!(["scope"]));
-            }
         }
     }
 }
@@ -1360,16 +1378,19 @@ fn hybrid_search_match_json(
 /// a decomposition. Emitting `0.0` for both would be a fabricated measurement, and
 /// emitting `null` would invite a caller to average it. The mount-level `recallMode` says
 /// what produced the ranking instead.
+///
+/// Takes the LOGICAL path rather than deriving it from a mount, because the federated
+/// caller has already translated it (fusion keys on logical paths) and translating twice
+/// would double the mount prefix.
 fn native_recall_match_json(
     hit: &deep_obsidian_backend::RecallHit,
-    mount: &NativeRecallMount,
+    logical: &str,
     options: TextPayloadOptions,
 ) -> Value {
-    let logical = mount.to_logical(&hit.path);
     let mut object = Map::from_iter([
-        ("path".to_string(), json!(logical.clone())),
+        ("path".to_string(), json!(logical)),
         ("title".to_string(), json!(hit.title.clone())),
-        ("resourceUri".to_string(), json!(note_uri(&logical))),
+        ("resourceUri".to_string(), json!(note_uri(logical))),
         ("chunkIndex".to_string(), json!(hit.chunk_index)),
         ("startLine".to_string(), json!(hit.start_line)),
         ("endLine".to_string(), json!(hit.end_line)),
@@ -1508,7 +1529,8 @@ async fn native_load_knowledge_payload(
     let mut note_bucket = HashMap::<String, KnowledgeNote>::new();
     for (position, hit) in response.hits.iter().enumerate() {
         let logical = mount.to_logical(&hit.path);
-        let mut chunk_value = native_recall_match_json(hit, mount, text_options);
+        let mut chunk_value =
+            native_recall_match_json(hit, &mount.to_logical(&hit.path), text_options);
         if let Some(object) = chunk_value.as_object_mut() {
             object.insert("wikiLink".to_string(), json!(note_wiki_link(&logical)));
         }
@@ -1563,6 +1585,1234 @@ async fn native_load_knowledge_payload(
         "graphUnavailableReason".to_string(),
         json!(NATIVE_RECALL_NO_GRAPH_REASON),
     );
+    insert_response_truncation_flags(&mut result, response_truncated);
+    Ok(Value::Object(result))
+}
+
+// ---------------------------------------------------------------------------
+// Federated recall: the unscoped multi-mount answer
+// ---------------------------------------------------------------------------
+
+/// Note on a federated payload explaining why the answer may not be the best one.
+///
+/// Emitted only when the deepening loop stopped on the candidate budget with the frontier
+/// still open. Without it, the payload would be indistinguishable from a search that
+/// searched everything worth searching.
+/// Why a federated `find_files` payload carries `truncated: true`.
+const FEDERATED_FIND_FILES_TRUNCATION_NOTE: &str = "this vault has several mounts and their notes were merged in logical-path order before the limit was applied, so these are the alphabetically first matches across the whole vault and a mount whose paths sort later may be absent entirely. Raise 'limit', or narrow 'query'.";
+
+const FEDERATION_BUDGET_NOTE: &str = "the federated candidate budget was reached before \
+the ranking stabilized, so a better hit may exist on a mount that was not read further. \
+Lower 'limit', or scope the search to one mount to search it exhaustively.";
+
+/// Why a federated `load_knowledge` returned no graph when it also returned no chunks.
+///
+/// A graph traversal needs a note to start from, and the federated path anchors on the
+/// top-ranked chunk. With no chunks there is no anchor, and that is a different fact from
+/// "the mount that answered has no edges" — asserting the second here would be a false
+/// statement about a mount whose graph was never opened.
+const FEDERATION_GRAPH_NO_ANCHOR_REASON: &str = "no chunk matched the subject on any mount, so there was no note to anchor a graph traversal on. This says nothing about whether the vault has links around the subject — none were looked for.";
+
+/// Why `load_knowledge`'s graph covers ONE mount on a federated answer.
+const FEDERATION_GRAPH_MOUNT_LOCAL_REASON: &str = "link graphs are mount-local: each \
+mount's index is built from its own vault directory, so a wiki link from a note on one \
+mount to a note on another is not an edge in either graph. This graph is the graph of the \
+mount that produced the top-ranked chunk, named in graphMountId; the notes and chunks \
+above span every mount.";
+
+/// How one mount answers a federated recall request.
+enum FederatedRecallKind {
+    /// The server's own SQLite index for that mount, queried EXACTLY ONCE.
+    ///
+    /// # Why a local index is not paged
+    ///
+    /// Its candidate pool is derived from the limit the query was issued with
+    /// (`hybrid_candidate_limit`), and the graph-proximity rerank runs over that pool — so
+    /// a second query at a larger limit produces a DIFFERENT ranking rather than a
+    /// continuation of the first. There is no cursor that could make the two agree, and
+    /// stitching two incompatible rankings together would corrupt the ranks fusion is
+    /// built on. So the one query asks for the whole per-mount candidate target
+    /// ([`federation::candidate_target`]) and the mount is then closed. When it came back
+    /// full it is closed WITHOUT being exhausted, which is what tells a caller the mount
+    /// had more to give — see [`federation::MountList::closed`].
+    Local {
+        runtime: Arc<RuntimeState>,
+        queried: bool,
+    },
+    /// The mount's backend, through [`RecallRequest::Search`], page by page. This is the
+    /// arm the deepening loop exists for.
+    Native {
+        backend: Arc<dyn deep_obsidian_backend::VaultBackend>,
+        cursor: Option<deep_obsidian_backend::OpaqueCursor>,
+        /// True once the backend stopped offering a cursor.
+        done: bool,
+    },
+}
+
+impl FederatedRecallKind {
+    /// How the payload names this mount's recall source.
+    fn label(&self) -> &'static str {
+        match self {
+            FederatedRecallKind::Local { .. } => "local-index",
+            FederatedRecallKind::Native { .. } => "native-recall",
+        }
+    }
+}
+
+/// One hit, kept so the payload can be rendered in the FUSED order rather than in any one
+/// mount's order.
+///
+/// Both variants hold a path already translated into the logical namespace: fusion keys on
+/// logical paths (that is what makes them namespaced and therefore collision-free), so
+/// translating later would mean translating twice.
+enum FederatedHit {
+    Local(index_search::SearchMatch),
+    Native(deep_obsidian_backend::RecallHit),
+    /// An artifact hit from one mount's artifact embedding table. Artifacts are whole
+    /// files rather than chunks, so its candidate key carries chunk index 0.
+    Artifact(index_search::ArtifactSearchMatch),
+}
+
+/// Which ranked list federation is fusing.
+///
+/// The two share the fusion, the deepening loop, the tie-break and every honesty carrier,
+/// and differ only in which per-mount query produces a page — which is exactly the amount
+/// of duplication a second copy of this module would have added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FederatedRetrieval {
+    /// `hybrid_search` / `load_knowledge`: ranked note chunks. Served by a local index or
+    /// by a native-recall backend.
+    Chunks,
+    /// `search_artifacts`: ranked non-markdown files. Served ONLY by a local index — an
+    /// artifact embedding table is built by the server and has no backend equivalent.
+    Artifacts,
+}
+
+/// One mount taking part in a federated recall, with the provenance its summary reports.
+struct FederatedRecallMount {
+    id: String,
+    /// The logical folder this mount's paths sit under; `""` for the root mount.
+    mount_at: String,
+    kind: FederatedRecallKind,
+    /// Rendered hits by candidate key, filled as pages arrive.
+    hits: HashMap<federation::CandidateKey, FederatedHit>,
+    /// `Some` for a native mount: which retrieval stage produced its ordering.
+    recall_mode: Option<deep_obsidian_backend::RecallMode>,
+    /// `Some` for a local mount: which semantic backend its index used.
+    semantic_backend: Option<String>,
+    /// A local mount whose embedding backend was down, so its list is BM25-only.
+    degraded: bool,
+    degradation_reason: Option<String>,
+    /// Whether serving this mount rebuilt its index.
+    rebuilt: bool,
+    /// This mount's index snapshot, for a LOCAL mount that was queried.
+    ///
+    /// Held so the rerank can read stored chunk vectors and embed the query WITHOUT taking a
+    /// second snapshot: a refresh between the fusion query and the rerank would score
+    /// candidates against an index that no longer contains all of them.
+    index: Option<Arc<deep_obsidian_index::index::SearchIndex>>,
+    /// Why this mount is legitimately absent from this answer, when it is.
+    ///
+    /// # Not the same thing as an error
+    ///
+    /// A mount whose backend cannot hold a binary file cannot hold an ARTIFACT either, so
+    /// leaving it out of `search_artifacts` omits nothing — there is no gap to report and
+    /// the answer is complete. That is different from a mount that could hold artifacts and
+    /// could not be searched, which is a genuine shortfall and sets `error` instead. Both
+    /// are reported; only the second one degrades the answer.
+    skipped_reason: Option<String>,
+}
+
+impl FederatedRecallMount {
+    /// A mount-relative path as a logical vault path. Identity for the root mount.
+    fn to_logical(&self, mount_relative: &str) -> String {
+        if self.mount_at.is_empty() {
+            mount_relative.to_string()
+        } else {
+            format!("{}/{}", self.mount_at, mount_relative)
+        }
+    }
+
+    /// The inverse: a logical path as this mount's index spells it. Identity for the root
+    /// mount, which is what keeps a single-mount vault's addressing untouched.
+    ///
+    /// Needed because fusion keys on LOGICAL paths (that is what makes them namespaced and
+    /// collision-free) while a mount's own index has never heard of the logical namespace.
+    fn to_mount_relative(&self, logical: &str) -> String {
+        if self.mount_at.is_empty() {
+            return logical.to_string();
+        }
+        logical
+            .strip_prefix(&format!("{}/", self.mount_at))
+            .unwrap_or(logical)
+            .to_string()
+    }
+}
+
+/// The federated candidate source: one round of `next_page` per mount that needs one.
+struct FederatedRecallSource<'a> {
+    mounts: &'a mut Vec<FederatedRecallMount>,
+    query: String,
+    /// The refresh reason recorded against a local mount's index snapshot.
+    reason: &'static str,
+    retrieval: FederatedRetrieval,
+}
+
+/// What a fetch needs, lifted out of the mount so nothing is borrowed across the await.
+enum FederatedFetchPlan {
+    Local(Arc<RuntimeState>),
+    Native(
+        Arc<dyn deep_obsidian_backend::VaultBackend>,
+        Option<deep_obsidian_backend::OpaqueCursor>,
+    ),
+    /// The mount has already given everything it can. `exhausted` is what it claimed.
+    Spent {
+        exhausted: bool,
+    },
+}
+
+impl federation::CandidateSource for FederatedRecallSource<'_> {
+    async fn next_page(
+        &mut self,
+        list_index: usize,
+        page_size: usize,
+    ) -> Result<federation::CandidatePage, String> {
+        let query = self.query.clone();
+        let reason = self.reason;
+        let plan = match &self.mounts[list_index].kind {
+            FederatedRecallKind::Local { runtime, queried } => {
+                if *queried {
+                    FederatedFetchPlan::Spent { exhausted: false }
+                } else {
+                    FederatedFetchPlan::Local(runtime.clone())
+                }
+            }
+            FederatedRecallKind::Native {
+                backend,
+                cursor,
+                done,
+            } => {
+                if *done {
+                    FederatedFetchPlan::Spent { exhausted: true }
+                } else {
+                    FederatedFetchPlan::Native(backend.clone(), cursor.clone())
+                }
+            }
+        };
+
+        match plan {
+            FederatedFetchPlan::Spent { exhausted } => Ok(federation::CandidatePage {
+                keys: Vec::new(),
+                exhausted,
+            }),
+            FederatedFetchPlan::Local(runtime) => {
+                let snapshot = runtime.fresh_snapshot(reason).await?;
+                let index = snapshot.index.clone();
+                let mount_index = list_index;
+                let count = match self.retrieval {
+                    FederatedRetrieval::Chunks => {
+                        let outcome = hybrid_search_matches(
+                            index.clone(),
+                            query,
+                            RankingOptions {
+                                limit: page_size,
+                                ..RankingOptions::default()
+                            },
+                        )
+                        .await?;
+                        let mount = &mut self.mounts[mount_index];
+                        mount.degraded = outcome.degraded;
+                        mount.degradation_reason = outcome.degradation_reason;
+                        let mut keys = Vec::with_capacity(outcome.matches.len());
+                        for match_item in outcome.matches {
+                            let logical = mount.to_logical(&match_item.path);
+                            let key = (logical.clone(), match_item.chunk_index);
+                            keys.push(key.clone());
+                            mount.hits.insert(
+                                key,
+                                FederatedHit::Local(index_search::SearchMatch {
+                                    path: logical,
+                                    ..match_item
+                                }),
+                            );
+                        }
+                        keys
+                    }
+                    FederatedRetrieval::Artifacts => {
+                        let matches =
+                            artifact_search_matches(index.clone(), query, page_size).await?;
+                        let mount = &mut self.mounts[mount_index];
+                        let mut keys = Vec::with_capacity(matches.len());
+                        for match_item in matches {
+                            let logical = mount.to_logical(&match_item.path);
+                            // Artifacts are whole files, so chunk index 0 is the only key
+                            // an artifact can have — and it is unique per path.
+                            let key = (logical.clone(), 0_usize);
+                            keys.push(key.clone());
+                            mount.hits.insert(
+                                key,
+                                FederatedHit::Artifact(index_search::ArtifactSearchMatch {
+                                    path: logical,
+                                    ..match_item
+                                }),
+                            );
+                        }
+                        keys
+                    }
+                };
+                // The mount returned exactly as many hits as it was allowed: it had more
+                // and this is not all of them.
+                let filled = count.len() >= page_size;
+                let mount = &mut self.mounts[list_index];
+                if let FederatedRecallKind::Local { queried, .. } = &mut mount.kind {
+                    *queried = true;
+                }
+                mount.rebuilt |= snapshot.rebuilt;
+                mount.semantic_backend = Some(index.semantic_backend.as_str().to_string());
+                mount.index = Some(index);
+                Ok(federation::CandidatePage {
+                    keys: count,
+                    exhausted: !filled,
+                })
+            }
+            FederatedFetchPlan::Native(backend, cursor) => {
+                let response = backend
+                    .execute(BackendRequest::recall_search_page(query, page_size, cursor))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .into_recall_search()
+                    .map_err(|error| error.to_string())?;
+                let mount = &mut self.mounts[list_index];
+                if let FederatedRecallKind::Native { cursor, done, .. } = &mut mount.kind {
+                    *done = response.next_cursor.is_none();
+                    *cursor = response.next_cursor.clone();
+                }
+                mount.recall_mode = Some(response.recall_mode);
+                let mut keys = Vec::with_capacity(response.hits.len());
+                for hit in response.hits {
+                    let logical = mount.to_logical(&hit.path);
+                    let key = (logical.clone(), hit.chunk_index);
+                    keys.push(key.clone());
+                    mount.hits.insert(
+                        key,
+                        FederatedHit::Native(deep_obsidian_backend::RecallHit {
+                            path: logical,
+                            ..hit
+                        }),
+                    );
+                }
+                Ok(federation::CandidatePage {
+                    keys,
+                    exhausted: response.exhausted,
+                })
+            }
+        }
+    }
+}
+
+/// Every mount that takes part in a federated recall, in [`federation::canonical_order`].
+///
+/// # Nothing is silently dropped
+///
+/// Every mount in the router's table gets an entry, and a mount that cannot contribute
+/// says which of the two reasons applies:
+///
+/// * it COULD have contributed and could not be asked — `error`, which degrades the answer
+///   and puts the mount in `missingBackends`. That covers a mount with neither a local index
+///   nor native recall (impossible today, so this is a guard rather than a tested path), and
+///   a mount whose backend has binary reads but no artifact index, which is a real gap.
+/// * it could never have contributed anything — `skipped_reason`, which does NOT degrade the
+///   answer. A backend with no [`Capability::BinaryRead`] cannot hold a binary file and
+///   therefore cannot hold an artifact, so its absence from `search_artifacts` omits
+///   nothing. Reporting it as missing would train a reader to ignore `missingBackends`.
+fn federated_recall_mounts(
+    state: &AppState,
+    retrieval: FederatedRetrieval,
+) -> (Vec<FederatedRecallMount>, Vec<federation::MountList>) {
+    let mut mounts: Vec<FederatedRecallMount> = Vec::new();
+    let mut lists: Vec<federation::MountList> = Vec::new();
+    for mount in state.router.mounts() {
+        let weight = state
+            .config
+            .mounts
+            .iter()
+            .find(|declared| declared.id == mount.id)
+            .and_then(|declared| declared.recall_weight)
+            .unwrap_or(federation::DEFAULT_RECALL_WEIGHT);
+        let mut list = federation::MountList::new(mount.id.clone(), weight);
+        let mut skipped_reason = None;
+        // A mount that will never be asked. `Native` with `done` set is the "ask me
+        // nothing" shape; the backend handle it carries is never used.
+        let never_asked = || FederatedRecallKind::Native {
+            backend: mount.backend.clone(),
+            cursor: None,
+            done: true,
+        };
+        let kind = match state.runtimes.for_mount(&mount.id) {
+            Some(runtime) => FederatedRecallKind::Local {
+                runtime: runtime.clone(),
+                queried: false,
+            },
+            // Artifact search has no backend equivalent: the artifact embedding table is
+            // built by the server from binary files it read itself.
+            None if retrieval == FederatedRetrieval::Artifacts => {
+                if mount.backend.descriptor().supports(Capability::BinaryRead) {
+                    list.error = Some(format!(
+                        "mount '{}' can hold binary files but has no local artifact index, \
+                         so its artifacts were not searched",
+                        mount.id
+                    ));
+                } else {
+                    skipped_reason = Some(format!(
+                        "mount '{}' has a {} backend, which cannot store a binary file and \
+                         therefore holds no artifacts; nothing was omitted by not searching it",
+                        mount.id,
+                        mount.backend.descriptor().kind.as_str()
+                    ));
+                    list.exhausted = true;
+                }
+                list.closed = true;
+                never_asked()
+            }
+            None if mount_serves_native_recall(mount) => FederatedRecallKind::Native {
+                backend: mount.backend.clone(),
+                cursor: None,
+                done: false,
+            },
+            None => {
+                list.error = Some(format!(
+                    "mount '{}' has no local search index and its backend ({}) does not \
+                     answer ranked search, so it contributed nothing to this answer",
+                    mount.id,
+                    mount.backend.descriptor().kind.as_str()
+                ));
+                list.closed = true;
+                never_asked()
+            }
+        };
+        mounts.push(FederatedRecallMount {
+            id: mount.id.clone(),
+            mount_at: mount.mount_at.clone(),
+            kind,
+            hits: HashMap::new(),
+            recall_mode: None,
+            semantic_backend: None,
+            degraded: false,
+            degradation_reason: None,
+            rebuilt: false,
+            index: None,
+            skipped_reason,
+        });
+        lists.push(list);
+    }
+    // Canonical (mount-id) order for BOTH tables, with the same permutation, so
+    // `list_index` addresses the same mount in each. See `federation::canonical_order`.
+    let permutation = federation::canonical_order(&lists);
+    let mut slots: Vec<Option<FederatedRecallMount>> = mounts.into_iter().map(Some).collect();
+    let mut ordered_mounts = Vec::with_capacity(slots.len());
+    let mut ordered_lists = Vec::with_capacity(lists.len());
+    for index in permutation {
+        ordered_mounts.push(
+            slots[index]
+                .take()
+                .expect("a permutation visits each mount once"),
+        );
+        ordered_lists.push(lists[index].clone());
+    }
+    (ordered_mounts, ordered_lists)
+}
+
+/// Run a federated recall and return the fused hits alongside the mounts that produced
+/// them.
+///
+/// Split from the payload builders because `hybrid_search`, `load_knowledge` and
+/// `search_artifacts` render the same fused list three different ways.
+async fn federated_recall(
+    state: &AppState,
+    reason: &'static str,
+    retrieval: FederatedRetrieval,
+    query: &str,
+    limit: usize,
+) -> (federation::FederationOutcome, Vec<FederatedRecallMount>) {
+    let (mut mounts, lists) = federated_recall_mounts(state, retrieval);
+    let mut source = FederatedRecallSource {
+        mounts: &mut mounts,
+        query: query.to_string(),
+        reason,
+        retrieval,
+    };
+    // Fused to the RERANK WINDOW rather than to `limit`: the rerank can only reorder what it
+    // is given, and a candidate fusion placed just outside the answer is exactly what rank
+    // interleaving produces. This costs no extra fetching -- see `federate_with_window`. The
+    // truncation to `limit` happens in `finish_federated_recall`.
+    let outcome = federation::federate_with_window(
+        lists,
+        limit,
+        federation::rerank_window(limit),
+        &mut source,
+    )
+    .await;
+    (outcome, mounts)
+}
+
+/// Apply the final rerank when it is enabled, or truncate the fused window to `limit` when it
+/// is not.
+///
+/// One function so "who truncates the window" has exactly one answer. Skipping it would leave a
+/// payload carrying the whole rerank window -- up to 50 hits for a caller that asked for 8.
+async fn finish_federated_recall(
+    state: &AppState,
+    outcome: &mut federation::FederationOutcome,
+    mounts: &[FederatedRecallMount],
+    query: &str,
+    limit: usize,
+) -> federation::RerankOutcome {
+    if !state.config.federated_rerank {
+        outcome.hits.truncate(limit.max(1));
+        return federation::RerankOutcome::not_applicable();
+    }
+    apply_federated_rerank(outcome, mounts, query, limit).await
+}
+
+/// Gather the rerank's per-candidate signals and apply it, in place.
+///
+/// # What makes the scorer mount-independent
+///
+/// Both signals are computed by the SERVER over the candidate set, and neither depends on
+/// which mount a candidate came from:
+///
+/// * **semantic** — cosine of ONE query vector against the candidate's own stored chunk
+///   vector, read from its own mount's index. Every mount's index is built from the same
+///   configured embedding model, so those cosines live in one space; embedding the query once
+///   is what guarantees it (see [`index_search::embed_query_vector`]). A candidate with no
+///   stored vector — a hit from a backend that ranks for itself — is embedded server-side
+///   from the text the payload will show.
+/// * **lexical** — BM25 over the candidate set AS ITS OWN CORPUS. Each mount's index has its
+///   own document frequencies, so its BM25 numbers are not comparable with another's; deriving
+///   the IDFs from the candidate set instead makes them comparable by construction. It also
+///   makes the scorer independent of vault size, which is the property that lets a two-mount
+///   answer and a one-vault answer be compared at all.
+///
+/// # Every failure degrades with provenance rather than erroring
+///
+/// * no embedding backend anywhere — [`federation::RerankStage::None`], NOT degraded. A
+///   lexical-only deployment has lost nothing; this is the documented no-op.
+/// * the query could not be embedded — `None` and DEGRADED: the ordering signal this
+///   deployment normally has is missing, and the answer is subject to rank interleaving.
+/// * one mount's vector lookup, or the batch embed for native hits, failed — those candidates
+///   have no semantic score and are absent from the semantic list. The query still answers.
+async fn apply_federated_rerank(
+    outcome: &mut federation::FederationOutcome,
+    mounts: &[FederatedRecallMount],
+    query: &str,
+    limit: usize,
+) -> federation::RerankOutcome {
+    if outcome.hits.is_empty() {
+        outcome.hits.truncate(limit);
+        return federation::RerankOutcome::not_applicable();
+    }
+    // Any embedding-backed mount can embed the query: they share one configured model, so the
+    // vector is valid against all of them. `None` means this vault has no dense retrieval at
+    // all, which is the lexical-only no-op rather than a fault.
+    let Some(scorer) = mounts.iter().find_map(|mount| {
+        mount.index.as_ref().filter(|index| {
+            index.semantic_backend == deep_obsidian_index::index::SemanticBackend::Embedding
+        })
+    }) else {
+        outcome.hits.truncate(limit);
+        return federation::RerankOutcome::not_applicable();
+    };
+
+    let scorer = scorer.clone();
+    let query_owned = query.to_string();
+    let query_vector = match tokio::task::spawn_blocking(move || {
+        index_search::embed_query_vector(&scorer, &query_owned)
+    })
+    .await
+    {
+        Ok(Ok(vector)) => vector,
+        Ok(Err(error)) => {
+            outcome.hits.truncate(limit);
+            return federation::RerankOutcome::unavailable(format!(
+                "the federated results could not be reranked because the query could not be \
+                 embedded ({error}), so they are in pure rank-fusion order: with several mounts \
+                 that order interleaves each mount's best hits rather than ranking them against \
+                 each other"
+            ));
+        }
+        Err(error) => {
+            outcome.hits.truncate(limit);
+            return federation::RerankOutcome::unavailable(error.to_string());
+        }
+    };
+
+    // --- semantic: stored vectors per mount, one batch embed for the rest ---------------
+    let mut semantic: Vec<Option<f64>> = vec![None; outcome.hits.len()];
+    for mount in mounts {
+        let Some(index) = mount.index.clone() else {
+            continue;
+        };
+        // This mount's candidates, as ITS index spells them: the fused key is logical.
+        let positions: Vec<usize> = outcome
+            .hits
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| hit.mount_id == mount.id)
+            .map(|(position, _)| position)
+            .collect();
+        if positions.is_empty() {
+            continue;
+        }
+        let keys: Vec<(String, usize)> = positions
+            .iter()
+            .map(|position| {
+                let hit = &outcome.hits[*position];
+                (mount.to_mount_relative(&hit.key.0), hit.key.1)
+            })
+            .collect();
+        let vector = query_vector.clone();
+        // A failure here costs those candidates their semantic score and nothing else.
+        let scores = tokio::task::spawn_blocking(move || {
+            index_search::semantic_scores_for_chunks(&index, &vector, &keys)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok);
+        if let Some(scores) = scores {
+            for (position, score) in positions.iter().zip(scores) {
+                semantic[*position] = score;
+            }
+        }
+    }
+
+    // Candidates still without a vector: a native-recall mount's hits. Embedded server-side
+    // from the same text the payload will carry, in ONE batched call.
+    let unscored: Vec<usize> = (0..outcome.hits.len())
+        .filter(|position| semantic[*position].is_none())
+        .collect();
+    if !unscored.is_empty() {
+        let texts: Vec<String> = unscored
+            .iter()
+            .map(|position| federated_hit_text(outcome, mounts, *position))
+            .collect();
+        if texts.iter().any(|text| !text.trim().is_empty()) {
+            let scorer = mounts
+                .iter()
+                .find_map(|mount| mount.index.clone())
+                .expect("a scorer index was found above");
+            let vector = query_vector.clone();
+            let embedded = tokio::task::spawn_blocking(move || {
+                index_search::embed_texts_for_index(&scorer, &texts).map(|vectors| {
+                    vectors
+                        .iter()
+                        .map(|document| index_search::semantic_score_for_vectors(&vector, document))
+                        .collect::<Vec<f64>>()
+                })
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
+            if let Some(scores) = embedded {
+                for (position, score) in unscored.iter().zip(scores) {
+                    semantic[*position] = Some(score);
+                }
+            }
+        }
+    }
+
+    // --- lexical: BM25 with the candidate set as the corpus -----------------------------
+    //
+    // The document model is the CHUNK'S OWN indexed term counts, taken from the mount's index,
+    // not a re-tokenization of the text the payload renders. The two are genuinely different:
+    // small-to-big expansion means a hit's rendered `text` is the whole enclosing section,
+    // several times larger than the chunk that actually matched, so re-tokenizing it would
+    // score a document the local ranker never scored. Since the gate compares this ordering
+    // against a single-vault `hybrid_search`, using the same document model is the point.
+    //
+    // A native-recall hit has no indexed chunk, so its snippet is tokenized instead — the only
+    // text it has.
+    let query_terms = tokenize(query);
+    let term_counts: Vec<std::collections::BTreeMap<String, usize>> = (0..outcome.hits.len())
+        .map(|position| {
+            federated_hit_term_counts(outcome, mounts, position).unwrap_or_else(|| {
+                deep_obsidian_index::index::count_terms(&federated_hit_text(
+                    outcome, mounts, position,
+                ))
+            })
+        })
+        .collect();
+    let mut document_frequencies: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for counts in &term_counts {
+        for term in counts.keys() {
+            *document_frequencies.entry(term.clone()).or_insert(0) += 1;
+        }
+    }
+    let lengths: Vec<f64> = term_counts
+        .iter()
+        .map(|counts| deep_obsidian_index::index::token_count(counts) as f64)
+        .collect();
+    let average_length = deep_obsidian_index::index::average(&lengths);
+    let lexical: Vec<f64> = term_counts
+        .iter()
+        .zip(&lengths)
+        .map(|(counts, length)| {
+            deep_obsidian_index::index::bm25_score(
+                &query_terms,
+                counts,
+                &document_frequencies,
+                term_counts.len(),
+                *length as usize,
+                average_length,
+            )
+        })
+        .collect();
+
+    federation::rerank(
+        &mut outcome.hits,
+        &federation::RerankSignals { semantic, lexical },
+        limit,
+    )
+}
+
+/// The indexed term counts of one fused candidate's chunk, when it has one.
+///
+/// `None` for a candidate with no chunk in any local index — a native-recall hit, or a hit
+/// whose mount was reindexed between the fusion query and the rerank. The caller falls back
+/// to tokenizing the rendered snippet.
+fn federated_hit_term_counts(
+    outcome: &federation::FederationOutcome,
+    mounts: &[FederatedRecallMount],
+    position: usize,
+) -> Option<std::collections::BTreeMap<String, usize>> {
+    let hit = outcome.hits.get(position)?;
+    let mount = mounts.iter().find(|mount| mount.id == hit.mount_id)?;
+    let index = mount.index.as_ref()?;
+    let mount_relative = mount.to_mount_relative(&hit.key.0);
+    index
+        .chunks
+        .iter()
+        .find(|chunk| chunk.path == mount_relative && chunk.chunk_index == hit.key.1)
+        .map(|chunk| chunk.term_counts.clone())
+}
+
+/// The text of one fused candidate, as the payload will render it.
+///
+/// Scoring the text the CALLER sees rather than some other projection of the note is
+/// deliberate: it makes the lexical component explainable from the response alone, and it is
+/// the only text a native-recall hit has at all.
+fn federated_hit_text(
+    outcome: &federation::FederationOutcome,
+    mounts: &[FederatedRecallMount],
+    position: usize,
+) -> String {
+    let Some(hit) = outcome.hits.get(position) else {
+        return String::new();
+    };
+    mounts
+        .iter()
+        .find(|mount| mount.id == hit.mount_id)
+        .and_then(|mount| mount.hits.get(&hit.key))
+        .map(|found| match found {
+            FederatedHit::Local(match_item) => match_item.text.clone(),
+            FederatedHit::Native(native) => native.snippet.clone(),
+            FederatedHit::Artifact(artifact) => artifact.title.clone(),
+        })
+        .unwrap_or_default()
+}
+
+/// One fused hit, rendered in the scoped payload's shape plus `mountId`.
+fn federated_hit_json(hit: &FederatedHit, mount_id: &str, options: TextPayloadOptions) -> Value {
+    let mut value = match hit {
+        FederatedHit::Local(match_item) => hybrid_search_match_json(match_item, options),
+        // The path is already logical (see `FederatedHit`), so it is passed through
+        // rather than re-prefixed.
+        FederatedHit::Native(native) => native_recall_match_json(native, &native.path, options),
+        FederatedHit::Artifact(artifact) => artifact_search_match_json(artifact),
+    };
+    if let Some(object) = value.as_object_mut() {
+        // Which mount answered. The one field a federated hit carries that a scoped hit
+        // does not: without it a caller cannot tell where a result came from, and the
+        // logical path only says so for a non-root mount.
+        object.insert("mountId".to_string(), json!(mount_id));
+    }
+    value
+}
+
+/// The fused hits, rendered best-first, and whether any mount rebuilt its index.
+fn federated_matches_json(
+    outcome: &federation::FederationOutcome,
+    mounts: &[FederatedRecallMount],
+    options: TextPayloadOptions,
+) -> Vec<Value> {
+    outcome
+        .hits
+        .iter()
+        .filter_map(|fused| {
+            let mount = mounts.iter().find(|mount| mount.id == fused.mount_id)?;
+            let hit = mount.hits.get(&fused.key)?;
+            let mut value = federated_hit_json(hit, &mount.id, options);
+            // `score` is always THE NUMBER THAT PRODUCED THIS ORDER, so a client that sorts
+            // by it gets back the list it was handed. That makes it the rerank score when a
+            // rerank ran and the fused score otherwise; `rrfScore` and `mountRank` carry the
+            // earlier stages so the ordering stays explainable either way.
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "score".to_string(),
+                    json!(fused.rerank_score.unwrap_or(fused.score)),
+                );
+                object.insert("rrfScore".to_string(), json!(fused.score));
+                object.insert("mountRank".to_string(), json!(fused.mount_rank));
+            }
+            Some(value)
+        })
+        .collect()
+}
+
+/// The `federated`/`mounts[]`/`degraded`/`missingBackends` block every federated payload
+/// carries.
+///
+/// # Why `degraded` is a UNION and `mounts[]` is the detail
+///
+/// A federated answer can be less than complete for two unrelated reasons: a mount's
+/// embedding backend was down so its own list is lexical-only, or a mount could not be
+/// reached at all. A caller that has to branch on "is this answer trustworthy" needs ONE
+/// boolean, so `degraded` is true for either — and `degradationReason` plus the per-mount
+/// entry say which, because the remedies are different (restart the embedding service;
+/// fix the unreachable mount).
+///
+/// `missingBackends` is emitted only when non-empty, and lists every mount whose answer is
+/// missing or incomplete. `degraded` is ALWAYS present, matching the scoped payload, so a
+/// client can read it without probing.
+fn insert_federation_provenance(
+    result: &mut Map<String, Value>,
+    outcome: &federation::FederationOutcome,
+    mounts: &[FederatedRecallMount],
+    rerank: &federation::RerankOutcome,
+) {
+    result.insert("federated".to_string(), json!(true));
+    // Which stage produced the ORDER the caller is reading. Always present: "these are in
+    // rank-fusion order" and "these were rescored against the query" are different answers to
+    // the same question, and nothing in the hits lets a client tell which.
+    result.insert("rerank".to_string(), json!(rerank.stage.as_str()));
+    if rerank.stage != federation::RerankStage::None {
+        result.insert(
+            "rerankedCandidates".to_string(),
+            json!(rerank.semantic_signals),
+        );
+    }
+    let mut degraded = false;
+    let mut reasons: Vec<String> = Vec::new();
+    if rerank.degraded {
+        degraded = true;
+        if let Some(reason) = &rerank.reason {
+            reasons.push(reason.clone());
+        }
+    }
+    let mut summaries: Vec<Value> = Vec::new();
+    for list in &outcome.mounts {
+        let Some(mount) = mounts.iter().find(|mount| mount.id == list.mount_id) else {
+            continue;
+        };
+        let mut entry = Map::from_iter([
+            ("id".to_string(), json!(list.mount_id.clone())),
+            ("mountAt".to_string(), json!(mount.mount_at.clone())),
+            ("source".to_string(), json!(mount.kind.label())),
+            ("recallWeight".to_string(), json!(list.weight)),
+            ("candidateCount".to_string(), json!(list.keys.len())),
+            ("exhausted".to_string(), json!(list.exhausted)),
+        ]);
+        if let Some(mode) = mount.recall_mode {
+            entry.insert("recallMode".to_string(), json!(mode.as_str()));
+        }
+        if let Some(reason) = &mount.skipped_reason {
+            // Reported, and deliberately NOT counted as degradation. See
+            // `FederatedRecallMount::skipped_reason`.
+            entry.insert("skipped".to_string(), json!(true));
+            entry.insert("skippedReason".to_string(), json!(reason));
+        }
+        if let Some(backend) = &mount.semantic_backend {
+            entry.insert("semanticBackend".to_string(), json!(backend));
+        }
+        if mount.degraded {
+            degraded = true;
+            entry.insert("degraded".to_string(), json!(true));
+            if let Some(reason) = &mount.degradation_reason {
+                entry.insert("degradationReason".to_string(), json!(reason));
+                reasons.push(format!("mount '{}': {reason}", list.mount_id));
+            }
+        }
+        if let Some(error) = &list.error {
+            degraded = true;
+            entry.insert("error".to_string(), json!(error));
+            reasons.push(format!(
+                "mount '{}' could not be searched: {error}",
+                list.mount_id
+            ));
+        }
+        summaries.push(Value::Object(entry));
+    }
+    result.insert("mounts".to_string(), json!(summaries));
+    let missing = outcome.missing_mounts();
+    if !missing.is_empty() {
+        result.insert("missingBackends".to_string(), json!(missing));
+    }
+    if outcome.budget_reached {
+        result.insert("candidateBudgetReached".to_string(), json!(true));
+    }
+    // Only the UNSTABLE case degrades the answer. Hitting the budget with a stable
+    // frontier means the search stopped because there was nothing left worth reading,
+    // which is not a shortfall.
+    if outcome.frontier_unstable {
+        degraded = true;
+        reasons.push(FEDERATION_BUDGET_NOTE.to_string());
+    }
+    result.insert("degraded".to_string(), json!(degraded));
+    if !reasons.is_empty() {
+        result.insert("degradationReason".to_string(), json!(reasons.join("; ")));
+    }
+    result.insert(
+        "rebuilt".to_string(),
+        json!(mounts.iter().any(|mount| mount.rebuilt)),
+    );
+}
+
+/// `hybrid_search` over every mount, fused.
+async fn federated_hybrid_search_payload(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    options: TextPayloadOptions,
+) -> Result<Value, String> {
+    let (mut outcome, mounts) = federated_recall(
+        state,
+        "hybrid_search",
+        FederatedRetrieval::Chunks,
+        query,
+        limit,
+    )
+    .await;
+    let rerank = finish_federated_recall(state, &mut outcome, &mounts, query, limit).await;
+    let mut match_values = federated_matches_json(&outcome, &mounts, options);
+    let response_truncated =
+        apply_response_text_budget(&mut match_values, "text", RESPONSE_TEXT_BUDGET_CHARS);
+    let mut result = Map::new();
+    result.insert("query".to_string(), json!(query));
+    insert_federation_provenance(&mut result, &outcome, &mounts, &rerank);
+    result.insert("count".to_string(), json!(match_values.len()));
+    result.insert("matches".to_string(), json!(match_values));
+    insert_response_truncation_flags(&mut result, response_truncated);
+    Ok(Value::Object(result))
+}
+
+/// One artifact hit, in the shape `search_artifacts` has always rendered.
+///
+/// Shared by the scoped and the federated paths so the two cannot drift: the federated
+/// answer must be the scoped shape plus `mountId`, not a second dialect of it.
+fn artifact_search_match_json(item: &index_search::ArtifactSearchMatch) -> Value {
+    json!({
+        "path": item.path,
+        "title": item.title,
+        "kind": item.kind,
+        "mimeType": item.mime_type,
+        "size": item.size,
+        "score": item.score,
+        "metadata": serde_json::from_str::<Value>(&item.metadata_json).unwrap_or(Value::Null),
+    })
+}
+
+/// Run one mount's artifact search off the async runtime.
+///
+/// `artifact_semantic_search` embeds the query through the (multimodal) artifact backend
+/// over HTTP, so it must not run on the async runtime. The backend-unavailable case is
+/// remapped to [`ARTIFACT_EMBEDDING_BACKEND_UNAVAILABLE_MESSAGE`] here rather than at the
+/// call site, so the federated path reports the same actionable message the scoped path
+/// does instead of a raw upstream 400.
+async fn artifact_search_matches(
+    index: Arc<deep_obsidian_index::index::SearchIndex>,
+    query: String,
+    limit: usize,
+) -> Result<Vec<index_search::ArtifactSearchMatch>, String> {
+    tokio::task::spawn_blocking(move || {
+        index_search::artifact_semantic_search_with_options(
+            index.as_ref(),
+            &query,
+            RankingOptions {
+                limit,
+                ..RankingOptions::default()
+            },
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| match error {
+        IndexError::EmbeddingBackendUnavailable(_) => {
+            ARTIFACT_EMBEDDING_BACKEND_UNAVAILABLE_MESSAGE.to_string()
+        }
+        other => other.to_string(),
+    })
+}
+
+/// `search_artifacts` over every mount that has an artifact index, fused.
+///
+/// # Why an all-mounts failure is an error rather than an empty answer
+///
+/// `search_artifacts` has no lexical fallback — artifacts carry no BM25 terms — so a dead
+/// artifact embedding backend produces no ranking at all, on any mount. Returning an empty
+/// `matches[]` with `degraded: true` would say "there are no matching artifacts", which is
+/// the one thing that is not true. When every mount that could have answered failed, the
+/// tool errors with the first mount's message, exactly as the scoped path does.
+async fn federated_search_artifacts_payload(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+) -> Result<Value, String> {
+    let (mut outcome, mounts) = federated_recall(
+        state,
+        "search_artifacts",
+        FederatedRetrieval::Artifacts,
+        query,
+        limit,
+    )
+    .await;
+    // Artifacts go through the same rerank, but on a WEAKER signal than chunks do, and the
+    // difference is worth knowing rather than discovering.
+    //
+    // An artifact's stored vector lives in the ARTIFACT embedding table, not the chunk one, and
+    // its path is not a chunk path -- so `semantic_scores_for_chunks` finds nothing for it and
+    // `federated_hit_term_counts` finds nothing either. Both signals therefore fall back to the
+    // only text an artifact hit carries: its TITLE. The ordering that comes out is title
+    // relevance plus candidate-set BM25 over titles, which is a real ordering but a much
+    // thinner one than a chunk rerank, and the recall gates do not exercise it (the eval corpus
+    // holds one dummy artifact that no gold query matches). Reranking artifacts against their
+    // own stored vectors is a follow-up, not a claim this code makes.
+    let rerank = finish_federated_recall(state, &mut outcome, &mounts, query, limit).await;
+    let askable = outcome
+        .mounts
+        .iter()
+        .filter(|list| {
+            mounts
+                .iter()
+                .any(|mount| mount.id == list.mount_id && mount.skipped_reason.is_none())
+        })
+        .collect::<Vec<_>>();
+    if !askable.is_empty() && askable.iter().all(|list| list.error.is_some()) {
+        return Err(askable[0]
+            .error
+            .clone()
+            .expect("every askable mount failed"));
+    }
+    let mut match_values =
+        federated_matches_json(&outcome, &mounts, TextPayloadOptions::without_text());
+    let mut result = Map::new();
+    result.insert("query".to_string(), json!(query));
+    insert_federation_provenance(&mut result, &outcome, &mounts, &rerank);
+    result.insert("count".to_string(), json!(match_values.len()));
+    result.insert(
+        "matches".to_string(),
+        json!(std::mem::take(&mut match_values)),
+    );
+    Ok(Value::Object(result))
+}
+
+/// `load_knowledge`'s four sizing arguments, as one value.
+///
+/// Grouped rather than passed individually because they travel together everywhere and are
+/// all small integers and a bool — the shape a caller is most likely to transpose.
+#[derive(Debug, Clone, Copy)]
+struct FederatedKnowledgeOptions {
+    limit_notes: usize,
+    limit_chunks: usize,
+    include_graph: bool,
+    graph_depth: usize,
+}
+
+/// `load_knowledge` over every mount, fused.
+///
+/// # What is federated and what is honestly mount-local
+///
+/// * `chunks` — the ranked passages. Federated, so a subject whose best evidence lives on a
+///   minority mount is found.
+/// * `notes` — derived from the FUSED chunk order by the same `1/(position + 1)` scoring the
+///   scoped path applies to its own chunk order, so a top chunk is worth the same either
+///   way. What the scoped path additionally does and this does not is expand each seed
+///   through `related_notes`: that walks one index's similarity neighbourhood, and running
+///   it per mount would mix cosine similarities from independently built indexes into one
+///   ordering. The notes here are therefore exactly the notes the fused chunks came from.
+/// * `graph` — the link graph of the ONE mount that produced the top-ranked chunk, named in
+///   `graphMountId`, with [`FEDERATION_GRAPH_MOUNT_LOCAL_REASON`] saying why it is not the
+///   whole vault's. A cross-mount graph does not exist to return: a wiki link from a note on
+///   one mount to a note on another is not an edge in either index, because each index is
+///   built from its own vault directory. Returning one mount's graph and SAYING so beats an
+///   empty graph (which would read as "this subject has no links") and beats a synthesized
+///   union (which would invent edges).
+async fn federated_load_knowledge_payload(
+    state: &AppState,
+    subject: &str,
+    project: Option<&str>,
+    knowledge: FederatedKnowledgeOptions,
+    options: TextPayloadOptions,
+) -> Result<Value, String> {
+    let FederatedKnowledgeOptions {
+        limit_notes,
+        limit_chunks,
+        include_graph,
+        graph_depth,
+    } = knowledge;
+    let query = [Some(subject.to_string()), project.map(ToOwned::to_owned)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (mut outcome, mounts) = federated_recall(
+        state,
+        "load_knowledge",
+        FederatedRetrieval::Chunks,
+        &query,
+        limit_chunks,
+    )
+    .await;
+    let rerank = finish_federated_recall(state, &mut outcome, &mounts, &query, limit_chunks).await;
+
+    let mut chunks = federated_matches_json(&outcome, &mounts, options);
+    for chunk in chunks.iter_mut() {
+        let path = chunk
+            .get("path")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if let (Some(object), Some(path)) = (chunk.as_object_mut(), path) {
+            object.insert("wikiLink".to_string(), json!(note_wiki_link(&path)));
+        }
+    }
+    let response_truncated =
+        apply_response_text_budget(&mut chunks, "text", RESPONSE_TEXT_BUDGET_CHARS);
+
+    // Same rank-derived scoring as the scoped path: top chunk = 1.0, then 0.5, 0.33, ...
+    let mut note_bucket = HashMap::<String, KnowledgeNote>::new();
+    for (position, chunk) in chunks.iter().enumerate() {
+        let Some(path) = chunk.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let title = chunk
+            .get("title")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| note_name(path));
+        merge_knowledge_note(
+            &mut note_bucket,
+            KnowledgeNote {
+                path: path.to_string(),
+                title,
+                wiki_link: note_wiki_link(path),
+                score: 1.0 / (position as f64 + 1.0),
+                reasons: vec!["top chunk match".to_string()],
+                shared_links: Vec::new(),
+            },
+        );
+    }
+    let mut notes = note_bucket
+        .into_values()
+        .map(knowledge_note_value)
+        .collect::<Vec<_>>();
+    notes.sort_by(|left, right| {
+        let left_score = left.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let right_score = right.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        normalize_score_order(
+            left_score,
+            right_score,
+            left.get("path").and_then(Value::as_str).unwrap_or(""),
+            right.get("path").and_then(Value::as_str).unwrap_or(""),
+        )
+    });
+    notes.truncate(limit_notes);
+
+    // The graph of whichever mount produced the top-ranked chunk, if it has a local index.
+    let mut graph = json!({"nodes": [], "edges": []});
+    let mut graph_mount: Option<String> = None;
+    if include_graph {
+        if let Some(top) = outcome.hits.first() {
+            if let Some(runtime) = state.runtimes.for_mount(&top.mount_id) {
+                let mount = mounts.iter().find(|mount| mount.id == top.mount_id);
+                let snapshot = runtime.fresh_snapshot("load_knowledge").await?;
+                // The graph is addressed in the mount's OWN namespace, so the fused
+                // logical path has to be stripped back down before the traversal and
+                // re-prefixed on the way out.
+                let mount_at = mount.map(|mount| mount.mount_at.as_str()).unwrap_or("");
+                let mount_relative = if mount_at.is_empty() {
+                    top.key.0.clone()
+                } else {
+                    top.key
+                        .0
+                        .strip_prefix(&format!("{mount_at}/"))
+                        .unwrap_or(&top.key.0)
+                        .to_string()
+                };
+                let scoped = ScopedIndex {
+                    runtime: runtime.clone(),
+                    mount_at: mount_at.to_string(),
+                };
+                let traversed = index_graph::graph_traverse(
+                    &snapshot.index,
+                    &mount_relative,
+                    index_graph::GraphDirection::Both,
+                    graph_depth,
+                    (limit_notes * 4).max(20),
+                )
+                .map_err(|error| error.to_string())?;
+                graph = json!({
+                    "nodes": traversed.nodes.into_iter().map(|node| note_result_json(scoped.to_logical(&node.path), node.title, |object| {
+                        object.insert("depth".to_string(), json!(node.depth));
+                    })).collect::<Vec<_>>(),
+                    "edges": traversed.edges.into_iter().map(|edge| json!({
+                        "source": scoped.to_logical(&edge.source),
+                        "target": scoped.to_logical(&edge.target),
+                        "rawLink": edge.raw_link
+                    })).collect::<Vec<_>>()
+                });
+                graph_mount = Some(top.mount_id.clone());
+            }
+        }
+    }
+
+    let mut result = Map::new();
+    result.insert("subject".to_string(), json!(subject));
+    if let Some(project) = project {
+        result.insert("project".to_string(), json!(project));
+    }
+    insert_federation_provenance(&mut result, &outcome, &mounts, &rerank);
+    result.insert("notes".to_string(), json!(notes));
+    result.insert("chunks".to_string(), json!(chunks));
+    result.insert("graph".to_string(), graph);
+    match graph_mount {
+        Some(mount_id) => {
+            result.insert("graphMountId".to_string(), json!(mount_id));
+            result.insert(
+                "graphScopeReason".to_string(),
+                json!(FEDERATION_GRAPH_MOUNT_LOCAL_REASON),
+            );
+        }
+        // No graph was traversed, and WHICH of the three reasons applies matters: the empty
+        // graph needs a reason for the same argument `NATIVE_RECALL_NO_GRAPH_REASON` exists
+        // for, and a reason that is not the actual reason is worse than none. There were
+        // chunks, so the mount that produced the best one has no local graph.
+        None if include_graph && !outcome.hits.is_empty() => {
+            result.insert(
+                "graphUnavailableReason".to_string(),
+                json!(NATIVE_RECALL_NO_GRAPH_REASON),
+            );
+        }
+        // Nothing matched at all, so there was no note to anchor a traversal on. Saying
+        // "this mount exposes no edges" here would be a false statement about a mount whose
+        // graph was never consulted.
+        None if include_graph => {
+            result.insert(
+                "graphUnavailableReason".to_string(),
+                json!(FEDERATION_GRAPH_NO_ANCHOR_REASON),
+            );
+        }
+        // `includeGraph: false`. The caller declined it, so there is nothing to explain.
+        None => {}
+    }
     insert_response_truncation_flags(&mut result, response_truncated);
     Ok(Value::Object(result))
 }
@@ -1743,22 +2993,33 @@ async fn backend_call(
         .map_err(|error| error.to_string())
 }
 
-/// Refuse a whole-vault tool that has no way to name a single mount.
+/// Refuse the one whole-vault tool whose answer cannot be federated.
 ///
-/// Every mount now has its own index, so the limitation is no longer "only the
-/// root mount is indexed" — it is that answering these tools across mounts means
-/// MERGING and re-ranking several independent result sets, which this slice
-/// deliberately does not do. `find_files` (a limit-truncated path match over the
-/// whole vault) and `recommend_folder` (a whole-vault placement ranking) are both
-/// exactly that question, and neither has an argument that could narrow it, so the
-/// honest answer is still an error rather than one mount's partial view.
-/// Single-mount configs never reach it.
+/// # Why `recommend_folder` alone, now that recall federates
+///
+/// Every other whole-vault tool has an answer that survives being assembled from several
+/// mounts: `find_files` is an ENUMERATION filtered by a path match, so concatenating each
+/// mount's notes is the same answer a single vault would give; `hybrid_search`,
+/// `load_knowledge` and `search_artifacts` are RANKINGS, and ranks fuse (see
+/// [`crate::federation`]).
+///
+/// `recommend_folder` is neither. It scores every top-level folder against ONE corpus's
+/// semantics — the folder names come from the vault, but the evidence is "how many of this
+/// query's best chunks live under that folder", and those counts are only comparable
+/// within one index. Fusing them would mean deciding that a folder on a small mount and a
+/// folder on a large one are equally well-evidenced by the same number of hits, which is
+/// not a ranking, it is a coin toss with a score attached. And the tool's output is a
+/// SINGLE folder a session note will be written to, so a plausible-looking wrong answer
+/// silently misfiles work.
+///
+/// So this stays a refusal on purpose, not for lack of a slice. Single-mount configs never
+/// reach it.
 fn require_single_mount(state: &AppState, tool: &str) -> Result<(), String> {
     if !state.router.is_multi_mount() {
         return Ok(());
     }
     Err(format!(
-        "{tool} does not support a multi-mount vault yet: it takes no argument that could narrow it to one mount, and answering it across mounts would mean merging and re-ranking each mount's own index, which is not implemented. Reduce the vault to a single mount, or use a recall tool that takes 'scope'."
+        "{tool} does not support a multi-mount vault: it ranks candidate folders by how much of the query's evidence lives under each one, and those counts are only comparable within a single index — merging them across mounts would produce a confident-looking arbitrary answer, and this tool's output is the one folder a note gets written to. Choose the folder yourself (list_children on the vault root shows every top-level folder, including each mount), or reduce the vault to a single mount."
     ))
 }
 
@@ -1875,53 +3136,15 @@ impl ScopedIndex {
     }
 }
 
-/// The index serving a recall tool that takes a `scope`.
-///
-/// * single mount — the root runtime, unconditionally: `scope` is not even in the
-///   tool schema, so this is the pre-slice behaviour verbatim;
-/// * multi-mount, no `scope` — refused. Each mount has its own index, so an
-///   unscoped answer would silently omit every other mount;
-/// * multi-mount, `scope` naming a mount root — that mount's runtime.
-///
-/// A `scope` must name a mount root EXACTLY. These tools rank and truncate to
-/// `limit`, so a narrower scope could only be honoured by filtering an
-/// already-truncated list — silently returning fewer results than asked for. A
-/// refusal that names the acceptable scopes is the exact answer; an approximate
-/// one is not.
-///
-/// # `scope` selects a MOUNT, not a folder subtree
-///
-/// `'/'` therefore means "the mount at the vault root", not "the whole logical
-/// vault": it is answered from the root mount's own index, and content grafted
-/// under it by another mount is not included. That is the only reading that leaves
-/// the root mount reachable at all — every non-root mount is nested inside the
-/// root's subtree by definition, so treating `'/'` as a subtree would refuse it
-/// always. The tool schema says so in as many words, and the refusal above
-/// enumerates every mount, so a caller who wants the whole vault knows exactly
-/// which calls to make. (Contrast `grep_search`, whose `glob` genuinely IS a
-/// subtree filter and so must refuse a scope containing another mount — see
-/// [`VaultRouter::scope_contains_other_mount`](deep_obsidian_backend::VaultRouter::scope_contains_other_mount).)
-fn resolve_recall_scope(
-    state: &AppState,
-    tool: &str,
-    scope: Option<&str>,
-) -> Result<ScopedIndex, String> {
-    match resolve_recall_target(state, tool, scope, false)? {
-        RecallTarget::Local(index) => Ok(index),
-        // Unreachable: `include_native_recall: false` never produces this variant. Kept
-        // as an error rather than an `unreachable!` because a panic in a tool handler
-        // takes down the request, and a future caller that flips the flag here deserves a
-        // message rather than a crash.
-        RecallTarget::Native(_) => Err(format!("{tool} cannot be served by a mount's own index")),
-    }
-}
-
-/// Which mount, and by which mechanism, serves a scoped recall request.
+/// Which mount, and by which mechanism, serves a recall request.
 enum RecallTarget {
     /// The server's own SQLite index for that mount.
     Local(ScopedIndex),
     /// The mount's backend, through [`RecallRequest::Search`].
     Native(NativeRecallMount),
+    /// EVERY mount, fused. The answer to an unscoped recall on a multi-mount vault; see
+    /// [`crate::federation`].
+    Federated,
 }
 
 /// A mount that answers ranked search itself.
@@ -1945,18 +3168,41 @@ impl NativeRecallMount {
     }
 }
 
-/// [`resolve_recall_scope`], but allowed to answer with a mount that ranks for itself.
+/// Which mount (or mounts) serves a recall request, and by which mechanism.
 ///
-/// Used by the two tools whose answer is a ranked list of note chunks —
-/// `hybrid_search` and `load_knowledge` — because that is the one question a
-/// [`Capability::NativeRecall`] backend can answer. Every other scoped recall tool goes
-/// through [`resolve_recall_scope`] and keeps the honest "no local index" refusal, since
-/// a link graph, a similarity neighbourhood and an artifact embedding table are not
-/// things a remote corpus exposes.
+/// * single mount — the root runtime, unconditionally. `scope` is not even in the tool
+///   schema, so this is the pre-slice behaviour verbatim and every golden is provably
+///   unaffected by everything below;
+/// * multi-mount, no `scope` — [`RecallTarget::Federated`]: every mount is searched and the
+///   rankings are fused. This REPLACED a refusal. The refusal was right while there was no
+///   way to merge two mounts' orderings, because answering from one mount would have
+///   reported "no matches" for text that exists in the vault — but it was never the answer
+///   a caller wanted, and `scope` is now optional rather than required;
+/// * multi-mount, `scope` naming a mount root — that mount's index (or its backend, when it
+///   ranks for itself and `include_native_recall` is set).
 ///
-/// The single-mount fast path is untouched and unconditional: a mount with no local index
-/// cannot be the vault root, so a single-mount vault is always `Local` and every golden
-/// is provably unaffected by everything below.
+/// A `scope` must still name a mount root EXACTLY. A scoped search ranks and truncates to
+/// `limit`, so a narrower scope could only be honoured by filtering an already-truncated
+/// list — silently returning fewer results than asked for. A caller who wants a subtree
+/// wants the federated answer plus their own filter, or `grep_search`, whose `glob`
+/// genuinely IS a subtree filter.
+///
+/// # `scope` selects a MOUNT, not a folder subtree
+///
+/// `'/'` therefore means "the mount at the vault root", not "the whole logical vault": it
+/// is answered from the root mount's own index, and content grafted under it by another
+/// mount is not included. That is the only reading that leaves the root mount addressable
+/// at all — every non-root mount is nested inside the root's subtree by definition, so
+/// treating `'/'` as a subtree would refuse it always. Omitting `scope` is now how a caller
+/// asks for the whole vault.
+///
+/// # `include_native_recall`
+///
+/// Set by the tools whose answer is a ranked list of note chunks (`hybrid_search`,
+/// `load_knowledge`), because that is the one question a [`Capability::NativeRecall`]
+/// backend can answer. `search_artifacts` leaves it clear and keeps the honest "no local
+/// index" refusal for a SCOPED call, since an artifact embedding table is not something a
+/// remote corpus exposes.
 fn resolve_recall_target(
     state: &AppState,
     tool: &str,
@@ -1970,10 +3216,7 @@ fn resolve_recall_target(
         }));
     }
     let Some(scope) = scope else {
-        return Err(format!(
-            "{tool} requires a 'scope' on a multi-mount vault: every mount has its own search index, so an unscoped answer would silently omit every mount but one. Pass 'scope' naming the mount to search: {}.",
-            mount_scope_hint(state, include_native_recall)
-        ));
+        return Ok(RecallTarget::Federated);
     };
     let resolved = state
         .router
@@ -2814,8 +4057,15 @@ pub async fn call_tool(
                 Value::Object(result),
             ))
         }
+        // Federated on a multi-mount vault, and the router does all of it: `walk_markdown`
+        // now concatenates every mount's notes in the logical namespace, so the match and the
+        // truncation below run over the whole vault exactly as they run over one.
+        //
+        // This tool is an ENUMERATION filtered by a path match, not a ranking — the matcher
+        // is a substring or regex test and the results are the first `limit` in walk order —
+        // which is why it federates while `recommend_folder` still refuses. See
+        // `require_single_mount`.
         "find_files" => {
-            require_single_mount(state, "find_files")?;
             let query = string_arg(arguments, "query")?;
             let mode = optional_enum_string_arg(arguments, "mode", &["substring", "regex"])?
                 .unwrap_or_else(|| "substring".to_string());
@@ -2824,16 +4074,28 @@ pub async fn call_tool(
                 .await?
                 .into_markdown_files()
                 .map_err(|error| error.to_string())?;
-            let matches = live_find_file_matches(files, &query, &mode, limit)?
-                .into_iter()
-                .map(|item| file_path_match_json(&item))
-                .collect::<Vec<_>>();
-            Ok(json_text_result(json!({
-                "query": query,
-                "mode": mode,
-                "count": matches.len(),
-                "matches": matches
-            })))
+            let found = live_find_file_matches(files, &query, &mode, limit)?;
+            let truncated = found.len() >= limit;
+            let matches = found.iter().map(file_path_match_json).collect::<Vec<_>>();
+            let mut result = Map::from_iter([
+                ("query".to_string(), json!(query)),
+                ("mode".to_string(), json!(mode)),
+                ("count".to_string(), json!(matches.len())),
+                ("matches".to_string(), json!(matches)),
+            ]);
+            // Truncation honesty, and MULTI-MOUNT ONLY so the frozen single-mount goldens are
+            // untouched. It matters more here than on one vault: the merged walk is ordered by
+            // logical path, so a full result set is the alphabetically first `limit` matches
+            // and a whole mount's notes can sit entirely past the cut. On a single vault the
+            // same truncation has always been silent, and that shape is frozen.
+            if truncated && state.router.is_multi_mount() {
+                result.insert("truncated".to_string(), json!(true));
+                result.insert(
+                    "truncationNote".to_string(),
+                    json!(FEDERATED_FIND_FILES_TRUNCATION_NOTE),
+                );
+            }
+            Ok(json_text_result(Value::Object(result)))
         }
         "grep_search" => {
             if !state.rg_available {
@@ -2891,6 +4153,26 @@ pub async fn call_tool(
                 result.insert(
                     "exhaustiveNote".to_string(),
                     json!(NON_EXHAUSTIVE_GREP_NOTE),
+                );
+            }
+            // A federated grep that lost a mount says WHICH one, and marks itself degraded.
+            //
+            // `exhaustive: false` above already fired, but on its own it cannot distinguish
+            // "a backend caps its candidate set" from "part of your vault is offline", and
+            // those have different remedies. Emitted only when non-empty, so a single-mount
+            // grep and any successfully routed one are byte-identical to before.
+            if !outcome.missing_mounts.is_empty() {
+                result.insert("degraded".to_string(), json!(true));
+                result.insert(
+                    "missingBackends".to_string(),
+                    json!(outcome.missing_mounts.clone()),
+                );
+                result.insert(
+                    "degradationReason".to_string(),
+                    json!(format!(
+                        "these vault mounts could not be searched, so matches inside them are                          missing from this answer rather than absent from the vault: {}",
+                        outcome.missing_mounts.join(", ")
+                    )),
                 );
             }
             Ok(json_text_result_from_arguments(
@@ -3026,6 +4308,15 @@ pub async fn call_tool(
             // shape, with its provenance stated. See `insert_native_recall_provenance`.
             let scoped = match target {
                 RecallTarget::Local(scoped) => scoped,
+                // Unscoped on a multi-mount vault: every mount, fused.
+                RecallTarget::Federated => {
+                    let text_options =
+                        TextPayloadOptions::search_snippet_from_arguments(arguments, true);
+                    return Ok(json_text_result_from_arguments(
+                        arguments,
+                        federated_hybrid_search_payload(state, &query, limit, text_options).await?,
+                    ));
+                }
                 RecallTarget::Native(mount) => {
                     let text_options =
                         TextPayloadOptions::search_snippet_from_arguments(arguments, true);
@@ -3033,7 +4324,13 @@ pub async fn call_tool(
                     let mut match_values = response
                         .hits
                         .iter()
-                        .map(|hit| native_recall_match_json(hit, &mount, text_options))
+                        .map(|hit| {
+                            native_recall_match_json(
+                                hit,
+                                &mount.to_logical(&hit.path),
+                                text_options,
+                            )
+                        })
                         .collect::<Vec<_>>();
                     let response_truncated = apply_response_text_budget(
                         &mut match_values,
@@ -3109,40 +4406,37 @@ pub async fn call_tool(
             ))
         }
         "search_artifacts" => {
-            let scoped = resolve_recall_scope(
+            let target = resolve_recall_target(
                 state,
                 "search_artifacts",
                 optional_string_arg(arguments, "scope").as_deref(),
+                // An artifact embedding table is built by the server from binary files it
+                // read itself; no backend answers artifact search natively.
+                false,
             )?;
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
-            let snapshot = scoped.runtime.fresh_snapshot("search_artifacts").await?;
-            let index = snapshot.index;
-            let query_for_search = query.clone();
-            // artifact_semantic_search embeds the query via the (multimodal) artifact
-            // backend over HTTP, so run it off the async runtime.
-            let matches = tokio::task::spawn_blocking(move || {
-                index_search::artifact_semantic_search_with_options(
-                    index.as_ref(),
-                    &query_for_search,
-                    RankingOptions {
-                        limit,
-                        ..RankingOptions::default()
-                    },
-                )
-            })
-            .await
-            .map_err(|error| error.to_string())?
-            // search_artifacts has no lexical fallback (artifacts carry no BM25 terms), so a
-            // dead artifact backend can only surface as an error. Map the backend-unavailable
-            // case to a clear, actionable message instead of leaking the raw upstream 400.
-            .map_err(|error| match error {
-                IndexError::EmbeddingBackendUnavailable(_) => {
-                    ARTIFACT_EMBEDDING_BACKEND_UNAVAILABLE_MESSAGE.to_string()
+            let scoped = match target {
+                RecallTarget::Local(scoped) => scoped,
+                RecallTarget::Federated => {
+                    return Ok(json_text_result_from_arguments(
+                        arguments,
+                        federated_search_artifacts_payload(state, &query, limit).await?,
+                    ));
                 }
-                other => other.to_string(),
-            })?;
+                // Unreachable: `include_native_recall: false` never produces this variant.
+                // An error rather than an `unreachable!` because a panic in a tool handler
+                // takes down the request, and a future caller that flips the flag deserves
+                // a message rather than a crash.
+                RecallTarget::Native(_) => {
+                    return Err(
+                        "search_artifacts cannot be served by a mount's own index".to_string()
+                    )
+                }
+            };
+            let snapshot = scoped.runtime.fresh_snapshot("search_artifacts").await?;
+            let matches = artifact_search_matches(snapshot.index, query.clone(), limit).await?;
             Ok(json_text_result_from_arguments(
                 arguments,
                 json!({
@@ -3150,17 +4444,11 @@ pub async fn call_tool(
                     "rebuilt": snapshot.rebuilt,
                     "count": matches.len(),
                     "matches": matches
-                        .into_iter()
-                        .map(|item| json!({
+                        .iter()
+                        .map(|item| artifact_search_match_json(&index_search::ArtifactSearchMatch {
                             // Logical path: identity on the root mount.
-                            "path": scoped.to_logical(&item.path),
-                            "title": item.title,
-                            "kind": item.kind,
-                            "mimeType": item.mime_type,
-                            "size": item.size,
-                            "score": item.score,
-                            "metadata": serde_json::from_str::<Value>(&item.metadata_json)
-                                .unwrap_or(Value::Null),
+                            path: scoped.to_logical(&item.path),
+                            ..item.clone()
                         }))
                         .collect::<Vec<_>>()
                 }),
@@ -3270,6 +4558,27 @@ pub async fn call_tool(
             // back empty with a reason rather than absent or fabricated.
             let scoped = match target {
                 RecallTarget::Local(scoped) => scoped,
+                // Unscoped on a multi-mount vault: chunks fused across every mount, the
+                // graph from the mount that produced the best chunk. See
+                // `federated_load_knowledge_payload`.
+                RecallTarget::Federated => {
+                    return Ok(json_text_result_from_arguments(
+                        arguments,
+                        federated_load_knowledge_payload(
+                            state,
+                            &subject,
+                            project.as_deref(),
+                            FederatedKnowledgeOptions {
+                                limit_notes,
+                                limit_chunks,
+                                include_graph,
+                                graph_depth: clamped_usize_arg(arguments, "graphDepth", 1, 1, 3),
+                            },
+                            TextPayloadOptions::search_snippet_from_arguments(arguments, true),
+                        )
+                        .await?,
+                    ));
+                }
                 RecallTarget::Native(mount) => {
                     return Ok(json_text_result_from_arguments(
                         arguments,
@@ -3809,6 +5118,7 @@ mod tests {
 
     fn test_config(vault_path: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            federated_rerank: true,
             index_dir: vault_path.join(".deep-obsidian-mcp-test"),
             vault_path,
             mounts: Vec::new(),

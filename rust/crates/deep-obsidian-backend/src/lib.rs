@@ -717,6 +717,19 @@ pub struct GrepOutcome {
     /// reporting "candidates: 4021" alongside `exhausted: true` would invite the reader
     /// to think a cap was involved.
     pub candidate_count: Option<usize>,
+    /// Mounts whose part of the search FAILED, on a federated (whole-vault) grep.
+    ///
+    /// # Why this is not folded into `exhausted`
+    ///
+    /// `exhausted: false` already means "I did not look everywhere", and a failed mount is
+    /// certainly that — but it says nothing about WHICH lines were never read, so a caller
+    /// cannot tell "the backend caps its candidate set" from "a third of your vault is
+    /// offline right now". The two have different remedies (raise the bound; fix the mount),
+    /// so the mount ids are carried rather than collapsed.
+    ///
+    /// Always empty for a single-mount vault and for any single-mount routed search, which
+    /// is what keeps every existing grep payload byte-identical.
+    pub missing_mounts: Vec<String>,
 }
 
 impl GrepOutcome {
@@ -726,6 +739,7 @@ impl GrepOutcome {
             matches,
             exhausted: true,
             candidate_count: None,
+            missing_mounts: Vec::new(),
         }
     }
 }
@@ -1110,12 +1124,26 @@ impl BackendRequest {
         BackendRequest::Mutation(MutationRequest::SoftDelete { path: path.into() })
     }
 
-    /// A ranked search served by the backend itself.
+    /// A ranked search served by the backend itself, from the most relevant hit.
     pub fn recall_search(query: impl Into<String>, limit: usize) -> Self {
+        BackendRequest::recall_search_page(query, limit, None)
+    }
+
+    /// One PAGE of a backend-served ranked search, resuming from `cursor`.
+    ///
+    /// The paginated form exists for federated recall's deepening loop, which asks a
+    /// native-recall mount for another page when its next unseen candidate could still
+    /// enter the fused top-`limit`. A caller that only wants the best hits uses
+    /// [`Self::recall_search`], which is this with no cursor.
+    pub fn recall_search_page(
+        query: impl Into<String>,
+        limit: usize,
+        cursor: Option<OpaqueCursor>,
+    ) -> Self {
         BackendRequest::Recall(RecallRequest::Search(SearchRequest {
             query: query.into(),
             limit,
-            cursor: None,
+            cursor,
         }))
     }
 

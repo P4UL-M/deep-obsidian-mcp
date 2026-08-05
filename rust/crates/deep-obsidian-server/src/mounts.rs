@@ -664,6 +664,7 @@ mod tests {
 
     fn config_with(mounts: Vec<MountConfig>, index_dir: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            federated_rerank: true,
             vault_path: PathBuf::from("/tmp/root-vault"),
             mounts,
             experimental: ExperimentalConfig {
@@ -685,6 +686,7 @@ mod tests {
 
     fn couchdb_mount(id: &str, mount_at: &str) -> MountConfig {
         MountConfig {
+            recall_weight: None,
             id: id.to_string(),
             mount_at: mount_at.to_string(),
             backend: MountBackendConfig::Couchdb {
@@ -731,6 +733,7 @@ mod tests {
         let config = config_with(
             vec![
                 MountConfig {
+                    recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
                     backend: MountBackendConfig::Filesystem {
@@ -769,6 +772,7 @@ mod tests {
         let config = config_with(vec![], index_dir.clone());
 
         let root = MountConfig {
+            recall_weight: None,
             id: "vault".to_string(),
             mount_at: String::new(),
             backend: MountBackendConfig::Filesystem {

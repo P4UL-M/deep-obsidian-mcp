@@ -85,6 +85,15 @@ pub enum ConfigError {
         first: String,
         second: String,
     },
+    /// A `recallWeight` that cannot produce a meaningful federated ordering.
+    ///
+    /// Zero and negative are rejected rather than clamped: a zero weight would drop
+    /// the mount out of every federated ranking while `vault_info` still reported it
+    /// healthy and scoped search still answered from it, and a negative weight would
+    /// order that mount's hits worst-first. Both are silent wrong answers, which is
+    /// exactly what a config error exists to prevent.
+    #[error("invalid recallWeight {weight} on mount {id:?}: it must be a finite number greater than 0 (omit it for the default 1.0). A weight of 0 would silently remove the mount from every federated ranking while leaving it listed as healthy.")]
+    InvalidRecallWeight { id: String, weight: f64 },
     /// More than a single root mount without the opt-in flag.
     #[error("multi-vault mounts are experimental: set {{\"experimental\": {{\"multiVault\": true}}}} in the config to resolve a table of {count} mounts")]
     MultiVaultNotEnabled { count: usize },
@@ -553,10 +562,20 @@ fn normalize_mounts(mounts: Vec<MountConfig>) -> Result<(Vec<MountConfig>, usize
                 second: id,
             });
         }
+        // Validated here rather than at the fusion call site: a weight that cannot
+        // produce a meaningful ordering is a CONFIG mistake, and discovering it on the
+        // first federated query — after the server has come up reporting every mount
+        // healthy — would surface it as a search bug.
+        if let Some(weight) = mount.recall_weight {
+            if !weight.is_finite() || weight <= 0.0 {
+                return Err(ConfigError::InvalidRecallWeight { id, weight });
+            }
+        }
         normalized.push(MountConfig {
             id,
             mount_at,
             backend: expand_mount_backend_paths(mount.backend),
+            recall_weight: mount.recall_weight,
         });
     }
 
@@ -668,6 +687,9 @@ pub fn normalize_service_config(
     let auth = normalize_auth_input(input.auth);
 
     Ok(ResolvedServiceConfig {
+        // Absent means enabled: the rerank is what makes a federated answer RANKED rather
+        // than merely merged, so a config that never mentions it gets it.
+        federated_rerank: input.federated_rerank.unwrap_or(true),
         vault_path,
         mounts,
         experimental,
@@ -708,6 +730,7 @@ pub fn normalize_persisted_config(
         embedding: input.embedding,
         artifact_embedding: input.artifact_embedding,
         auth: input.auth,
+        federated_rerank: input.federated_rerank,
         config_file_path: None,
     })?;
 
@@ -794,6 +817,13 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
             })
         } else {
             None
+        },
+        // Only written back when it was TURNED OFF. Emitting `true` would add a key to every
+        // config that never mentioned the flag, which is the opposite of a round trip.
+        federated_rerank: if config.federated_rerank {
+            None
+        } else {
+            Some(false)
         },
     }
 }
@@ -997,6 +1027,7 @@ mod tests {
 
     fn filesystem_mount(id: &str, mount_at: &str, vault_path: &str) -> MountConfig {
         MountConfig {
+            recall_weight: None,
             id: id.to_string(),
             mount_at: mount_at.to_string(),
             backend: MountBackendConfig::Filesystem {
@@ -1261,6 +1292,7 @@ mod tests {
         let resolved = normalize_service_config(mounts_input(
             vec![
                 MountConfig {
+                    recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
                     backend: MountBackendConfig::Filesystem {
@@ -1270,6 +1302,7 @@ mod tests {
                 },
                 // A non-root mount's indexDir is accepted but not consumed yet.
                 MountConfig {
+                    recall_weight: None,
                     id: "team".to_string(),
                     mount_at: "Team".to_string(),
                     backend: MountBackendConfig::Filesystem {
@@ -1289,6 +1322,7 @@ mod tests {
             index_dir: Some(PathBuf::from("/tmp/top-level")),
             ..mounts_input(
                 vec![MountConfig {
+                    recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
                     backend: MountBackendConfig::Filesystem {
@@ -1499,6 +1533,7 @@ mod tests {
 
     fn couchdb_mount(id: &str, mount_at: &str) -> MountConfig {
         MountConfig {
+            recall_weight: None,
             id: id.to_string(),
             mount_at: mount_at.to_string(),
             backend: MountBackendConfig::Couchdb {
@@ -1679,6 +1714,7 @@ mod tests {
 
     fn algolia_mount(id: &str, mount_at: &str) -> MountConfig {
         MountConfig {
+            recall_weight: None,
             id: id.to_string(),
             mount_at: mount_at.to_string(),
             backend: MountBackendConfig::Algolia {
