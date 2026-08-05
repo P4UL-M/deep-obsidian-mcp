@@ -3648,9 +3648,16 @@ fn render_mount_line(mount: &MountConfig, root_index_dir: Option<&Path>) -> Stri
         MountBackendConfig::Couchdb {
             url,
             database,
+            writable,
             index_dir,
             ..
-        } => (format!("{url}/{database} (read-only)"), index_dir.clone()),
+        } => (
+            format!(
+                "{url}/{database}{}",
+                if *writable { "" } else { " (read-only)" }
+            ),
+            index_dir.clone(),
+        ),
         // `appId`, `indexName` and — when set — `baseUrl`. No key, and no `apiKeyRef`
         // identifier either. `baseUrl` is validated at config load to carry no userinfo
         // (`ConfigError::AlgoliaBaseUrlHasUserinfo`), which is what makes printing it
@@ -4343,6 +4350,42 @@ mod tests {
                 index_dir: index_dir.map(PathBuf::from),
             },
         }
+    }
+
+    /// The `(read-only)` label must track the mount's `writable` flag for every
+    /// backend kind. The couchdb arm printed it unconditionally, so `doctor`
+    /// called a writable mount read-only while `upsert_note` into it succeeded —
+    /// found by the multi-backend demo, pinned here for both states.
+    #[test]
+    fn doctor_mount_lines_track_writability() {
+        let couchdb = |writable: bool| MountConfig {
+            id: "team".to_string(),
+            mount_at: "Team".to_string(),
+            backend: deep_obsidian_types::MountBackendConfig::Couchdb {
+                url: "http://127.0.0.1:5984".to_string(),
+                database: "vault".to_string(),
+                username: None,
+                password_ref: deep_obsidian_types::SecretRef::EncryptedFile {
+                    id: "team-couchdb".to_string(),
+                },
+                e2ee: None,
+                sidecar_path: None,
+                index_dir: None,
+                options: None,
+                writable,
+            },
+            recall_weight: None,
+            unknown: Default::default(),
+        };
+
+        assert_eq!(
+            render_mount_line(&couchdb(false), None),
+            "mount team at /Team (couchdb): http://127.0.0.1:5984/vault (read-only)"
+        );
+        assert_eq!(
+            render_mount_line(&couchdb(true), None),
+            "mount team at /Team (couchdb): http://127.0.0.1:5984/vault"
+        );
     }
 
     /// Overwriting an existing config must leave a faithful `.bak` copy of the
