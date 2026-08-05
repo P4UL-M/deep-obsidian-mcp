@@ -48,8 +48,43 @@ installs:
 
 - `/usr/bin/deep-obsidian-mcp` — the CLI/server binary
 - `/usr/share/deep-obsidian-mcp/{skills,obsidian-snippets,assets}` — packaged templates and assets
+- `/usr/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs` — the LiveSync sidecar bundle (see below)
 - `/usr/lib/systemd/user/deep-obsidian-mcp.service` — a systemd **user** service (not auto-started)
 - `/usr/share/doc/deep-obsidian-mcp/` — README and this document
+
+### The LiveSync sidecar, and why `nodejs` is a `Recommends`
+
+The bundle is used **only** by the experimental `couchdb` (Self-hosted LiveSync) mount
+kind, which runs it in a Node child process. Every other mount — including the default
+filesystem vault — needs no Node, so making Node a `Depends` would pull a ~30 MB runtime
+onto every install for a feature behind an experimental flag. Hence:
+
+```
+Recommends: nodejs (>= 20)
+```
+
+Debian 12 ships nodejs 18, below the sidecar's floor
+(`sidecar/livesync-sidecar/package.json` → `engines.node`), so on bookworm `apt` cannot
+satisfy that recommendation and skips it. Install Node 20+ from backports or NodeSource
+only if you want a couchdb mount.
+
+**The bundle path is not arbitrary, and no environment variable points at it.** The binary
+derives it from its own location: `/usr/bin/deep-obsidian-mcp` walks up to `/usr` and
+appends `share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs`
+(`PACKAGED_BUNDLE_PREFIX` in `rust/crates/deep-obsidian-backend/src/sidecar.rs`). The same
+rule resolves to Homebrew's `pkgshare`, which is why one constant covers both channels and
+the systemd unit carries no `Environment=DEEP_OBSIDIAN_LIVESYNC_SIDECAR` line.
+`DEEP_OBSIDIAN_LIVESYNC_SIDECAR` remains a user-facing override for a hand-built bundle.
+
+Check the result — no CouchDB and no credentials required:
+
+```bash
+deep-obsidian-mcp doctor        # per couchdb mount: bundle located? node >= 20?
+```
+
+`scripts/linux-smoke-test.sh` asserts exactly this in CI, running `doctor` from `/` against
+a hand-written couchdb mount config so that a source checkout in the working directory
+cannot satisfy the probe by accident.
 
 ## Configure
 
@@ -91,8 +126,8 @@ systemctl --user disable --now deep-obsidian-mcp
 
 ## Build the `.deb` from source
 
-Requires a Linux host (or container) with a Rust toolchain. `cargo-deb` is
-installed automatically if missing:
+Requires a Linux host (or container) with a Rust toolchain **and Node 20+**, which builds
+the sidecar bundle the package ships. `cargo-deb` is installed automatically if missing:
 
 ```bash
 scripts/build-deb.sh              # version from Cargo.toml
@@ -100,10 +135,19 @@ scripts/build-deb.sh 0.1.0-alpha.11   # stamp an explicit version
 # Output: target/debian/deep-obsidian-mcp_<version>_<arch>.deb
 ```
 
+The script runs `npm ci && npm run build` in `sidecar/livesync-sidecar` before invoking
+cargo-deb (which declares the bundle as an asset and would abort on a missing one), and
+skips that step if `dist/sidecar.mjs` already exists. With no Node, or Node below 20, it
+**fails with a message rather than building a package without the bundle** — such a `.deb`
+would install and serve filesystem vaults perfectly and fail only once someone configured a
+couchdb mount, by which time it is published.
+
 CI builds both architectures natively (`ubuntu-24.04` for amd64,
 `ubuntu-24.04-arm` for arm64) inside a Debian bookworm container, installs and
 smoke-tests each `.deb`, and validates a signed APT repo by installing from it
-over `file://` (`.github/workflows/release-deb.yml`).
+over `file://` (`.github/workflows/release-deb.yml`). The container image has no Node and
+bookworm's apt `nodejs` is 18, so the workflow uses `actions/setup-node@v4` to supply
+Node 20.
 
 **glibc compatibility:** the package links against the build host's glibc, and
 `cargo-deb` stamps the required symbol versions as the `libc6` floor. Building

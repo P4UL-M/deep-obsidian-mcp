@@ -103,6 +103,7 @@ impl Fixture {
             vault_path: self.vault(),
             mounts: vec![
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
@@ -112,6 +113,7 @@ impl Fixture {
                     },
                 },
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: MOUNT_ID.to_string(),
                     mount_at: MOUNT_AT.to_string(),

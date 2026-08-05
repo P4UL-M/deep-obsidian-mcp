@@ -108,6 +108,7 @@ impl Fixture {
             vault_path: self.root_vault.clone(),
             mounts: vec![
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
@@ -117,6 +118,7 @@ impl Fixture {
                     },
                 },
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: "team".to_string(),
                     mount_at: "Team".to_string(),
@@ -1413,6 +1415,7 @@ impl CouchdbFixture {
         // so the routing assertions below are about the BACKEND KIND rather than about
         // a different prefix.
         config.mounts[1] = MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: "live".to_string(),
             mount_at: "LiveSync".to_string(),
@@ -2153,6 +2156,7 @@ impl AlgoliaFixture {
         // so every assertion below is about the backend kind rather than about a
         // different prefix.
         config.mounts[1] = MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: "shared".to_string(),
             mount_at: "_Shared".to_string(),
@@ -2203,6 +2207,7 @@ impl AlgoliaFixture {
 fn an_algolia_mount_requires_the_algolia_vaults_flag_and_a_non_root_prefix() {
     let mounts = vec![
         MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: "vault".to_string(),
             mount_at: String::new(),
@@ -2212,6 +2217,7 @@ fn an_algolia_mount_requires_the_algolia_vaults_flag_and_a_non_root_prefix() {
             },
         },
         MountConfig {
+            unknown: Default::default(),
             recall_weight: None,
             id: "shared".to_string(),
             mount_at: "_Shared".to_string(),

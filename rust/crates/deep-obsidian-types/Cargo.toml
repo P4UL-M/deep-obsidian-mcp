@@ -6,6 +6,6 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
-
-[dev-dependencies]
+# `serde_json::Map` is the retention container for unknown config fields (see
+# `UnknownFields`), so it is a public part of this crate's types, not a test-only dep.
 serde_json.workspace = true

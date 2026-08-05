@@ -206,6 +206,7 @@ impl Fixture {
             vault_path: self.base.join("root-vault"),
             mounts: vec![
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
@@ -215,6 +216,7 @@ impl Fixture {
                     },
                 },
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: MOUNT_ID.to_string(),
                     mount_at: "LiveSync".to_string(),

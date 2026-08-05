@@ -1,5 +1,50 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::path::PathBuf;
+
+/// Config keys this build does not know, kept verbatim so a load→save round trip
+/// cannot delete them.
+///
+/// # The failure this prevents
+///
+/// A config written by a NEWER build names fields this one has never heard of. Every
+/// writer in the CLI (`setup-service`, the wizard) goes through
+/// `to_persisted_config` → `write_config_file`, which serializes the struct — so
+/// without retention a single `setup-service --overwrite` under an older binary
+/// silently deletes the newer build's settings, and the user's only clue is that the
+/// feature stopped working after a downgrade.
+///
+/// # Where it applies
+///
+/// On the two structs a user's file is shaped like at the level a new key can appear
+/// WITHOUT changing the meaning of the surrounding ones: [`PersistedServiceConfig`]
+/// (top level) and [`MountConfig`] (per mount entry). Those two cover every key an
+/// operator writes by hand at the level a version skew is likely to add one.
+///
+/// # Where it does not, and what that costs
+///
+/// Two other groups behave differently, and neither is changed by this mechanism:
+///
+/// * **Sections with `deny_unknown_fields`** — [`EmbeddingConfigInput`] and the
+///   chunking knobs. They FAIL CLOSED: an unrecognized key is an error naming the
+///   field, which is right for a section where a typo would silently change how
+///   content is embedded rather than merely add a setting.
+/// * **[`MountBackendConfig`]'s variants** — permissive, and an unrecognized key is
+///   DROPPED. That is pre-existing behaviour, not a choice made here, and it cannot be
+///   fixed by either mechanism today: the enum is internally tagged (`kind`), and
+///   serde supports neither `flatten` nor `deny_unknown_fields` on an internally
+///   tagged variant that also has a `#[serde(default)]` field — which every variant
+///   here does. So a *backend-level* key from a newer build is still lost on rewrite.
+///   Pinned by a test in `deep-obsidian-config` so the gap is recorded rather than
+///   assumed closed; closing it needs the enum to become externally tagged, which is a
+///   breaking config change.
+pub type UnknownFields = Map<String, Value>;
+
+/// True when there is nothing to retain. Used as serde's `skip_serializing_if` so a
+/// config that never carried an unknown key serializes byte-identically to before.
+pub fn unknown_fields_is_empty(unknown: &UnknownFields) -> bool {
+    unknown.is_empty()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -447,6 +492,13 @@ pub struct MountConfig {
     /// healthy, and a negative weight would rank a mount's best hit below its worst.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall_weight: Option<f64>,
+    /// Per-mount keys this build does not know. See [`UnknownFields`].
+    ///
+    /// Retained here rather than only at the top level because this same type serves
+    /// the persisted and resolved forms, so a mount-level unknown survives the whole
+    /// load → normalize → save path with no extra plumbing.
+    #[serde(flatten, default, skip_serializing_if = "unknown_fields_is_empty")]
+    pub unknown: UnknownFields,
 }
 
 /// Opt-in flags for behaviour that is not yet stable.
@@ -533,6 +585,15 @@ pub struct PersistedServiceConfig {
     /// save/load round trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub federated_rerank: Option<bool>,
+    /// Top-level keys this build does not know. See [`UnknownFields`].
+    ///
+    /// This is the struct a config FILE is parsed into (`read_config_file`) as well as
+    /// the one written back (`write_config_file`), so capturing unknowns here covers
+    /// the read half of the round trip. The write half needs the CLI to carry them
+    /// across `to_persisted_config`, which rebuilds this struct from the resolved
+    /// config and therefore cannot know them — see `carry_unknown_fields`.
+    #[serde(flatten, default, skip_serializing_if = "unknown_fields_is_empty")]
+    pub unknown: UnknownFields,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -625,6 +686,12 @@ impl ResolvedServiceConfig {
                     vault_path: self.vault_path.clone(),
                     index_dir: None,
                 },
+                // Empty by construction, not by omission: this mount is SYNTHESIZED
+                // for a legacy `vaultPath` config that has no `mounts` array, so
+                // there was never a mount entry for an unknown key to sit on. A
+                // legacy config's top-level unknowns are retained on
+                // `PersistedServiceConfig` instead.
+                unknown: UnknownFields::new(),
             }];
         }
         self.mounts.clone()

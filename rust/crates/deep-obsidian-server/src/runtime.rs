@@ -1355,6 +1355,7 @@ mod tests {
             federated_rerank: true,
             mounts: vec![
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: "vault".to_string(),
                     mount_at: String::new(),
@@ -1364,6 +1365,7 @@ mod tests {
                     },
                 },
                 MountConfig {
+                    unknown: Default::default(),
                     recall_weight: None,
                     id: "team".to_string(),
                     mount_at: "Team".to_string(),

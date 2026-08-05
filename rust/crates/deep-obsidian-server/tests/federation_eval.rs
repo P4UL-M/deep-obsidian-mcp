@@ -834,6 +834,7 @@ impl Harness {
                     dir
                 };
                 MountConfig {
+                    unknown: Default::default(),
                     id: id.to_string(),
                     mount_at,
                     backend: MountBackendConfig::Filesystem {
@@ -1421,6 +1422,7 @@ fn an_unusable_recall_weight_is_refused_by_config_validation() {
         let error = deep_obsidian_config::normalize_service_config(
             deep_obsidian_types::ServiceConfigInput {
                 mounts: Some(vec![MountConfig {
+                    unknown: Default::default(),
                     id: "vault".to_string(),
                     mount_at: String::new(),
                     backend: MountBackendConfig::Filesystem {
@@ -1444,6 +1446,7 @@ fn an_unusable_recall_weight_is_refused_by_config_validation() {
     let resolved =
         deep_obsidian_config::normalize_service_config(deep_obsidian_types::ServiceConfigInput {
             mounts: Some(vec![MountConfig {
+                unknown: Default::default(),
                 id: "vault".to_string(),
                 mount_at: String::new(),
                 backend: MountBackendConfig::Filesystem {
@@ -1512,6 +1515,7 @@ async fn a_mount_that_cannot_hold_artifacts_is_skipped_rather_than_reported_miss
         vault_path: root_vault.clone(),
         mounts: vec![
             MountConfig {
+                unknown: Default::default(),
                 id: "vault".to_string(),
                 mount_at: String::new(),
                 backend: MountBackendConfig::Filesystem {
@@ -1521,6 +1525,7 @@ async fn a_mount_that_cannot_hold_artifacts_is_skipped_rather_than_reported_miss
                 recall_weight: None,
             },
             MountConfig {
+                unknown: Default::default(),
                 id: "shared".to_string(),
                 mount_at: "_Shared".to_string(),
                 backend: MountBackendConfig::Algolia {
