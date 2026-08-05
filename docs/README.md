@@ -6,6 +6,7 @@ the top-level guides instead:** [README](../README.md) ·
 
 ## Reference
 
+- [demo.md](./demo.md) — `scripts/demo-multi-backend.sh`: a one-command, runnable tour of the multi-backend architecture (filesystem + CouchDB + Algolia under one namespace).
 - [mcp-reference.md](./mcp-reference.md) — MCP tools, resources, and prompts.
 - [architecture.md](./architecture.md) — indexing model, semantic backends, roadmap.
 - [algolia-mounts.md](./algolia-mounts.md) — the experimental shared Algolia corpus: design, versioning, CLI, security, limits.
