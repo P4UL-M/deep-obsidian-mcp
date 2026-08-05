@@ -24,6 +24,17 @@ base64 = "0.22"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
+# Ripgrep's OWN glob engine (`globset` is a crate of the ripgrep repository, used
+# by `ignore` which rg walks with). The CouchDB backend's virtual grep has to make
+# `--glob` mean exactly what it means on the ripgrep path, and `*`/`**`/`?`/`[a-z]`/
+# `{a,b}`/escapes are far too much surface to reimplement from a spec — a
+# hand-rolled matcher that quietly mishandles brace alternation is precisely how a
+# faithful imitation becomes a lookalike. The heavier `ignore` crate was rejected:
+# its `Override` matcher is rooted at the process CWD, which is the one ripgrep
+# behaviour the virtual grep deliberately does NOT reproduce (see
+# `virtual_grep::GlobFilter`), so it would cost walkdir + crossbeam for fidelity
+# that is then discarded.
+globset = "0.4"
 hmac = "0.12"
 keyring = { version = "3", features = [
     "apple-native",

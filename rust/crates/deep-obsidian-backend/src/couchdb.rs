@@ -13,6 +13,12 @@
 //!   `deleted: true`. Listings exclude them — a tombstone is not a file — while
 //!   `read`/`stat` on one still answers, so a caller holding a stale path gets the
 //!   content rather than a lie.
+//! * **There is no ripgrep.** `grep_search` is served by an IMITATION of ripgrep
+//!   ([`crate::virtual_grep`]) running over note text read back through the sidecar:
+//!   the manifest supplies the corpus, the caller's glob pre-filters it by path, and
+//!   every surviving note is read and matched line by line. It is exhaustive in the
+//!   same sense ripgrep is — it looks everywhere — and it costs a full corpus read per
+//!   query. See [`CouchDbVaultBackend::grep`].
 //! * **Conflicts are served.** The winning revision is returned and
 //!   `conflicted: true` comes back with it. [`ContentResponse::Stat`] carries only
 //!   `size_bytes`, so the flag cannot be surfaced through the public MCP schema
@@ -27,6 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::stream::{self, StreamExt};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -35,12 +42,14 @@ use crate::sidecar::{
     SidecarCredentials, SidecarError, SidecarErrorKind, SidecarMode, SidecarSupervisor, StatResult,
     WriteGuard, WritePayload, WriteResult,
 };
+use crate::virtual_grep::{self, GlobFilter, LineMatcher};
 use crate::watch::ChangeStream;
 use crate::{
     BackendDescriptor, BackendError, BackendKind, BackendRequest, BackendResponse, BaseVersion,
-    Capability, ChildListing, ContentRequest, ContentResponse, HealthRequest, HealthResponse,
-    ManifestRequest, ManifestResponse, MutationRequest, MutationResponse, OpaqueCursor,
-    RecallRequest, VaultBackend, VaultChildEntry, VaultEntryKind,
+    Capability, ChildListing, ContentRequest, ContentResponse, GrepMatch, GrepOutcome,
+    HealthRequest, HealthResponse, ManifestRequest, ManifestResponse, MutationRequest,
+    MutationResponse, OpaqueCursor, RecallRequest, RecallResponse, VaultBackend, VaultChildEntry,
+    VaultEntryKind,
 };
 
 /// Refusal for every write against a READ-ONLY CouchDB mount.
@@ -65,11 +74,29 @@ experimental.couchdbVaults, which is already on if this mount loaded) and restar
 guarded writes are then compare-and-swapped against the revision each read observed. Otherwise \
 edit the note in Obsidian and let LiveSync replicate it, or write to a filesystem mount instead.";
 
-/// Refusal for `grep_search` against a CouchDB mount.
-pub const COUCHDB_GREP_UNSUPPORTED_MESSAGE: &str = "grep_search is unavailable on this mount: it \
-is an EXPERIMENTAL, READ-ONLY CouchDB (Self-hosted LiveSync) vault, and line search is served by \
-ripgrep over local files, which do not exist for a CouchDB vault. Use hybrid_search or \
-bm25_search, which are served by this mount's own index.";
+/// How many notes the virtual grep reads at once.
+///
+/// The scan is bounded rather than unbounded because the sidecar is ONE child process
+/// serving one CouchDB connection: firing a thousand concurrent `read` calls at it
+/// would queue a thousand JSON-RPC lines, hold every decrypted body in memory at once,
+/// and make a `limit`-satisfied grep pay for notes it never needed. Eight keeps the
+/// queue and the peak memory bounded by a constant.
+///
+/// # What the concurrency actually buys, measured
+///
+/// The Rust side genuinely pipelines: `SidecarSupervisor::request` releases the stdin
+/// lock before awaiting its reply, so N requests are in flight at once. But the sidecar
+/// is a single Node process, so ITS dispatch — not this number — bounds the win. Measured
+/// against the local mock CouchDB (`a_grep_reads_the_whole_corpus_and_reports_its_throughput`,
+/// 40 notes), `1` gives ~880 notes/sec and `8` gives ~955: about 9%, because a loopback
+/// read costs almost nothing to overlap. The number is here for the case that measurement
+/// cannot show — a REMOTE CouchDB, where per-read latency dominates and eight overlapping
+/// round trips are eight times fewer serial waits. Do not read the 9% as the ceiling, and
+/// do not raise this expecting the local figure to move.
+///
+/// Order-preserving (`buffered`, not `buffer_unordered`), because the scan's
+/// determinism is load-bearing: see [`crate::virtual_grep`] on output order.
+const GREP_READ_CONCURRENCY: usize = 8;
 
 /// Refusal for a ranked search asked of a CouchDB mount.
 ///
@@ -129,6 +156,10 @@ replicate the removal.";
 /// manifest older than the request that triggered it. `CouchDbSource` additionally
 /// pins one manifest per refresh (see the server's `couchdb_source` module), which
 /// is what actually collapses 4 walks into 1.
+///
+/// One caller opts OUT of the window entirely: the virtual grep, whose corpus the
+/// manifest defines rather than merely describes, and which claims to have looked
+/// everywhere. See [`CouchDbVaultBackend::collect_manifest_entries`].
 const MANIFEST_REUSE_WINDOW: Duration = Duration::from_secs(2);
 
 /// A collected manifest and when it was collected.
@@ -210,6 +241,29 @@ impl CouchDbVaultBackend {
         if let Some(cached) = self.cached_manifest() {
             return Ok(cached);
         }
+        self.collect_manifest_entries().await
+    }
+
+    /// Collect the manifest from the sidecar, ignoring any cached one, and cache the
+    /// result.
+    ///
+    /// # Why grep must not reuse a cached manifest
+    ///
+    /// [`MANIFEST_REUSE_WINDOW`]'s own contract is that "no user-visible read can be
+    /// served from a manifest older than the request that triggered it". A LISTING can
+    /// tolerate a two-second-old snapshot — a caller reading a directory expects eventual
+    /// consistency. A grep cannot, because the manifest is not metadata to it: it is the
+    /// definition of what "everywhere" means, and the outcome CLAIMS to have looked
+    /// everywhere (`exhausted: true`). A note written a moment ago and absent from the
+    /// cached manifest would be reported as containing no matches, which is the one thing
+    /// an exhaustive search must never do.
+    ///
+    /// This was found by the multi-backend demo, which writes a note through MCP and then
+    /// greps for a line in it: the write landed, the read-back was correct, and the grep
+    /// returned nothing because a manifest collected during the preceding listing was
+    /// still inside the window. The cost of the fix is one extra manifest walk per grep,
+    /// which is marginal next to the per-candidate content reads the same grep then makes.
+    async fn collect_manifest_entries(&self) -> Result<Arc<Vec<ManifestEntry>>, BackendError> {
         let entries = Arc::new(map_sidecar(self.supervisor.collect_manifest().await)?);
         if let Ok(mut slot) = self.manifest.lock() {
             *slot = Some(CachedManifest {
@@ -627,6 +681,95 @@ impl CouchDbVaultBackend {
             .await
     }
 
+    /// Line search: an imitation of ripgrep over the whole corpus.
+    ///
+    /// # Cost, stated rather than hidden
+    ///
+    /// Every call is a manifest walk plus a `read` of EVERY note the glob admits, each
+    /// one a JSON-RPC round trip to the sidecar and from there to CouchDB (decrypting
+    /// on the way, on an E2EE vault). There is no content cache: a grep that answered
+    /// from stale text would be a worse failure than a slow one, and the manifest's own
+    /// reuse window ([`MANIFEST_REUSE_WINDOW`]) is short for the same reason. The reads
+    /// run [`GREP_READ_CONCURRENCY`] at a time and stop as soon as `limit` is reached,
+    /// so a narrow glob or a small `limit` is genuinely cheaper — but an unfiltered
+    /// grep over a large vault reads the large vault.
+    ///
+    /// # Why this is `exhausted: true`
+    ///
+    /// Because it looked everywhere. `exhausted` distinguishes a search that examined
+    /// the whole scope from one that was CANDIDATE-BOUNDED (the Algolia mount's, which
+    /// evaluates the pattern over the top-N chunks a lexical prefilter returned and can
+    /// therefore miss a match it never fetched). This scan has no such shortlist, so it
+    /// reports what the ripgrep path reports — including under a `limit`, which
+    /// truncates the OUTPUT on both paths without either of them claiming to have
+    /// stopped looking. `candidate_count` stays `None` for the same reason: there was no
+    /// candidate set, and a number here would invite the reader to think there was.
+    ///
+    /// A read that FAILS propagates. A note the manifest named and the sidecar could not
+    /// serve (a remote outage, or a tombstone that landed between the walk and the read)
+    /// means some lines were never examined, and there is no field on a successful
+    /// outcome that can say so — `exhausted: false` would say "bounded", which is a
+    /// different fact. The router turns the error into
+    /// [`GrepOutcome::missing_mounts`] naming this mount on a federated grep, and a
+    /// scoped grep surfaces it, which is the honest report in both shapes.
+    async fn grep(
+        &self,
+        query: String,
+        regex: bool,
+        case_sensitive: bool,
+        glob: Option<String>,
+        context_lines: usize,
+        limit: usize,
+    ) -> Result<GrepOutcome, BackendError> {
+        // Both compiled BEFORE the manifest walk: a bad pattern or an uninterpretable
+        // glob must cost the caller a message, not N round trips to CouchDB.
+        let matcher = LineMatcher::new(&query, regex, case_sensitive)?;
+        let filter = GlobFilter::new(glob.as_deref())?;
+        let limit = limit.max(1);
+
+        // A FRESH manifest, never the cached one: see `collect_manifest_entries` for why
+        // an exhaustive search cannot be scoped by a corpus snapshot that predates it.
+        let entries = self.collect_manifest_entries().await?;
+        let candidates = grep_corpus(&entries, &filter);
+        debug!(
+            "virtual grep over {} candidate note{} on a couchdb mount",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" }
+        );
+
+        let mut matches: Vec<GrepMatch> = Vec::new();
+        // `buffered` keeps the results in candidate order, so the scan is deterministic
+        // and `limit` truncates the same set on every run.
+        let mut reads = stream::iter(candidates.into_iter().map(|path| async move {
+            let result = self.supervisor.read(&path).await;
+            (path, result)
+        }))
+        .buffered(GREP_READ_CONCURRENCY);
+        while let Some((path, result)) = reads.next().await {
+            let result = map_sidecar(result)?;
+            note_conflict(&path, result.conflicted);
+            let text = match result.payload {
+                ReadPayload::Text(text) => text,
+                // A manifest entry the sidecar classified as text but read back as
+                // bytes. Skipped rather than lossily decoded: ripgrep would have
+                // detected the file as binary and reported no line matches for it
+                // either, so skipping is the faithful answer as well as the safe one.
+                ReadPayload::Bytes(_) => continue,
+            };
+            if virtual_grep::collect_note_matches(
+                &path,
+                &text,
+                &matcher,
+                context_lines,
+                limit,
+                &mut matches,
+            ) {
+                break;
+            }
+        }
+        Ok(GrepOutcome::exhaustive(matches))
+    }
+
     async fn health(&self, request: HealthRequest) -> Result<HealthResponse, BackendError> {
         match request {
             // NOT a hard startup gate: a CouchDB mount whose remote is unreachable
@@ -647,17 +790,25 @@ impl CouchDbVaultBackend {
 impl VaultBackend for CouchDbVaultBackend {
     /// # Capability rationale
     ///
+    /// * `GrepSearch` — served by [`Self::grep`], an imitation of ripgrep over note
+    ///   text rather than files. Advertised UNCONDITIONALLY, and in particular
+    ///   independently of `writable`: line search is a read, and a read-only mount can
+    ///   do it perfectly well. (It does not depend on a local `rg` binary either — the
+    ///   pattern is evaluated in-process — so this mount can serve grep on a host where
+    ///   a filesystem mount could not.)
     /// * `BinaryRead` — attachments are read through the sidecar's `read` with
     ///   `kind: "binary"`.
     /// * `Watch` — the sidecar's live change feed.
-    /// * NO `GrepSearch` — ripgrep needs files on disk. See
-    ///   [`COUCHDB_GREP_UNSUPPORTED_MESSAGE`].
     /// * `BinaryWrite`, `Upload` — only on a `writable` mount, i.e. only when the
     ///   sidecar behind it was initialized `read-write`. A read-only mount advertises
     ///   neither and refuses both with [`COUCHDB_READ_ONLY_MESSAGE`], exactly as
     ///   before.
     fn descriptor(&self) -> BackendDescriptor {
-        let mut capabilities = vec![Capability::BinaryRead, Capability::Watch];
+        let mut capabilities = vec![
+            Capability::GrepSearch,
+            Capability::BinaryRead,
+            Capability::Watch,
+        ];
         if self.writable {
             capabilities.push(Capability::BinaryWrite);
             capabilities.push(Capability::Upload);
@@ -707,9 +858,17 @@ impl VaultBackend for CouchDbVaultBackend {
                 .commit_upload(&path, expected_hash.as_deref(), max_bytes, chunks)
                 .await
                 .map(BackendResponse::Mutation),
-            BackendRequest::Recall(RecallRequest::Grep { .. }) => Err(BackendError::Unsupported(
-                COUCHDB_GREP_UNSUPPORTED_MESSAGE.to_string(),
-            )),
+            BackendRequest::Recall(RecallRequest::Grep {
+                query,
+                regex,
+                case_sensitive,
+                glob,
+                context_lines,
+                limit,
+            }) => self
+                .grep(query, regex, case_sensitive, glob, context_lines, limit)
+                .await
+                .map(|outcome| BackendResponse::Recall(RecallResponse::Grep(outcome))),
             BackendRequest::Recall(RecallRequest::Search(_)) => Err(BackendError::Unsupported(
                 COUCHDB_NATIVE_RECALL_UNSUPPORTED_MESSAGE.to_string(),
             )),
@@ -1096,6 +1255,55 @@ fn walk_markdown(entries: &[ManifestEntry]) -> Vec<String> {
     files
 }
 
+/// The notes a virtual grep will read, sorted and glob-filtered.
+///
+/// # Why this is not [`walk_markdown`]
+///
+/// `walk_markdown` additionally requires an `.md` extension, because it feeds the
+/// INDEX, which is about notes. Grep is about the caller's glob: the ripgrep path
+/// searches whatever the glob admits, and `--glob '*.txt'` really does return matches
+/// from `.txt` files. Reusing `walk_markdown` here would silently answer that request
+/// with nothing. So the extension decision belongs to `filter`, and this only decides
+/// what is READABLE AS TEXT:
+///
+/// * [`is_listable`] drops tombstones (a deleted entry is still a readable document, and
+///   grepping one would return lines from a note the vault no longer has) and `i:`
+///   internal entries;
+/// * [`EntryKind::Markdown`] means "stored as text" in LiveSync's vocabulary — not only
+///   `.md`. A `Binary` entry is excluded, which is also what ripgrep effectively does:
+///   it detects a binary file and reports no line matches for it;
+/// * [`path_is_filtered`] drops hidden and ignored subtrees, keeping grep's corpus equal
+///   to the corpus every other tool on this mount sees. See [`crate::virtual_grep`] for
+///   why this deliberately differs from ripgrep's `--hidden`.
+///
+/// The glob is applied HERE rather than after reading, so a note the caller excluded
+/// costs nothing at all. Sorted and deduplicated so the scan order — and therefore a
+/// `limit`-truncated result — is deterministic.
+///
+/// # Why `size` is not used to skip anything
+///
+/// Skipping `size == 0` entries was tried and REMOVED. It looks free — an empty note has
+/// no lines, so it can hold no match, and ripgrep was confirmed to report nothing for an
+/// empty file — but it is the only decision in the imitation that would trust METADATA
+/// instead of bytes, under an outcome that claims to have looked everywhere. `size` is
+/// written by whichever LiveSync client created the entry; a writer that left it at `0`
+/// for a note with content would make this grep silently skip that note while reporting
+/// `exhausted: true`. Ripgrep opens the file. So does this, and the saving it gives up is
+/// one round trip per empty note.
+fn grep_corpus(entries: &[ManifestEntry], filter: &GlobFilter) -> Vec<String> {
+    let mut paths: Vec<String> = entries
+        .iter()
+        .filter(|entry| is_listable(entry))
+        .filter(|entry| matches!(entry.kind, EntryKind::Markdown))
+        .filter(|entry| !path_is_filtered(&entry.path))
+        .filter(|entry| filter.is_match(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 /// Visible top-level folders, sorted.
 fn top_level_folders(entries: &[ManifestEntry]) -> Vec<String> {
     let mut folders: BTreeSet<String> = BTreeSet::new();
@@ -1313,15 +1521,68 @@ mod tests {
 
     /// The refusal strings name the experimental read-only state explicitly, which
     /// is the whole point of not reusing a generic capability error.
+    ///
+    /// `grep_search` is deliberately absent from this list: it is no longer refused at
+    /// all, and the constant that used to carry its refusal is gone rather than left
+    /// behind as documentation of a state the backend is not in.
     #[test]
     fn refusal_strings_say_experimental_and_read_only() {
-        for message in [COUCHDB_READ_ONLY_MESSAGE, COUCHDB_GREP_UNSUPPORTED_MESSAGE] {
-            assert!(message.contains("EXPERIMENTAL"), "{message}");
-            assert!(message.contains("READ-ONLY"), "{message}");
-        }
-        // ...and each points at what DOES work.
+        assert!(COUCHDB_READ_ONLY_MESSAGE.contains("EXPERIMENTAL"));
+        assert!(COUCHDB_READ_ONLY_MESSAGE.contains("READ-ONLY"));
+        // ...and it points at what DOES work.
         assert!(COUCHDB_READ_ONLY_MESSAGE.contains("filesystem mount"));
-        assert!(COUCHDB_GREP_UNSUPPORTED_MESSAGE.contains("hybrid_search"));
+    }
+
+    /// The grep corpus: tombstones, binaries, hidden and ignored subtrees are all out,
+    /// the glob decides the extension, and an empty entry is not worth a round trip.
+    #[test]
+    fn the_grep_corpus_is_glob_filtered_text_entries_only() {
+        let filter = GlobFilter::new(None).expect("glob");
+        assert_eq!(
+            grep_corpus(&vault(), &filter),
+            vec![
+                "Alpha.md".to_string(),
+                "Notes/Beta.md".to_string(),
+                "Notes/Deep/Gamma.md".to_string(),
+                "NotesArchive/Old.md".to_string(),
+            ]
+        );
+        // The binary attachment is never a grep candidate, whatever the glob says.
+        let everything = GlobFilter::new(Some("**/*")).expect("glob");
+        let corpus = grep_corpus(&vault(), &everything);
+        assert!(!corpus.contains(&"Assets/logo.png".to_string()));
+        // The tombstone and the ignored subtree stay out under a permissive glob too.
+        assert!(!corpus.contains(&"Removed.md".to_string()));
+        assert!(!corpus.contains(&"node_modules/pkg/index.md".to_string()));
+    }
+
+    /// Unlike the index's walk, the corpus does NOT require an `.md` extension: the
+    /// caller's glob decides, exactly as ripgrep's does.
+    #[test]
+    fn a_non_markdown_glob_reaches_text_entries_the_index_walk_skips() {
+        let mut entries = vault();
+        entries.push(entry("Notes/Plain.txt", EntryKind::Markdown, false));
+        assert!(!walk_markdown(&entries).contains(&"Notes/Plain.txt".to_string()));
+        let filter = GlobFilter::new(Some("*.txt")).expect("glob");
+        assert_eq!(
+            grep_corpus(&entries, &filter),
+            vec!["Notes/Plain.txt".to_string()]
+        );
+    }
+
+    /// A zero-`size` entry is STILL read. It cannot hold a match, so reading it is
+    /// wasted work — but `size` is metadata a foreign writer produced, and an exhaustive
+    /// search does not decide what to skip from metadata. See `grep_corpus`.
+    #[test]
+    fn a_zero_size_entry_is_still_a_candidate() {
+        let mut empty = entry("Empty.md", EntryKind::Markdown, false);
+        empty.size = 0;
+        let filter = GlobFilter::new(None).expect("glob");
+        assert_eq!(
+            grep_corpus(&[empty], &filter),
+            vec!["Empty.md".to_string()],
+            "a grep that claims to look everywhere must not trust `size`"
+        );
     }
 
     /// The write refusal must name its ACTUAL cause and the setting that changes it.

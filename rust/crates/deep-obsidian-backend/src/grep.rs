@@ -92,7 +92,11 @@ fn relative_vault_path(vault_path: &Path, absolute_path: &str) -> String {
 
 /// Split note text into lines exactly the way the tool layer does, so context line
 /// text is identical to what a `read_file` of the same note would report.
-fn split_note_lines(content: &str) -> Vec<String> {
+///
+/// Shared with [`crate::virtual_grep`] rather than transcribed there: it is the
+/// definition of a grep CONTEXT line, and a second copy that drifted (over the `\r` of
+/// a CRLF pair, say) would make one mount's context disagree with another's.
+pub(crate) fn split_note_lines(content: &str) -> Vec<String> {
     content
         .split('\n')
         .map(|line| line.trim_end_matches('\r').to_string())

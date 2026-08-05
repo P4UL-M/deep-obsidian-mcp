@@ -565,6 +565,23 @@ ARCH_READ="$(mcp read_file '{"path":"Wiki/Architecture.md"}' | pick 'd.result.st
 assert_eq "Wiki/Architecture.md round-trips byte-identical" \
   "$(printf '%b' "$ARCH_BODY")" "$ARCH_READ"
 
+say "grep_search scoped to Team/ -- line search on a mount with NO files on disk"
+note "There is nothing for ripgrep to open under Team/: those bytes live in CouchDB."
+note "The backend imitates ripgrep instead -- same pattern semantics, same match shape,"
+note "same context lines -- over note text it reads back through the sidecar."
+cmd "tools/call grep_search {query: Owner, glob: Team/**/*.md, contextLines: 1}"
+TEAM_GREP="$(mcp grep_search '{"query":"Owner","glob":"Team/**/*.md","contextLines":1}')"
+printf '%s\n' "$TEAM_GREP" | show '.result.structuredContent'
+GREP_PAYLOAD="$(printf '%s\n' "$TEAM_GREP" | pick 'JSON.stringify(d.result.structuredContent)')"
+assert_contains "grep on the couchdb mount finds the line" "Team/Standup.md" "$GREP_PAYLOAD"
+assert_contains "grep reports the matched line text" "Owner: demo" "$GREP_PAYLOAD"
+note "No 'exhaustive' key in that payload: this scan read EVERY note the glob admitted,"
+note "so it is exhaustive in exactly the sense ripgrep is. Contrast the Algolia mount,"
+note "whose grep is candidate-bounded and says so with exhaustive:false + candidateCount."
+note "The cost is the honest part: one full corpus read per query, no cache."
+EXHAUSTIVE_KEY="$(printf '%s\n' "$TEAM_GREP" | pick 'String(d.result.structuredContent.exhaustive)')"
+assert_eq "an exhaustive grep carries no exhaustive flag" "undefined" "$EXHAUSTIVE_KEY"
+
 say "list_children at the root: synthesized mount folders beside physical ones"
 cmd "tools/call list_children {path: \"\"}"
 CHILDREN="$(mcp list_children '{"path":""}')"
@@ -873,7 +890,8 @@ cat <<RECAP
        the Algolia mount's absent binary capabilities and the CouchDB mount's watch
     4  path-based routing, proved from INSIDE each backend: a LiveSync entry+leaf
        pair in CouchDB, note+chunk records in Algolia, byte-identical reads back,
-       and synthesized mount folders indistinguishable from physical ones
+       synthesized mount folders indistinguishable from physical ones, and
+       grep_search finding a line on a mount that has no files for ripgrep to open
     5  expectedHash as compare-and-set: the stale write refused with both hashes
        named, the fresh one applied
     6  one unscoped hybrid_search fanning out to three mounts, per-hit mountId,

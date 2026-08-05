@@ -11,7 +11,8 @@ and usage, see the top-level [USAGE.md](../USAGE.md).
 - `list_children` — list a folder's contents (`foldersOnly:true` for subfolders only)
 - `read_file` — read a whole note or a line range (`startLine`/`endLine`)
 - `find_files` — find notes by substring or regex path match
-- `grep_search` — search note contents with ripgrep
+- `grep_search` — search note contents with ripgrep (or, on a CouchDB mount, an exhaustive
+  imitation of it — see "Line search per mount kind")
 - `build_index` — force an explicit index rebuild
 - `hybrid_search` — BM25 + semantic ranking (`bm25Weight:0` = semantic-only, `semanticWeight:0` = BM25-only)
 - `related_notes` — notes related by subject similarity
@@ -27,8 +28,12 @@ and usage, see the top-level [USAGE.md](../USAGE.md).
 contains. Everything else about it is frozen. The rule throughout: **a tool that could only
 ever refuse is not advertised.**
 
-1. **ripgrep** — `grep_search` exists if and only if a working `rg` was resolved. It is
-   omitted rather than advertised-and-failing.
+1. **ripgrep** — `grep_search` exists if and only if the ROOT mount declares
+   `grep-search`, which on a filesystem root means a working `rg` was resolved. It is
+   omitted rather than advertised-and-failing. A non-root CouchDB mount declares
+   `grep-search` without needing `rg` (it imitates it in-process), but `tools/list` cannot
+   say "available for some paths", so registration stays keyed on the root; per-mount truth
+   is in `vault_info.mounts[].capabilities`.
 2. **multiple mounts** — a multi-mount vault adds a required `scope` argument to the recall
    tools that rank (`hybrid_search`, `load_knowledge`, `search_artifacts`). It adds no tool
    and removes none; a single-mount vault's list is unchanged.
@@ -71,6 +76,20 @@ produce that case emits payloads byte-identical to the ones it always emitted:
 - `grep_search` gains `exhaustive: false`, `candidateCount` and `exhaustiveNote` only when the
   search could not read every line in scope. A ripgrep-served search emits none of them, so
   an absent `exhaustive` still means exhaustive.
+
+#### Line search per mount kind
+
+The match shape is identical everywhere. What differs is completeness and cost:
+
+| Mount | How | Exhaustive? | Cost |
+|---|---|---|---|
+| Filesystem | spawns `rg` | yes | one tree walk |
+| CouchDB (LiveSync) | exhaustive virtual scan: manifest → `glob` pre-filter → read every candidate note through the sidecar and match in-process | yes | **a full corpus read per query**; no cache. Narrow the `glob` or lower the `limit` |
+| Algolia | candidate-bounded: top-200 lexical prefilter, then the pattern | **no** | one search request |
+
+So a CouchDB grep is complete (no `exhaustive` key, like ripgrep's) but slow on a large
+vault, and an Algolia grep is fast but reports `exhaustive: false` with a `candidateCount`.
+An unscoped grep on a multi-mount vault concatenates every mount's matches in config order.
 
 #### Recall on a native-recall mount
 

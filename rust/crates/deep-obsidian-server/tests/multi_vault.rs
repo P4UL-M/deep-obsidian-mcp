@@ -2046,22 +2046,23 @@ async fn vault_info_reports_write_capabilities_per_mount() {
     }
 }
 
-/// `grep_search` scoped to a CouchDB mount is refused, and the refusal says the vault
-/// has no local files rather than blaming a missing ripgrep.
+/// `grep_search` scoped to a CouchDB mount is SERVED, with context and logical paths.
 ///
-/// # Which guard actually fires, verified rather than assumed
+/// This replaced a refusal. The mount has no files for ripgrep to open, so the backend
+/// imitates ripgrep over note text read back through the sidecar — and the caller
+/// cannot tell, which is the whole point: same matches, same context, same
+/// `exhaustive`-by-omission payload shape.
+///
+/// # Which path actually serves it, verified rather than assumed
 ///
 /// `AppState::rg_available` is derived from the ROOT mount only, so with a filesystem
-/// root it stays true and `grep_search` stays advertised. `VaultRouter::grep` does NOT
-/// check `Capability::GrepSearch`; it scopes by the caller's `glob` and delegates to
-/// that one mount's backend. So a glob that narrows to the couchdb prefix DOES reach
-/// `CouchDbVaultBackend`'s `Recall::Grep` arm, and its message is what the caller sees
-/// — the arm is genuinely reachable through MCP, not dead defence-in-depth.
-///
-/// An UNSCOPED grep is refused earlier, by the router's federation guard, which is
-/// already covered by `an_unscoped_grep_is_refused_rather_than_answered_from_one_mount`.
+/// root it stays true and `grep_search` stays advertised. `VaultRouter::grep` scopes by
+/// the caller's `glob` and delegates to that one mount's backend. So a glob that narrows
+/// to the couchdb prefix reaches `CouchDbVaultBackend`'s `Recall::Grep` arm, and its
+/// matches are what the caller sees — the arm is genuinely reachable through MCP, not
+/// dead defence-in-depth.
 #[tokio::test]
-async fn grep_scoped_to_a_couchdb_mount_is_refused_honestly() {
+async fn grep_scoped_to_a_couchdb_mount_is_served_by_the_virtual_grep() {
     if !node_available() {
         eprintln!("skipping: `node` is not available on PATH");
         return;
@@ -2076,29 +2077,49 @@ async fn grep_scoped_to_a_couchdb_mount_is_refused_honestly() {
     let response = tool_call(
         &state,
         "grep_search",
-        json!({"query": "Charter", "glob": "LiveSync/**/*.md"}),
+        json!({"query": "LiveSync", "glob": "LiveSync/**/*.md", "contextLines": 1}),
     )
     .await;
-    let message = error_message(&response);
-    // The couchdb backend's own refusal, reached through the router.
-    assert!(message.contains("EXPERIMENTAL"), "{message}");
-    assert!(message.contains("READ-ONLY"), "{message}");
+    let payload = structured(&response);
+    let matches = payload["matches"].as_array().expect("matches");
+    let paths: Vec<&str> = matches
+        .iter()
+        .map(|item| item["path"].as_str().expect("path"))
+        .collect();
+    // Both stub notes contain "LiveSync", and the paths are LOGICAL: the router
+    // re-prefixed the mount-relative paths the backend reported.
+    assert!(paths.contains(&"LiveSync/Charter.md"), "{paths:?}");
+    assert!(paths.contains(&"LiveSync/Deep/Nested.md"), "{paths:?}");
     assert!(
-        message.contains("do not exist for a CouchDB vault"),
-        "the refusal must name the real reason: {message}"
+        paths.iter().all(|path| path.starts_with("LiveSync/")),
+        "{paths:?}"
     );
-    // ...and it must NOT blame a missing binary, which is the honest-error point.
-    assert!(
-        !message.contains("ripgrep is not installed"),
-        "the refusal must not blame a missing binary: {message}"
+    // Context travelled with the matches, from the same one round trip.
+    let charter = matches
+        .iter()
+        .find(|item| item["path"] == "LiveSync/Charter.md")
+        .expect("the charter match");
+    assert_eq!(charter["lineNumber"], json!(1));
+    assert_eq!(charter["lineText"], json!("# LiveSync Charter"));
+    assert_eq!(
+        charter["contextAfter"][0]["lineText"],
+        json!(""),
+        "the blank line under the heading: {charter}"
     );
-    // It points at what DOES work on this mount.
-    assert!(message.contains("hybrid_search"), "{message}");
+    // A full scan, so the payload keeps grep's frozen "exhaustive by omission" shape:
+    // no `exhaustive` key, no `candidateCount`, nothing about being degraded. This is
+    // what distinguishes it from the Algolia mount's candidate-bounded grep.
+    for absent in ["exhaustive", "candidateCount", "exhaustiveNote", "degraded"] {
+        assert!(
+            payload.get(absent).is_none(),
+            "an exhaustive grep must not carry {absent}: {payload}"
+        );
+    }
 
-    // Sanity: grep on the FILESYSTEM root still works, so the refusal is per-mount and
-    // not a global loss of the tool. The glob names `Notes/` rather than `*.md`
-    // because a root-scoped glob would span the LiveSync mount too, which the
-    // router refuses for the unrelated federation reason.
+    // Grep on the FILESYSTEM root still works, so nothing about the couchdb mount
+    // changed the rg path. The glob names `Notes/` rather than `*.md` because a
+    // root-scoped glob would span the LiveSync mount too, which the router refuses for
+    // the unrelated federation reason.
     let root = tool_call(
         &state,
         "grep_search",
@@ -2109,6 +2130,86 @@ async fn grep_scoped_to_a_couchdb_mount_is_refused_honestly() {
         root.get("result").is_some(),
         "grep on the filesystem root must still work: {root}"
     );
+}
+
+/// An UNSCOPED grep now includes the couchdb mount's hits alongside the filesystem
+/// root's, and stops reporting the mount as missing.
+///
+/// # The transition this pins
+///
+/// Federation concatenates each mount's matches, and a mount whose grep FAILED lands in
+/// `missingBackends` with `exhaustive: false` — which is exactly what a couchdb mount
+/// used to do, because its `Recall::Grep` arm refused. With the capability present it
+/// simply participates, so the degradation keys disappear from the payload. Asserting
+/// their ABSENCE is what makes the transition observable rather than incidental.
+#[tokio::test]
+async fn an_unscoped_federated_grep_includes_the_couchdb_mounts_hits() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-grep-federated");
+    let state = fixture.state().await;
+    if !state.rg_available {
+        eprintln!("skipping: ripgrep is not available, so grep_search is not advertised");
+        return;
+    }
+
+    // "Nested" is in BOTH vaults: the filesystem root's `Notes/Deep/Nested.md` and the
+    // couchdb mount's `Deep/Nested.md`. One unscoped query must return both.
+    let response = tool_call(&state, "grep_search", json!({"query": "nested"})).await;
+    let payload = structured(&response);
+    let paths: Vec<&str> = payload["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .map(|item| item["path"].as_str().expect("path"))
+        .collect();
+    assert!(
+        paths.iter().any(|path| path.starts_with("LiveSync/")),
+        "the couchdb mount must contribute to a federated grep: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| !path.starts_with("LiveSync/")),
+        "the filesystem root must still contribute: {paths:?}"
+    );
+    // Every mount answered, so the answer is neither degraded nor short.
+    assert!(payload.get("missingBackends").is_none(), "{payload}");
+    assert!(payload.get("degraded").is_none(), "{payload}");
+    assert!(payload.get("exhaustive").is_none(), "{payload}");
+}
+
+/// The capability is reported through `vault_info`, so a client can see WHY grep works
+/// on this mount rather than having to try it.
+///
+/// Also the proof that it does not ride on `writable`: the mount here is read-only.
+#[tokio::test]
+async fn a_read_only_couchdb_mount_advertises_grep_search_in_vault_info() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-grep-capability");
+    let state = fixture.state().await;
+
+    let response = tool_call(&state, "vault_info", json!({})).await;
+    let info = structured(&response);
+    let mount = info["mounts"]
+        .as_array()
+        .expect("mounts")
+        .iter()
+        .find(|entry| entry["id"] == "live")
+        .unwrap_or_else(|| panic!("the couchdb mount must be listed: {info}"));
+    let capabilities: Vec<&str> = mount["capabilities"]
+        .as_array()
+        .expect("capabilities")
+        .iter()
+        .map(|item| item.as_str().expect("capability"))
+        .collect();
+    assert!(capabilities.contains(&"grep-search"), "{capabilities:?}");
+    // ...while the write capabilities stay absent, which is the axis `writable` gates.
+    assert!(!capabilities.contains(&"binary-write"), "{capabilities:?}");
+    assert!(!capabilities.contains(&"upload"), "{capabilities:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2142,8 +2243,7 @@ impl AlgoliaFixture {
             .expect("fixture base")
             .to_path_buf();
         let state = deep_obsidian_algolia::mock::MockAlgolia::default();
-        let (base_url, mock) =
-            deep_obsidian_algolia::mock::spawn_mock_with(state.clone()).await;
+        let (base_url, mock) = deep_obsidian_algolia::mock::spawn_mock_with(state.clone()).await;
         Self {
             inner,
             base_url,
@@ -3831,7 +3931,10 @@ async fn an_algolia_mount_that_goes_down_mid_session_fails_honestly_and_recovers
     // Warm the cache: this read hydrates from chunks and fills it.
     let warm = structured(&tool_call(&state, "read_file", json!({"path": path})).await).clone();
     assert!(
-        warm["text"].as_str().expect("text").contains("in the cache"),
+        warm["text"]
+            .as_str()
+            .expect("text")
+            .contains("in the cache"),
         "{warm}"
     );
 

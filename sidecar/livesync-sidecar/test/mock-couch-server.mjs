@@ -22,6 +22,7 @@
 import { createInterface } from "node:readline";
 import { MockCouch } from "./mock-couch.mjs";
 import { largeVault, smallVault } from "./fixtures.mjs";
+import { loadE2EEFixture } from "./e2ee-fixture.mjs";
 
 /** The fixture vaults the Rust suite can ask for, by `--vault`. */
 const VAULTS = {
@@ -39,6 +40,17 @@ const VAULTS = {
     },
     /** Enough entries that manifest pagination is exercised. */
     large: () => largeVault(40),
+    /**
+     * The committed dump of a REAL E2EE vault: `Notes/Encrypted.md` and
+     * `assets/encrypted.bin` are stored as `h:+` chunks of genuine ciphertext, produced
+     * by upstream's own key schedule (`npm run fixtures:e2ee`).
+     *
+     * Exposed to the Rust suite so a test can prove a feature composes with DECRYPTION
+     * rather than only with plaintext reads. A caller must supply
+     * `E2EE_PASSPHRASE` — without it the handshake reports `e2ee-required`, which is
+     * exactly the fixture's other use in the sidecar's own suite.
+     */
+    e2ee: () => loadE2EEFixture().vault,
 };
 
 function usage() {
@@ -88,6 +100,18 @@ const couch = new MockCouch({
 const url = await couch.listen();
 
 /**
+ * Monotonic suffix for pushed chunk ids.
+ *
+ * `Date.now()` alone is NOT unique: a parent seeding several notes back to back over
+ * the pipe lands them inside one millisecond, every push then computes the SAME chunk
+ * id, `putDoc` overwrites the previous body, and each of those entries'
+ * `children: [id]` aliases the last writer's text. A reader gets the wrong content for
+ * every note but the last — silently, and looking exactly like a bug in whatever is
+ * reading. The counter makes the id unique per push regardless of timing.
+ */
+let pushSeq = 0;
+
+/**
  * Commands the parent can issue. Kept to what a Rust test genuinely cannot do
  * from outside: cause a live edit, and read back the write ledger.
  */
@@ -97,7 +121,8 @@ const COMMANDS = {
      * lower-cased paths, matching upstream's `path2id_base`.
      */
     "push-note": ({ path, text }) => {
-        const id = `h:pushed-${Date.now()}`;
+        pushSeq += 1;
+        const id = `h:pushed-${Date.now()}-${pushSeq}`;
         couch.putDoc(id, { type: "leaf", data: text });
         couch.pushChange(path.toLowerCase(), {
             path,

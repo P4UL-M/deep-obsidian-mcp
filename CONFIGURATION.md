@@ -385,7 +385,11 @@ within a single index.
   gain an **optional** `scope` argument: omit it for the federated whole-vault answer,
   pass it to search one mount natively. A single-mount vault's tool surface is unchanged.
 - `grep_search` and `find_files` search every mount too. Both produce matches or an
-  enumeration rather than a ranking, so merging them needs no fusion.
+  enumeration rather than a ranking, so merging them needs no fusion. How a mount serves
+  line search differs by backend — a filesystem mount spawns `rg`, a CouchDB mount runs an
+  exhaustive virtual scan that costs a full corpus read per query, and an Algolia mount is
+  candidate-bounded and says so with `exhaustive: false`. See
+  [docs/behavior-contract.md](./docs/behavior-contract.md#line-search-per-backend).
 - Tools whose whole purpose depends on a capability appear only when some mount has
   it. See
   [docs/mcp-reference.md](./docs/mcp-reference.md#conditionally-advertised-tools).
