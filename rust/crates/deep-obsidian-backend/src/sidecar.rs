@@ -947,6 +947,14 @@ impl Connection {
         self.dead.load(Ordering::SeqCst)
     }
 
+    /// The OS pid of the child, or `None` once it has been reaped.
+    fn pid(&self) -> Option<u32> {
+        self.child
+            .lock()
+            .ok()
+            .and_then(|child| child.as_ref().and_then(Child::id))
+    }
+
     /// One request/response round trip.
     async fn request(
         &self,
@@ -1384,6 +1392,20 @@ impl SidecarSupervisor {
         if let Ok(mut health) = self.health.lock() {
             apply(&mut health);
         }
+    }
+
+    /// The pid of the child currently serving this supervisor, if one is running.
+    ///
+    /// Diagnostic, and the one thing a supervision test genuinely cannot get any other
+    /// way: proving that an ABRUPT death is survived means killing the real process,
+    /// and killing by name or process group would risk somebody else's `node`. Returns
+    /// `None` before the first start and between a death and the next restart, so a
+    /// caller must never treat it as "the supervisor is up".
+    pub fn child_pid(&self) -> Option<u32> {
+        self.connection
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(|connection| connection.pid()))
     }
 
     /// The last opaque cursor observed. Callers persist it and hand it back

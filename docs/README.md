@@ -18,7 +18,8 @@ the top-level guides instead:** [README](../README.md) ·
 
 ## Maintainer / internal
 
-- [behavior-contract.md](./behavior-contract.md) — server behavior contract.
+- [behavior-contract.md](./behavior-contract.md) — server behavior contract, including the
+  [multi-mount rules](./behavior-contract.md#multi-mount-vaults) a client can rely on.
 - [retrieval-eval.md](./retrieval-eval.md) — retrieval evaluation harness.
 - [release-checklist.md](./release-checklist.md) — release steps.
 - [homebrew-gap-todo.md](./homebrew-gap-todo.md) — outstanding release-artifact gaps.

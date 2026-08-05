@@ -105,6 +105,29 @@ export class MockCouch {
          * it, and a naive retry would use a base revision that no longer exists.
          */
         this.dropNextEntryPutResponses = 0;
+        /**
+         * Answer the next N requests of ANY kind 500 -- a remote OUTAGE rather than a
+         * write failure.
+         *
+         * Separate from `failNextWrites` because the two model different faults, and a
+         * resilience test needs the one that breaks READS: under `failNextWrites` every
+         * GET still works, so the mount keeps serving content and nothing about an
+         * outage or a recovery from one is observable.
+         *
+         * Counted rather than a boolean so the outage ENDS BY ITSELF after a known
+         * number of requests. That is what lets a test assert recovery by polling the
+         * operation instead of sleeping for a window it guessed at.
+         */
+        this.failNextRequests = 0;
+        /**
+         * DESTROY the socket for the next N requests without answering -- a connection
+         * drop rather than an HTTP error.
+         *
+         * The distinction matters at the boundary: a 500 is a response the client can
+         * classify and report, a dropped socket is a transport failure. Modelling only
+         * the 500 would leave the transport branch untested.
+         */
+        this.destroyNextRequests = 0;
 
         for (const [id, body] of Object.entries(options.docs ?? {})) {
             this.putDoc(id, body);
@@ -220,6 +243,21 @@ export class MockCouch {
         const record = `${req.method} ${req.url}`;
         this.requests.push(record);
         if (this.debug) process.stderr.write(`MOCK ${record}${body ? ` ${body.slice(0, 300)}` : ""}\n`);
+
+        // The outage injections run BEFORE anything is dispatched and AFTER the request
+        // is recorded, so a test can still see what was attempted during the window.
+        // Ahead of `authStatus` on purpose: an outage is not an authorization verdict,
+        // and a fixture configured with both must report the outage.
+        if (this.destroyNextRequests > 0) {
+            this.destroyNextRequests -= 1;
+            req.destroy();
+            res.destroy();
+            return;
+        }
+        if (this.failNextRequests > 0) {
+            this.failNextRequests -= 1;
+            return send(res, 500, { error: "internal_server_error", reason: "injected outage" });
+        }
 
         if (this.authStatus !== undefined) {
             return send(res, this.authStatus, { error: "unauthorized", reason: "mock" });

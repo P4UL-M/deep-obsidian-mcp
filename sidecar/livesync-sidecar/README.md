@@ -588,6 +588,23 @@ pass. Failure injection (`failNextWrites`, `dropNextEntryPutResponses`) and
 through the write API — that is the point of CAS) are what make the retry-safety and
 `conflicts` tests possible.
 
+Two further injections model an **outage** rather than a write failure, and they are
+what the Rust resilience suite drives:
+
+- `failNextRequests` — answer the next N requests of *any* kind `500`;
+- `destroyNextRequests` — destroy the socket for the next N requests without
+  answering.
+
+Both are needed because `failNextWrites` leaves every `GET` working, so a mount under
+it keeps serving content and nothing about an outage — or a recovery from one — is
+observable. The two are separate because they arrive at the sidecar's HTTP client as
+different failures: a `500` is a response that can be classified, a dropped socket is
+a transport failure with no status code. Both are request **counts** rather than
+durations, so a caller either bounds the window or opens it wide and clears it with
+`0`: the fixture keeps its port for the whole test and a recovery is observed by
+re-issuing the operation, never by sleeping. Unbinding and rebinding a listener would
+be the alternative and would race `TIME_WAIT`.
+
 ### Closed by the write plane: E2EE and obfuscation
 
 Earlier slices could only prove *classification* — `e2ee-required` and
