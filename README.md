@@ -74,10 +74,14 @@ A vault does not have to be one directory. An experimental `mounts` table grafts
 other storage onto folders of your vault — a Self-hosted LiveSync database in
 CouchDB, or a Markdown-only corpus in an Algolia index that a whole team can mount
 at once — so your agent sees a single namespace while different prefixes are served
-from different places. Everything is behind `experimental` flags, read-only unless
-you opt in per mount, and off by default: a config with no `mounts` table behaves
-exactly as it always has. See
-[CONFIGURATION.md § Multiple vaults](./CONFIGURATION.md#multiple-vaults-mounts), and
+from different places. Search spans the whole namespace: an unscoped query asks every
+mount and fuses the answers, and if a mount cannot be reached the answer says so and
+names it rather than quietly returning less. Everything is behind `experimental`
+flags, read-only unless you opt in per mount, and off by default: a config with no
+`mounts` table behaves exactly as it always has. See
+[CONFIGURATION.md § Multiple vaults](./CONFIGURATION.md#multiple-vaults-mounts) for
+the config, [docs/behavior-contract.md § Multi-mount vaults](./docs/behavior-contract.md#multi-mount-vaults)
+for what a client can rely on, and
 [docs/algolia-mounts.md](./docs/algolia-mounts.md) for the shared-corpus design,
 its versioning model, and its limits.
 

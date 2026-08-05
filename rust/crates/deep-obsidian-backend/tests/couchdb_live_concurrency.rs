@@ -40,6 +40,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,8 +52,32 @@ use deep_obsidian_backend::{
 };
 use secrecy::SecretString;
 
-/// Created and dropped by this file. Never the configured database.
-const SCRATCH_DATABASE: &str = "deep-obsidian-rust-concurrency";
+/// Prefix of the databases created and dropped by this file. Never the configured one.
+const SCRATCH_DATABASE_PREFIX: &str = "deep-obsidian-rust-concurrency";
+
+/// Distinguishes concurrently created scratch databases within one process.
+static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A scratch database name UNIQUE to this `ScratchVault`.
+///
+/// # Why this cannot be a constant
+///
+/// `live-scratch.mjs` DELETEs the name before creating it, which is what makes a crashed
+/// previous run recoverable. With one shared name and `cargo test`'s default parallelism,
+/// the second test's create wiped the first test's database mid-run: both tests passed
+/// alone and one of them failed, alternating, whenever they ran together. Suffixing by pid
+/// and a counter is what makes the isolation real rather than nominal, and the pid keeps
+/// two concurrent `cargo test` invocations against one server apart as well.
+///
+/// CouchDB database names allow only `[a-z0-9_$()+/-]` and must start with a letter, so
+/// the suffix is digits and hyphens only.
+fn scratch_database_name() -> String {
+    format!(
+        "{SCRATCH_DATABASE_PREFIX}-{}-{}",
+        std::process::id(),
+        SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 fn sidecar_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -123,7 +148,7 @@ impl ScratchVault {
             .args(["--url", &target.url])
             .args(["--user", &target.username])
             .args(["--password", &target.password])
-            .args(["--database", SCRATCH_DATABASE])
+            .args(["--database", &scratch_database_name()])
             .current_dir(sidecar_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

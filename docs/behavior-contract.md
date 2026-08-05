@@ -113,10 +113,13 @@ what it contains. Everything else about it is frozen.
 1. **Environment — ripgrep.** `grep_search` is advertised if and only if a working `rg` was
    resolved. "rg works or `grep_search` does not exist": it is omitted rather than
    advertised-and-failing.
-2. **Configuration — multiple mounts.** A multi-mount vault adds a required `scope`
+2. **Configuration — multiple mounts.** A multi-mount vault adds an OPTIONAL `scope`
    argument to the recall tools that rank (`hybrid_search`, `load_knowledge`,
    `search_artifacts`). It adds no tool and removes none. A single-mount vault's list is
-   unchanged.
+   unchanged. `scope` must not be required: omitting it asks for the federated answer
+   over every mount, and declaring it required would tell a client the whole-vault
+   search does not exist. Each `scope` description must state what omitting it does, or
+   a client reading only the schema cannot discover federation at all.
 3. **Configuration — mount capabilities.** A mount declares what its storage can do
    (`vault_info.mounts[].capabilities`), and tools whose whole purpose depends on a
    capability are advertised only when at least one mount has it:
@@ -174,6 +177,87 @@ Resources must preserve:
 - `obsidian://note?path=...`
 - `obsidian://heading?path=...&slug=...`
 - `obsidian://block?path=...&id=...`
+
+## Multi-mount vaults
+
+A vault may be composed of several **mounts**, each a prefix of the logical namespace
+served by its own storage backend. This is experimental and off by default: a config with
+no `mounts` table resolves to exactly one filesystem mount at the root and every rule
+below collapses to what it has always been. The shape of the config, and the per-backend
+setup, live in [CONFIGURATION.md § Multiple vaults](../CONFIGURATION.md#multiple-vaults-mounts)
+and [docs/algolia-mounts.md](./algolia-mounts.md); this section states only the rules a
+*client* can rely on, and it is a reference — the per-doc details are not repeated here.
+
+### One namespace, one path vocabulary
+
+Every path a client sends or receives is **logical**: relative to the vault root, with the
+owning mount's prefix included. A client never sees a backend's own addressing, and a
+mount's internal layout is not discoverable from a path. Routing is longest-prefix over
+`mountAt`, so exactly one mount owns any given path.
+
+### The honesty rules
+
+These are the same rules stated per-payload under "Payload additions are conditional on
+being true" above, and they are collected here because multi-mount is where they all
+become reachable at once:
+
+- **`degraded` / `missingBackends` / `degradationReason`** — a federated answer that could
+  not consult every mount says so, names the mounts it lost, and says what happened. These
+  describe *the answer just produced*, not a latched state: once the mount answers again,
+  the same query stops being degraded and stops naming it.
+- **Skipped is not missing.** A mount that legitimately holds nothing a tool asks for (an
+  Algolia mount has no artifact store) is reported as skipped with a reason, and the answer
+  is **not** degraded. Nothing was omitted. Calling that a missing backend would teach a
+  reader to ignore `missingBackends`.
+- **`foldersTruncated`** — a mount that could not enumerate every subfolder says so. A
+  mount whose folders are real directories never sets it.
+- **`exhaustive` (grep) and `exhausted` (recall) are different facts** and must not be
+  unified. `exhaustive: false` means the search did not look everywhere, so an empty result
+  is not proof of absence. `exhausted: false` means the search looked everywhere and there
+  are more results than `limit` asked for.
+- **Native recall is labelled.** When a mount ranked with its own index rather than the
+  local one, the result carries `nativeRecall`, `recallMode`, `mountId` and `exhausted`,
+  and omits the fields that describe the local ranker — which would otherwise be fabricated
+  values.
+- **Enumeration refuses rather than under-reporting.** A whole-vault listing that cannot
+  reach a mount fails, naming the mount. A listing that silently omitted it would assert
+  those notes do not exist.
+- **Readiness names the mount.** A failing non-root mount degrades readiness (`503`,
+  `degradedMounts`) while the root keeps serving. The frozen top-level wording is unchanged;
+  the mount id appears in the additive per-mount detail rather than being laundered into
+  `lastError`.
+
+### Capability gating, and its one exception
+
+A mount declares what its storage can do (`vault_info.mounts[].capabilities`). A tool whose
+whole purpose depends on a capability is advertised only when at least one mount has it, and
+an advertised tool may still refuse a particular path whose owning mount lacks it — naming
+the mount, its backend, and the mounts that do support the operation. See "Tool availability"
+above for the current mapping.
+
+The exception is **binary content**, and it is per-path rather than per-mount. An Algolia
+mount stores Markdown only — there is no record shape for bytes — so it advertises Markdown
+capabilities normally and refuses every binary operation on its prefix, including a raw byte
+read of a `.md` path. `request_vault_upload` is refused **at the mint**, before a token is
+issued, so a caller never streams a body to an impossible destination. These refusals must
+not mention `writable`: turning writes on cannot help, and naming a setting that would not
+fix it sends the reader to the wrong place. See
+[docs/algolia-mounts.md § The binary exception](./algolia-mounts.md#the-binary-exception).
+
+### What multi-mount does not promise
+
+- **A write is never fanned out.** A write lands in the single mount owning its path.
+- **No content crosses a backend boundary.** Mounts meet as *ranks*: fusion consumes a
+  logical path, a chunk index, a rank and a mount id, and nothing else. The final rerank
+  does read candidate text and vectors, but it reads and scores them inside the server, over
+  content the server already holds to render snippets — no mount is ever asked to score
+  another mount's content, and nothing is sent to a backend that did not already have it.
+- **Change cursors are not persisted.** A backend rebuilt from config starts with no cursor
+  and replays from the beginning, so it misses nothing but does more work. Cursors survive a
+  child-process restart within one supervisor's life, not a server restart.
+- **A cached compatibility verdict needs a restart.** A CouchDB mount whose remote was
+  unreachable when the sidecar hand-shook stays degraded until the child re-hand-shakes;
+  bringing the remote back does not by itself clear it.
 
 ## Fixture Vault Contract
 

@@ -138,6 +138,26 @@ const COMMANDS = {
         couch.dropNextEntryPutResponses = Number(count ?? 1);
         return { dropNextEntryPutResponses: couch.dropNextEntryPutResponses };
     },
+    /**
+     * Answer the next N requests of ANY kind 500: a remote OUTAGE, which is the only
+     * injection that breaks reads and therefore the only one a resilience test can
+     * observe a recovery from.
+     *
+     * The window is a request COUNT rather than a duration: a caller either bounds it
+     * (fail the next 3) or opens it wide and clears it with `count: 0`. Either way the
+     * fixture keeps its port for the whole test, so a recovery is observed by re-issuing
+     * the operation. Unbinding and rebinding a listener would be the alternative and
+     * would race `TIME_WAIT`.
+     */
+    "fail-next-requests": ({ count }) => {
+        couch.failNextRequests = Number(count ?? 1);
+        return { failNextRequests: couch.failNextRequests };
+    },
+    /** Destroy the socket for the next N requests: a connection drop, not a 500. */
+    "destroy-next-requests": ({ count }) => {
+        couch.destroyNextRequests = Number(count ?? 1);
+        return { destroyNextRequests: couch.destroyNextRequests };
+    },
 };
 
 // The handshake line. Written before any command is read so the parent can wait

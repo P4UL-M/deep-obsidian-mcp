@@ -8,12 +8,15 @@
 //! engine: ranking is a simple token-overlap score with `updatedAtMs`
 //! tie-break.
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -33,16 +36,54 @@ pub struct MockAlgolia {
     /// outside their scope. Without this the anti-enumeration mapping could only be
     /// verified against a live account.
     forbidden_object_ids: Arc<Vec<String>>,
+    /// While set, EVERY endpoint answers 503 instead of dispatching.
+    ///
+    /// # Why a flag rather than dropping the server
+    ///
+    /// The obvious way to make a backend unreachable is to abort the serving task, and
+    /// it cannot be undone: the ephemeral port is gone, and rebinding it races
+    /// `TIME_WAIT`. A resilience test has to assert RECOVERY as well as failure, so the
+    /// listener stays bound for the whole test and only the dispatch is gated. What the
+    /// client sees is a 5xx from the configured host, which is the transient failure a
+    /// single-host client actually meets (see `client.rs`: no retry fan-out to the
+    /// `-1..-3.algolianet.com` fallbacks).
+    ///
+    /// Shared through the `Clone`, so a test that holds a clone can flip it while the
+    /// server task holds another.
+    outage: Arc<AtomicBool>,
 }
 
 impl MockAlgolia {
     /// A mock that refuses `object_ids` with the secured-key 403.
     pub fn with_forbidden_object_ids(object_ids: Vec<String>) -> Self {
         Self {
-            indexes: Arc::new(Mutex::new(HashMap::new())),
             forbidden_object_ids: Arc::new(object_ids),
+            ..Self::default()
         }
     }
+
+    /// Every subsequent request answers 503 until [`Self::end_outage`].
+    pub fn begin_outage(&self) {
+        self.outage.store(true, Ordering::SeqCst);
+    }
+
+    /// Serve normally again. The corpus is untouched by an outage, so a read that
+    /// succeeded before it succeeds again after it.
+    pub fn end_outage(&self) {
+        self.outage.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Answers 503 while the mock is in an outage; otherwise dispatches normally.
+async fn outage_gate(State(state): State<MockAlgolia>, request: Request, next: Next) -> Response {
+    if state.outage.load(Ordering::SeqCst) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"message": "injected outage", "status": 503})),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Binds to an ephemeral loopback port and serves the mock; returns the base
@@ -90,6 +131,10 @@ pub fn router(state: MockAlgolia) -> Router {
             "/1/indexes/{index}/facets/{facet}/query",
             post(handle_facet_query),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            outage_gate,
+        ))
         .with_state(state)
 }
 

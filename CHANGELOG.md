@@ -2,6 +2,97 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## Unreleased
+
+### Added
+
+- **Multi-backend vaults (experimental, off by default).** A vault can now be
+  composed of several **mounts**, each grafting other storage onto a folder of
+  your vault while your agent keeps seeing one namespace. Nothing changes for a
+  config with no `mounts` table: it resolves to exactly one filesystem mount at
+  the root and every payload stays byte-identical to what it was. Every backend
+  beyond the filesystem is behind its own `experimental` flag and is read-only
+  until you opt in per mount.
+
+  - **A `VaultBackend` boundary.** All vault IO — reads, listings, writes,
+    uploads, grep, recall — goes through one trait, with the filesystem as its
+    first implementation and a parameterized conformance suite every backend must
+    pass. Indexing was generalized behind a `NoteSource` trait so a mount's index
+    no longer assumes a directory.
+  - **A multi-mount router.** Longest-prefix routing over `mountAt`: exactly one
+    mount owns any path, each mount gets its own runtime and index in its own
+    directory, and a write lands in the single mount that owns its path.
+  - **CouchDB / Self-hosted LiveSync mounts** (`experimental.couchdbVaults`).
+    Mount a LiveSync database as a folder of your vault. Served by a supervised
+    Node **sidecar** speaking a versioned stdio protocol, pinned to the upstream
+    library triple it was built against so a schema drift fails closed instead of
+    reassembling notes wrong. Reads, listings, live change feed, revision-guarded
+    writes, soft deletes, conflict enumeration, binary uploads, and export/restore.
+    E2EE and path obfuscation supported.
+  - **Algolia mounts** (`experimental.algoliaVaults`). Mount a **shared,
+    Markdown-only** corpus that a whole team can mount at once, with per-note
+    version history, guarded fork-on-stale writes, divergence recording and
+    resolution, retention, and a `note`/`chunk` record model. Ranking is served by
+    Algolia itself rather than by a local index.
+  - **Federated recall.** An unscoped `hybrid_search` / `load_knowledge` /
+    `search_artifacts` asks every mount and fuses the answers with weighted
+    reciprocal-rank fusion plus a final single-ranker rerank, so one mount's best
+    hit can actually be compared with another's. Optional per-mount
+    `recallWeight`; `federatedRerank: false` exposes the pure fusion order. Recall
+    quality is gated against the single-index baseline by a dedicated eval suite.
+  - **Capability-gated tools.** `note_history`, `read_version`,
+    `resolve_divergence` and `delete_note` are advertised only when a mount can
+    actually serve them, and refuse per-path by naming the mount, its backend, and
+    the mounts that do support the operation. A tool that could only ever refuse is
+    not advertised at all.
+  - **Packaging and diagnostics.** The sidecar ships in the `.deb`, `doctor`
+    reports per-mount status, and readiness degrades by mount name (`503`,
+    `degradedMounts`) while the vault root keeps serving.
+
+### Improved
+
+- **Answers say what they could not do.** A federated answer that lost a mount
+  carries `degraded`, `missingBackends` and a `degradationReason` naming it; a
+  mount that legitimately holds nothing a tool asks for is reported as *skipped*
+  and the answer is **not** degraded. A truncated folder listing sets
+  `foldersTruncated`; a non-exhaustive grep sets `exhaustive: false`. Every one of
+  these fields appears only in the case it describes, so a backend that cannot
+  produce that case emits the payloads it always emitted. `docs/behavior-contract.md`
+  now has a consolidated **Multi-mount vaults** section stating the rules a client
+  can rely on.
+- **Resilience is now tested end to end.** A sidecar child killed outright is
+  restarted by the next call and an edit made while it was down still arrives, via
+  a `changesSince` catch-up. A remote answering `500`s — or dropping sockets —
+  fails reads honestly and recovers when it stops, without recycling the child. A
+  mount unreadable at startup recovers when its vault appears, and an Algolia mount
+  taken down mid-session refuses reads rather than serving its own cache, then
+  serves again when the backend returns. Two limits are asserted rather than
+  papered over: change cursors are not persisted across a server restart (a rebuilt
+  backend replays from the beginning, so it misses nothing), and a CouchDB mount
+  whose remote was unreachable at handshake time stays degraded until the child
+  re-hand-shakes.
+- **The black-box MCP surface is frozen** by a golden-based contract suite, so a
+  single-mount vault's `tools/list` and payloads cannot drift while multi-mount
+  work lands. Unknown config fields are retained rather than dropped on rewrite.
+
+### Fixed
+
+- **Secrets stored in the OS keyring actually persisted.** `keyring` was declared
+  without its platform features, so every `put()` landed in the crate's in-memory
+  mock store, reported success, and evaporated with the process — and the
+  encrypted-file fallback never engaged, because the mock returns `Ok`. HTTP auth
+  tokens and embedding API keys were affected. Platform backends are now enabled
+  (with a vendored dbus, so the `.deb` gains no runtime dependency).
+- **`setup-service --wizard` no longer replaces a config with no way back.** The
+  auth prompt always marked the config changed, bypassing the overwrite guard, and
+  its hardcoded default silently turned auth off on Enter. Content-changing
+  overwrites now back the previous file up to `config.json.bak`, and every prompt is
+  prefilled from the existing config.
+- **`grep_search` no longer reports an in-vault index directory's SQLite files as
+  notes.** A custom `indexDir` inside the vault surfaced as phantom matches under
+  caller-supplied globs. They are now excluded before the match limit, so a phantom
+  can never displace a real note.
+
 ## v0.1.0-alpha.12 — 2026-07-02
 
 ### Improved

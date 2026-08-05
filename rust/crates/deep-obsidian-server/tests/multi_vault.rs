@@ -2125,6 +2125,11 @@ struct AlgoliaFixture {
     inner: Fixture,
     base_url: String,
     _mock: tokio::task::JoinHandle<()>,
+    /// A clone of the mock's shared state, so a test can take the backend down and
+    /// bring it back on a STABLE port. Aborting `_mock` would be the other way to
+    /// simulate an outage and could not be undone — the ephemeral port is gone, and
+    /// rebinding it races `TIME_WAIT`.
+    mock: deep_obsidian_algolia::mock::MockAlgolia,
     secrets: PathBuf,
 }
 
@@ -2136,11 +2141,14 @@ impl AlgoliaFixture {
             .parent()
             .expect("fixture base")
             .to_path_buf();
-        let (base_url, mock) = deep_obsidian_algolia::mock::spawn_mock().await;
+        let state = deep_obsidian_algolia::mock::MockAlgolia::default();
+        let (base_url, mock) =
+            deep_obsidian_algolia::mock::spawn_mock_with(state.clone()).await;
         Self {
             inner,
             base_url,
             _mock: mock,
+            mock: state,
             secrets: base.join("secrets.json"),
         }
     }
@@ -3660,4 +3668,329 @@ async fn a_read_only_algolia_mount_refuses_a_delete_it_never_advertised() {
         json!({"path": "_Shared/Missing.md"}),
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Resilience: recovery
+// ---------------------------------------------------------------------------
+//
+// The failure halves of these scenarios are asserted above and in `federation_eval.rs`.
+// What is added here is the other half — that a mount which failed comes BACK, without a
+// process restart — because a degradation nobody can recover from is an outage with extra
+// steps, and none of the earlier slices proved the return path.
+//
+// # No sleeps
+//
+// Recovery is never a background loop here. Every mount's freshness is checked inside the
+// operation that needs it (`fresh_snapshot` on a query, a live HTTP call on an algolia
+// read), so the polls below RE-ISSUE THE OPERATION rather than watching a status field —
+// a field-watching poll would sit there until its deadline and then fail. The deadline is
+// the only timing these tests contain.
+
+/// The bound every recovery poll below is allowed.
+const RECOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Poll `attempt` until it returns `Some`, or panic with `what` and the last value seen.
+///
+/// Returns the value rather than a bool so the caller asserts on what it actually got.
+async fn poll_until_some<T, F, Fut>(what: &str, mut attempt: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let deadline = std::time::Instant::now() + RECOVERY_DEADLINE;
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        match attempt().await {
+            Ok(value) => return value,
+            Err(reason) => {
+                last = reason;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!("{what} did not recover within {RECOVERY_DEADLINE:?}; last observation: {last}");
+}
+
+/// A mount that was unreadable at startup serves — and clears its degraded readiness —
+/// once its vault appears, with no process restart.
+///
+/// The companion to `a_broken_mount_degrades_readiness_by_name_while_the_root_keeps_serving`,
+/// which proves the failure. This proves the return, and it is the one recovery in this
+/// repository that happens with no help at all: a filesystem mount re-scans its vault on
+/// every query that needs a fresh snapshot, so the directory appearing is the whole fix.
+#[tokio::test]
+async fn a_mount_that_was_unreadable_at_startup_recovers_when_its_vault_appears() {
+    let fixture = Fixture::new("mount-recovery");
+    let missing = fixture.index_dir.parent().expect("base").join("late-vault");
+    let config = fixture.config_with_team_vault(missing.clone());
+    let state = fixture.state_for(config).await;
+
+    // Degraded to start with, and NAMED — the precondition, restated so a failure here
+    // is distinguishable from a failure of the recovery.
+    let diagnostics = state.runtimes.aggregate_diagnostics();
+    assert_eq!(diagnostics.status.as_str(), "degraded");
+    let mut payload = build_readiness_payload(&state.config, &diagnostics);
+    insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
+    assert_eq!(payload["degradedMounts"], json!(["team"]));
+
+    // The vault appears, as a remounted volume or a restored backup would make it.
+    fs::create_dir_all(&missing).expect("create the late vault");
+    fs::write(
+        missing.join("Late.md"),
+        "# Late\n\nThis note arrived after startup.\n",
+    )
+    .expect("write the late note");
+
+    // The mount serves. Polled by RE-READING, because nothing refreshes on its own.
+    let text = poll_until_some("a read on the recovered mount", || async {
+        let response = tool_call(&state, "read_file", json!({"path": "Team/Late.md"})).await;
+        response
+            .get("result")
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| response.to_string())
+    })
+    .await;
+    assert!(text.contains("arrived after startup"), "{text}");
+
+    // Readiness clears: no mount is degraded any more and the payload stops naming one.
+    // A server that served the mount while still reporting it broken would make
+    // readiness useless as a gate.
+    let ready = poll_until_some("readiness to clear", || async {
+        // A scoped query is what re-refreshes the mount's index; readiness only reports
+        // what the last refresh recorded.
+        let _ = tool_call(
+            &state,
+            "hybrid_search",
+            json!({"query": "late note", "scope": "Team"}),
+        )
+        .await;
+        let diagnostics = state.runtimes.aggregate_diagnostics();
+        let mut payload = build_readiness_payload(&state.config, &diagnostics);
+        insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
+        if payload["ready"] == json!(true) {
+            Ok(payload)
+        } else {
+            Err(payload.to_string())
+        }
+    })
+    .await;
+    assert_eq!(ready["status"], json!("ready"), "{ready}");
+    assert!(
+        ready.get("degradedMounts").is_none(),
+        "a recovered mount must stop being named: {ready}"
+    );
+    let mounts = ready["mounts"].as_array().expect("mounts");
+    let team = mounts
+        .iter()
+        .find(|mount| mount["id"] == json!("team"))
+        .expect("the team mount");
+    assert_eq!(team["indexStatus"], json!("ready"), "{team}");
+
+    // ...and enumeration works again, rather than still refusing by naming the mount.
+    let listed = request(&state, "resources/list", json!({})).await;
+    assert!(
+        listed.get("error").is_none(),
+        "enumeration must stop refusing once the mount is back: {listed}"
+    );
+}
+
+/// An algolia mount that goes down MID-SESSION fails reads honestly — it never serves a
+/// cached body as if it were live — and recovers when the backend answers again.
+///
+/// # Why the cache cannot lie here, and why that is asserted rather than assumed
+///
+/// The algolia backend is the only one in this repository with a note cache, so it is the
+/// only one where "the backend is down" could plausibly be answered from local state. It
+/// cannot be: `reads::read_note` looks the head record up FIRST and only then consults the
+/// cache, keyed by the version that lookup returned. The head lookup is a live call, so an
+/// outage fails before the cache is ever reached — the freshness check and the network call
+/// are the same call, by construction.
+///
+/// The test therefore warms the cache with a successful read before the outage. Without
+/// that step a failing read would prove nothing: an empty cache has nothing to serve
+/// staleley either way.
+#[tokio::test]
+async fn an_algolia_mount_that_goes_down_mid_session_fails_honestly_and_recovers() {
+    let fixture = AlgoliaFixture::new("algolia-outage").await;
+    let state = fixture.state_writable(true).await;
+
+    let path = "_Shared/Outage/Note.md";
+    let body = "# Outage\n\nThe body that is in the cache when the backend goes away.\n";
+    let created = tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": path, "content": body}),
+    )
+    .await;
+    assert_eq!(structured(&created)["created"], json!(true));
+
+    // Warm the cache: this read hydrates from chunks and fills it.
+    let warm = structured(&tool_call(&state, "read_file", json!({"path": path})).await).clone();
+    assert!(
+        warm["text"].as_str().expect("text").contains("in the cache"),
+        "{warm}"
+    );
+
+    fixture.mock.begin_outage();
+
+    // The read FAILS. The cached body exists and is byte-correct, and it is still not
+    // served: without a head lookup the server cannot know it is current, and answering
+    // anyway would hand a caller stale content it could not detect.
+    let response = tool_call(&state, "read_file", json!({"path": path})).await;
+    let message = error_message(&response).to_string();
+    assert!(
+        !message.contains("in the cache"),
+        "a read during an outage must not leak the cached body: {message}"
+    );
+    // And it says the BACKEND failed, rather than looking like a missing note. That
+    // distinction is the honesty that matters most here: "not found" would be a claim
+    // about the vault's contents, and a caller acting on it could recreate a note that
+    // already exists.
+    assert!(
+        message.contains("algolia") && message.contains("503"),
+        "the failure must identify the backend and the remote status: {message}"
+    );
+    assert!(
+        !message.to_lowercase().contains("not found"),
+        "an unreachable backend must not be reported as a missing note: {message}"
+    );
+    // A listing fails too, rather than reporting the mount as empty — which a caller
+    // could not tell from every shared note having been deleted.
+    let listed = tool_call(&state, "list_children", json!({"path": "_Shared/Outage"})).await;
+    assert!(
+        listed.get("error").is_some(),
+        "a listing during an outage must fail rather than report an empty folder: {listed}"
+    );
+
+    fixture.mock.end_outage();
+
+    // Recovery, with no restart of anything: the next read succeeds and answers the same
+    // content it answered before the outage.
+    let recovered = poll_until_some("a read after the algolia outage ended", || async {
+        let response = tool_call(&state, "read_file", json!({"path": path})).await;
+        response
+            .get("result")
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| response.to_string())
+    })
+    .await;
+    assert_eq!(
+        recovered,
+        warm["text"].as_str().expect("text"),
+        "the content after recovery is the one that was always there"
+    );
+
+    // The root mount was never involved in any of it.
+    let root = tool_call(&state, "read_file", json!({"path": "Root.md"})).await;
+    assert!(structured(&root)["text"]
+        .as_str()
+        .expect("text")
+        .contains("Root note"));
+}
+
+/// A federated answer degrades and NAMES the algolia mount while it is down, then stops
+/// doing either once it is back.
+///
+/// The permanently-dead-mount half of this is `federation_eval.rs`'s
+/// `an_unavailable_mount_degrades_the_answer_and_is_named_without_disturbing_the_rest`.
+/// What is new is that `degraded` and `missingBackends` are TRANSIENT: they describe the
+/// answer that was just produced, not a latched state, so a caller that retries after an
+/// outage gets a clean answer rather than a permanent warning it learns to ignore.
+#[tokio::test]
+async fn a_federated_answer_stops_being_degraded_once_the_algolia_mount_returns() {
+    let fixture = AlgoliaFixture::new("algolia-federated-outage").await;
+    let state = fixture.state_writable(true).await;
+
+    tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "_Shared/Charter.md",
+            "content": "# Charter\n\nQuaalbrook retention charter for the shared corpus.\n",
+        }),
+    )
+    .await;
+
+    let query = json!({"query": "Quaalbrook retention charter"});
+
+    // Healthy: not degraded, nothing missing.
+    let healthy = structured(&tool_call(&state, "hybrid_search", query.clone()).await).clone();
+    assert_eq!(healthy["degraded"], json!(false), "{healthy}");
+    assert!(healthy.get("missingBackends").is_none(), "{healthy}");
+
+    fixture.mock.begin_outage();
+
+    // Down: the ROOT mount still answers, so the call succeeds — and says what it lost.
+    let degraded = structured(&tool_call(&state, "hybrid_search", query.clone()).await).clone();
+    assert_eq!(degraded["degraded"], json!(true), "{degraded}");
+    assert_eq!(
+        degraded["missingBackends"],
+        json!(["shared"]),
+        "the unreachable mount must be named: {degraded}"
+    );
+    let reason = degraded["degradationReason"]
+        .as_str()
+        .expect("a degradation reason");
+    assert!(
+        reason.contains("shared"),
+        "the reason must say which mount: {reason}"
+    );
+    // Nothing from the down mount is presented as a result.
+    let paths: Vec<&str> = degraded["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .filter_map(|item| item["path"].as_str())
+        .collect();
+    assert!(
+        paths.iter().all(|path| !path.starts_with("_Shared/")),
+        "{paths:?}"
+    );
+
+    fixture.mock.end_outage();
+
+    // Back: the very same query is no longer degraded and the mount is no longer named.
+    let recovered = poll_until_some("a federated answer after the outage ended", || async {
+        let payload = structured(&tool_call(&state, "hybrid_search", query.clone()).await).clone();
+        if payload["degraded"] == json!(false) {
+            Ok(payload)
+        } else {
+            Err(payload.to_string())
+        }
+    })
+    .await;
+    assert!(
+        recovered.get("missingBackends").is_none(),
+        "a recovered answer must not keep naming the mount: {recovered}"
+    );
+    let shared = recovered["mounts"]
+        .as_array()
+        .expect("mounts")
+        .iter()
+        .find(|mount| mount["id"] == json!("shared"))
+        .expect("the shared mount is reported again")
+        .clone();
+    assert!(
+        shared.get("error").is_none(),
+        "the recovered mount must not still carry an error: {shared}"
+    );
+    // And it is contributing again, which is the difference between "not degraded"
+    // and "actually working".
+    let paths: Vec<&str> = recovered["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .filter_map(|item| item["path"].as_str())
+        .collect();
+    assert!(
+        paths.iter().any(|path| path.starts_with("_Shared/")),
+        "the recovered mount must contribute results again: {paths:?}"
+    );
 }

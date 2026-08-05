@@ -203,6 +203,61 @@ impl MockCouch {
         }));
         assert_eq!(reply["ok"], serde_json::json!(true), "{reply}");
     }
+
+    /// Answer the next `count` requests of ANY kind 500: a remote outage.
+    ///
+    /// Set to a count larger than any operation's request budget to open an outage that
+    /// lasts until it is cleared, and to `0` to close it. Explicit open/close rather
+    /// than a duration: the fixture keeps its port for the whole test, so recovery is
+    /// observed by polling the operation rather than by sleeping out a guessed window.
+    fn fail_next_requests(&mut self, count: u32) {
+        let reply = self.command(serde_json::json!({
+            "command": "fail-next-requests", "count": count
+        }));
+        assert_eq!(reply["ok"], serde_json::json!(true), "{reply}");
+    }
+
+    /// Destroy the socket for the next `count` requests: a connection DROP rather than a
+    /// 500. Distinct from [`Self::fail_next_requests`] because the two arrive at the
+    /// sidecar's HTTP client as different failures, and only one of them is a response.
+    fn destroy_next_requests(&mut self, count: u32) {
+        let reply = self.command(serde_json::json!({
+            "command": "destroy-next-requests", "count": count
+        }));
+        assert_eq!(reply["ok"], serde_json::json!(true), "{reply}");
+    }
+}
+
+/// The deadline every recovery assertion in this file is bounded by.
+///
+/// Recovery here is never a background loop -- the supervisor restarts lazily, inside
+/// the next call -- so the poll below RE-ISSUES the operation each time rather than
+/// watching a status field, which would never flip on its own.
+const RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Poll `attempt` until it succeeds, or panic naming the last failure.
+///
+/// No bare sleeps anywhere in the resilience tests: a sleep long enough for a slow CI
+/// box is a sleep every developer pays on every run, and one short enough not to hurt
+/// is a flake. The deadline is the only timing this file contains.
+async fn poll_until_ok<T, E, F, Fut>(what: &str, mut attempt: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let deadline = std::time::Instant::now() + RECOVERY_DEADLINE;
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        match attempt().await {
+            Ok(value) => return value,
+            Err(error) => {
+                last = error.to_string();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!("{what} did not recover within {RECOVERY_DEADLINE:?}; last failure: {last}");
 }
 
 impl Drop for MockCouch {
@@ -1363,6 +1418,512 @@ async fn a_real_couchdb_is_classified_rather_than_crashed_on() {
         .await
         .expect_err("data methods must refuse until the remote is serveable");
     assert!(matches!(error, SidecarError::NotReady { .. }));
+
+    supervisor.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Resilience
+// ---------------------------------------------------------------------------
+//
+// The four faults the roadmap names: the child process dying, the remote going away
+// mid-session, a cursor across a restart, and recovery from each. All of them against
+// the REAL sidecar and the REAL fixture CouchDB, because that is the only place where
+// "the supervision claims to catch up" can be distinguished from "the supervision
+// claims to catch up".
+//
+// # What is deliberately NOT asserted here
+//
+// The child dying *mid-request* -- the `call_tracked` retry-once path and its
+// "first attempt unobserved" flag -- is not reachable from outside: killing the child
+// between two calls is, killing it while one is in flight is a race no test can win
+// reliably. The HTTP-layer analogue of that ambiguity IS covered, by
+// `a_write_whose_response_was_lost_is_reported_as_the_no_op_it_is`, which drops a
+// response the remote already applied.
+
+/// Kill `pid` outright, the way a crash or an OOM would.
+///
+/// SIGKILL rather than the `shutdown` RPC: a graceful stop is a message the child
+/// answers, which proves the protocol works and says nothing about supervision. What
+/// supervision has to survive is a death with no notice, and only a signal produces
+/// one. `child_pid` is the supervisor's own view of its own child, so nothing else on
+/// the machine can be hit.
+fn kill_child(pid: u32) {
+    let status = Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill -9 {pid} failed");
+}
+
+/// A child killed outright is restarted by the next call, and the read still answers.
+///
+/// This is the load-bearing supervision claim: everything else in this section assumes
+/// a dead child comes back.
+#[tokio::test]
+async fn a_child_killed_outright_is_restarted_by_the_next_call() {
+    require_prerequisites!();
+    let couch = MockCouch::start("small");
+    let (supervisor, backend) = backend(&couch);
+
+    supervisor.ensure_ready().await.expect("the first handshake");
+    let first_pid = supervisor.child_pid().expect("a running child has a pid");
+    assert_eq!(supervisor.health().starts, 1);
+
+    // The content a read answers BEFORE the death, so the post-restart read can be
+    // asserted to be the real thing rather than an empty success.
+    let before = backend
+        .execute(BackendRequest::read_text("Notes/Alpha.md"))
+        .await
+        .expect("the pre-death read")
+        .into_text()
+        .expect("text");
+    assert!(!before.is_empty());
+
+    kill_child(first_pid);
+
+    // The next call restarts and re-hand-shakes. Polled rather than assumed to be the
+    // FIRST attempt: whether the reader task has already seen EOF when the call lands
+    // decides whether the restart happens in `live_connection` or in the retry inside
+    // `call_tracked`, and both are correct.
+    let after = poll_until_ok("a read after the child was killed", || {
+        backend.execute(BackendRequest::read_text("Notes/Alpha.md"))
+    })
+    .await
+    .into_text()
+    .expect("text");
+    assert_eq!(
+        after, before,
+        "a restart must not change what a read answers"
+    );
+
+    // Health REPORTS the restart rather than hiding it: an operator looking at a mount
+    // that keeps restarting has to be able to see that it is.
+    let health = supervisor.health();
+    assert_eq!(
+        health.starts, 2,
+        "the restart must be counted: {health:?}"
+    );
+    assert_eq!(
+        health.consecutive_failures, 0,
+        "a SUCCESSFUL restart clears the failure count: {health:?}"
+    );
+    assert!(health.is_ready(), "{health:?}");
+    let second_pid = supervisor.child_pid().expect("a running child has a pid");
+    assert_ne!(
+        second_pid, first_pid,
+        "the restart must be a NEW process, not a revived handle"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// An edit made while the child was DOWN arrives after the restart, through the
+/// `changesSince` catch-up.
+///
+/// This is the claim the supervision was built for and the one that cannot be inferred
+/// from any other test: `watch` only ever delivers from the moment it is armed, so an
+/// edit during an outage is invisible to it. Only the catch-up replay can find it, and
+/// the catch-up reports itself as `livesync:resume-catchup` -- a reason no live
+/// notification ever carries, which is what makes this assertion unambiguous.
+#[tokio::test]
+async fn an_edit_made_while_the_child_was_down_arrives_through_the_catch_up() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start("small");
+    let (supervisor, backend) = backend(&couch);
+
+    supervisor.ensure_ready().await.expect("the first handshake");
+    let mut stream = backend.changes(None);
+    // Arm the feed before the outage: an unarmed feed would make the catch-up below
+    // trivially explainable by "it was never watching".
+    for _ in 0..200 {
+        if supervisor.health().watching {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        supervisor.health().watching,
+        "the change feed must arm before the outage: {:?}",
+        supervisor.health()
+    );
+    let cursor_before = supervisor.cursor();
+    assert!(
+        cursor_before.is_some(),
+        "arming `watch` must record a cursor, or there is nothing to catch up FROM"
+    );
+
+    let pid = supervisor.child_pid().expect("a running child has a pid");
+    kill_child(pid);
+
+    // The edit lands with NO client connected. Nothing is listening on the change feed
+    // at this moment, which is precisely the gap the catch-up exists to close.
+    couch.push_note("Outage.md", "Written while the sidecar was dead.\n");
+
+    // Any call restarts the child; the restart's own catch-up is what finds the edit.
+    poll_until_ok("a read after the child was killed", || {
+        backend.execute(BackendRequest::read_text("Notes/Alpha.md"))
+    })
+    .await;
+
+    // The catch-up announces itself. Drained with a deadline rather than taking the
+    // first event: a re-armed `watch` may also deliver, and the assertion is about the
+    // catch-up specifically.
+    let deadline = std::time::Instant::now() + RECOVERY_DEADLINE;
+    let mut seen: Vec<String> = Vec::new();
+    let mut caught_up = false;
+    while std::time::Instant::now() < deadline && !caught_up {
+        match tokio::time::timeout(Duration::from_millis(500), stream.recv()).await {
+            Ok(Some(deep_obsidian_backend::ChangeEvent::Change(reason))) => {
+                caught_up = reason == "livesync:resume-catchup";
+                seen.push(reason);
+            }
+            Ok(Some(other)) => panic!("expected a Change event, got {other:?}"),
+            Ok(None) => panic!("the change stream must survive a restart, not close"),
+            Err(_) => {}
+        }
+    }
+    assert!(
+        caught_up,
+        "the restart must replay `changesSince` and report it as a change; saw {seen:?}"
+    );
+
+    // The catch-up must have carried the PAYLOAD, not merely fired. Without this the test
+    // would pass on any non-empty replay page, which proves the mechanism ran and says
+    // nothing about whether the edit made during the outage survived it -- and that edit
+    // is the entire claim.
+    let paths = poll_until_ok("the manifest after the catch-up", || {
+        supervisor.collect_manifest()
+    })
+    .await
+    .into_iter()
+    .map(|entry| entry.path)
+    .collect::<Vec<_>>();
+    assert!(
+        paths.iter().any(|path| path == "Outage.md"),
+        "the edit made during the outage must be in the vault afterwards; saw {paths:?}"
+    );
+    let recovered = backend
+        .execute(BackendRequest::read_text("Outage.md"))
+        .await
+        .expect("the edit made during the outage must be readable")
+        .into_text()
+        .expect("text");
+    assert_eq!(recovered, "Written while the sidecar was dead.\n");
+
+    // And the feed is armed AGAIN, so the next live edit does not need another outage
+    // to be noticed.
+    assert!(
+        supervisor.health().watching,
+        "the restart must re-arm `watch`: {:?}",
+        supervisor.health()
+    );
+    // The cursor moved past what it was before the outage: the catch-up consumed the
+    // pages it replayed rather than replaying them forever.
+    assert_ne!(
+        supervisor.cursor(),
+        cursor_before,
+        "the catch-up must advance the cursor"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// While the remote is answering 500 to everything, reads FAIL -- and once it answers
+/// again, they succeed, with no process restart and no stale content in between.
+///
+/// # What "no stale content" means on this backend
+///
+/// It means there is nowhere for stale content to come from. The CouchDB path has no
+/// note cache at all: every read is a live `_bulk_get` against the remote, so a read
+/// during an outage has no fallback to silently take. That is asserted rather than
+/// assumed below -- a read that returned the content the PREVIOUS read returned would
+/// be a cache appearing where the design says there is none, and it would be
+/// indistinguishable from a fresh read to any caller.
+///
+/// (The Algolia backend DOES have a hydrated-note cache, and its own honesty rule is
+/// different and stronger: the cache is keyed by head version, so serving from it
+/// requires a successful head lookup against the live remote. See
+/// `an_algolia_mount_that_goes_down_mid_session_fails_honestly_and_recovers` in the
+/// server crate's `multi_vault.rs`.)
+#[tokio::test]
+async fn reads_fail_honestly_during_a_remote_outage_and_recover_when_it_ends() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start("small");
+    let (supervisor, backend) = backend(&couch);
+
+    let before = backend
+        .execute(BackendRequest::read_text("Notes/Alpha.md"))
+        .await
+        .expect("the pre-outage read")
+        .into_text()
+        .expect("text");
+    assert!(!before.is_empty());
+    let starts_before = supervisor.health().starts;
+
+    // Wide enough to outlast any single operation's request budget, so the window is
+    // closed by the test rather than by running out.
+    couch.fail_next_requests(100_000);
+
+    let error = backend
+        .execute(BackendRequest::read_text("Notes/Alpha.md"))
+        .await
+        .expect_err("a read against a remote answering 500 must FAIL, not answer");
+    let message = error.to_string();
+    assert!(
+        !message.contains(before.trim()),
+        "the failure must not smuggle the previous read's content back out: {message}"
+    );
+    // A manifest walk fails too, rather than reporting an empty vault -- which a caller
+    // could not tell from a vault whose notes were all deleted.
+    backend
+        .execute(BackendRequest::walk_markdown())
+        .await
+        .expect_err("a manifest walk during an outage must fail rather than report empty");
+
+    couch.fail_next_requests(0);
+
+    // The other shape of the same outage: the socket is DROPPED rather than answered.
+    // Asserted separately because it reaches the sidecar's HTTP client as a transport
+    // failure with no status code to classify, and a backend that only handled the 5xx
+    // would report a dropped connection as something else -- most dangerously as an
+    // empty result.
+    couch.destroy_next_requests(100_000);
+    backend
+        .execute(BackendRequest::read_text("Notes/Alpha.md"))
+        .await
+        .expect_err("a read whose connection is dropped must FAIL, not answer");
+    couch.destroy_next_requests(0);
+
+    let recovered = poll_until_ok("a read after the remote outage ended", || {
+        backend.execute(BackendRequest::read_text("Notes/Alpha.md"))
+    })
+    .await
+    .into_text()
+    .expect("text");
+    assert_eq!(recovered, before, "the content is the remote's, unchanged");
+
+    // A remote outage is not a child problem, so the child must not have been recycled
+    // for it. Restarting on every 5xx would turn a brief remote blip into a handshake
+    // storm.
+    assert_eq!(
+        supervisor.health().starts,
+        starts_before,
+        "a remote 500 must not restart the child: {:?}",
+        supervisor.health()
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// Cursors are NOT persisted across a process restart, and that is safe because a
+/// supervisor with no cursor replays from the beginning.
+///
+/// # What this test claims, precisely
+///
+/// The `OpaqueCursor` a `changes(after)` call accepts is honoured for the life of the
+/// SUPERVISOR: it outlives its child, so a child restart resumes from where the feed
+/// had got to (proved by
+/// `an_edit_made_while_the_child_was_down_arrives_through_the_catch_up`). Nothing
+/// writes it to disk, so a SERVER restart -- or any rebuild of the backend from config
+/// -- starts with no cursor.
+///
+/// That is asserted here rather than treated as a gap, because the consequence is the
+/// safe one: `resume_watch` with no cursor calls `changesSince` with no `cursor`
+/// parameter, which replays the whole feed, and the mount's index is rebuilt from a
+/// full `manifest` at bootstrap anyway. A fresh backend therefore MISSES NOTHING; it
+/// only does more work. Persistent cursors would make a restart cheaper and are not
+/// claimed by anything in this repository.
+#[tokio::test]
+async fn a_rebuilt_backend_has_no_cursor_and_replays_everything_rather_than_missing_it() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start("small");
+
+    // --- The first backend, which advances a cursor. ---
+    let (first, first_backend) = backend(&couch);
+    first.ensure_ready().await.expect("the first handshake");
+    let _first_stream = first_backend.changes(None);
+    for _ in 0..200 {
+        if first.health().watching {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(first.health().watching, "{:?}", first.health());
+
+    couch.push_note("Before.md", "Written while the first backend was up.\n");
+    // Wait for the cursor to actually move, so "the first backend had a cursor" is a
+    // fact and not a hope.
+    let advanced = poll_until_ok("the first backend's cursor to advance", || {
+        let first = first.clone();
+        async move {
+            match first.cursor() {
+                Some(cursor) => Ok(cursor),
+                None => Err("no cursor yet".to_string()),
+            }
+        }
+    })
+    .await;
+    assert!(!advanced.is_empty());
+
+    // The whole backend goes away, as a server restart would take it.
+    first.shutdown().await;
+    drop(first_backend);
+    drop(first);
+
+    // A SECOND writer edits the vault while nothing at all is running. The mock IS that
+    // second client: it is the only participant in this fixture besides the sidecar.
+    couch.push_note("During.md", "Written while no backend existed.\n");
+
+    // --- The rebuilt backend, from the same config. ---
+    let (second, second_backend) = backend(&couch);
+    assert_eq!(
+        second.cursor(),
+        None,
+        "a backend rebuilt from config starts with NO cursor: they are not persisted"
+    );
+
+    // And it misses nothing: the full manifest carries both edits, the one made while
+    // the first backend was up and the one made while none existed.
+    let paths = poll_until_ok("the rebuilt backend's manifest", || {
+        second.collect_manifest()
+    })
+    .await
+    .into_iter()
+    .map(|entry| entry.path)
+    .collect::<Vec<_>>();
+    for expected in ["Before.md", "During.md"] {
+        assert!(
+            paths.iter().any(|path| path == expected),
+            "a rebuilt backend must see {expected}; it saw {paths:?}"
+        );
+    }
+    // Listed AND readable: an entry a manifest names but a read cannot fetch would be a
+    // worse answer than an omission.
+    let during = second_backend
+        .execute(BackendRequest::read_text("During.md"))
+        .await
+        .expect("the edit made while no backend existed must be readable")
+        .into_text()
+        .expect("text");
+    assert_eq!(during, "Written while no backend existed.\n");
+
+    // The replay starts from the beginning rather than from a cursor nobody stored.
+    let replay = second
+        .call("changesSince", serde_json::json!({}))
+        .await
+        .expect("a cursorless changesSince must be accepted");
+    let changes = replay["changes"].as_array().expect("changes");
+    assert!(
+        !changes.is_empty(),
+        "a cursorless replay must return the feed from its start: {replay}"
+    );
+    assert!(
+        replay["nextCursor"].is_string(),
+        "the replay must hand back a cursor to continue from: {replay}"
+    );
+
+    second.shutdown().await;
+}
+
+/// A remote that was DOWN at handshake time leaves the mount degraded, and bringing
+/// the remote back does not by itself fix it -- the child has to re-handshake.
+///
+/// # Why this is asserted as a limit rather than as a recovery
+///
+/// The compatibility verdict is decided once, by `initialize`, and cached on BOTH
+/// sides: the sidecar answers `health` from `state.vault.compatibilityStatus` rather
+/// than re-probing, and the supervisor answers `ready_connection` from the health it
+/// recorded. Nothing re-runs `initialize` while the child is alive, and the restart
+/// backoff only runs when the connection has DIED -- an unreachable remote does not kill
+/// the child, it only makes its verdict useless.
+///
+/// So the honest claim is the narrow one, and both halves of it are asserted below: an
+/// outage at startup degrades the mount rather than failing the server, and the mount
+/// comes back exactly when the child does. An operator whose CouchDB was down when the
+/// service started has to restart the service (or wait for a transport failure to
+/// recycle the child); that is a real limitation, and a test that polled until the mount
+/// healed by itself would have been asserting something this code does not do.
+#[tokio::test]
+async fn a_remote_down_at_handshake_time_recovers_when_the_child_restarts_and_not_before() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start("small");
+    // The outage is in place BEFORE the first handshake, so `initialize` never sees a
+    // working remote. Wide enough to outlast the handshake's whole request budget.
+    couch.fail_next_requests(100_000);
+
+    let (supervisor, backend) = backend(&couch);
+
+    // The child starts and hand-shakes: an unreachable remote is a VERDICT, not a
+    // crash. This is what keeps the server up and the vault root serving.
+    supervisor
+        .ensure_started()
+        .await
+        .expect("an unreachable remote must still complete the handshake");
+    let degraded = supervisor.health();
+    assert_eq!(degraded.starts, 1);
+    assert!(
+        !degraded.is_ready(),
+        "a remote answering 500 to everything must not be reported serveable: {degraded:?}"
+    );
+    let status = degraded
+        .compatibility
+        .as_ref()
+        .expect("a verdict")
+        .status;
+    assert_eq!(
+        status,
+        CompatibilityStatus::Unreachable,
+        "a remote answering 500 to every request classifies as unreachable: {degraded:?}"
+    );
+    // Reads refuse with the verdict rather than answering an empty vault.
+    let error = backend
+        .execute(BackendRequest::read_text("Notes/Alpha.md"))
+        .await
+        .expect_err("a degraded mount must refuse reads");
+    assert!(!error.to_string().is_empty());
+
+    couch.fail_next_requests(0);
+
+    // The remote is back, and the mount is STILL degraded -- repeatedly, including
+    // through `probe_health`, which is the one call that refreshes the verdict from the
+    // child and therefore the most likely place for a self-heal to happen if there were
+    // one. A bounded number of attempts, because the assertion is that nothing changes.
+    for attempt in 0..10 {
+        let health = supervisor.probe_health().await;
+        assert!(
+            !health.is_ready(),
+            "attempt {attempt}: the verdict is cached until a re-handshake, so it must \
+             not flip on its own: {health:?}"
+        );
+        assert_eq!(
+            health.compatibility.as_ref().expect("a verdict").status,
+            status,
+            "attempt {attempt}: the cached verdict must not drift either"
+        );
+        assert_eq!(health.starts, 1, "nothing may restart the child implicitly");
+    }
+
+    // Killing the child is what forces a fresh `initialize` -- and against the recovered
+    // remote that one reports `ok`, so the mount serves again with no server restart.
+    let pid = supervisor.child_pid().expect("a running child has a pid");
+    kill_child(pid);
+
+    let text = poll_until_ok("a read after the child re-handshook a recovered remote", || {
+        backend.execute(BackendRequest::read_text("Notes/Alpha.md"))
+    })
+    .await
+    .into_text()
+    .expect("text");
+    assert_eq!(text, "# Alpha\n\nFirst note body.\n");
+
+    let recovered = supervisor.health();
+    assert!(recovered.is_ready(), "{recovered:?}");
+    assert_eq!(
+        recovered.starts, 2,
+        "the recovery is the RESTART, and health says so: {recovered:?}"
+    );
 
     supervisor.shutdown().await;
 }
