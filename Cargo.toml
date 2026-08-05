@@ -21,7 +21,13 @@ base64 = "0.22"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
-keyring = "3"
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+    "vendored",
+] }
 notify = "6"
 rand = "0.8"
 regex = "1"

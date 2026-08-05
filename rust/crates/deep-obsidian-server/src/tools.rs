@@ -1369,6 +1369,7 @@ fn live_find_file_matches(
 async fn live_grep_matches(
     ripgrep_path: std::path::PathBuf,
     vault_path: std::path::PathBuf,
+    index_dir: Option<std::path::PathBuf>,
     query: String,
     regex_mode: bool,
     case_sensitive: bool,
@@ -1376,6 +1377,18 @@ async fn live_grep_matches(
     context_lines: usize,
     limit: usize,
 ) -> Result<Vec<LiveGrepMatch>, String> {
+    // A custom index dir INSIDE the vault (holding the SQLite index and its
+    // sidecar files) must never leak into grep results as phantom vault paths.
+    // This is filtered on the emitted path rather than with a `--glob`: ripgrep
+    // matches globs containing a separator against paths relative to the process
+    // working directory (not to the searched root), so the only glob form that
+    // fires here is the unanchored `!**/<name>/**` — which would also hide a
+    // real note under any same-named directory elsewhere in the vault. An index
+    // dir equal to the vault root strips to an empty prefix; skip that
+    // degenerate case rather than hiding the whole vault.
+    let index_dir_prefix = index_dir
+        .and_then(|dir| dir.strip_prefix(&vault_path).ok().map(|p| p.to_path_buf()))
+        .filter(|relative| relative.components().next().is_some());
     tokio::task::spawn_blocking(move || {
         let mut args = vec![
             "--json".to_string(),
@@ -1447,6 +1460,16 @@ async fn live_grep_matches(
                 .and_then(|value| value.get("text"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| "rg match payload missing path".to_string())?;
+            // Drop hits under a vault-internal index dir before they count
+            // towards `limit`, so a phantom path never displaces a real note.
+            if let Some(prefix) = index_dir_prefix.as_ref() {
+                if Path::new(absolute_path)
+                    .strip_prefix(&vault_path)
+                    .is_ok_and(|relative| relative.starts_with(prefix))
+                {
+                    continue;
+                }
+            }
             let line_number = data
                 .get("line_number")
                 .and_then(Value::as_u64)
@@ -1770,6 +1793,7 @@ pub async fn call_tool(
             let matches = live_grep_matches(
                 (*state.ripgrep_path).clone(),
                 config.vault_path.clone(),
+                Some(config.index_dir.clone()),
                 query.clone(),
                 regex_mode,
                 case_sensitive,
@@ -3097,6 +3121,7 @@ mod tests {
         let matches = live_grep_matches(
             super::resolve_ripgrep(),
             vault_path,
+            None,
             "needle".to_string(),
             false,
             true,
@@ -3127,6 +3152,7 @@ mod tests {
         let matches = live_grep_matches(
             super::resolve_ripgrep(),
             vault_path,
+            None,
             "--pre=/bin/echo".to_string(),
             false,
             true,
@@ -3140,6 +3166,103 @@ mod tests {
         assert_eq!(matches.len(), 1, "literal flag-like string should match once");
         assert_eq!(matches[0].line_number, 2);
         assert!(matches[0].line_text.contains("--pre=/bin/echo"));
+    }
+
+    #[tokio::test]
+    async fn grep_search_excludes_a_custom_index_dir_inside_the_vault() {
+        // An index dir configured INSIDE the vault holds the SQLite index and
+        // its sidecars. With a caller-supplied glob those files are reachable by
+        // rg and would surface as phantom vault paths.
+        let vault_path = temp_dir("grep-index-dir");
+        let index_dir = vault_path.join("Index Cache");
+        fs::create_dir_all(&index_dir).expect("create index dir");
+        fs::write(vault_path.join("Real.md"), "needle in a real note\n").expect("write note");
+        fs::write(index_dir.join("index.sqlite"), "needle in the index\n").expect("write index");
+        fs::write(index_dir.join("cached.md"), "needle in a cache file\n").expect("write cache");
+        // A real note under a SAME-NAMED directory elsewhere must survive: the
+        // exclusion is the index dir itself, not every path segment like it.
+        let namesake = vault_path.join("Projets/Index Cache");
+        fs::create_dir_all(&namesake).expect("create namesake dir");
+        fs::write(namesake.join("Notes.md"), "needle in a real note\n").expect("write namesake");
+
+        let paths = |matches: &[super::LiveGrepMatch]| {
+            let mut paths: Vec<String> = matches.iter().map(|item| item.path.clone()).collect();
+            paths.sort();
+            paths
+        };
+
+        // Without the exclusion the index dir leaks into the results — this is
+        // the bug, asserted so the fix below cannot pass vacuously.
+        let leaked = live_grep_matches(
+            super::resolve_ripgrep(),
+            vault_path.clone(),
+            None,
+            "needle".to_string(),
+            false,
+            true,
+            Some("**/*".to_string()),
+            0,
+            10,
+        )
+        .await
+        .expect("grep matches");
+        assert_eq!(
+            paths(&leaked),
+            vec![
+                "Index Cache/cached.md".to_string(),
+                "Index Cache/index.sqlite".to_string(),
+                "Projets/Index Cache/Notes.md".to_string(),
+                "Real.md".to_string()
+            ]
+        );
+
+        // With the resolved index dir the phantom paths are gone — and only
+        // those: the same-named directory deeper in the vault is untouched.
+        let filtered = live_grep_matches(
+            super::resolve_ripgrep(),
+            vault_path.clone(),
+            Some(index_dir),
+            "needle".to_string(),
+            false,
+            true,
+            Some("**/*".to_string()),
+            0,
+            10,
+        )
+        .await
+        .expect("grep matches");
+        assert_eq!(
+            paths(&filtered),
+            vec![
+                "Projets/Index Cache/Notes.md".to_string(),
+                "Real.md".to_string()
+            ]
+        );
+
+        // An index dir outside the vault yields no exclusion and no false
+        // negatives.
+        let outside = live_grep_matches(
+            super::resolve_ripgrep(),
+            vault_path.clone(),
+            Some(temp_dir("grep-index-dir-outside")),
+            "needle".to_string(),
+            false,
+            true,
+            None,
+            0,
+            10,
+        )
+        .await
+        .expect("grep matches");
+        assert_eq!(
+            paths(&outside),
+            vec![
+                "Index Cache/cached.md".to_string(),
+                "Projets/Index Cache/Notes.md".to_string(),
+                "Real.md".to_string()
+            ],
+            "the default *.md glob still sees every markdown file"
+        );
     }
 
     #[tokio::test]
@@ -3423,6 +3546,7 @@ mod tests {
         let result = live_grep_matches(
             missing_rg,
             vault_path,
+            None,
             "needle".to_string(),
             false,
             true,
