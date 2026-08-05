@@ -66,6 +66,4 @@ workflows:
 - `obsidian-capture-session`
 - `obsidian-knowledge-maintenance`
 
-See also [agent-workflows.md](./agent-workflows.md) and the snippet-backed
-writing-conventions pattern in
-[writing-conventions-pattern.md](./writing-conventions-pattern.md).
+See also [agent-workflows.md](./agent-workflows.md).
