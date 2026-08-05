@@ -946,7 +946,12 @@ fn insert_capability_tools(definitions: &mut Vec<ToolDefinition>, capabilities: 
         annotations: Some(tool_annotations(true, None, None)),
         execution: Some(json!({"taskSupport":"forbidden"})),
         input_schema: object_schema(
-            vec![("path", json!({"type":"string","description":"Logical vault-relative note path, on a mount that keeps a version history."}))],
+            vec![
+                ("path", json!({"type":"string","description":"Logical vault-relative note path, on a mount that keeps a version history."})),
+                // Schema `exclusiveMinimum`/`maximum` pair exactly with the runtime
+                // `clamped_usize_arg(.., 50, 1, 500)` bounds, as everywhere else here.
+                ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":500,"default":50,"description":"Maximum versions to return, newest first. When the note has more, `truncated: true` and `totalCount` are added."})),
+            ],
             vec!["path"],
         ),
     });
@@ -3703,19 +3708,70 @@ fn note_version_json(version: &deep_obsidian_backend::NoteVersion) -> Value {
     })
 }
 
-/// `note_history`: a note's retained versions, newest first.
-async fn note_history_payload(state: &AppState, path: &str) -> Result<Value, String> {
+/// The note the truncation flag carries, so a caller knows what it is missing and how
+/// to see it. Sibling to [`FEDERATED_FIND_FILES_TRUNCATION_NOTE`]'s discipline.
+const NOTE_HISTORY_TRUNCATION_NOTE: &str = "this note has more retained versions than \
+'limit'; the newest were returned and the oldest were dropped. 'totalCount' is how many the \
+mount retains. Raise 'limit' to see further back.";
+
+/// `note_history`: a note's retained versions, newest first, at most `limit` of them.
+///
+/// # Why the limit is applied HERE and not pushed into the boundary
+///
+/// It reads like it belongs on `ManifestRequest::Versions` — the backend would then fetch
+/// fewer records. It must not go there, because `resolve_divergence_payload` issues the
+/// same request and then does `.find(|version| version.current)`, treating a missing
+/// current version as a hard error. A limit inside the request would let a truncated list
+/// drop the head and turn a perfectly ordinary divergence into a failure. Slicing above
+/// the boundary keeps the two callers independent, and matches how `find_files` already
+/// works: the walk is unbounded and the tool layer decides what to show.
+///
+/// The cost is that a note with a thousand retained versions still assembles a thousand
+/// records inside the mount. That is the ACKNOWLEDGED shape of this fix: the measured
+/// problem was an O(versions) payload handed to a client with no way to ask for less
+/// (0.94 ms and growing at ~70 versions), and this bounds the payload. Bounding the fetch
+/// as well needs a limit the divergence path can opt out of, which is a boundary change
+/// worth doing on its own evidence rather than smuggling in here.
+///
+/// # `count` keeps its meaning
+///
+/// `count` has always been "how many versions are in `versions`", and it still is —
+/// nothing that reads it needs rewriting. When the list was cut short, `totalCount` says
+/// how many the mount retains, and it appears ONLY then: an untruncated answer has no new
+/// field, so nothing about the pre-existing shape moves.
+async fn note_history_payload(state: &AppState, path: &str, limit: usize) -> Result<Value, String> {
     refuse_incapable_mount(state, "note_history", path, Capability::VersionHistory)?;
     let history = backend_call(state, BackendRequest::note_versions(path))
         .await?
         .into_note_history()
         .map_err(|error| error.to_string())?;
-    Ok(json!({
-        "path": path,
-        "hasDivergence": history.has_divergence,
-        "count": history.versions.len(),
-        "versions": history.versions.iter().map(note_version_json).collect::<Vec<_>>(),
-    }))
+    let total = history.versions.len();
+    // Newest first is the order the mount returns and the order this tool documents, so
+    // taking a prefix keeps the most recent versions and drops the oldest — which is the
+    // useful direction, and the reason no reordering is needed.
+    let versions: Vec<Value> = history
+        .versions
+        .iter()
+        .take(limit)
+        .map(note_version_json)
+        .collect();
+    let mut payload = Map::from_iter([
+        ("path".to_string(), json!(path)),
+        ("hasDivergence".to_string(), json!(history.has_divergence)),
+        ("count".to_string(), json!(versions.len())),
+        ("versions".to_string(), json!(versions)),
+    ]);
+    // Only when true, and never as `false`. A caller that sees no `truncated` key has the
+    // whole history, which is what every caller written before this had.
+    if total > limit {
+        payload.insert("truncated".to_string(), json!(true));
+        payload.insert("totalCount".to_string(), json!(total));
+        payload.insert(
+            "truncationNote".to_string(),
+            json!(NOTE_HISTORY_TRUNCATION_NOTE),
+        );
+    }
+    Ok(Value::Object(payload))
 }
 
 /// `read_version`: one named version's text, with the hash of THAT text.
@@ -3959,12 +4015,57 @@ pub async fn call_tool(
             let path = string_arg(arguments, "path")?;
             validate_format_arg(arguments)?;
             let text_options = TextPayloadOptions::from_arguments(arguments, true);
-            let text = backend_read_text(state, &path).await?;
-            // Full-file content hash, computed with the same helper the write tools use so a
-            // write's `newHash` can be fed straight back into a read's `knownHash`. Always the
-            // full-file hash regardless of any startLine/endLine slice.
-            let hash = content_hash(text.as_bytes());
             let known_hash = optional_string_arg(arguments, "knownHash");
+            // The hash goes DOWN to the backend rather than only being compared up here.
+            //
+            // On a filesystem mount that changes nothing: it cannot know what a file
+            // hashes to without reading it, says so, and answers with the text exactly as
+            // before. On a mount where a read is a network conversation that reassembles
+            // the note out of chunks — the CouchDB and Algolia shapes — the provider can
+            // often establish "still that hash" from metadata it holds anyway, and then
+            // the whole hydration is skipped rather than only the response body. That was
+            // the finding: through a couchdb mount, `knownHash` used to save nothing
+            // measurable (2.64 ms against 2.60 ms) because the body was the only part it
+            // saved and the body was the cheap part.
+            //
+            // A backend that skips the read answers `Unchanged`. A backend that does not
+            // answers with the text, and the comparison below then runs exactly as it
+            // always has — so this is one code path with two entry points, not two
+            // behaviours.
+            let read = match &known_hash {
+                Some(known_hash) => {
+                    backend_call(state, BackendRequest::read_text_known_hash(&path, known_hash))
+                        .await?
+                }
+                None => backend_call(state, BackendRequest::read_text(&path)).await?,
+            };
+            let (text, hash) = match read
+                .into_text_unless_unchanged()
+                .map_err(|error| error.to_string())?
+            {
+                // The backend proved the caller's copy is current without materializing
+                // the note. `known_hash` is `Some` by construction — no other request
+                // shape can be answered this way.
+                (None, _) => {
+                    let result = Map::from_iter([
+                        ("path".to_string(), json!(path.clone())),
+                        ("hash".to_string(), json!(known_hash.unwrap_or_default())),
+                        ("unchanged".to_string(), json!(true)),
+                    ]);
+                    return Ok(json_text_result_from_arguments(
+                        arguments,
+                        Value::Object(result),
+                    ));
+                }
+                // Full-file content hash, computed with the same helper the write tools use
+                // so a write's `newHash` can be fed straight back into a read's
+                // `knownHash`. Always the full-file hash regardless of any
+                // startLine/endLine slice.
+                (Some(text), _) => {
+                    let hash = content_hash(text.as_bytes());
+                    (text, hash)
+                }
+            };
             if known_hash.as_deref() == Some(hash.as_str()) {
                 let result = Map::from_iter([
                     ("path".to_string(), json!(path.clone())),
@@ -4527,7 +4628,10 @@ pub async fn call_tool(
         }
         "note_history" => {
             let path = string_arg(arguments, "path")?;
-            Ok(json_text_result(note_history_payload(state, &path).await?))
+            let limit = clamped_usize_arg(arguments, "limit", 50, 1, 500);
+            Ok(json_text_result(
+                note_history_payload(state, &path, limit).await?,
+            ))
         }
         "read_version" => {
             let path = string_arg(arguments, "path")?;

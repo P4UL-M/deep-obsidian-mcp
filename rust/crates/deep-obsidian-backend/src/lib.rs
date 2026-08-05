@@ -349,9 +349,35 @@ pub enum ContentRequest {
     /// precondition out of a deliberate historical read. Callers that read in order to
     /// write must use the UNVERSIONED read; the server's `backend_read_note_for_write`
     /// does.
+    ///
+    /// # `known_hash`: an OPPORTUNITY, never an obligation
+    ///
+    /// `read_file`'s `knownHash` lets a caller say "I already have this content, at this
+    /// hash". Historically that comparison happened entirely above the boundary: the
+    /// note was read in full, hashed, and the body then omitted from the reply. That
+    /// saves response bytes and nothing else — and on a provider where a read is a
+    /// network conversation that reassembles the note out of chunks, the bytes are the
+    /// cheap part.
+    ///
+    /// Passing the hash DOWN lets a backend that can answer "unchanged" without
+    /// materializing the content do so, by replying
+    /// [`ContentResponse::Unchanged`]. It is purely optional in both directions:
+    ///
+    /// * A backend may ignore it entirely and return [`ContentResponse::Text`] as
+    ///   always. The filesystem does, and must: `fnv1a64` cannot be computed without
+    ///   reading the bytes, so there is nothing to skip. Nothing is lost — the caller
+    ///   compares the hash itself, exactly as before.
+    /// * A backend may answer `Unchanged` only when it can PROVE the hash it compared
+    ///   against is the current one. Guessing here would serve a stale "nothing changed"
+    ///   for a note that had changed, which is worse than any read cost.
+    ///
+    /// `None` when the caller has no prior content, and `None` for every read whose
+    /// answer must carry text (a read that feeds a write's precondition, an export, the
+    /// index refresh) — such a caller cannot use `Unchanged` and must not invite it.
     ReadText {
         path: String,
         version: Option<String>,
+        known_hash: Option<String>,
     },
     /// Read raw bytes. IO errors are [`BackendError::Io`]-flavoured (bare).
     ReadBytes { path: String },
@@ -655,6 +681,23 @@ pub enum ContentResponse {
         /// [`MutationRequest::WriteText`]; see [`BaseVersion`].
         version: Option<String>,
     },
+    /// The note's content still hashes to the `known_hash` the request carried, and the
+    /// backend established that WITHOUT materializing the content.
+    ///
+    /// Only ever produced for a [`ContentRequest::ReadText`] that supplied a
+    /// `known_hash`, so a caller that supplied none can treat it as unreachable — which
+    /// is what [`ContentResponse::into_text`] does, by erroring rather than inventing an
+    /// empty string.
+    ///
+    /// `hash` is echoed rather than recomputed: it is by definition the request's own
+    /// `known_hash`, and returning it keeps the caller's payload construction identical
+    /// on both branches.
+    Unchanged {
+        hash: String,
+        /// The version the backend OBSERVED while establishing this, on a backend that
+        /// versions its documents. Same meaning and same use as [`Self::Text`]'s.
+        version: Option<String>,
+    },
     Bytes(Vec<u8>),
     Stat {
         size_bytes: u64,
@@ -956,10 +999,35 @@ impl BackendResponse {
 
     /// Text from a [`ContentRequest::ReadText`] together with the opaque version it
     /// was read at. The pair a caller needs to write the note back safely.
+    ///
+    /// [`ContentResponse::Unchanged`] falls into the mismatch arm on purpose: a caller
+    /// reaching this wants text, and it can only be answered `Unchanged` if it supplied
+    /// a `known_hash` — which a caller that wants text does not. So the error names a
+    /// caller bug rather than papering over one.
     pub fn into_versioned_text(self) -> Result<(String, Option<String>), BackendError> {
         match self {
             BackendResponse::Content(ContentResponse::Text { text, version }) => {
                 Ok((text, version))
+            }
+            other => Err(mismatch("read-text", &other)),
+        }
+    }
+
+    /// The answer to a [`ContentRequest::ReadText`] that CARRIED a `known_hash`:
+    /// either the text, or the backend's proof that the caller's copy is current.
+    ///
+    /// `Ok(None)` means unchanged. The version travels out of both branches, so a
+    /// caller does not have to know which one it got to record what it observed.
+    #[allow(clippy::type_complexity)]
+    pub fn into_text_unless_unchanged(
+        self,
+    ) -> Result<(Option<String>, Option<String>), BackendError> {
+        match self {
+            BackendResponse::Content(ContentResponse::Text { text, version }) => {
+                Ok((Some(text), version))
+            }
+            BackendResponse::Content(ContentResponse::Unchanged { version, .. }) => {
+                Ok((None, version))
             }
             other => Err(mismatch("read-text", &other)),
         }
@@ -1103,6 +1171,23 @@ impl BackendRequest {
         BackendRequest::Content(ContentRequest::ReadText {
             path: path.into(),
             version: None,
+            known_hash: None,
+        })
+    }
+
+    /// Read the current text of a note, offering the hash the caller already holds so a
+    /// backend that can prove "unchanged" cheaply may skip materializing the content.
+    ///
+    /// The answer is [`BackendResponse::into_text_unless_unchanged`]'s, not
+    /// [`BackendResponse::into_text`]'s. See [`ContentRequest::ReadText`] for why this is
+    /// separate from [`Self::read_text`] rather than an extra argument on it: the callers
+    /// that must never be answered `Unchanged` outnumber the one that wants to be, and
+    /// making them pass `None` would be an invitation to pass something else.
+    pub fn read_text_known_hash(path: impl Into<String>, known_hash: impl Into<String>) -> Self {
+        BackendRequest::Content(ContentRequest::ReadText {
+            path: path.into(),
+            version: None,
+            known_hash: Some(known_hash.into()),
         })
     }
 
@@ -1111,6 +1196,9 @@ impl BackendRequest {
         BackendRequest::Content(ContentRequest::ReadText {
             path: path.into(),
             version: Some(version.into()),
+            // A historical read must always carry text: it exists to show the caller
+            // content it does NOT already have, so there is no prior hash to offer.
+            known_hash: None,
         })
     }
 

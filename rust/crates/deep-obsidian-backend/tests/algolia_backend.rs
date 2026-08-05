@@ -85,6 +85,29 @@ fn raw_client(base_url: &str) -> AlgoliaClient {
     AlgoliaClient::new("TESTAPP", "test-key", Some(base_url))
 }
 
+/// Move the mount's generation sentinel from outside the write path.
+///
+/// For fixtures that stage a corpus change with the raw client: the listing cache is
+/// validated against this record, so a staged change that leaves it alone is invisible to
+/// a listing by design. The token only has to DIFFER from whatever is there; it is opaque
+/// and never parsed.
+async fn stage_generation_bump(client: &AlgoliaClient, index: &str) {
+    client
+        .save_objects_awaited(
+            index,
+            vec![json!({
+                "objectID": deep_obsidian_backend::algolia::generation::GENERATION_OBJECT_ID,
+                "recordType": deep_obsidian_backend::algolia::generation::GENERATION_RECORD_TYPE,
+                "token": format!("staged-{}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or(0)),
+            })],
+        )
+        .await
+        .expect("move the generation sentinel");
+}
+
 async fn write(
     backend: &AlgoliaVaultBackend,
     path: &str,
@@ -595,6 +618,12 @@ async fn a_tombstoned_note_leaves_reads_and_listings_but_a_write_resurrects_it()
         )
         .await
         .expect("remove the chunks");
+    // Part of the same staging, and part of what a soft delete does for itself: move the
+    // mount's generation sentinel. Whole-corpus listings are cached against it, so a
+    // writer that changes the corpus without moving it is claiming nothing changed. A
+    // raw writer that skips this is out of contract — see `algolia::generation` — which
+    // is exactly why the fixture has to do it by hand here.
+    stage_generation_bump(&client, "tombstone-wiki").await;
 
     // Reads: absent, and absent as `NotFound` so a write over it is a create.
     let error = backend
@@ -788,6 +817,131 @@ async fn a_forbidden_object_id_reads_as_a_missing_note() {
 
 /// Folders are synthesized from facets, and the ordering is CORE's — directories
 /// first, then files, each group by path — so a caller cannot tell which backend
+/// The generation sentinel: a repeated listing browses once, and a write re-browses.
+///
+/// The measured problem was that `resources/list` performed a full whole-corpus browse on
+/// every call, forever, against a corpus that had not changed. Asserting the RESULT cannot
+/// show this fixed — a correct cache and no cache return the same listing — so this counts
+/// the mock's browses, which is the request a real account charges for.
+///
+/// Four properties, each one a way this could be wrong:
+///
+/// * a second identical listing costs NO browse (the cache is used at all);
+/// * it returns the same answer (the cache is not returning something else);
+/// * a write through this mount makes the next listing browse again (the cache is
+///   invalidated), with no sleep — the local write path drops it synchronously rather than
+///   waiting to notice its own change;
+/// * the sentinel record is not itself listed (it lives in the same index as the notes).
+#[tokio::test]
+async fn a_repeated_listing_is_served_from_cache_until_a_write_moves_the_generation() {
+    let mock = MockAlgolia::default();
+    let (base_url, _server) = spawn_mock_with(mock.clone()).await;
+    let backend = writable(&base_url, "generation-wiki");
+    write(&backend, "Alpha.md", "# Alpha\n\nbody\n", BaseVersion::Absent)
+        .await
+        .expect("create");
+
+    let first = markdown_files(&backend).await;
+    assert_eq!(first, vec!["Alpha.md".to_string()]);
+    let after_first = mock.browse_count();
+    assert!(after_first > 0, "the first listing must actually browse");
+
+    // Second listing, nothing changed: same answer, no browse.
+    let second = markdown_files(&backend).await;
+    assert_eq!(second, first, "a cached listing must be the same listing");
+    assert_eq!(
+        mock.browse_count(),
+        after_first,
+        "an unchanged generation must not cost a second whole-corpus browse"
+    );
+
+    // A write invalidates it, with no wait.
+    write(&backend, "Beta.md", "# Beta\n\nbody\n", BaseVersion::Absent)
+        .await
+        .expect("create the second note");
+    let third = markdown_files(&backend).await;
+    assert_eq!(
+        third,
+        vec!["Alpha.md".to_string(), "Beta.md".to_string()],
+        "a listing after a local write must see the write with no wait"
+    );
+    assert!(
+        mock.browse_count() > after_first,
+        "and must have gone back to the index to find out"
+    );
+
+    // The sentinel shares the main index with the notes, so the thing to prove is that no
+    // read path can ever surface it. `recordType:"meta"` fails every `recordType:note` and
+    // `recordType:chunk` filter positively, and it carries no `path` for the listings that
+    // check one locally.
+    let sentinel = raw_client(&base_url)
+        .get_objects(
+            "generation-wiki",
+            &[deep_obsidian_backend::algolia::generation::GENERATION_OBJECT_ID.to_string()],
+        )
+        .await
+        .expect("fetch the sentinel")
+        .pop()
+        .flatten()
+        .expect("the sentinel must exist after a write");
+    assert_eq!(sentinel["recordType"], json!("meta"), "{sentinel}");
+    assert!(sentinel.get("path").is_none(), "{sentinel}");
+
+    for listed in markdown_files(&backend).await {
+        assert!(
+            !listed.contains("meta:"),
+            "the sentinel must never appear in a listing: {listed}"
+        );
+    }
+    let children = backend
+        .execute(BackendRequest::list_children(None, false, false))
+        .await
+        .expect("list root")
+        .into_children()
+        .expect("children");
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| child.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Alpha.md", "Beta.md"],
+        "nor in a root listing"
+    );
+}
+
+/// A mount that cannot read the sentinel still lists correctly — it just never caches.
+///
+/// A SECURED key scoped so `meta:generation` cannot be addressed answers 403, not "not
+/// found". If that were treated as an error the mount would stop listing at all; if it
+/// were treated as "no change" the cache would be trusted with no evidence. It has to
+/// mean "no usable reading", i.e. browse every time — exactly the behaviour from before
+/// this cache existed.
+#[tokio::test]
+async fn a_mount_that_cannot_read_the_sentinel_lists_correctly_and_never_caches() {
+    let mock = MockAlgolia::with_forbidden_object_ids(vec![
+        deep_obsidian_backend::algolia::generation::GENERATION_OBJECT_ID.to_string(),
+    ]);
+    let (base_url, _server) = spawn_mock_with(mock.clone()).await;
+    let backend = writable(&base_url, "scoped-wiki");
+    write(&backend, "Alpha.md", "# Alpha\n\nbody\n", BaseVersion::Absent)
+        .await
+        .expect("create");
+
+    let first = markdown_files(&backend).await;
+    assert_eq!(first, vec!["Alpha.md".to_string()]);
+    let after_first = mock.browse_count();
+
+    let second = markdown_files(&backend).await;
+    assert_eq!(
+        second, first,
+        "a mount that cannot validate a cache must still answer correctly"
+    );
+    assert!(
+        mock.browse_count() > after_first,
+        "and must browse again rather than trust a cache it cannot validate"
+    );
+}
+
 /// answered from the shape of a listing.
 #[tokio::test]
 async fn listings_synthesize_folders_and_keep_cores_ordering() {

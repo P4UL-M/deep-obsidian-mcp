@@ -43,7 +43,7 @@ ever refuse is not advertised.**
 
 | Tool | Needs | What it does |
 |---|---|---|
-| `note_history` | `version-history` | List a note's retained versions, newest first, with each version's author and timestamp. Retention keeps the most recent versions plus anything inside the mount's age window, so older versions may be absent. |
+| `note_history` | `version-history` | List a note's retained versions, newest first, with each version's author and timestamp. Retention keeps the most recent versions plus anything inside the mount's age window, so older versions may be absent. `limit` (default 50, max 500) bounds the answer; because the order is newest-first it keeps the most recent versions, and when it cut the list short the payload also carries `truncated: true`, `totalCount` and `truncationNote`. An untruncated answer carries none of those keys. |
 | `read_version` | `version-history` | Read one specific, possibly superseded version, reassembled from the mount's history. Take the `versionId` from `note_history`. |
 | `resolve_divergence` | `version-history` | Return a diverged note's current head, the version it overtook, and their common ancestor, so **you** can three-way merge them. The server never merges: a wrong automatic merge produces plausible text and is nearly undetectable. Write the result with `upsert_note` and `resolveDivergence: true` to clear the mark. |
 | `delete_note` | `soft-delete` | Soft-delete a note whose removal is observable to other participants and recoverable: it leaves listings and search, its previous version moves to history, and the content stays readable through `note_history` / `read_version`. |

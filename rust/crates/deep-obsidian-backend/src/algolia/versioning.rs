@@ -311,6 +311,12 @@ pub async fn push_note_version(
         .cache()
         .put(remote_path, &version_id, &built.note.content_hash, content);
 
+    // Announce the change to every other process, and drop this one's listing cache.
+    // AFTER the head move, so the sentinel never says "something changed" for a write
+    // that did not land; and after `ensure_main_settings`, so a first write's sentinel
+    // lands in a provisioned index. See `generation::bump`.
+    super::generation::bump(backend).await;
+
     purge_history(backend, remote_path).await?;
 
     Ok(VersionedWriteOutcome {
@@ -453,6 +459,9 @@ pub async fn soft_delete_note(
     // the next read on this process would serve the body from a note that no longer
     // exists.
     backend.cache().remove(remote_path);
+    // A tombstoned note leaves every listing, so the listings must be rebuilt. See
+    // `generation::bump`.
+    super::generation::bump(backend).await;
     purge_history(backend, remote_path).await?;
 
     Ok(SoftDeleteOutcome {

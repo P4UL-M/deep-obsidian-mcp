@@ -206,6 +206,23 @@ no filter anyone can forget.
 - **There is no change feed.** Algolia has no "what changed since" primitive, so this mount
   advertises no `watch` capability and nothing waits on one. A colleague's edit is picked up
   by your next read — the head lookup *is* the freshness check.
+- **Whole-corpus listings are cached against a generation sentinel.** `resources/list`,
+  `find_files` and the divergence report each need every live note, which is a `browse`
+  followed to exhaustion. One reserved record, `meta:generation`, holds an opaque token that
+  every Deep Obsidian write path replaces; a listing is reused only while that token is
+  unchanged, so the repeat cost is one object lookup instead of a whole-corpus browse. Your
+  own writes drop the cache immediately — a write-then-list through your server needs no
+  wait — and the token is re-read on every listing, so there is **no time window** during
+  which a colleague's write could be invisible: this cache adds no staleness that reading
+  the index directly would not also have.
+
+  Three consequences worth knowing. The record is `recordType: "meta"` with no `path` and no
+  `noteId`, so no listing, search, grep or delete-by-query can ever touch it. A mount whose
+  API key is scoped so it cannot read that object browses every time, exactly as before —
+  correct, just not cached. And a tool that writes to the index through Algolia's **raw
+  API** without replacing the token will not be noticed at all; that is out of contract
+  (such a writer already breaks this mount's versioning invariants) and the mount's own CLI
+  and MCP tools all go through paths that bump it.
 
 ## The CLI
 

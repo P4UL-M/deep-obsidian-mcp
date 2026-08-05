@@ -2667,3 +2667,393 @@ async fn a_grep_issued_immediately_after_a_write_sees_the_new_note() {
 
     supervisor.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// The manifest cache's invalidation, and the conditional read built on it
+// ---------------------------------------------------------------------------
+
+/// Every listable path in the manifest, through the cached accessor.
+async fn listed_paths(backend: &CouchDbVaultBackend) -> Vec<String> {
+    backend
+        .execute(BackendRequest::walk_markdown())
+        .await
+        .expect("walk markdown")
+        .into_markdown_files()
+        .expect("markdown files")
+}
+
+/// A write through this backend is visible to the very next manifest read, with NO wait.
+///
+/// This is the invariant the manifest cache's whole design turns on. The cache is now
+/// valid until invalidated rather than for two seconds, so the thing that must be proved
+/// is that a local write invalidates it SYNCHRONOUSLY — not on the change feed's echo,
+/// which would arrive some unbounded moment later and would make this test need a sleep.
+/// There is deliberately no sleep, no poll and no retry here: if the invalidation were
+/// asynchronous this would fail, and a `sleep` would have hidden it.
+#[tokio::test]
+async fn a_local_write_invalidates_the_manifest_cache_with_no_wait() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    // Warm the cache, so what follows is testing invalidation rather than a cold read.
+    let before = listed_paths(&backend).await;
+    assert!(
+        !before.iter().any(|path| path == "Fresh.md"),
+        "the fixture must not already contain the note this test creates: {before:?}"
+    );
+
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "Fresh.md",
+            "# Fresh\n\nwritten by the agent\n",
+            BaseVersion::Absent,
+        ))
+        .await
+        .expect("the create must land");
+
+    let after = listed_paths(&backend).await;
+    assert!(
+        after.iter().any(|path| path == "Fresh.md"),
+        "a manifest read after a local write must see the write with no wait: {after:?}"
+    );
+    assert_eq!(
+        after.len(),
+        before.len() + 1,
+        "and must see exactly one more note than before"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// The same invariant for the virtual grep, which is the caller that used to opt out of
+/// the cache entirely.
+///
+/// The grep reuses the cache now (see `fresh_manifest_entries`), so the demo's
+/// write-then-grep has to keep working for the original reason: a grep reports
+/// `exhausted: true` and must never answer "no matches" for a note it simply did not
+/// know about. No sleep, for the same reason as above.
+#[tokio::test]
+async fn a_grep_after_a_local_write_finds_the_written_line_with_no_wait() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    // Warm the manifest cache through a listing, which is exactly how the demo produced
+    // the original failure: the grep then ran inside the listing's reuse window.
+    let _ = listed_paths(&backend).await;
+
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "Greppable.md",
+            "# Greppable\n\nthe needle is xyzzy-marker here\n",
+            BaseVersion::Absent,
+        ))
+        .await
+        .expect("the create must land");
+
+    let outcome = backend
+        .execute(BackendRequest::Recall(RecallRequest::Grep {
+            query: "xyzzy-marker".to_string(),
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 0,
+            limit: 10,
+        }))
+        .await
+        .expect("grep")
+        .into_grep_outcome()
+        .expect("outcome");
+    assert_eq!(
+        outcome
+            .matches
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Greppable.md"],
+        "an exhaustive grep must never miss a note this backend just wrote"
+    );
+    assert!(outcome.exhausted);
+
+    supervisor.shutdown().await;
+}
+
+/// A write by SOMEBODY ELSE reaches this backend's manifest through the change feed.
+///
+/// The local-write path cannot cover this: the note is pushed straight into the mock
+/// CouchDB, so nothing in this process knows about it until the feed says so. Bounded
+/// poll rather than a fixed sleep — the feed's latency is the mock's and is not this
+/// test's to assert.
+#[tokio::test]
+async fn an_external_write_invalidates_the_manifest_cache_through_the_change_feed() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+    supervisor.ensure_ready().await.expect("handshake");
+
+    // Arm the feed and wait for it, so a failure below cannot be explained by "the feed
+    // was never listening" — which would make this test prove nothing.
+    let _stream = backend.changes(None);
+    for _ in 0..200 {
+        if supervisor.change_feed_live() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        supervisor.change_feed_live(),
+        "the change feed must be live before an external write can be noticed: {:?}",
+        supervisor.health()
+    );
+
+    // Warm the cache. With the feed live and nothing changed, this is the answer that
+    // must NOT survive the push below.
+    let before = listed_paths(&backend).await;
+    assert!(!before.iter().any(|path| path == "Elsewhere.md"));
+
+    couch.push_note("Elsewhere.md", "# Elsewhere\n\nwritten by another client\n");
+
+    let mut noticed = false;
+    for _ in 0..200 {
+        if listed_paths(&backend)
+            .await
+            .iter()
+            .any(|path| path == "Elsewhere.md")
+        {
+            noticed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        noticed,
+        "a manifest cache that is valid until invalidated must be invalidated by the change \
+         feed, or an external write would never become visible at all"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// An abruptly dead child stops the feed being reported as live, without anything
+/// having to ask.
+///
+/// This is the hole a `watching`-only check would leave. `watching` records that `watch`
+/// was armed and is not cleared by a child dying on its own, so a cache trusting it alone
+/// would read "the epoch has not moved" as "nothing changed" when the truth is "nothing
+/// can reach us" — unbounded staleness, strictly worse than the fallback window it
+/// replaced. The connection's reader task marks the connection dead at stdout EOF, so
+/// this needs no call to notice.
+#[tokio::test]
+async fn an_abrupt_child_death_stops_the_change_feed_being_reported_as_live() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+    supervisor.ensure_ready().await.expect("handshake");
+    let _stream = backend.changes(None);
+    for _ in 0..200 {
+        if supervisor.change_feed_live() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(supervisor.change_feed_live(), "{:?}", supervisor.health());
+
+    let pid = supervisor.child_pid().expect("a running child");
+    kill_child(pid);
+
+    let mut reported_dead = false;
+    for _ in 0..200 {
+        if !supervisor.change_feed_live() {
+            reported_dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        reported_dead,
+        "a dead child must not leave the change feed reported as live: {:?}",
+        supervisor.health()
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// The conditional read: `unchanged` without hydrating, and never after a change.
+///
+/// Three facts in one test because they are one mechanism:
+///
+/// * a matching hash for the revision the cache holds answers `Unchanged`;
+/// * a hash that does not match falls through and returns the text;
+/// * a write MOVES the revision, so the cached hash stops being evidence and the next
+///   conditional read with the OLD hash returns text rather than `unchanged` — which is
+///   the cache-poisoning failure this must be impossible.
+#[tokio::test]
+async fn a_conditional_read_answers_unchanged_only_while_the_revision_it_saw_is_current() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    // A first, unconditional read is what populates the hash cache.
+    let (text, _) = read_versioned(&backend, "Beta.md").await;
+    let hash = deep_obsidian_core::content_hash(text.as_bytes());
+
+    // Hit: the revision has not moved, so the hash is current.
+    let response = backend
+        .execute(BackendRequest::read_text_known_hash("Beta.md", &hash))
+        .await
+        .expect("a conditional read");
+    let (body, version) = response
+        .into_text_unless_unchanged()
+        .expect("text or unchanged");
+    assert!(
+        body.is_none(),
+        "a matching hash on an unmoved revision must be answered `unchanged` rather than \
+         hydrated"
+    );
+    assert!(
+        version.is_some(),
+        "and must still name the revision it was established at"
+    );
+
+    // Miss: a hash the note does not have must never be answered `unchanged`.
+    let (body, _) = backend
+        .execute(BackendRequest::read_text_known_hash(
+            "Beta.md",
+            "fnv1a64:0000000000000000",
+        ))
+        .await
+        .expect("a conditional read")
+        .into_text_unless_unchanged()
+        .expect("text or unchanged");
+    assert_eq!(
+        body.as_deref(),
+        Some(text.as_str()),
+        "a non-matching hash must fall through to the full read"
+    );
+
+    // Stale: the write moves the revision, so the cached (rev, hash) pair stops being
+    // evidence about the head and the OLD hash must no longer short-circuit.
+    let (_, version) = read_versioned(&backend, "Beta.md").await;
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "Beta.md",
+            "Beta note, changed.\n",
+            BaseVersion::Version(version.expect("a revision")),
+        ))
+        .await
+        .expect("the write must land");
+
+    let (body, _) = backend
+        .execute(BackendRequest::read_text_known_hash("Beta.md", &hash))
+        .await
+        .expect("a conditional read")
+        .into_text_unless_unchanged()
+        .expect("text or unchanged");
+    assert_eq!(
+        body.as_deref(),
+        Some("Beta note, changed.\n"),
+        "after a write, a conditional read holding the PRE-write hash must be served the new \
+         content — answering `unchanged` here would be the cache serving a stale fact"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// A conditional read that CANNOT be short-circuited costs nothing extra.
+///
+/// The pessimisation this guards against: probing the remote with a `stat` before
+/// consulting the cache would add a round trip to exactly the two cases where it can
+/// never help — a path this process has never read (an agent resuming with hashes stored
+/// in an earlier session, i.e. every read it makes) and a hash that does not match what
+/// we hold (the note really did change). Both would then pay stat + read where they used
+/// to pay read.
+///
+/// Counted in sidecar REQUESTS rather than milliseconds: a timing assertion would be
+/// flaky and would not say which round trips happened. The mock records every request it
+/// serves, so "did this cost an extra `stat`?" is answerable exactly.
+#[tokio::test]
+async fn a_conditional_read_that_cannot_short_circuit_costs_no_extra_round_trip() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+    supervisor.ensure_ready().await.expect("handshake");
+
+    // A path this process has never read, with a plausible-looking hash. Nothing is
+    // cached for it, so no `stat` can establish anything.
+    let before = supervisor.request_count();
+    let (body, _) = backend
+        .execute(BackendRequest::read_text_known_hash(
+            "Beta.md",
+            "fnv1a64:1111111111111111",
+        ))
+        .await
+        .expect("a conditional read")
+        .into_text_unless_unchanged()
+        .expect("text or unchanged");
+    assert!(body.is_some(), "a cold conditional read must return the text");
+    let cold_cost = supervisor.request_count() - before;
+
+    // The same read with no `knownHash` at all: the cost this must not exceed.
+    let before = supervisor.request_count();
+    let _ = read_versioned(&backend, "Beta.md").await;
+    let plain_cost = supervisor.request_count() - before;
+
+    assert!(
+        cold_cost <= plain_cost,
+        "a conditional read that cannot short-circuit must not cost more than an \
+         unconditional one: {cold_cost} requests against {plain_cost}"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// A write records what it wrote, so reading it back with the returned hash is cheap.
+///
+/// This is the documented client loop — `upsert_note` hands back `newHash`, the agent
+/// feeds it back as `knownHash` — and it was the case the cache missed entirely while it
+/// was populated only from reads: the very next read re-hydrated a note this process had
+/// just composed itself.
+#[tokio::test]
+async fn a_write_records_its_own_hash_so_the_read_back_never_hydrates() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+    supervisor.ensure_ready().await.expect("handshake");
+
+    let content = "# Written\n\nby this very process\n";
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "WrittenBack.md",
+            content,
+            BaseVersion::Absent,
+        ))
+        .await
+        .expect("the create must land");
+    let hash = deep_obsidian_core::content_hash(content.as_bytes());
+
+    // No unconditional read in between: the ONLY thing that can have populated the cache
+    // is the write itself.
+    let before = supervisor.request_count();
+    let (body, version) = backend
+        .execute(BackendRequest::read_text_known_hash("WrittenBack.md", &hash))
+        .await
+        .expect("a conditional read")
+        .into_text_unless_unchanged()
+        .expect("text or unchanged");
+    let cost = supervisor.request_count() - before;
+
+    assert!(
+        body.is_none(),
+        "reading back a just-written note with the hash the write returned must be \
+         answered `unchanged`, not hydrated"
+    );
+    assert!(version.is_some(), "and must name the revision it was written at");
+    assert!(
+        cost <= 1,
+        "it must cost at most the one metadata round trip, not an entry fetch plus every \
+         chunk: {cost} requests"
+    );
+
+    supervisor.shutdown().await;
+}

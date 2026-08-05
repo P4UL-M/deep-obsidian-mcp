@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -51,6 +51,16 @@ pub struct MockAlgolia {
     /// Shared through the `Clone`, so a test that holds a clone can flip it while the
     /// server task holds another.
     outage: Arc<AtomicBool>,
+    /// How many `browse` requests this mock has served, ever.
+    ///
+    /// A browse is the expensive read against a real account — cursor-followed over the
+    /// whole corpus — so "was the corpus browsed again?" is the question a caching test
+    /// has to answer, and it is not answerable from the RESULT (a correct cache and no
+    /// cache return the same listing). Counting the requests is the only way to
+    /// distinguish them, which is why this lives here rather than in a test.
+    ///
+    /// Shared through the `Clone` for the same reason `outage` is.
+    browses: Arc<AtomicUsize>,
 }
 
 impl MockAlgolia {
@@ -71,6 +81,11 @@ impl MockAlgolia {
     /// succeeded before it succeeds again after it.
     pub fn end_outage(&self) {
         self.outage.store(false, Ordering::SeqCst);
+    }
+
+    /// How many `browse` requests have been served. See [`Self::browses`].
+    pub fn browse_count(&self) -> usize {
+        self.browses.load(Ordering::SeqCst)
     }
 }
 
@@ -568,6 +583,9 @@ async fn handle_browse(
     AxumPath(index): AxumPath<String>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    // Counted before the filter is validated, so a rejected browse still counts as one
+    // request made: the question this answers is "did the caller go to the index?".
+    state.browses.fetch_add(1, Ordering::SeqCst);
     let params = body_params(&body);
     let filters = params.get("filters").cloned().unwrap_or_default();
     if let Some(message) = invalid_filter(&filters) {

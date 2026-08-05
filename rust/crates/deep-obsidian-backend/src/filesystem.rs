@@ -154,6 +154,16 @@ impl FilesystemVaultBackend {
             } => Err(BackendError::Unsupported(
                 FILESYSTEM_VERSION_HISTORY_UNSUPPORTED_MESSAGE.to_string(),
             )),
+            // `known_hash` is IGNORED here, and this backend is the reason the field is
+            // an opportunity rather than a contract. `fnv1a64` has no shortcut: the only
+            // way to know what this file hashes to is to read every byte of it and hash
+            // them, which is exactly what a full read does. There is nothing to skip, so
+            // there is no `Unchanged` to answer — the caller compares the hash itself,
+            // as it always has, and saves the response body. An `mtime`/`ino` check
+            // could stand in for the hash, but that is a precondition this backend has
+            // never enforced (see `version` below) and inventing one here would make a
+            // read cheaper by making it wrong under any tool that rewrites content
+            // without moving the mtime.
             ContentRequest::ReadText { path, .. } => Ok(ContentResponse::Text {
                 text: vault::read_text_file(&self.vault_path, &path)?.text,
                 // The filesystem mints no version token. A caller therefore gets
@@ -194,7 +204,7 @@ impl FilesystemVaultBackend {
         })
     }
 
-    fn recall(&self, request: RecallRequest) -> Result<RecallResponse, BackendError> {
+    async fn recall(&self, request: RecallRequest) -> Result<RecallResponse, BackendError> {
         match request {
             RecallRequest::Grep {
                 query,
@@ -213,21 +223,43 @@ impl FilesystemVaultBackend {
                 // in scope. This is the only backend that can claim it, and the claim
                 // is what makes the server's `exhaustive` field meaningful when
                 // another backend cannot.
-                Ok(RecallResponse::Grep(GrepOutcome::exhaustive(
-                    grep::run_grep(
-                        &self.ripgrep_path,
-                        &self.vault_path,
-                        self.index_dir.as_deref(),
-                        GrepParams {
-                            query,
-                            regex,
-                            case_sensitive,
-                            glob,
-                            context_lines,
-                            limit,
-                        },
-                    )?,
-                )))
+                //
+                // # On a blocking thread, which it was always documented to need
+                //
+                // `run_grep` spawns `rg` and waits for it — tens of milliseconds of
+                // genuinely blocking work — and its own doc comment says "the caller runs
+                // it on a blocking thread". It did not. Calling it inline held a reactor
+                // thread for the whole search, which cost two things:
+                //
+                // * a federated grep could not overlap its mounts AT ALL. The router
+                //   fans out concurrently, but concurrency needs futures that yield, and
+                //   a future that blocks inside `poll` runs to completion before its
+                //   siblings are polled at all — so N mounts cost N greps end to end
+                //   however they were driven (measured: +17.9 ms per additional mount).
+                // * every other request on that thread waited behind it, federated or not.
+                //
+                // So this is not an optimisation for the router's benefit; it is the fix
+                // for a blocking call in an async context, and the router's fan-out is
+                // what made its absence visible.
+                let ripgrep_path = self.ripgrep_path.clone();
+                let vault_path = self.vault_path.clone();
+                // Owned so it can cross into the blocking task; `run_grep` takes the
+                // backend's index dir separately from the cross-backend `GrepParams`.
+                let index_dir = self.index_dir.clone();
+                let params = GrepParams {
+                    query,
+                    regex,
+                    case_sensitive,
+                    glob,
+                    context_lines,
+                    limit,
+                };
+                let matches = tokio::task::spawn_blocking(move || {
+                    grep::run_grep(&ripgrep_path, &vault_path, index_dir.as_deref(), params)
+                })
+                .await
+                .map_err(|error| BackendError::Message(error.to_string()))??;
+                Ok(RecallResponse::Grep(GrepOutcome::exhaustive(matches)))
             }
             RecallRequest::Search(_) => Err(BackendError::Unsupported(
                 FILESYSTEM_NATIVE_RECALL_UNSUPPORTED_MESSAGE.to_string(),
@@ -313,7 +345,9 @@ impl VaultBackend for FilesystemVaultBackend {
                 sweep_orphan_temp_files_at(&self.vault_path, std::time::SystemTime::now());
                 Ok(BackendResponse::Mutation(MutationResponse::Swept))
             }
-            BackendRequest::Recall(request) => self.recall(request).map(BackendResponse::Recall),
+            BackendRequest::Recall(request) => {
+                self.recall(request).await.map(BackendResponse::Recall)
+            }
             BackendRequest::Health(request) => self.health(request).map(BackendResponse::Health),
         }
     }

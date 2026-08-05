@@ -25,6 +25,7 @@ use deep_obsidian_algolia::SearchRequest;
 use serde_json::Value;
 use tracing::warn;
 
+use super::generation;
 use super::versioning::fetch_head;
 use super::{empty_if_missing_index, empty_search_response, map_algolia, AlgoliaVaultBackend};
 use crate::{BackendError, VaultChildEntry, VaultEntryKind};
@@ -370,7 +371,19 @@ pub async fn list_children(
 /// is capped at 1000 hits per page and would silently truncate a corpus above it.
 /// `WalkMarkdown` feeds `find_files` and the resource listing, both of which are
 /// meaningless if incomplete.
+/// Cached against the mount's generation sentinel, because `resources/list` asks for
+/// this on every call and a corpus that nothing has written has not changed. See
+/// [`generation`] for what makes that safe; the browse below is unchanged and still runs
+/// whenever the sentinel cannot vouch for a cached answer.
 pub async fn walk_markdown(backend: &AlgoliaVaultBackend) -> Result<Vec<String>, BackendError> {
+    generation::cached(backend, generation::WALK_MARKDOWN, || {
+        collect_markdown(backend)
+    })
+    .await
+    .map(|files| files.as_ref().clone())
+}
+
+async fn collect_markdown(backend: &AlgoliaVaultBackend) -> Result<Vec<String>, BackendError> {
     let records = empty_if_missing_index(
         backend
             .client()
@@ -392,6 +405,16 @@ pub async fn walk_markdown(backend: &AlgoliaVaultBackend) -> Result<Vec<String>,
 
 /// Visible top-level folders, sorted.
 pub async fn top_level_folders(backend: &AlgoliaVaultBackend) -> Result<Vec<String>, BackendError> {
+    generation::cached(backend, generation::TOP_LEVEL_FOLDERS, || {
+        collect_top_level_folders(backend)
+    })
+    .await
+    .map(|folders| folders.as_ref().clone())
+}
+
+async fn collect_top_level_folders(
+    backend: &AlgoliaVaultBackend,
+) -> Result<Vec<String>, BackendError> {
     let (hits, truncated) = empty_if_missing_index(
         backend
             .client()
@@ -425,6 +448,16 @@ pub async fn top_level_folders(backend: &AlgoliaVaultBackend) -> Result<Vec<Stri
 /// forked content is sitting in the history index and has never been merged into the
 /// line the head belongs to. See [`AlgoliaVaultBackend::conflicted_paths`].
 pub async fn divergent_paths(backend: &AlgoliaVaultBackend) -> Result<Vec<String>, BackendError> {
+    generation::cached(backend, generation::DIVERGENT_PATHS, || {
+        collect_divergent_paths(backend)
+    })
+    .await
+    .map(|paths| paths.as_ref().clone())
+}
+
+async fn collect_divergent_paths(
+    backend: &AlgoliaVaultBackend,
+) -> Result<Vec<String>, BackendError> {
     let records = empty_if_missing_index(
         backend
             .client()

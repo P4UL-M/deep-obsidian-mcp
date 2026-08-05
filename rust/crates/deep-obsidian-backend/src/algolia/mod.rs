@@ -33,6 +33,7 @@
 //!   stream, so nothing advertises `Watch` and no auto-reindex pump waits on one.
 
 pub mod cache;
+pub mod generation;
 pub mod grep;
 pub mod reads;
 pub mod recall;
@@ -189,6 +190,9 @@ pub struct AlgoliaVaultBackend {
     writable: bool,
     participant_id: String,
     cache: cache::NoteCache,
+    /// Whole-corpus listings, validated against the mount's generation sentinel
+    /// rather than a timer. See [`generation`].
+    listings: generation::ListingCache,
     retention: (usize, u64),
     /// Set once the MAIN index's settings have been applied. Under mount-only
     /// authorship nothing else provisions it: the index is created by the first mount
@@ -257,6 +261,7 @@ impl AlgoliaVaultBackend {
                 .clone()
                 .unwrap_or_else(default_participant_id),
             cache,
+            listings: generation::ListingCache::default(),
             retention: (
                 options
                     .retention_min_versions
@@ -285,6 +290,10 @@ impl AlgoliaVaultBackend {
 
     pub(crate) fn cache(&self) -> &cache::NoteCache {
         &self.cache
+    }
+
+    pub(crate) fn listings(&self) -> &generation::ListingCache {
+        &self.listings
     }
 
     pub fn participant_id(&self) -> &str {
@@ -386,6 +395,7 @@ impl AlgoliaVaultBackend {
             ContentRequest::ReadText {
                 path,
                 version: Some(version),
+                ..
             } => {
                 ensure_vault_relative(&path)?;
                 Ok(ContentResponse::Text {
@@ -795,6 +805,16 @@ impl AlgoliaVaultBackend {
             serde_json::Value::Null,
         )?;
         self.cache.remove(remote_path);
+        // A retracted note is gone from every listing, so the sentinel must move.
+        //
+        // Note what this adds that the other two mutation sites did not need: `retract`
+        // awaited NOTHING before this — both its deletes are fire-and-forget — so the
+        // bump is a genuinely new awaited round trip here. It is worth it for the same
+        // reason it is worth it there, and slightly more: a purge is the mutation most
+        // likely to leave another participant's listing pointing at a note that no longer
+        // exists at all. The sentinel is one small object; the two deletes it follows are
+        // whole-corpus queries.
+        generation::bump(self).await;
         Ok(())
     }
 }
