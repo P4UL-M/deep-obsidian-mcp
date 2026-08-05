@@ -1334,6 +1334,42 @@ pub struct SidecarSupervisor {
     /// without holding a reference to the supervisor (which would be a cycle, since
     /// the supervisor owns the pump's `JoinHandle`).
     cursor: Arc<StdMutex<Option<String>>>,
+    /// Monotonic counter of "something may have changed in this vault".
+    ///
+    /// A caller that wants to cache anything DERIVED from vault content (the
+    /// backend's manifest, a content hash) reads this BEFORE it collects, and its
+    /// cache is trustworthy only while the value has not moved. That makes the
+    /// counter the invalidation signal, replacing the guesswork of a short TTL.
+    ///
+    /// Bumped by exactly three things, and the set is deliberately over-inclusive
+    /// (a spurious bump costs one re-collection; a missed bump serves stale content):
+    ///
+    /// 1. **Every `write` this supervisor issues**, on completion and WHATEVER the
+    ///    outcome — a write reported as failed may still have landed (see
+    ///    `WriteAttempt::outcome_unknown`), so success is the wrong condition. This
+    ///    is what lets a write-then-read need no sleep and no feed echo.
+    /// 2. **Every `change` notification** the pump receives, i.e. every edit that
+    ///    reached the remote from anywhere — another device, another client, Obsidian.
+    /// 3. **A restart's `changesSince` catch-up**, when it saw anything, because the
+    ///    edits it replayed arrived while no pump was listening.
+    ///
+    /// Behind its own `Arc` for the same reason as `cursor`: the pump bumps it
+    /// without holding a reference to the supervisor.
+    ///
+    /// Nothing reads it as a quantity — only "is it still what it was" — so
+    /// `Relaxed` would do; `SeqCst` matches every other atomic here and the ordering
+    /// discussion is not worth the two nanoseconds.
+    change_epoch: Arc<AtomicU64>,
+    /// How many data requests this supervisor has issued to its child, ever.
+    ///
+    /// A DIAGNOSTIC, in the same spirit as [`Self::child_pid`] and for the same reason:
+    /// it measures something no other observation can reach. A round trip to the sidecar
+    /// is the unit of cost on this backend — each one is IPC plus a CouchDB conversation
+    /// plus, on an E2EE vault, decryption — so "how many round trips did that cost?" is
+    /// the question a caching change has to answer, and it is not answerable from the
+    /// RESULT (a cache that works and a cache that does not return the same bytes) nor
+    /// from a timing (which would be flaky and would not say WHICH calls happened).
+    requests: AtomicU64,
     /// Set once anything calls [`SidecarSupervisor::changes`], so a restart
     /// re-arms the live feed.
     watch_requested: AtomicBool,
@@ -1359,6 +1395,8 @@ impl SidecarSupervisor {
             connection: StdMutex::new(None),
             health: StdMutex::new(SupervisorHealth::new()),
             cursor: Arc::new(StdMutex::new(None)),
+            change_epoch: Arc::new(AtomicU64::new(0)),
+            requests: AtomicU64::new(0),
             watch_requested: AtomicBool::new(false),
             subscribers: Arc::new(StdMutex::new(Vec::new())),
             notification_pump: StdMutex::new(None),
@@ -1418,6 +1456,64 @@ impl SidecarSupervisor {
         if let (Some(cursor), Ok(mut slot)) = (cursor, self.cursor.lock()) {
             *slot = Some(cursor);
         }
+    }
+
+    /// How many data requests have been issued. See [`Self::requests`].
+    pub fn request_count(&self) -> u64 {
+        self.requests.load(Ordering::SeqCst)
+    }
+
+    /// The current value of [`Self::change_epoch`].
+    ///
+    /// # The contract a caching caller must honour
+    ///
+    /// Read this **before** issuing the collection you intend to cache, and store the
+    /// value you read. Reading it afterwards would stamp a snapshot with an epoch that
+    /// post-dates it: a change landing mid-collection would then be invisible AND
+    /// unreported, which is the one failure mode this counter exists to prevent. The
+    /// price of reading it early is a needless re-collection when a change happens to
+    /// land during one, and that is the correct direction to be wrong in.
+    pub fn change_epoch(&self) -> u64 {
+        self.change_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Record that the vault may have changed. See [`Self::change_epoch`].
+    fn bump_change_epoch(&self) {
+        self.change_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// True when a change to this vault made ANYWHERE would move
+    /// [`Self::change_epoch`] — i.e. when "the epoch has not moved" is evidence of
+    /// "nothing changed" rather than merely "nothing told us".
+    ///
+    /// # Why this is not just `health().watching`
+    ///
+    /// `watching` records that `watch` was armed successfully. It is not cleared when
+    /// the child dies ABRUPTLY, because nothing observes that until the next call — so
+    /// a caller trusting `watching` alone would treat an epoch that stopped moving
+    /// because the feed was gone as an epoch that stopped moving because the vault was
+    /// idle. That is unbounded staleness, strictly worse than the fallback TTL it would
+    /// have replaced.
+    ///
+    /// So the live connection is checked too, and that check is PROACTIVE: the
+    /// connection's reader task sets `dead` the moment the child's stdout reaches EOF,
+    /// with no call needed to notice. The moment the child dies, this reports `false`
+    /// and every caller falls back to its own conservative behaviour.
+    pub fn change_feed_live(&self) -> bool {
+        let connected = self
+            .connection
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.as_ref()
+                    .map(|connection| !connection.is_dead())
+            })
+            .unwrap_or(false);
+        // Two locks are taken here, never nested: the connection lock is released by
+        // the end of the expression above, before `health()` takes its own. Nothing
+        // else in this file holds one while taking the other, so there is no ordering
+        // to get wrong.
+        connected && self.health().watching
     }
 
     /// Ensure a child is running and its handshake reported `ok`.
@@ -1621,6 +1717,7 @@ impl SidecarSupervisor {
     fn start_notification_pump(&self, mut receiver: mpsc::UnboundedReceiver<(String, Value)>) {
         let subscribers = self.subscriber_handle();
         let cursor_slot = self.cursor.clone();
+        let change_epoch = self.change_epoch.clone();
         let pump = tokio::spawn(async move {
             while let Some((method, params)) = receiver.recv().await {
                 if method != "change" {
@@ -1632,6 +1729,10 @@ impl SidecarSupervisor {
                         *slot = Some(cursor.to_string());
                     }
                 }
+                // BEFORE the broadcast, so a subscriber that reacts by asking this
+                // supervisor for a manifest cannot be served one collected against the
+                // pre-change epoch. See `change_epoch`.
+                change_epoch.fetch_add(1, Ordering::SeqCst);
                 let path = params
                     .get("path")
                     .and_then(Value::as_str)
@@ -1707,6 +1808,10 @@ impl SidecarSupervisor {
         // A restart that missed edits must not leave a stale index: report the
         // catch-up as one change so the runtime reindexes.
         if any_change {
+            // And, for the same reason, no cached manifest collected before the outage
+            // may survive it: the edits replayed above landed while no pump was
+            // listening, so nothing else would have moved the epoch.
+            self.bump_change_epoch();
             self.subscriber_handle()
                 .broadcast(ChangeEvent::Change("livesync:resume-catchup".to_string()));
         }
@@ -1747,6 +1852,10 @@ impl SidecarSupervisor {
         method: &str,
         params: Value,
     ) -> (Result<Value, SidecarError>, bool) {
+        // Counted per ATTEMPT, before the child is even reached: the retry below is a
+        // second round trip and a caller asking "how many did that cost?" wants to be
+        // told about it.
+        self.requests.fetch_add(1, Ordering::SeqCst);
         let connection = match self.ready_connection().await {
             Ok(connection) => connection,
             // Never reached the child, so nothing can have taken effect.
@@ -1762,6 +1871,7 @@ impl SidecarSupervisor {
             return (Err(error), false);
         }
         warn!("livesync sidecar {method} failed ({error}); restarting and retrying once");
+        self.requests.fetch_add(1, Ordering::SeqCst);
         self.mark_connection_dead();
         let connection = match self.ready_connection().await {
             Ok(connection) => connection,
@@ -1782,6 +1892,11 @@ impl SidecarSupervisor {
         if let Some(previous) = previous {
             previous.dead.store(true, Ordering::SeqCst);
         }
+        // The feed died with the child that served it. Reported here rather than left
+        // for the restart to correct, because `watching` is read as "changes will
+        // reach us" (see `change_feed_live`) and a stale `true` would be a lie in the
+        // dangerous direction. `resume_watch` sets it back when the child returns.
+        self.update_health(|health| health.watching = false);
     }
 
     /// `health`, which the protocol keeps available even when nothing else is.
@@ -1979,6 +2094,20 @@ impl SidecarSupervisor {
             }
             other => other,
         };
+
+        // The local half of cache invalidation, and the reason a write-then-read needs
+        // no sleep: this happens before the caller gets its answer, so a manifest
+        // collected before this write can never be served to whatever the caller does
+        // next.
+        //
+        // UNCONDITIONAL, including on the error paths above. `outcome_unknown` exists
+        // precisely because a write reported as failed may already have landed, and
+        // `is_retryable_remote` is the same story — chunks go out before the entry
+        // root. Bumping only on success would leave exactly those cases serving a
+        // manifest that predates a write that happened. The cost of being wrong the
+        // other way is one manifest walk.
+        self.bump_change_epoch();
+
         WriteAttempt {
             outcome: raw.and_then(|value| {
                 serde_json::from_value(value).map_err(|error| {

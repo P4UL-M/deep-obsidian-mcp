@@ -59,6 +59,52 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 ### Improved
 
+- **Multi-backend performance: five measured fixes.** All five came out of a
+  release-build audit of the multi-backend stack and each is verified against that
+  audit's own harness. No payload changes and no new staleness: every cache here is
+  invalidated by a signal, not merely aged out.
+
+  - **A CouchDB mount's listings no longer re-walk the vault.** The manifest cache
+    was valid for a fixed two seconds, which interactive traffic misses almost every
+    time, so `vault_info`, `resources/list`, `list_children` and `conflicted_paths`
+    each paid a full cursor-looped manifest walk — O(notes), measured at **+45.7 ms
+    per mount** over 300 notes and growing linearly (112 ms at 1200 notes). The cache
+    is now valid **until invalidated**, by a local write (synchronously, before the
+    writing caller is answered) or by the change feed. Cold `vault_info` with a
+    CouchDB mount: **57.2 ms → 14.1 ms**, and the cost is now **flat** in vault size
+    (10.7 / 11.2 / 11.1 ms at 600 / 900 / 1500 notes, against a recorded 39.9 / 82.0 /
+    112.4 ms). While the change feed is not running the old two-second window applies
+    unchanged — with nothing watching, that conservatism is still correct.
+  - **A federated `grep_search` searches its mounts at once.** It cost one whole
+    ripgrep run per mount, end to end, `+17.9 ms` for each mount added. The fan-out is
+    now concurrent — and the reason it could not already be was that the filesystem
+    backend ran `rg` *synchronously inside an async fn*, holding a reactor thread for
+    the entire search and making every other request on that thread wait behind it,
+    federated or not. Grep over 1 / 2 / 3 mounts: **59.4 / 77.3 / 93.9 ms → 60.0 /
+    57.7 / 58.4 ms**. Results are still merged in mount order, so the output is
+    byte-identical to before, including `exhaustive: false` when a limit truncates the
+    answer with mounts left to search.
+  - **`read_file`'s `knownHash` finally saves something on a CouchDB mount.** It
+    saved only response bytes (2.64 ms against 2.60 ms unconditional), because the
+    note was fully fetched, reassembled and decrypted just to compute the hash. The
+    hash now travels to the backend, which keeps a bounded `path → (revision, hash)`
+    cache and answers "unchanged" from metadata alone. **2.64 ms → 0.064 ms**, faster
+    than reading the same note off local disk. A write records its own hash too, so
+    feeding `upsert_note`'s `newHash` straight back costs one metadata call rather
+    than a hydration. The filesystem backend ignores the hint and says why: there is
+    no way to know what a file hashes to without reading it.
+  - **An Algolia mount's listings are validated by a generation sentinel.** A
+    whole-corpus `browse` ran on every `resources/list`. One small `meta:generation`
+    record is now replaced by every write path, and a listing is reused only while
+    that token is unchanged — so an unchanged listing costs one object lookup instead
+    of a cursor-followed browse, and a write invalidates it immediately with no wait.
+    A mount whose API key cannot read the sentinel browses every time, exactly as
+    before.
+  - **`note_history` takes a `limit`.** It was O(versions) with no way to ask for
+    less. `limit` (default 50, max 500) keeps the newest versions; a shortened answer
+    adds `truncated`, `totalCount` and `truncationNote`, and an untruncated one is
+    byte-identical to before.
+
 - **Answers say what they could not do.** A federated answer that lost a mount
   carries `degraded`, `missingBackends` and a `degradationReason` naming it; a
   mount that legitimately holds nothing a tool asks for is reported as *skipped*

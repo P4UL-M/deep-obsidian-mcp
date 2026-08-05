@@ -874,6 +874,7 @@ async fn responses_mirror_their_request_family() {
             .execute(BackendRequest::Content(ContentRequest::ReadText {
                 path: "Home.md".to_string(),
                 version: None,
+                known_hash: None,
             }))
             .await
             .expect("read")

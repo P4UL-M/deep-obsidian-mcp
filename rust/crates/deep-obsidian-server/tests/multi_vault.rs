@@ -3346,6 +3346,75 @@ async fn the_capability_tools_appear_only_for_a_mount_that_can_serve_them() {
     );
 }
 
+/// `note_history`'s `limit`: the newest versions, and truncation reported only when real.
+///
+/// The payload was O(versions) with no way to ask for less. Three properties matter and
+/// each one is a way the fix could have been wrong:
+///
+/// * **untruncated answers do not change shape** — no `truncated`, no `totalCount`,
+///   nothing. Every client written before this keeps working, and `count` keeps meaning
+///   what it meant.
+/// * **the versions kept are the NEWEST** — the list is newest-first, so a limit takes a
+///   prefix. A limit that had kept the oldest would be useless in exactly the case that
+///   motivates it.
+/// * **truncation is stated** — `truncated: true` plus `totalCount`, so a caller can tell
+///   "that is all of them" from "that is the first page".
+#[tokio::test]
+async fn note_history_limits_to_the_newest_versions_and_says_when_it_truncated() {
+    let fixture = AlgoliaFixture::new("algolia-history-limit").await;
+    let state = fixture.state_writable(true).await;
+    let path = "_Shared/Decisions/Paginated.md";
+
+    for revision in 1..=3 {
+        tool_call(
+            &state,
+            "upsert_note",
+            json!({"path": path, "content": format!("# Paginated\n\nbody {revision}\n")}),
+        )
+        .await;
+    }
+
+    // Unlimited: three versions, and NOT a single new key.
+    let full = structured(&tool_call(&state, "note_history", json!({"path": path})).await).clone();
+    assert_eq!(full["count"], json!(3), "{full}");
+    assert!(
+        full.get("truncated").is_none(),
+        "an untruncated history must carry no `truncated` key at all: {full}"
+    );
+    assert!(full.get("totalCount").is_none(), "{full}");
+    let newest = full["versions"][0]["versionId"].clone();
+    let second_newest = full["versions"][1]["versionId"].clone();
+
+    // Limited: the two NEWEST, in the same order, with the shortfall named.
+    let page =
+        structured(&tool_call(&state, "note_history", json!({"path": path, "limit": 2})).await)
+            .clone();
+    assert_eq!(page["count"], json!(2), "{page}");
+    assert_eq!(page["truncated"], json!(true), "{page}");
+    assert_eq!(page["totalCount"], json!(3), "{page}");
+    assert!(
+        page["truncationNote"].is_string(),
+        "a truncation flag travels with prose explaining it: {page}"
+    );
+    assert_eq!(page["versions"][0]["versionId"], newest, "{page}");
+    assert_eq!(page["versions"][1]["versionId"], second_newest, "{page}");
+    assert_eq!(
+        page["versions"][0]["current"],
+        json!(true),
+        "the head survives truncation, which is what `resolve_divergence` depends on: {page}"
+    );
+
+    // A limit at or above the total is not truncation.
+    let exact =
+        structured(&tool_call(&state, "note_history", json!({"path": path, "limit": 3})).await)
+            .clone();
+    assert_eq!(exact["count"], json!(3), "{exact}");
+    assert!(
+        exact.get("truncated").is_none(),
+        "exactly enough is not truncated: {exact}"
+    );
+}
+
 /// `note_history`, `read_version` and `delete_note` round-trip: versions accumulate, an
 /// old one is still readable, a delete hides the note everywhere, and the content is
 /// recoverable from the version the delete named.

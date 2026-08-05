@@ -543,9 +543,17 @@ impl VaultRouter {
             // `version` is forwarded, not dropped: dropping it would turn a request for
             // a superseded version into a request for the current one, and the caller
             // would be handed the wrong content with no error at all.
-            ContentRequest::ReadText { version, .. } => ContentRequest::ReadText {
+            // `known_hash` is forwarded for the mirror-image reason: dropping it would
+            // silently downgrade every conditional read on a multi-mount vault to an
+            // unconditional one, which is a performance cliff with no error to find it by.
+            ContentRequest::ReadText {
+                version,
+                known_hash,
+                ..
+            } => ContentRequest::ReadText {
                 path: resolved.backend_relative_path,
                 version,
+                known_hash,
             },
             ContentRequest::ReadBytes { .. } => ContentRequest::ReadBytes {
                 path: resolved.backend_relative_path,
@@ -952,11 +960,14 @@ impl VaultRouter {
     ///
     /// # The `limit` is a whole-vault budget, spent in mount order
     ///
-    /// Each mount is asked for the REMAINING budget rather than the full `limit`, so the
-    /// total is exactly `limit` and no work is done for matches that would be discarded. The
-    /// cost is that mount order decides whose matches survive truncation, which is why
-    /// `exhausted` goes to `false` the moment the budget runs out with mounts left to search:
-    /// a truncated concatenation is precisely "I did not look everywhere".
+    /// Every mount is searched CONCURRENTLY and the results are merged in mount order, so
+    /// the answer does not depend on which backend finished first and a federated grep costs
+    /// roughly what the slowest mount costs rather than the sum. The merge is a faithful
+    /// replay of the serial loop this replaced — see the comment on it.
+    ///
+    /// Mount order still decides whose matches survive truncation, which is why `exhausted`
+    /// goes to `false` the moment the budget runs out with mounts left to search: a truncated
+    /// concatenation is precisely "I did not look everywhere".
     ///
     /// # A failed mount is partial, not fatal
     ///
@@ -972,12 +983,68 @@ impl VaultRouter {
         context_lines: usize,
         limit: usize,
     ) -> Result<BackendResponse, RouterError> {
+        // Every mount at once. Serial fan-out cost one full backend grep per mount end
+        // to end — one `rg` spawn, or one whole virtual-grep corpus read — and measured
+        // at +17.9 ms per additional mount, which is latency the caller pays for no
+        // reason: the mounts share nothing, so the searches are independent.
+        //
+        // Each is asked for the FULL `limit`, because the remaining budget is a
+        // sequential quantity and there is no longer a sequence. The budget is then
+        // applied in the replay below, which is what keeps this from changing the
+        // answer; see there.
+        let searches = self.mounts.iter().map(|mount| {
+            let request = BackendRequest::Recall(RecallRequest::Grep {
+                query: query.clone(),
+                regex,
+                case_sensitive,
+                glob: glob.clone(),
+                context_lines,
+                limit,
+            });
+            async move {
+                mount
+                    .backend
+                    .execute(request)
+                    .await
+                    .and_then(BackendResponse::into_grep_outcome)
+            }
+        });
+        // `join_all` rather than `FuturesUnordered`: the results are wanted in mount
+        // order, and collecting them in order is the whole point (see below). Nothing
+        // here short-circuits on the first completion, so there is nothing to gain from
+        // an unordered stream.
+        let outcomes = futures_util::future::join_all(searches).await;
+
         let mut matches: Vec<GrepMatch> = Vec::new();
         let mut exhausted = true;
         let mut candidate_count: Option<usize> = None;
         let mut missing_mounts: Vec<String> = Vec::new();
 
-        for mount in &self.mounts {
+        // # The replay
+        //
+        // The merge below is the OLD SERIAL LOOP with the awaits removed: same mount
+        // order (`self.mounts`, i.e. the order the mounts were configured in — the
+        // order every previous release reported matches in), same running budget, same
+        // early exit. Only the waiting became parallel.
+        //
+        // That is deliberate, and it is stronger than "deterministic": it makes the
+        // output BYTE-IDENTICAL to the serial version, which is why every existing
+        // grep test passes unmodified.
+        //
+        // * **matches** — a backend's own output is an order-preserving prefix of its
+        //   full match list under any `limit` (the filesystem's `rg` pass and the
+        //   virtual grep both stop appending at the cap; Algolia's iterates a fixed
+        //   candidate list). So the first `remaining` of a mount's `limit`-capped
+        //   answer is exactly the `remaining`-capped answer the serial loop asked for.
+        // * **exhausted** — the early exit still forces `false` when the budget runs out
+        //   with mounts left. A plain AND over every mount's `exhausted` would NOT do:
+        //   with `limit: 1` and two mounts that each looked everywhere, it would report
+        //   `exhausted: true` for an answer that dropped the second mount's matches.
+        // * **candidate_count / missing_mounts** — a mount past the exit contributes
+        //   neither, exactly as when it was never asked. (It now does the work anyway
+        //   and the work is discarded. That is the price of the fan-out, and it is paid
+        //   only in the rare shape "the budget was filled before the last mount".)
+        for (mount, outcome) in self.mounts.iter().zip(outcomes) {
             let remaining = limit.saturating_sub(matches.len());
             if remaining == 0 {
                 // The budget is spent and there are mounts left, so the answer is short by
@@ -985,18 +1052,6 @@ impl VaultRouter {
                 exhausted = false;
                 break;
             }
-            let outcome = mount
-                .backend
-                .execute(BackendRequest::Recall(RecallRequest::Grep {
-                    query: query.clone(),
-                    regex,
-                    case_sensitive,
-                    glob: glob.clone(),
-                    context_lines,
-                    limit: remaining,
-                }))
-                .await
-                .and_then(BackendResponse::into_grep_outcome);
             match outcome {
                 Ok(outcome) => {
                     // A mount that could not read everything makes the WHOLE answer
@@ -1006,9 +1061,11 @@ impl VaultRouter {
                     if let Some(count) = outcome.candidate_count {
                         candidate_count = Some(candidate_count.unwrap_or(0) + count);
                     }
-                    matches.extend(outcome.matches.into_iter().map(|item| GrepMatch {
-                        path: mount.to_logical(&item.path),
-                        ..item
+                    matches.extend(outcome.matches.into_iter().take(remaining).map(|item| {
+                        GrepMatch {
+                            path: mount.to_logical(&item.path),
+                            ..item
+                        }
                     }));
                 }
                 Err(_) => {
@@ -1031,7 +1088,8 @@ impl VaultRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Capability, FilesystemVaultBackend};
+    use crate::watch::ChangeStream;
+    use crate::{BackendDescriptor, BackendKind, Capability, FilesystemVaultBackend, OpaqueCursor};
     use std::path::PathBuf;
     use std::time::SystemTime;
 
@@ -1761,5 +1819,185 @@ mod tests {
         assert!(error
             .to_string()
             .contains("vault path does not exist or is not a directory"));
+    }
+    // -----------------------------------------------------------------------
+    // Federated grep: parallel fan-out, deterministic merge
+    // -----------------------------------------------------------------------
+
+    /// A backend that answers grep with fixed matches after a fixed delay.
+    ///
+    /// The delay is the whole point: it lets a test make the mounts COMPLETE in the
+    /// opposite order to the one they are configured in, which is the only way to
+    /// distinguish "merged in mount order" from "merged in completion order". Nothing
+    /// else about it is interesting — every other request family is refused, because a
+    /// mock that answered them would invite a later test to rely on it.
+    #[derive(Debug)]
+    struct SlowGrepBackend {
+        delay: std::time::Duration,
+        paths: Vec<String>,
+    }
+
+    impl SlowGrepBackend {
+        /// Not `new`: it returns the `Arc<dyn VaultBackend>` a `Mount` takes rather than
+        /// a `Self`, and every call site wants the mount-ready form.
+        fn mounted(delay_ms: u64, paths: &[&str]) -> Arc<dyn VaultBackend> {
+            Arc::new(Self {
+                delay: std::time::Duration::from_millis(delay_ms),
+                paths: paths.iter().map(|path| path.to_string()).collect(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VaultBackend for SlowGrepBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            BackendDescriptor::new(BackendKind::InMemory, [Capability::GrepSearch])
+        }
+
+        async fn execute(&self, request: BackendRequest) -> Result<BackendResponse, BackendError> {
+            match request {
+                BackendRequest::Recall(RecallRequest::Grep { limit, .. }) => {
+                    tokio::time::sleep(self.delay).await;
+                    let matches = self
+                        .paths
+                        .iter()
+                        .take(limit)
+                        .map(|path| GrepMatch {
+                            path: path.clone(),
+                            line_number: 1,
+                            submatches: Vec::new(),
+                            line_text: "charter".to_string(),
+                            context_before: Vec::new(),
+                            context_after: Vec::new(),
+                        })
+                        .collect();
+                    Ok(BackendResponse::Recall(RecallResponse::Grep(
+                        GrepOutcome::exhaustive(matches),
+                    )))
+                }
+                _ => Err(BackendError::Message("mock: grep only".to_string())),
+            }
+        }
+
+        /// Nothing to watch, and nothing advertises `Watch`.
+        fn changes(&self, _after: Option<OpaqueCursor>) -> ChangeStream {
+            ChangeStream::empty()
+        }
+    }
+
+    /// The merged order is MOUNT order, whatever order the mounts finish in.
+    ///
+    /// The fan-out is concurrent now, so completion order is a property of the network
+    /// rather than of the configuration — and a caller that saw matches reorder between
+    /// two identical greps could not diff two results or page through them. The first
+    /// mount here is deliberately the slowest, so a merge that appended results as they
+    /// arrived would put `Fast/` first and fail.
+    #[tokio::test]
+    async fn a_federated_grep_merges_in_mount_order_not_completion_order() {
+        let router = VaultRouter::new(vec![
+            Mount::new("slow", "Slow", SlowGrepBackend::mounted(60, &["A.md", "B.md"])),
+            Mount::new("fast", "Fast", SlowGrepBackend::mounted(0, &["C.md"])),
+        ])
+        .expect("router");
+
+        // Twice, because a single run of a race can pass by luck.
+        for _ in 0..2 {
+            let outcome = router
+                .execute(grep(None))
+                .await
+                .expect("grep")
+                .into_grep_outcome()
+                .expect("outcome");
+            assert_eq!(
+                outcome
+                    .matches
+                    .iter()
+                    .map(|item| item.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["Slow/A.md", "Slow/B.md", "Fast/C.md"],
+                "the slowest mount is configured first, so its matches come first"
+            );
+            assert!(outcome.exhausted);
+            assert!(outcome.missing_mounts.is_empty());
+        }
+    }
+
+    /// The fan-out really is concurrent: three mounts cost about what one costs.
+    ///
+    /// The measured problem was +17.9 ms of latency per additional mount from searching
+    /// them one after another. Asserting a wall-clock bound is unusual and justified
+    /// here: the fix IS a timing property, and a version that quietly went back to
+    /// serial would pass every other test in this file. The bound is loose (three 60 ms
+    /// mounts must finish well inside their 180 ms serial cost) so it cannot flake on a
+    /// loaded machine while still failing outright on a serial implementation.
+    #[tokio::test]
+    async fn a_federated_grep_searches_every_mount_at_once() {
+        let router = VaultRouter::new(vec![
+            Mount::new("one", "One", SlowGrepBackend::mounted(60, &["A.md"])),
+            Mount::new("two", "Two", SlowGrepBackend::mounted(60, &["B.md"])),
+            Mount::new("three", "Three", SlowGrepBackend::mounted(60, &["C.md"])),
+        ])
+        .expect("router");
+
+        let started = std::time::Instant::now();
+        let outcome = router
+            .execute(grep(None))
+            .await
+            .expect("grep")
+            .into_grep_outcome()
+            .expect("outcome");
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome.matches.len(), 3, "every mount contributed");
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "three 60ms mounts searched concurrently must finish well inside their 180ms \
+             serial cost, took {elapsed:?}"
+        );
+    }
+
+    /// A spent budget still reports `exhausted: false` when mounts are left.
+    ///
+    /// The one place the parallel merge could have drifted. Every mount is now asked for
+    /// the full `limit` and every answer is available at merge time, so a naive AND over
+    /// their `exhausted` flags would report `true` here — both mounts DID look
+    /// everywhere. But the answer dropped the second mount's match to honour `limit`, and
+    /// "I did not look everywhere" is exactly what the caller needs to be told. The
+    /// sequential replay is what preserves this.
+    #[tokio::test]
+    async fn a_grep_whose_budget_runs_out_with_mounts_left_is_not_exhausted() {
+        let router = VaultRouter::new(vec![
+            Mount::new("one", "One", SlowGrepBackend::mounted(0, &["A.md"])),
+            Mount::new("two", "Two", SlowGrepBackend::mounted(0, &["B.md"])),
+        ])
+        .expect("router");
+
+        let outcome = router
+            .execute(BackendRequest::Recall(RecallRequest::Grep {
+                query: "charter".to_string(),
+                regex: false,
+                case_sensitive: false,
+                glob: None,
+                context_lines: 0,
+                limit: 1,
+            }))
+            .await
+            .expect("grep")
+            .into_grep_outcome()
+            .expect("outcome");
+
+        assert_eq!(
+            outcome
+                .matches
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["One/A.md"],
+            "the budget is spent by the first mount, in mount order"
+        );
+        assert!(
+            !outcome.exhausted,
+            "a truncated concatenation must not claim to have looked everywhere"
+        );
     }
 }

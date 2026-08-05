@@ -141,31 +141,181 @@ configuration turns this on, and writing an empty note is NOT a substitute: it w
 empty note to every device rather than remove one. Delete the note in Obsidian and let LiveSync \
 replicate the removal.";
 
-/// How long a collected manifest may be reused.
+/// How long a collected manifest may be reused **while we are blind**.
 ///
-/// A short reuse window, not a cache with an independent lifetime. It exists for
-/// one specific shape: the index refresh asks for the note manifest and the
-/// artifact manifest back to back, and each ask is a full cursor-looped `manifest`
-/// walk over the sidecar. On a filesystem vault a second walk is a cheap
-/// `read_dir`; here it is N round trips to CouchDB.
+/// # This was the cache's whole lifetime, and is now only its fallback
 ///
-/// It is deliberately SHORT rather than invalidated by the change feed: a stale
-/// manifest that outlived a change would make the refresh conclude "unchanged" and
-/// silently serve stale content. Two seconds is long enough to cover one refresh's
-/// paired calls and short enough that no user-visible read can be served from a
-/// manifest older than the request that triggered it. `CouchDbSource` additionally
-/// pins one manifest per refresh (see the server's `couchdb_source` module), which
-/// is what actually collapses 4 walks into 1.
+/// It used to be the entire invalidation strategy: a two-second window, chosen
+/// short precisely because nothing told the cache when it had gone stale. That made
+/// every manifest-backed read (`vault_info`, `resources/list`, listings,
+/// `conflicted_paths`) pay a full cursor-looped `manifest` walk — N round trips to
+/// CouchDB, O(notes) — on the first call after any two-second gap, which for
+/// interactive traffic is very nearly every call. Measured at ~47 ms per mount over
+/// 300 notes, growing linearly.
 ///
-/// One caller opts OUT of the window entirely: the virtual grep, whose corpus the
-/// manifest defines rather than merely describes, and which claims to have looked
-/// everywhere. See [`CouchDbVaultBackend::collect_manifest_entries`].
+/// Something DOES tell us now: [`SidecarSupervisor::change_epoch`], moved by every
+/// local write and by every change the feed delivers. So the cache is valid until
+/// invalidated, and this constant survives for the one case the epoch cannot cover —
+/// **the feed is not live** (never armed because auto-reindex is off, or armed and
+/// then lost with the child). Then an epoch that has not moved is only evidence that
+/// nothing TOLD us, not that nothing changed, and the old conservatism is exactly
+/// right: bound the staleness by two seconds and re-walk.
+///
+/// So the number is unchanged and its justification is unchanged; only its scope
+/// shrank. See [`CouchDbVaultBackend::cached_manifest`] for the validity rule and
+/// [`CouchDbVaultBackend::fresh_manifest_entries`] for the stricter one the virtual
+/// grep needs.
 const MANIFEST_REUSE_WINDOW: Duration = Duration::from_secs(2);
 
-/// A collected manifest and when it was collected.
+/// How many `path → (rev, content_hash)` pairs the read cache keeps.
+///
+/// # Why an entry cap and not a byte budget
+///
+/// The Algolia mount's `NoteCache` bounds itself by BYTES because it caches note
+/// bodies, which vary by four orders of magnitude. This caches neither bodies nor
+/// anything else of variable size: an entry is a vault path, a CouchDB revision
+/// (`<n>-<32 hex>`) and an `fnv1a64:` hash — call it 200 bytes with allocator
+/// overhead. Counting entries is therefore counting bytes, with one fewer thing to
+/// get wrong, and 4096 entries is roughly a megabyte.
+///
+/// # Why 4096
+///
+/// It only has to cover the WORKING SET of one session's conditional re-reads, not
+/// the vault: a hit needs the same path read twice with the same revision, and an
+/// agent re-reading a note it already has is re-reading something it touched
+/// minutes ago. 4096 is comfortably above any plausible such set while staying
+/// small enough that the cap is never the interesting part of a bug report. A vault
+/// larger than this loses nothing but the optimisation, and loses it on the
+/// least-recently-read entries first.
+const HASH_CACHE_CAPACITY: usize = 4096;
+
+/// What the last successful read of one path observed.
+#[derive(Clone)]
+struct CachedHash {
+    /// The CouchDB revision the hash was computed from. The whole point: a hash
+    /// without the revision it belongs to cannot be shown to be current.
+    rev: String,
+    /// [`deep_obsidian_core::content_hash`] of that revision's bytes — the same
+    /// function, byte for byte, that `read_file` compares `knownHash` against.
+    content_hash: String,
+    /// The vault's change epoch when the read that produced this was ISSUED.
+    ///
+    /// PER ENTRY, not one value for the whole cache. A cache-wide epoch would be the
+    /// epoch of the most recent insertion, and "nothing has changed since the most
+    /// recent insertion" says nothing about an older entry — a change to note B
+    /// followed by a read of B would then certify a stale revision for note A. The
+    /// epoch has to travel with the observation it dates.
+    epoch: u64,
+    /// Whether the change feed was live when the read that produced this was issued.
+    /// Same hazard, same reason as [`CachedManifest::feed_live_when_collected`]: an
+    /// observation made while nothing was listening cannot be certified by a feed that
+    /// only started listening afterwards.
+    feed_live_when_read: bool,
+    /// For eviction. Monotonic tick rather than a clock: eviction only needs an
+    /// ORDER, and a `SystemTime` would let a clock adjustment reorder it.
+    last_used: u64,
+}
+
+/// A bounded `path → (rev, hash)` map. See [`HASH_CACHE_CAPACITY`].
+///
+/// The revision is stored WITH the hash rather than checked separately, because "I
+/// have a hash for this path" and "I have the hash of the revision that is current"
+/// are different facts and only the second one can answer `unchanged`. Borrowed from
+/// the Algolia mount's `NoteCache`, whose key is `(path, version_id)` for exactly
+/// this reason.
+///
+/// Approximate-LRU by the same construction as `NoteCache`'s: on overflow, sort by
+/// last use and drop the oldest. Batched (a quarter of the map at a time) so a
+/// steady-state-full cache does not pay a sort per insertion.
+#[derive(Default)]
+struct HashCache {
+    entries: std::collections::HashMap<String, CachedHash>,
+    tick: u64,
+}
+
+impl HashCache {
+    /// The whole entry for `path`, whatever its revision. The caller decides what the
+    /// revision and the epoch are worth.
+    fn get_entry(&mut self, path: &str) -> Option<CachedHash> {
+        self.touch(path).map(|entry| entry.clone())
+    }
+
+    fn touch(&mut self, path: &str) -> Option<&mut CachedHash> {
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        let entry = self.entries.get_mut(path)?;
+        entry.last_used = tick;
+        Some(entry)
+    }
+
+    fn put(
+        &mut self,
+        path: &str,
+        rev: &str,
+        content_hash: &str,
+        epoch: u64,
+        feed_live_when_read: bool,
+    ) {
+        // A read that could not name its revision teaches us nothing usable: the entry
+        // could never be shown to be current, so it would occupy a slot and always miss.
+        if rev.is_empty() {
+            return;
+        }
+        self.tick = self.tick.wrapping_add(1);
+        self.entries.insert(
+            path.to_string(),
+            CachedHash {
+                rev: rev.to_string(),
+                content_hash: content_hash.to_string(),
+                epoch,
+                feed_live_when_read,
+                last_used: self.tick,
+            },
+        );
+        if self.entries.len() > HASH_CACHE_CAPACITY {
+            self.evict();
+        }
+    }
+
+    fn evict(&mut self) {
+        let mut ages: Vec<(u64, String)> = self
+            .entries
+            .iter()
+            .map(|(path, entry)| (entry.last_used, path.clone()))
+            .collect();
+        ages.sort_unstable();
+        for (_, path) in ages.into_iter().take(HASH_CACHE_CAPACITY / 4) {
+            self.entries.remove(&path);
+        }
+    }
+}
+
+/// A collected manifest, when it was collected, and what the vault's change epoch was
+/// when the collection STARTED.
 struct CachedManifest {
     entries: Arc<Vec<ManifestEntry>>,
     collected_at: std::time::Instant,
+    /// Read before the walk was issued, never after — see
+    /// [`SidecarSupervisor::change_epoch`] for why that direction is the safe one.
+    epoch: u64,
+    /// Whether the change feed was live when the walk was ISSUED.
+    ///
+    /// # The hazard this closes
+    ///
+    /// The feed arms ASYNCHRONOUSLY — the server runtime spawns the subscription, and it
+    /// completes some moment after the mount starts serving. Without this flag the
+    /// sequence
+    ///
+    /// 1. collect the manifest at epoch 0, feed not yet armed,
+    /// 2. a change lands (nothing is listening, so the epoch does not move),
+    /// 3. the feed arms,
+    /// 4. read the manifest: epoch is still 0 and the feed is live, so serve the cache
+    ///
+    /// would serve a manifest that predates a change, for as long as nothing else moved
+    /// the epoch. "The epoch has not moved AND the feed is live now" is not sufficient;
+    /// the feed has to have been live for the WHOLE interval, and since the epoch pins
+    /// the end of that interval, all that is missing is the beginning.
+    feed_live_when_collected: bool,
 }
 
 /// A LiveSync vault reached through a supervised sidecar. Read-only unless the
@@ -173,6 +323,9 @@ struct CachedManifest {
 pub struct CouchDbVaultBackend {
     supervisor: Arc<SidecarSupervisor>,
     manifest: std::sync::Mutex<Option<CachedManifest>>,
+    /// What each recently-touched path's content hashed to, at which revision.
+    /// See [`HashCache`] and [`Self::read_text_conditionally`].
+    hashes: std::sync::Mutex<HashCache>,
     /// Derived from the supervisor's mode, never configured separately.
     ///
     /// A second flag could disagree with the sidecar it talks to, and the disagreement
@@ -203,6 +356,7 @@ impl CouchDbVaultBackend {
             writable: supervisor.mode().is_writable(),
             supervisor,
             manifest: std::sync::Mutex::new(None),
+            hashes: std::sync::Mutex::new(HashCache::default()),
         }
     }
 
@@ -233,10 +387,12 @@ impl CouchDbVaultBackend {
         &self.supervisor
     }
 
-    /// The whole manifest, reusing a very recent collection.
+    /// The whole manifest, from cache when the cache is still known-good.
     ///
-    /// See [`MANIFEST_REUSE_WINDOW`] for why the window is short rather than
-    /// change-feed-invalidated.
+    /// The everyday accessor: listings, `WalkMarkdown`, `TopLevelFolders`,
+    /// `conflicted_paths` and therefore `vault_info` and `resources/list`. Its
+    /// freshness rule is [`Self::cached_manifest`]'s. The virtual grep wants a
+    /// stronger one — see [`Self::fresh_manifest_entries`].
     pub async fn manifest_entries(&self) -> Result<Arc<Vec<ManifestEntry>>, BackendError> {
         if let Some(cached) = self.cached_manifest() {
             return Ok(cached);
@@ -244,40 +400,104 @@ impl CouchDbVaultBackend {
         self.collect_manifest_entries().await
     }
 
-    /// Collect the manifest from the sidecar, ignoring any cached one, and cache the
-    /// result.
+    /// The whole manifest, reused ONLY on positive evidence that nothing has changed.
     ///
-    /// # Why grep must not reuse a cached manifest
+    /// # Why the virtual grep needs its own rule
     ///
-    /// [`MANIFEST_REUSE_WINDOW`]'s own contract is that "no user-visible read can be
-    /// served from a manifest older than the request that triggered it". A LISTING can
-    /// tolerate a two-second-old snapshot — a caller reading a directory expects eventual
-    /// consistency. A grep cannot, because the manifest is not metadata to it: it is the
-    /// definition of what "everywhere" means, and the outcome CLAIMS to have looked
-    /// everywhere (`exhausted: true`). A note written a moment ago and absent from the
-    /// cached manifest would be reported as containing no matches, which is the one thing
-    /// an exhaustive search must never do.
+    /// A LISTING can tolerate a slightly old snapshot: a caller reading a directory
+    /// expects eventual consistency, which is what makes [`MANIFEST_REUSE_WINDOW`]'s
+    /// two-second fallback acceptable there. A grep cannot, because the manifest is not
+    /// metadata to it — it is the definition of what "everywhere" means, and the outcome
+    /// CLAIMS to have looked everywhere (`exhausted: true`). A note written a moment ago
+    /// and absent from the manifest would be reported as containing no matches, which is
+    /// the one thing an exhaustive search must never do.
     ///
-    /// This was found by the multi-backend demo, which writes a note through MCP and then
+    /// That was found by the multi-backend demo, which writes a note through MCP and then
     /// greps for a line in it: the write landed, the read-back was correct, and the grep
     /// returned nothing because a manifest collected during the preceding listing was
-    /// still inside the window. The cost of the fix is one extra manifest walk per grep,
-    /// which is marginal next to the per-candidate content reads the same grep then makes.
+    /// still inside the window. The fix at the time was to opt out of the cache entirely.
+    ///
+    /// # Why it no longer has to opt out
+    ///
+    /// The two writers that could invalidate a grep's corpus are now both reported,
+    /// and this reads the report rather than assuming the worst:
+    ///
+    /// * **A write through this backend** bumps the epoch on completion, before the
+    ///   caller is answered ([`SidecarSupervisor::change_epoch`]). So the demo's
+    ///   write-then-grep is exact with zero sleeps, and it is exact whether the feed is
+    ///   up or down — which is why that test passes unmodified.
+    /// * **A write from anywhere else** bumps the epoch when the feed delivers it, so it
+    ///   is covered exactly while [`SidecarSupervisor::change_feed_live`] holds.
+    ///
+    /// So: reuse iff the epoch has not moved AND the feed is live. **No TTL fallback
+    /// here** — with the feed down, an unmoved epoch says nothing about an external
+    /// write, and "probably nothing changed in the last two seconds" is not a basis for
+    /// claiming to have searched everywhere. Feed down therefore re-walks every time,
+    /// which is precisely the behaviour this replaced.
+    async fn fresh_manifest_entries(&self) -> Result<Arc<Vec<ManifestEntry>>, BackendError> {
+        if self.supervisor.change_feed_live() {
+            if let Some(cached) = self.cached_manifest_at_current_epoch() {
+                return Ok(cached);
+            }
+        }
+        self.collect_manifest_entries().await
+    }
+
+    /// Collect the manifest from the sidecar, ignoring any cached one, and cache the
+    /// result against the epoch the walk started at.
     async fn collect_manifest_entries(&self) -> Result<Arc<Vec<ManifestEntry>>, BackendError> {
+        // BEFORE the walk, both of them. A change landing while it runs must invalidate
+        // the result, and stamping afterwards would instead certify it. See
+        // `SidecarSupervisor::change_epoch` and `CachedManifest::feed_live_when_collected`.
+        let feed_live_when_collected = self.supervisor.change_feed_live();
+        let epoch = self.supervisor.change_epoch();
         let entries = Arc::new(map_sidecar(self.supervisor.collect_manifest().await)?);
         if let Ok(mut slot) = self.manifest.lock() {
             *slot = Some(CachedManifest {
                 entries: entries.clone(),
                 collected_at: std::time::Instant::now(),
+                epoch,
+                feed_live_when_collected,
             });
         }
         Ok(entries)
     }
 
+    /// The cached manifest when it is still good enough for a listing.
+    ///
+    /// Valid when the epoch has not moved AND either the feed is live (so an unmoved
+    /// epoch means nothing changed) or the collection is inside
+    /// [`MANIFEST_REUSE_WINDOW`] (the blind fallback).
+    ///
+    /// # Locking
+    ///
+    /// The supervisor's state is read FIRST and its locks are released before
+    /// `self.manifest` is taken, so only one lock is ever held at a time and there is no
+    /// order to invert. Nothing here awaits, so the `std::sync::Mutex` is never held
+    /// across a suspension point either.
     fn cached_manifest(&self) -> Option<Arc<Vec<ManifestEntry>>> {
+        let feed_live = self.supervisor.change_feed_live();
+        let epoch = self.supervisor.change_epoch();
         let slot = self.manifest.lock().ok()?;
         let cached = slot.as_ref()?;
-        (cached.collected_at.elapsed() < MANIFEST_REUSE_WINDOW).then(|| cached.entries.clone())
+        if cached.epoch != epoch {
+            return None;
+        }
+        // The feed must have been live for the WHOLE interval, not merely now — see
+        // `CachedManifest::feed_live_when_collected`.
+        let feed_vouches = feed_live && cached.feed_live_when_collected;
+        (feed_vouches || cached.collected_at.elapsed() < MANIFEST_REUSE_WINDOW)
+            .then(|| cached.entries.clone())
+    }
+
+    /// The cached manifest only when the epoch proves it current, with no TTL fallback.
+    /// The caller is responsible for having checked that the feed is live.
+    fn cached_manifest_at_current_epoch(&self) -> Option<Arc<Vec<ManifestEntry>>> {
+        let epoch = self.supervisor.change_epoch();
+        let slot = self.manifest.lock().ok()?;
+        let cached = slot.as_ref()?;
+        (cached.epoch == epoch && cached.feed_live_when_collected)
+            .then(|| cached.entries.clone())
     }
 
     async fn manifest_request(
@@ -324,8 +544,18 @@ impl CouchDbVaultBackend {
             } => Err(BackendError::Unsupported(
                 COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE.to_string(),
             )),
-            ContentRequest::ReadText { path, .. } => {
+            ContentRequest::ReadText {
+                path, known_hash, ..
+            } => {
                 ensure_vault_relative(&path)?;
+                if let Some(known_hash) = &known_hash {
+                    if let Some(response) = self.read_text_conditionally(&path, known_hash).await? {
+                        return Ok(response);
+                    }
+                }
+                // Both sampled before the read is issued; see `remember_hash`.
+                let feed_live_when_read = self.supervisor.change_feed_live();
+                let epoch = self.supervisor.change_epoch();
                 let result = map_sidecar(self.supervisor.read(&path).await)?;
                 note_conflict(&path, result.conflicted);
                 let version = (!result.rev.is_empty()).then(|| result.rev.clone());
@@ -334,7 +564,22 @@ impl CouchDbVaultBackend {
                     // caller that is about to write this note back turn its own
                     // `expectedHash` check into a storage-level precondition instead
                     // of a hope. See `BaseVersion`.
-                    ReadPayload::Text(text) => Ok(ContentResponse::Text { text, version }),
+                    ReadPayload::Text(text) => {
+                        // Populate the cache from the one place that has BOTH the bytes
+                        // and the revision that produced them. Computing the hash here
+                        // costs one pass over text we are already holding, and the layer
+                        // above is about to compute the identical hash with the identical
+                        // function anyway — so this is not extra work, it is the same
+                        // work done where its result can be kept.
+                        self.remember_hash(
+                            &path,
+                            &result.rev,
+                            &text,
+                            epoch,
+                            feed_live_when_read,
+                        );
+                        Ok(ContentResponse::Text { text, version })
+                    }
                     // A `newnote` entry read as text. Refused rather than
                     // lossily decoded: the caller asked for a note.
                     ReadPayload::Bytes(_) => Err(BackendError::Message(format!(
@@ -372,6 +617,142 @@ impl CouchDbVaultBackend {
                 Ok(ContentResponse::PathAccepted)
             }
         }
+    }
+
+    /// Record what one revision of one path hashed to. See [`HashCache`].
+    ///
+    /// `epoch` must be the value read BEFORE the read that produced `text` was issued —
+    /// same rule, and same reason, as [`Self::collect_manifest_entries`]'s. Stamping the
+    /// epoch afterwards would date the observation later than it happened, and a change
+    /// that landed mid-read would then be certified away.
+    fn remember_hash(
+        &self,
+        path: &str,
+        rev: &str,
+        text: &str,
+        epoch: u64,
+        feed_live_when_read: bool,
+    ) {
+        if let Ok(mut cache) = self.hashes.lock() {
+            cache.put(
+                path,
+                rev,
+                &deep_obsidian_core::content_hash(text.as_bytes()),
+                epoch,
+                feed_live_when_read,
+            );
+        }
+    }
+
+    /// Try to answer a conditional read WITHOUT hydrating the note.
+    ///
+    /// `Ok(Some(Unchanged))` when the caller's `known_hash` is provably the current
+    /// content's; `Ok(None)` when that could not be established and the caller must fall
+    /// through to a full read. An error is a real failure (an unreachable remote), not a
+    /// miss — a miss is `Ok(None)`.
+    ///
+    /// # What a full read costs here, and why this is worth a method
+    ///
+    /// On a filesystem mount `read_file` with a matching `knownHash` saves only the
+    /// response body: the file is read and hashed regardless, because `fnv1a64` cannot be
+    /// computed any other way. On this mount a read is a JSON-RPC round trip that fetches
+    /// the entry root, fetches every chunk it names, reassembles them, and decrypts the
+    /// lot on an E2EE vault — so the body was never the expensive part. Measured through
+    /// the mount, `knownHash` used to save nothing at all (2.64 ms against 2.60 ms) for
+    /// precisely that reason: the saving was on the only cheap step.
+    ///
+    /// # The chain that makes an answer legitimate
+    ///
+    /// The invariant is absolute: **never answer `unchanged` unless the revision the
+    /// cached hash belongs to is shown to be the CURRENT one.** Two ways to show it, and
+    /// the cheaper one is tried first:
+    ///
+    /// 1. **The change feed is live and the epoch has not moved since the entry was
+    ///    cached.** Then nothing in this vault has changed since we read this note —
+    ///    every local write bumps the epoch before its caller is answered, and every
+    ///    remote write bumps it when the feed delivers it — so the revision we recorded
+    ///    is still the head, and NO round trip is needed at all. This is the case the
+    ///    manifest cache's own invalidation (see [`Self::cached_manifest`]) buys for
+    ///    free; it is the same signal read for a different question.
+    /// 2. **Otherwise, `stat`.** One metadata round trip yields the current revision. If
+    ///    it equals the revision the cached hash belongs to, the hash is current. The
+    ///    chunk fetches and the reassembly are skipped; on a note of any size that is the
+    ///    entire cost of the read.
+    ///
+    /// A cache entry for a DIFFERENT revision is not evidence of anything and is not
+    /// treated as such — `HashCache::get` takes the revision as part of the lookup, so a
+    /// stale entry misses rather than answering. That is also why an external write can
+    /// never poison this: the write moves the revision, so either the feed reports it
+    /// (case 1 fails) or the `stat` observes it (case 2 fails), and both fall through to
+    /// a full read.
+    async fn read_text_conditionally(
+        &self,
+        path: &str,
+        known_hash: &str,
+    ) -> Result<Option<ContentResponse>, BackendError> {
+        // Nothing is asked of the remote until the cache says an answer is POSSIBLE.
+        //
+        // This ordering is the whole difference between an optimisation and a
+        // pessimisation. Probing with a `stat` first would add a round trip to precisely
+        // the cases it cannot help: a path this process has never read (an agent resuming
+        // with hashes from an earlier session — every read), and a `known_hash` that does
+        // not match what we hold (the note really did change — also every read). Both then
+        // pay stat + read where they used to pay read. So the cache is consulted first,
+        // and a miss costs nothing at all.
+        let Some(entry) = self.cached_hash_entry(path) else {
+            return Ok(None);
+        };
+        // A hash that is not the caller's cannot become `Unchanged` however current it
+        // turns out to be, so there is nothing worth confirming.
+        if entry.content_hash != known_hash {
+            return Ok(None);
+        }
+
+        // Case 1: no round trip at all. The feed is checked FIRST and the epoch sampled
+        // after it, so a change arriving between any two of these steps can only make the
+        // test fail, never pass. `feed_live_when_read` covers the other end of the
+        // interval — see `CachedManifest::feed_live_when_collected` for the hazard.
+        if entry.feed_live_when_read
+            && self.supervisor.change_feed_live()
+            && entry.epoch == self.supervisor.change_epoch()
+        {
+            debug!(
+                "read of {path} answered unchanged from the change feed alone: no revision \
+                 has moved in this vault since it was last read"
+            );
+            return Ok(Some(ContentResponse::Unchanged {
+                hash: known_hash.to_string(),
+                version: Some(entry.rev),
+            }));
+        }
+
+        // Case 2: one `stat`, worth paying now that the hash is known to match — it can
+        // only come back "yes, that revision is current" or "no", and the first answer
+        // saves the entry fetch, every chunk fetch, the reassembly and the decryption.
+        let Ok(stat) = self.supervisor.stat(path).await else {
+            // Not a miss to report as an error: the caller asked to read a note, and the
+            // full read below produces the right error for whatever is wrong with it.
+            return Ok(None);
+        };
+        if stat.rev.is_empty() || stat.rev != entry.rev {
+            return Ok(None);
+        }
+        note_conflict(path, stat.conflicted);
+        debug!(
+            "read of {path} answered unchanged after a metadata-only stat: revision {} is the \
+             one the cached hash belongs to, so no chunk was fetched",
+            stat.rev
+        );
+        Ok(Some(ContentResponse::Unchanged {
+            hash: known_hash.to_string(),
+            version: Some(stat.rev),
+        }))
+    }
+
+    /// Everything recorded for `path`, or `None` when nothing is.
+    fn cached_hash_entry(&self, path: &str) -> Option<CachedHash> {
+        let mut cache = self.hashes.lock().ok()?;
+        cache.get_entry(path)
     }
 
     // -----------------------------------------------------------------------
@@ -498,9 +879,33 @@ impl CouchDbVaultBackend {
         guard: WriteGuard,
         desired: &[u8],
     ) -> Result<WriteResult, BackendError> {
+        // Sampled before the write, for the usual reason: `remember_hash` requires an
+        // epoch that PRE-dates the observation it dates. Note the consequence — the write
+        // itself bumps the epoch, so a read of this note will not take the no-round-trip
+        // path (case 1 in `read_text_conditionally`); it takes the `stat` path, which
+        // still skips the entry fetch, every chunk fetch and the reassembly. Stamping the
+        // post-write epoch would make case 1 fire and would be WRONG: an external change
+        // landing between this write landing and its own bump would be ordered before the
+        // stamp, and this revision would be certified current after it had been
+        // superseded.
+        let epoch = self.supervisor.change_epoch();
+        let feed_live_when_read = self.supervisor.change_feed_live();
         let attempt = self.supervisor.write(path, &payload, &guard).await;
         match attempt.outcome {
             Ok(result) => {
+                // The write knows the new revision AND the bytes that are now at it, so
+                // it can record the pair the conditional read needs — which is what makes
+                // the documented client loop cheap: `upsert_note` hands back `newHash`,
+                // the agent feeds it straight back as `knownHash`, and that read no longer
+                // hydrates the note it just wrote.
+                //
+                // Only for a TEXT write. A binary entry is not readable as text, so a hash
+                // recorded for one could only ever serve a read that is refused anyway.
+                if let WritePayload::Text(_) = &payload {
+                    if let Ok(text) = std::str::from_utf8(desired) {
+                        self.remember_hash(path, &result.rev, text, epoch, feed_live_when_read);
+                    }
+                }
                 if result.conflicted {
                     warn!(
                         "wrote {path} on a livesync entry that has conflicting revisions; the \
@@ -688,8 +1093,9 @@ impl CouchDbVaultBackend {
     /// Every call is a manifest walk plus a `read` of EVERY note the glob admits, each
     /// one a JSON-RPC round trip to the sidecar and from there to CouchDB (decrypting
     /// on the way, on an E2EE vault). There is no content cache: a grep that answered
-    /// from stale text would be a worse failure than a slow one, and the manifest's own
-    /// reuse window ([`MANIFEST_REUSE_WINDOW`]) is short for the same reason. The reads
+    /// from stale text would be a worse failure than a slow one, and the manifest it
+    /// scopes itself by is reused only on positive evidence that it is current
+    /// ([`Self::fresh_manifest_entries`]) for the same reason. The reads
     /// run [`GREP_READ_CONCURRENCY`] at a time and stop as soon as `limit` is reached,
     /// so a narrow glob or a small `limit` is genuinely cheaper — but an unfiltered
     /// grep over a large vault reads the large vault.
@@ -727,9 +1133,11 @@ impl CouchDbVaultBackend {
         let filter = GlobFilter::new(glob.as_deref())?;
         let limit = limit.max(1);
 
-        // A FRESH manifest, never the cached one: see `collect_manifest_entries` for why
-        // an exhaustive search cannot be scoped by a corpus snapshot that predates it.
-        let entries = self.collect_manifest_entries().await?;
+        // A manifest that is PROVABLY current, which is not the same as always freshly
+        // walked: see `fresh_manifest_entries` for why an exhaustive search cannot be
+        // scoped by a corpus snapshot that might predate it, and what now constitutes
+        // proof that one does not.
+        let entries = self.fresh_manifest_entries().await?;
         let candidates = grep_corpus(&entries, &filter);
         debug!(
             "virtual grep over {} candidate note{} on a couchdb mount",
