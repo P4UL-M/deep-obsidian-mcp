@@ -68,14 +68,28 @@ Optional features and tuning live in [CONFIGURATION.md](./CONFIGURATION.md):
 - **Authentication** (bearer token) for non-loopback / tunnelled deployments
 - **Automatic reindexing** behaviour
 
+### Multi-backend mounts (experimental)
+
+A vault does not have to be one directory. An experimental `mounts` table grafts
+other storage onto folders of your vault — a Self-hosted LiveSync database in
+CouchDB, or a Markdown-only corpus in an Algolia index that a whole team can mount
+at once — so your agent sees a single namespace while different prefixes are served
+from different places. Everything is behind `experimental` flags, read-only unless
+you opt in per mount, and off by default: a config with no `mounts` table behaves
+exactly as it always has. See
+[CONFIGURATION.md § Multiple vaults](./CONFIGURATION.md#multiple-vaults-mounts), and
+[docs/algolia-mounts.md](./docs/algolia-mounts.md) for the shared-corpus design,
+its versioning model, and its limits.
+
 ## Documentation
 
 | Guide | What's in it |
 |---|---|
 | [INSTALL.md](./INSTALL.md) | Install on macOS, Debian/Ubuntu, or from source |
 | [USAGE.md](./USAGE.md) | Set up your vault, connect an agent, run the service, troubleshoot |
-| [CONFIGURATION.md](./CONFIGURATION.md) | Embeddings, authentication, reindexing |
+| [CONFIGURATION.md](./CONFIGURATION.md) | Embeddings, authentication, reindexing, mounts |
 | [docs/mcp-reference.md](./docs/mcp-reference.md) | MCP tools, resources, and prompts |
+| [docs/algolia-mounts.md](./docs/algolia-mounts.md) | Shared Algolia corpus (experimental) |
 | [docs/architecture.md](./docs/architecture.md) | Indexing model and internals |
 | [CHANGELOG.md](./CHANGELOG.md) | Release history |
 

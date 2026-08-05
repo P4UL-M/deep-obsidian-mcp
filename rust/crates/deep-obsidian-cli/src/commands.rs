@@ -41,6 +41,12 @@ Usage:
   deep-obsidian-mcp probe [--config <path>] [--json]
   deep-obsidian-mcp couchdb export --mount <id> --out <dir> [--config <path>] [--json]
   deep-obsidian-mcp couchdb restore --mount <id> --from <dir> [--dry-run] [--force] [--json]
+  deep-obsidian-mcp algolia seed --mount <id> [--from <folder>] [--dry-run] [--move] [--json]
+  deep-obsidian-mcp algolia dump --mount <id> --out <dir> [--json]
+  deep-obsidian-mcp algolia restore --mount <id> --from <dir> [--dry-run] [--force] [--json]
+  deep-obsidian-mcp algolia status --mount <id> [--json]
+  deep-obsidian-mcp algolia retract --mount <id> --path <note> [--yes] [--json]
+  deep-obsidian-mcp algolia key --mount <id> [--parent-key-ref <ref>] [--prefix <folder>] [--json]
 
 Commands:
   serve          Start the MCP server using resolved config.
@@ -49,6 +55,7 @@ Commands:
   print-config   Print the normalized persisted config.
   probe          Probe the configured HTTP health and MCP endpoints.
   couchdb        Snapshot (export) and restore a CouchDB (Self-hosted LiveSync) mount.
+  algolia        Seed, dump, restore, inspect and scope an Algolia-backed shared corpus.
   help           Show this help.
   version        Print the current version.
 
@@ -61,7 +68,25 @@ couchdb restore writes such a directory back through the same revision-guarded w
 path the MCP tools use. It creates missing entries, skips identical ones, and REFUSES
 entries whose remote content differs unless --force is given -- so the default cannot
 discard an edit made after the export. --dry-run reports exactly what a real run would
-do and works on a read-only mount.";
+do and works on a read-only mount.
+
+algolia seed imports a local folder into the mount's index ONCE. It defaults to the
+folder the mount shadows (<vaultPath>/<mountAt>), creates and updates only, and never
+deletes a note from the index to match the source. --move deletes each local original
+only after re-reading the index and confirming it holds those exact bytes.
+
+algolia dump writes every note to a directory plus a deterministic manifest.json; two
+dumps of an unchanged corpus are byte-identical. algolia restore writes such a tree
+back through the guarded write path: creates, skips identical, and REFUSES notes whose
+index content differs unless --force -- and even then nothing is destroyed, the current
+version moves to history. Non-.md files are refused outright: the corpus stores Markdown
+only, and no flag lifts that.
+
+algolia retract permanently deletes a note AND its whole history. It is the one
+destructive operation here, it prompts unless --yes, and it is deliberately not an MCP
+tool. algolia key derives a scoped read-only secured key for a teammate; it REFUSES a
+write-capable parent key, because a secured key inherits its parent's ACLs while its
+filter restriction constrains search only.";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -389,6 +414,10 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
+        Command::Algolia { command } => {
+            let resolved = crate::config::resolve_runtime_config(&cli.options)?;
+            run_algolia(&resolved.service, command, dry_run, json).await
+        }
         Command::Probe { timeout_ms } => {
             let resolved = crate::config::resolve_runtime_config(&cli.options)?;
             let report = probe(&resolved, timeout_ms).await?;
@@ -404,6 +433,136 @@ pub async fn run() -> Result<()> {
             }
         }
     }
+}
+
+/// Dispatch the `algolia` family.
+///
+/// Its own function rather than another arm inline: six subcommands with their own
+/// rendering, and the `retract` arm has an interactive gate that must not be lost in a
+/// match ladder.
+async fn run_algolia(
+    config: &ResolvedServiceConfig,
+    command: crate::cli::AlgoliaCommand,
+    global_dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    use crate::algolia_cmd as algolia;
+    use crate::cli::AlgoliaCommand;
+
+    match command {
+        AlgoliaCommand::Seed {
+            mount,
+            from,
+            dry_run,
+            move_files,
+        } => {
+            // The GLOBAL `--dry-run` counts too, here as everywhere: a user who has learned
+            // that it makes every command harmless must not be surprised by an import.
+            let report = algolia::seed(
+                config,
+                &mount,
+                from.as_deref(),
+                dry_run || global_dry_run,
+                move_files,
+            )
+            .await?;
+            print_report(json, &report, || algolia::render_seed_report(&report))
+        }
+        AlgoliaCommand::Dump { mount, out } => {
+            if global_dry_run {
+                println!(
+                    "(dry run: would dump mount '{mount}' to {}; nothing was read or written)",
+                    out.display()
+                );
+                return Ok(());
+            }
+            let report = algolia::dump(config, &mount, &out).await?;
+            print_report(json, &report, || algolia::render_dump_report(&report))?;
+            // A hash mismatch means a chunk record is missing or duplicated, so the dumped
+            // bytes are not what the index claims they are. That is a corrupt snapshot and
+            // a script must not read it as a good backup.
+            if report.hash_mismatches.is_empty() {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
+        }
+        AlgoliaCommand::Restore {
+            mount,
+            from,
+            dry_run,
+            force,
+        } => {
+            let report =
+                algolia::restore(config, &mount, &from, dry_run || global_dry_run, force).await?;
+            print_report(json, &report, || algolia::render_restore_report(&report))?;
+            if report.ok() {
+                Ok(())
+            } else {
+                // A refusal is the tool working, but the operator asked for a restore and
+                // did not fully get one, so it must not look like success to a script.
+                std::process::exit(1)
+            }
+        }
+        AlgoliaCommand::Status { mount } => {
+            let report = algolia::status(config, &mount).await?;
+            print_report(json, &report, || algolia::render_status_report(&report))?;
+            if report.reachable {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
+        }
+        AlgoliaCommand::Retract { mount, path, yes } => {
+            // Planned first, unconditionally: the confirmation has to be able to say WHAT
+            // is about to be destroyed — the note, its head version, and how many versions
+            // go with it — and that is only knowable by looking.
+            let planned = algolia::retract(config, &mount, &path, true).await?;
+            if global_dry_run {
+                return print_report(json, &planned, || algolia::render_retract_report(&planned));
+            }
+            if !yes && !confirm(&algolia::retract_confirmation(&planned))? {
+                println!("aborted; nothing was removed");
+                return Ok(());
+            }
+            let report = algolia::retract(config, &mount, &path, false).await?;
+            print_report(json, &report, || algolia::render_retract_report(&report))
+        }
+        AlgoliaCommand::Key {
+            mount,
+            parent_key_ref,
+            prefix,
+        } => {
+            let parent = algolia::parse_parent_key_ref(&parent_key_ref)?;
+            let report = algolia::derive_key(config, &mount, &parent, prefix.as_deref()).await?;
+            print_report(json, &report, || {
+                algolia::render_derived_key_report(&report)
+            })
+        }
+    }
+}
+
+/// Print a report as JSON or as its rendered text.
+fn print_report<T: Serialize>(
+    json: bool,
+    report: &T,
+    render: impl FnOnce() -> String,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!("{}", render());
+    }
+    Ok(())
+}
+
+/// Ask a yes/no question on the terminal. Anything but an explicit yes is a no.
+fn confirm(question: &str) -> Result<bool> {
+    print!("{question} [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 fn parse_boolean_like(value: &str, default_value: bool) -> bool {
@@ -485,12 +644,60 @@ fn normalize_required_bool_flag(
     ))
 }
 
+/// Whether a bare positional is a SUBCOMMAND rather than a vault path.
+///
+/// This list is load-bearing, not documentation. `normalize_cli_args` promotes the first
+/// unrecognized positional to `--vault <path>` — that is what makes
+/// `deep-obsidian-mcp ~/Vault` work — so a subcommand missing from here is SWALLOWED as a
+/// vault path, and its own subcommand then reaches clap at the top level and fails with
+/// "unrecognized subcommand". Every command in [`Command`](crate::cli::Command) must appear.
+///
+/// `couchdb` and `algolia` are the two that take nested subcommands, which is exactly why
+/// forgetting them is easy: the failure surfaces as a complaint about `export` or `status`
+/// rather than about the word that was actually lost.
 fn is_known_command(token: &str) -> bool {
     matches!(
         token,
-        "serve" | "setup-service" | "doctor" | "print-config" | "probe" | "help" | "version"
+        "serve"
+            | "setup-service"
+            | "doctor"
+            | "print-config"
+            | "probe"
+            | "couchdb"
+            | "algolia"
+            | "help"
+            | "version"
     )
 }
+
+/// Whether this command is followed by a nested subcommand of its own.
+///
+/// Needed because the positional-vault-path promotion is otherwise indistinguishable from a
+/// nested subcommand: `doctor ~/Vault` and `couchdb export` are both "a known command then a
+/// bare word", and the second word must be promoted in the first case and kept in the
+/// second. So the FIRST positional after one of these is never a vault path.
+fn command_takes_subcommand(token: &str) -> bool {
+    matches!(token, "couchdb" | "algolia")
+}
+
+/// Value-taking flags that belong to a SUBCOMMAND rather than to `ServiceOptions`.
+///
+/// They need listing for one reason: `normalize_cli_args` has to consume a flag's value, or
+/// the value is left looking like a bare positional and gets promoted to `--vault`. The
+/// global value flags are already enumerated below; these are the ones `couchdb` and
+/// `algolia` add.
+///
+/// **Anything added to a subcommand that takes a value must be added here.** The failure is
+/// silent and confusing — clap complains that the flag has no value, naming the flag whose
+/// value was stolen rather than the promotion that stole it.
+const SUBCOMMAND_VALUE_FLAGS: &[&str] = &[
+    "--mount",
+    "--out",
+    "--from",
+    "--path",
+    "--parent-key-ref",
+    "--prefix",
+];
 
 fn normalize_value_flag(
     args: &[String],
@@ -519,6 +726,8 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
     let mut index = 0;
     let mut pending_vault_path: Option<String> = None;
     let mut saw_vault_flag = false;
+    // Set by `couchdb` / `algolia`: the next bare word is their subcommand, not a path.
+    let mut awaiting_subcommand = false;
 
     while index < raw_args.len() {
         let token = &raw_args[index];
@@ -577,6 +786,22 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
         }
         if token == "--version" || token == "-v" {
             index += 1;
+            continue;
+        }
+        // Subcommand value flags, passed through with their VALUE consumed.
+        //
+        // Consuming the value is the whole point: `--mount wiki` leaves `wiki` as a bare
+        // positional otherwise, and the positional-vault-path promotion turns it into
+        // `--vault wiki` — so `algolia status --mount wiki` failed with "a value is required
+        // for '--mount'" about the flag whose value had just been stolen. Same class of bug
+        // as a subcommand missing from `is_known_command`, one level down.
+        if let Some(flag) = SUBCOMMAND_VALUE_FLAGS
+            .iter()
+            .find(|flag| token.as_str() == **flag || token.starts_with(&format!("{flag}=")))
+        {
+            let (replacement, next_index) = normalize_value_flag(raw_args, index, flag, flag);
+            normalized.extend(replacement);
+            index = next_index;
             continue;
         }
         if matches!(
@@ -669,6 +894,11 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
         }
         if !token.starts_with('-') {
             if is_known_command(token) {
+                awaiting_subcommand = command_takes_subcommand(token);
+                normalized.push(token.clone());
+            } else if awaiting_subcommand {
+                // The nested subcommand of `couchdb` / `algolia`, never a vault path.
+                awaiting_subcommand = false;
                 normalized.push(token.clone());
             } else if !saw_vault_flag && pending_vault_path.is_none() {
                 pending_vault_path = Some(token.clone());
@@ -3159,7 +3389,7 @@ mod tests {
     use super::{
         embedding_diagnostics, enable_obsidian_snippets, inspect_index, normalize_cli_args,
         redact_config, render_mount_line, setup_service, IndexDiagnostics, MountConfig,
-        INDEX_SQLITE_FILENAME,
+        INDEX_SQLITE_FILENAME, SUBCOMMAND_VALUE_FLAGS,
     };
     use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
     use deep_obsidian_types::{
@@ -3314,6 +3544,108 @@ mod tests {
                 "--vault".to_string(),
                 "tests/fixtures/vault".to_string(),
             ]
+        );
+    }
+
+    /// Every subcommand survives normalization, INCLUDING the two that take nested
+    /// subcommands of their own.
+    ///
+    /// A regression test with teeth: `couchdb` and `algolia` were absent from
+    /// `is_known_command`, so `couchdb export --mount x --out y` had its `couchdb`
+    /// promoted to `--vault couchdb` and clap then rejected `export` as an unrecognized
+    /// TOP-LEVEL subcommand. The whole family was unreachable from the command line while
+    /// every library-level test kept passing, because the tests call the functions
+    /// directly and never go through argv.
+    #[test]
+    fn normalize_cli_args_keeps_every_subcommand_including_the_nested_ones() {
+        for command in [
+            "serve",
+            "setup-service",
+            "doctor",
+            "print-config",
+            "probe",
+            "couchdb",
+            "algolia",
+            "help",
+            "version",
+        ] {
+            let normalized = normalize_cli_args(&[command.to_string()]).expect("normalize args");
+            assert_eq!(
+                normalized,
+                vec![command.to_string()],
+                "{command} was swallowed as a positional vault path"
+            );
+        }
+
+        // The shape that actually broke: a nested subcommand behind a global flag.
+        for (command, sub) in [("couchdb", "export"), ("algolia", "status")] {
+            let args = vec![
+                "--config".to_string(),
+                "/tmp/config.json".to_string(),
+                command.to_string(),
+                sub.to_string(),
+                "--mount".to_string(),
+                "wiki".to_string(),
+            ];
+            let normalized = normalize_cli_args(&args).expect("normalize args");
+            assert_eq!(
+                normalized, args,
+                "{command} {sub} must pass through untouched"
+            );
+            assert!(
+                !normalized.iter().any(|token| token == "--vault"),
+                "{command} must not be mistaken for a vault path: {normalized:?}"
+            );
+        }
+    }
+
+    /// Every subcommand value flag keeps its VALUE.
+    ///
+    /// The second half of the same bug: with `--mount` unknown to the normalizer, `wiki` was
+    /// left looking like a bare positional and promoted to `--vault wiki`, so clap reported
+    /// "a value is required for '--mount'" — naming the flag whose value had been stolen
+    /// rather than the theft.
+    #[test]
+    fn normalize_cli_args_consumes_every_subcommand_flags_value() {
+        for flag in SUBCOMMAND_VALUE_FLAGS {
+            for args in [
+                vec![
+                    "algolia".to_string(),
+                    "seed".to_string(),
+                    (*flag).to_string(),
+                    "a-value".to_string(),
+                ],
+                vec![
+                    "algolia".to_string(),
+                    "seed".to_string(),
+                    format!("{flag}=a-value"),
+                ],
+            ] {
+                let normalized = normalize_cli_args(&args).expect("normalize args");
+                assert!(
+                    !normalized.iter().any(|token| token == "--vault"),
+                    "{flag}'s value was promoted to a vault path: {normalized:?}"
+                );
+                assert!(
+                    normalized.iter().any(|token| token.contains("a-value")),
+                    "{flag}'s value was lost: {normalized:?}"
+                );
+            }
+        }
+
+        // A path-shaped value is not special-cased into a vault path either.
+        let normalized = normalize_cli_args(&[
+            "algolia".to_string(),
+            "dump".to_string(),
+            "--mount".to_string(),
+            "wiki".to_string(),
+            "--out".to_string(),
+            "/tmp/backup".to_string(),
+        ])
+        .expect("normalize args");
+        assert!(
+            !normalized.iter().any(|token| token == "--vault"),
+            "{normalized:?}"
         );
     }
 

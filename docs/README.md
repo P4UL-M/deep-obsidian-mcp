@@ -8,6 +8,7 @@ the top-level guides instead:** [README](../README.md) ·
 
 - [mcp-reference.md](./mcp-reference.md) — MCP tools, resources, and prompts.
 - [architecture.md](./architecture.md) — indexing model, semantic backends, roadmap.
+- [algolia-mounts.md](./algolia-mounts.md) — the experimental shared Algolia corpus: design, versioning, CLI, security, limits.
 - [agent-workflows.md](./agent-workflows.md) — agent workflow patterns.
 
 ## Service & packaging
