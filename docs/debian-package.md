@@ -130,10 +130,18 @@ Requires a Linux host (or container) with a Rust toolchain **and Node 20+**, whi
 the sidecar bundle the package ships. `cargo-deb` is installed automatically if missing:
 
 ```bash
-scripts/build-deb.sh              # version from Cargo.toml
-scripts/build-deb.sh 0.1.0-alpha.11   # stamp an explicit version
+scripts/build-deb.sh                 # version from Cargo.toml
+scripts/build-deb.sh 0.2.0-alpha.1   # stamp an explicit version (release tags do this)
 # Output: target/debian/deep-obsidian-mcp_<version>_<arch>.deb
 ```
+
+The two paths do not produce the same version string, by cargo-deb's design: with no
+argument cargo-deb converts a semver prerelease to Debian form itself
+(`0.2.0-alpha.1` → `0.2.0~alpha.1-1`), while an explicit `--deb-version` is used verbatim
+(`0.2.0-alpha.1`). The release workflow passes the tag explicitly, so published packages
+carry the verbatim form. See the Debian-ordering item in
+[release-checklist.md](./release-checklist.md#package) for why that matters at the first
+non-prerelease of a line.
 
 The script runs `npm ci && npm run build` in `sidecar/livesync-sidecar` before invoking
 cargo-deb (which declares the bundle as an asset and would abort on a missing one), and

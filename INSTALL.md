@@ -110,18 +110,20 @@ environment variable is involved in a packaged install — neither the systemd u
 | Install method | Bundle | What you need to do |
 |---|---|---|
 | apt / `.deb` | **Shipped** at `/usr/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs` | Install Node 20+ (`Recommends`, so apt may have skipped it) |
-| Homebrew | **Not shipped** — it is a build artifact absent from the release tarball, and building it needs network access `brew install` restricts | Install Node 20+ and build the bundle (below) |
+| Homebrew | **Shipped** (since v0.2.0-alpha.1) at `$(brew --prefix)/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs` — the formula fetches the prebuilt bundle attached to the release, because `brew install` cannot run `npm ci` | Install Node 20+ |
+| Docker | **Shipped** at `/opt/deep-obsidian-mcp/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs` | Nothing — the image carries Node |
 | From source | Built by you | `npm ci && npm run build` (below) |
 
-Build the bundle from a source checkout:
+Building the bundle by hand is therefore only needed for a **source install**, or for a
+Homebrew install pinned to a tag older than v0.2.0-alpha.1:
 
 ```bash
 cd sidecar/livesync-sidecar
 npm ci && npm run build      # writes dist/sidecar.mjs
 ```
 
-A source checkout is found automatically. For a Homebrew install, either copy the bundle
-into the probed location:
+A source checkout is found automatically. To use a hand-built bundle with a Homebrew
+install, copy it over the probed location:
 
 ```bash
 mkdir -p "$(brew --prefix)/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist"
