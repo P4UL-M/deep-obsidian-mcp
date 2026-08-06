@@ -1,13 +1,24 @@
 # Homebrew Packaging Gaps
 
-Date: 2026-04-02
+Date: 2026-04-02 (reviewed 2026-08-06, for v0.2.0-alpha.1)
 
 This document tracks what is still missing before `deep-obsidian-mcp` can be treated as a finished Homebrew package and service.
 
 ## Missing Packaging Work
 
-- [ ] Publish a real release source tarball or bottle artifact for the Rust build.
+- [x] Publish a real release source tarball for the Rust build — tag tarballs have been
+      the formula's `url` since v0.1.0-alpha.10; a **bottle** is still not published, so
+      every install builds from source with a `rust` build dependency.
 - [ ] Replace the placeholder `url` and `sha256` in [Formula/deep-obsidian-mcp.rb](../Formula/deep-obsidian-mcp.rb).
+      **Now a per-release step, not a gap**: this copy legitimately carries placeholder
+      hashes between a stack merge and a tag (nothing installs from it), and the real
+      hashes go into it *and* into the tap at tag time — see
+      [release-checklist.md](./release-checklist.md) → "Cutting a Release", steps 3–4.
+      That covers two hashes now: the source tarball and the `livesync-sidecar` resource.
+- [x] Ship the LiveSync sidecar bundle through Homebrew (v0.2.0-alpha.1). The release
+      attaches a prebuilt `livesync-sidecar-<version>.mjs`; the formula stages it into
+      `pkgshare` at the path the binary's own probe derives. Node 20+ on the PATH is still
+      the user's job, and only for a `couchdb` mount.
 - [ ] Validate `brew install deep-obsidian-mcp` from a clean machine without using the developer checkout.
 - [ ] Decide whether the formula installs from source with Cargo or from a prebuilt release artifact.
 - [ ] Document the supported macOS architectures and the bottle strategy.

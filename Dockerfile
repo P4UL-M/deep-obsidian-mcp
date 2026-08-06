@@ -114,7 +114,9 @@ RUN set -eux; \
 # Node 20 is the sidecar's declared floor (`engines.node >= 20`).
 FROM ${NODE_IMAGE} AS runtime
 
-ARG VERSION=0.1.0
+# Keep in step with `[workspace.package] version` in Cargo.toml; CI passes the tag
+# version explicitly when an image is published (docs/release-checklist.md).
+ARG VERSION=0.2.0-alpha.1
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="deep-obsidian-mcp" \

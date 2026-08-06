@@ -23,6 +23,8 @@ the top-level guides instead:** [README](../README.md) ·
 - [behavior-contract.md](./behavior-contract.md) — server behavior contract, including the
   [multi-mount rules](./behavior-contract.md#multi-mount-vaults) a client can rely on.
 - [retrieval-eval.md](./retrieval-eval.md) — retrieval evaluation harness.
-- [release-checklist.md](./release-checklist.md) — release steps.
+- [release-checklist.md](./release-checklist.md) — release steps, and where the version lives.
+- [stack-merge-procedure.md](./stack-merge-procedure.md) — landing a long linear PR stack on `main` before a tag.
+- [migration-and-rollback.md](./migration-and-rollback.md) — moving a folder onto a remote backend, and getting back off it.
 - [homebrew-gap-todo.md](./homebrew-gap-todo.md) — outstanding release-artifact gaps.
 - [FIX_EMBEDDING_CONTEXT_CRASH.md](./FIX_EMBEDDING_CONTEXT_CRASH.md) — incident note.

@@ -12,7 +12,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+# The release version, stamped into every crate. Reached by `CARGO_PKG_VERSION` in
+# `deep-obsidian-cli` (`deep-obsidian-mcp version`) and used by cargo-deb as the
+# default package version when `scripts/build-deb.sh` is called with no argument.
+# The tag-driven release passes the tag version explicitly, so this value and the tag
+# must agree — see docs/release-checklist.md.
+#
+# NOTE: the MCP `serverInfo.version` reported over the wire is deliberately NOT this
+# value (it is a frozen literal in deep-obsidian-server/src/mcp.rs, asserted by
+# tests/golden/initialize.json). Bumping here does not move that contract.
+version = "0.2.0-alpha.1"
 edition = "2021"
 license = "MIT"
 

@@ -2,7 +2,10 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
-## Unreleased
+## v0.2.0-alpha.1 — PENDING
+
+Date set when the tag is pushed — replace `PENDING` with the tag date as the first
+step of the release (see [docs/release-checklist.md](./docs/release-checklist.md)).
 
 ### Added
 
@@ -318,6 +321,14 @@ All notable changes to deep-obsidian-mcp are documented here.
   restart, once the LiveSync documents appear. Nothing is published: the GHCR push
   and its tag policy are present but commented out. See
   [docs/docker.md](./docs/docker.md).
+
+- **Homebrew now ships the LiveSync sidecar bundle.** The release attaches a prebuilt,
+  checksummed `livesync-sidecar-<version>.mjs` (a new job in
+  `.github/workflows/release-deb.yml`), and the formula fetches it as a `resource` into
+  the one exe-relative path the binary probes for — the same layout the `.deb` and the
+  container image use. A couchdb mount on a `brew` install therefore needs Node 20+ on
+  the PATH and nothing else; building the bundle by hand is now only for source
+  installs. Every other mount kind still needs no Node at all.
 
 ### Fixed
 
