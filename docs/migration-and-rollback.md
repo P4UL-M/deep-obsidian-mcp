@@ -60,7 +60,11 @@ into one. There is deliberately no "push my folder into CouchDB" command.
    ```
 
    The password is prompted **masked** and stored in the OS keyring (or the encrypted
-   secrets file, reported); only the `passwordRef` lands in the config. The command then
+   secrets file, reported — see [what that file does and does not
+   protect](../CONFIGURATION.md#what-the-encrypted-file-fallback-actually-protects-against),
+   and [`secrets set` / `secrets
+   check`](../CONFIGURATION.md#rotating-a-stored-secret) for rotating it later); only the
+   `passwordRef` lands in the config. The command then
    performs the sidecar handshake and **refuses to write** unless the compatibility verdict
    is `ok` — so step 4 below has already happened by the time it succeeds. Add `--e2ee` for
    an encrypted vault (it prompts for the passphrase too) and `--writable` only after
@@ -109,7 +113,8 @@ rsync -a --exclude manifest.json ~/live-final/ ~/Vault/Live/
 
 # 3. Unmount, and let the root vault serve ~/Vault/Live as an ordinary folder. Nothing is
 #    deleted from CouchDB; the previous config is kept at config.json.bak, and the stored
-#    password is kept and named so you can clean your keyring yourself.
+#    password is kept and named so you can clean your keyring yourself. `secrets check`
+#    afterwards no longer lists it: nothing references it any more.
 deep-obsidian-mcp mounts remove --id live
 
 # 4. Confirm.
@@ -148,7 +153,11 @@ before you put anything real in one.
    ```
 
    The API key is prompted **masked** and stored in the OS keyring (or the encrypted
-   secrets file, reported); only the `apiKeyRef` lands in the config. The command then
+   secrets file, reported — see [what that file does and does not
+   protect](../CONFIGURATION.md#what-the-encrypted-file-fallback-actually-protects-against),
+   and [`secrets set` / `secrets
+   check`](../CONFIGURATION.md#rotating-a-stored-secret) for rotating it later); only the
+   `apiKeyRef` lands in the config. The command then
    reads the index once and **refuses to write** if it cannot be reached, so steps 2 and 3
    below are already done when it succeeds. Add `--writable` only after you have verified
    the dump round trip.

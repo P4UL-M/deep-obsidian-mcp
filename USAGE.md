@@ -126,7 +126,12 @@ deep-obsidian-mcp doctor        # diagnose config, vault access, index, dependen
 deep-obsidian-mcp probe         # exercise the HTTP health and MCP endpoints
 deep-obsidian-mcp print-config  # show the resolved configuration (secrets redacted)
 deep-obsidian-mcp mounts list   # what is mounted where (experimental multi-backend vaults)
+deep-obsidian-mcp secrets check # does every stored credential still resolve? (no value printed)
 ```
+
+`secrets check` is also how you rotate one: it names the `secrets set` command for any
+reference it reports as `MISSING`. See
+[CONFIGURATION.md § Rotating a stored secret](./CONFIGURATION.md#rotating-a-stored-secret).
 
 Health endpoints (no auth required):
 

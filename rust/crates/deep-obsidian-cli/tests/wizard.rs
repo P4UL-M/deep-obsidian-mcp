@@ -356,9 +356,9 @@ async fn the_ollama_preset_fills_the_endpoint_and_the_key_becomes_a_reference() 
 ///
 /// The port is the substantive assertion: `setup-service` used to force HTTP unconditionally
 /// and discard `--transport`, so a transport SCREEN only means something if the answer reaches
-/// the file. Auth is declined here because provisioning on this path — a local root, which
-/// goes through `setup_service` — reaches the real OS keyring by design; the provisioned case
-/// is covered on the mount-table path below, where the store is injectable.
+/// the file. The DECLINED half is what this test is for — nothing is provisioned and nothing
+/// is referenced; the accepted half is
+/// [`accepting_http_auth_on_a_local_root_stores_a_token_by_reference`].
 #[tokio::test]
 async fn choosing_http_takes_a_port_and_a_declined_auth_stays_off() {
     let fixture = Fixture::new("transport-http");
@@ -402,13 +402,62 @@ async fn choosing_http_takes_a_port_and_a_declined_auth_stays_off() {
     let _ = std::fs::remove_dir_all(&fixture.base);
 }
 
-/// Choosing HTTP and accepting authentication provisions a token and puts a REFERENCE to it
-/// in the config — never the token.
+/// Accepting authentication on a LOCAL root provisions a token through the injected store.
 ///
-/// Driven on the mount-table path, where the secret store is injected, so the token lands in
-/// a temp encrypted file rather than in the developer's login keychain. That is not a
-/// convenience: before `provision_auth_token` took a store, this test hung until someone
-/// clicked a macOS keychain dialog.
+/// The path most users take, and until `setup_service` took an [`AuthStore`] it was the one
+/// path a wizard test could not drive: a local root finishes through `setup_service`, which
+/// hard-coded the real stores, so this run reached the developer's login keychain and hung on
+/// a macOS authorization dialog. The mount-table test below has always been able to assert
+/// this; the point here is that the ordinary shape now can too.
+#[tokio::test]
+async fn accepting_http_auth_on_a_local_root_stores_a_token_by_reference() {
+    let fixture = Fixture::new("transport-http-auth-local");
+    let vault = fixture.base.join("Vault");
+    std::fs::create_dir_all(&vault).expect("vault dir");
+    let options = fixture.options();
+    let mut io = fixture.io(
+        vec![
+            "1",                            // local folder
+            vault.to_str().expect("utf-8"), // vault folder
+            "",                             // add another vault? -> no
+            "",                             // embeddings -> no
+            "2",                            // transport -> HTTP
+            "4321",                         // port
+            "y",                            // enable bearer auth
+            "n",                            // register with local agents? -> no
+            "",                             // skills -> no
+            "",                             // snippets -> no
+            "",                             // write it -> yes
+        ],
+        Vec::new(),
+    );
+
+    let report = run_with_io(&request(&options, false), &mut io)
+        .await
+        .expect("the wizard completes");
+    assert!(report.written, "{:?}", report.messages);
+
+    let json = fixture.config_json();
+    assert_eq!(json["auth"]["enabled"], true);
+    // `encryptedFile` rather than `osKeyring` is the whole assertion: the store came from the
+    // wizard's injected resolver, not from the process default.
+    assert_eq!(json["auth"]["tokenRef"]["kind"], "encryptedFile");
+    assert_eq!(json["auth"]["tokenRef"]["id"], "http-auth-token");
+    assert!(fixture.secret_exists("http-auth-token"));
+    assert!(
+        json["auth"].get("token").is_none(),
+        "no plaintext token field may exist: {json}"
+    );
+
+    let _ = std::fs::remove_dir_all(&fixture.base);
+}
+
+/// The same thing on the mount-table path, which provisions through the wizard's own store
+/// rather than through `setup_service`.
+///
+/// Kept as a separate test because the two paths reach `provision_auth_token` through
+/// different code: a local root goes via `setup_service`, a mount table is written by the
+/// wizard itself. One passing does not imply the other.
 #[tokio::test]
 async fn accepting_http_auth_stores_a_token_by_reference() {
     let fixture = Fixture::new("transport-http-auth");

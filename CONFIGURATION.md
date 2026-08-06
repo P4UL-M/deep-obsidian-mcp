@@ -2,6 +2,7 @@
 
 - [The setup wizard](#the-setup-wizard)
 - [Config file & precedence](#config-file--precedence)
+- [Rotating a stored secret](#rotating-a-stored-secret)
 - [Semantic search (embeddings)](#semantic-search-embeddings)
 - [Authentication](#authentication)
 - [Automatic reindexing](#automatic-reindexing)
@@ -73,8 +74,7 @@ Settings resolve in this order:
 Secrets (embedding API keys, the auth token, a mount's CouchDB password or Algolia
 API key) are **never** stored in the config file. The config only holds a
 reference; the value lives in the OS keyring when available, or an encrypted local
-file as a fallback. The encrypted-file fallback is weaker than the OS keyring
-because the application carries the decryption key.
+file as a fallback.
 
 A reference is one of two shapes:
 
@@ -87,6 +87,97 @@ This is what makes `print-config` safe by construction rather than by careful
 redaction: there is nothing secret in the persisted config to redact. Everything
 else in a mount definition — a CouchDB URL and user name, an Algolia app id and
 index name — is an identifier, not a credential, and is printed verbatim.
+
+#### What the encrypted-file fallback actually protects against
+
+Be clear-eyed about this one. `~/.config/deep-obsidian-mcp/secrets.json` is encrypted with
+XChaCha20-Poly1305 under a **static key compiled into the binary**, and the binary is
+public. So the file protects against *accidental* disclosure — a `grep` through your dotfiles,
+a backup or a sync client that swallows the whole config directory, a secret scanner in CI, a
+config folder committed to a repository by mistake — and it means the credential is not
+sitting in plaintext next to a config file people do read. It protects against **nothing**
+where someone has local file access: anyone who can read the file can also fetch the key from
+the binary and decrypt it. Treat it as obfuscation-plus-integrity, not as a vault.
+
+The **OS keyring is the only genuinely protected store**, and every command prefers it: it
+is guarded by the login session, and on macOS the Keychain also gates access per
+application. The encrypted file is what you get when there is no keyring to reach — a
+container, a headless Linux box with no D-Bus session, a CI runner — and every command that
+falls back to it says so rather than doing it quietly. On such a host, if the credential
+warrants better than obfuscation, hand it to the service manager instead: `systemd-creds`
+(`LoadCredentialEncrypted=`) binds a secret to the machine's TPM or host key and hands it to
+the unit as a file, and the token can also be supplied out of band through
+`DEEP_OBSIDIAN_AUTH_TOKEN` (see [Authentication](#authentication)).
+
+`deep-obsidian-mcp secrets check` tells you which store each reference actually resolves in,
+without printing any value — see [Rotating a stored secret](#rotating-a-stored-secret).
+
+## Rotating a stored secret
+
+```bash
+deep-obsidian-mcp secrets check                                   # where does every reference resolve?
+deep-obsidian-mcp secrets set --mount team                        # rotate that mount's credential
+deep-obsidian-mcp secrets set --mount team --field e2ee-passphrase
+deep-obsidian-mcp secrets set --target auth-token
+deep-obsidian-mcp secrets set --target embedding-api-key
+```
+
+`secrets check` prints one line per reference the config holds — every mount credential, the
+bearer token, both embedding keys — saying whether the store answers for it, and naming the
+command that rotates it when it does not. **It never prints a value**, and it exits non-zero
+when any reference is `MISSING`, so it works as a gate in a script.
+
+```
+[ok     ] mounts.team.passwordRef          osKeyring service=deep-obsidian-mcp account=mount-team-password
+[MISSING] mounts.team.e2ee.passphraseRef   osKeyring service=deep-obsidian-mcp account=mount-team-e2ee-passphrase
+  rotate with: deep-obsidian-mcp secrets set --mount team --field e2ee-passphrase
+[ok     ] mounts.wiki.apiKeyRef            encryptedFile id=mount-wiki-api-key
+[ok     ] auth.tokenRef                    encryptedFile id=http-auth-token
+4 reference(s) checked, 3 resolved.
+```
+
+One caveat the output repeats, because it decides whether a `MISSING` line matters: `check`
+reports the **store**, not the effective value. `DEEP_OBSIDIAN_AUTH_TOKEN`,
+`DEEP_OBSIDIAN_EMBEDDING_API_KEY` and `DEEP_OBSIDIAN_ALGOLIA_API_KEY` shadow a reference at
+runtime and are not consulted, so a `MISSING` reference and a perfectly healthy server are
+compatible.
+
+`secrets set` **rotates**: it replaces the value one reference points at, and it **never
+modifies the config file**.
+
+- **It writes to the reference the config actually contains.** Read out of the file, custom
+  hand-written ids included — not to a freshly derived `mount-<id>-<purpose>`. A rotation that
+  guessed would leave the config pointing at a value nobody updated, the mount would keep
+  authenticating with the old secret, and nothing would say which of the two entries was live.
+- **The reference's own store is preserved: rotation is not migration.** An `osKeyring`
+  reference stays in the keyring, an `encryptedFile` reference stays in the file. This is
+  *different* from `mounts add`, which prefers the keyring and falls back to the encrypted
+  file — and the difference is not an inconsistency. `mounts add` writes the reference it
+  chose into the config in the same run, so any choice it makes is self-consistent.
+  `secrets set` writes no config, so the same fallback would put the value somewhere the
+  config does not point: the old secret would stay live and the operator would believe the
+  rotation had happened. So **a store that cannot be written to is reported, with the
+  remedy, and nothing is changed.** Moving a secret between stores means changing the
+  reference, which is a config edit (or `mounts remove` then `mounts add`, which chooses
+  fresh).
+- **The new value is never a flag value**, for the reason a mount's password is not: it is
+  prompted **masked**, or read from the first line of stdin with `--stdin`.
+- **`--field` defaults by backend kind** — a couchdb mount's `password`, an algolia mount's
+  `api-key`. `e2ee-passphrase` is never the default: a mount that has one also has a
+  password, so a wrong guess would rotate the other secret and surface later as "cannot
+  decrypt".
+- **Adding a secret the config has no reference for is refused**, and the message names the
+  command that does it. Turning on E2EE, or enabling auth for the first time, changes the
+  mount or the `auth` section — `secrets set` only ever changes a value. The one reference no
+  command rotates is a couchdb mount's `e2ee.obfuscatePassphraseRef`: nothing in this binary
+  creates it, so it only exists hand-written. `check` still reports it, and says to store the
+  value under the id or account it names.
+- `--dry-run` reports which reference *would* be written to and reads no value at all.
+
+After rotating, restart the server: it resolves each reference once, at startup. Rotating
+`auth-token` invalidates the token every client holds, and `doctor --probe-remote` is what
+confirms a mount can still authenticate with its new credential — `secrets set` writes to the
+store and does not contact anything.
 
 ## Semantic search (embeddings)
 

@@ -53,6 +53,9 @@ Usage:
   deep-obsidian-mcp mounts add algolia [--id <id>] [--mount-at <prefix>] [--app-id <id>] [--index-name <index>] [--base-url <url>] [--api-key-stdin] [--writable] [--participant-id <who>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
   deep-obsidian-mcp mounts list [--json]
   deep-obsidian-mcp mounts remove --id <id> [--purge-index] [--yes] [--json]
+  deep-obsidian-mcp secrets set --mount <id> [--field password|e2ee-passphrase|api-key] [--stdin] [--dry-run] [--json]
+  deep-obsidian-mcp secrets set --target auth-token|embedding-api-key [--stdin] [--dry-run] [--json]
+  deep-obsidian-mcp secrets check [--json]
 
 Commands:
   serve          Start the MCP server using resolved config.
@@ -63,6 +66,7 @@ Commands:
   couchdb        Snapshot (export) and restore a CouchDB (Self-hosted LiveSync) mount.
   algolia        Seed, dump, restore, inspect and scope an Algolia-backed shared corpus.
   mounts         Build and inspect the config's mount table (add / list / remove).
+  secrets        Rotate the value behind a stored reference, and check every one resolves.
   help           Show this help.
   version        Print the current version.
 
@@ -113,6 +117,26 @@ store. The local index stays unless --purge-index, and the stored credential is 
 kept and named, because a reference can be shared by more than one mount. Removing the
 root while other mounts exist is refused (they resolve beneath it), and so is removing
 the last mount -- a config needs a root mount, so edit the file directly to start over.
+
+secrets set ROTATES: it replaces the value one stored reference points at and never
+modifies the config file. The reference it writes to is the one the config actually
+CONTAINS -- read out of the file, hand-written custom ids included -- so a rotation
+cannot leave the config pointing at a value nobody updated. The reference's own store is
+therefore preserved (an osKeyring ref stays in the keyring, an encryptedFile ref stays
+in the file): rotation is not migration, and if that store cannot be written to, the
+command reports it and changes nothing rather than falling back to the other one and
+orphaning the reference. --field defaults by backend kind (couchdb -> password,
+algolia -> api-key); e2ee-passphrase must be named explicitly. The new value is never a
+flag value: it is prompted MASKED, or read from the first line of stdin with --stdin.
+Adding a secret a mount does not have yet -- an e2ee passphrase, a first bearer token --
+is a config change, so it is refused here and the message names the command that does it.
+
+secrets check prints one line per reference the config holds -- every mount credential,
+the bearer token, the embedding keys -- saying whether the store answers for it and, if
+not, what would rotate it. It never prints a value, and it exits non-zero when any
+reference is MISSING. It reports the STORE, not the effective value: an environment
+variable such as DEEP_OBSIDIAN_AUTH_TOKEN shadows a reference at runtime and is not
+consulted here.
 
 doctor prints one block of checks per declared mount. The local ones always run and
 contact nothing: a filesystem mount's directory, and for a couchdb mount whether the
@@ -413,16 +437,21 @@ pub async fn run() -> Result<()> {
                 .await?
             } else {
                 let resolved = crate::config::resolve_runtime_config(&cli.options)?;
-                setup_service(
-                    &resolved,
+                setup_service(&SetupServiceRequest {
+                    resolved: &resolved,
                     dry_run,
                     overwrite,
-                    mcp,
-                    skills,
-                    vault_snippets,
-                    auth_choice,
-                    false,
-                )?
+                    installs: InstallChoices {
+                        mcp,
+                        skills,
+                        vault_snippets,
+                    },
+                    enable_auth: auth_choice,
+                    interactive_auth: false,
+                    // The real stores: this is the flag-driven path, run by a person or a
+                    // script on their own machine.
+                    auth_store: AuthStore::Default,
+                })?
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -518,6 +547,12 @@ pub async fn run() -> Result<()> {
         // mount. See `mounts_cmd::run`.
         Command::Mounts { command } => {
             crate::mounts_cmd::run(&cli.options, command, dry_run, json).await
+        }
+        // Not preceded by `resolve_runtime_config` for the reason `mounts` is not, and one
+        // more: a rotation must write to the reference the FILE holds, and the resolved view
+        // can present a reference the file does not declare.
+        Command::Secrets { command } => {
+            crate::secrets_cmd::run(&cli.options, command, dry_run, json)
         }
         Command::Probe { timeout_ms } => {
             let resolved = crate::config::resolve_runtime_config(&cli.options)?;
@@ -767,6 +802,7 @@ fn is_known_command(token: &str) -> bool {
             | "couchdb"
             | "algolia"
             | "mounts"
+            | "secrets"
             | "help"
             | "version"
     )
@@ -786,7 +822,7 @@ fn is_known_command(token: &str) -> bool {
 fn subcommand_depth(token: &str) -> usize {
     match token {
         "mounts" => 2,
-        "couchdb" | "algolia" => 1,
+        "couchdb" | "algolia" | "secrets" => 1,
         _ => 0,
     }
 }
@@ -821,6 +857,9 @@ const SUBCOMMAND_VALUE_FLAGS: &[&str] = &[
     "--index-name",
     "--base-url",
     "--participant-id",
+    // The `secrets` family. `--mount` is already above; `--stdin` takes no value.
+    "--field",
+    "--target",
 ];
 
 fn normalize_value_flag(
@@ -1090,20 +1129,67 @@ fn normalize_cli_args_detailed(raw_args: &[String]) -> Result<(Vec<String>, bool
     Ok((normalized, in_mounts_family))
 }
 
-pub fn setup_service(
-    resolved: &ResolvedRuntimeConfig,
-    dry_run: bool,
-    overwrite: bool,
-    install_mcp: bool,
-    install_skills: bool,
-    install_vault_snippets: bool,
-    // `Some(true)` enables auth (generates/stores/prints a token), `Some(false)`
-    // disables it, `None` leaves the resolved auth config untouched.
-    enable_auth: Option<bool>,
-    // When true (wizard), prompt before the encrypted-file fallback; when false
-    // (flag-driven), fall back automatically.
-    interactive_auth: bool,
-) -> Result<SetupServiceReport> {
+/// Where an auth change's bearer token is stored.
+///
+/// # Why the two facts are ONE value
+///
+/// A [`SecretResolver`] routes by reference SHAPE, so an `osKeyring` reference reaches the
+/// real login keychain however the resolver was built — which on macOS means an authorization
+/// dialog and a run that hangs until someone clicks it. Naming a resolver *without* also
+/// saying "not the keyring" therefore isolates nothing. Two independent fields would let a
+/// caller set the first and forget the second and believe it was isolated; one enum makes
+/// that state unrepresentable.
+#[derive(Debug, Clone, Copy)]
+pub enum AuthStore<'a> {
+    /// The process-wide stores, OS keyring preferred. What the CLI passes.
+    Default,
+    /// An explicit store, with the keyring deliberately NOT preferred. What a test and a
+    /// headless runner pass.
+    Injected(&'a SecretResolver),
+}
+
+/// One `setup-service` run's inputs.
+///
+/// # Why a struct
+///
+/// For the reason [`InstallChoices`] is one, and then some. The positional form ended
+/// `(&resolved, false, true, false, false, false, None, false)`: five booleans in a row at
+/// every call site, i.e. five chances to transpose two of them silently. It had also reached
+/// clippy's argument limit, and *that* is what kept the secret store hard-coded inside this
+/// function instead of injected — so the wizard's LOCAL-root auth path could not be tested
+/// without touching the developer's login keychain, while its mount-table path could. Naming
+/// the inputs made room for [`Self::auth_store`], which closes that gap.
+pub struct SetupServiceRequest<'a> {
+    pub resolved: &'a ResolvedRuntimeConfig,
+    pub dry_run: bool,
+    pub overwrite: bool,
+    pub installs: InstallChoices,
+    /// `Some(true)` enables auth (generates/stores/prints a token), `Some(false)` disables
+    /// it, `None` leaves the resolved auth config untouched.
+    pub enable_auth: Option<bool>,
+    /// When true (wizard), prompt before the encrypted-file fallback; when false
+    /// (flag-driven), fall back automatically.
+    pub interactive_auth: bool,
+    /// Only consulted when [`Self::enable_auth`] is `Some(_)`; nothing else in this function
+    /// touches a secret store.
+    pub auth_store: AuthStore<'a>,
+}
+
+pub fn setup_service(request: &SetupServiceRequest<'_>) -> Result<SetupServiceReport> {
+    let SetupServiceRequest {
+        resolved,
+        dry_run,
+        overwrite,
+        installs,
+        enable_auth,
+        interactive_auth,
+        auth_store,
+    } = *request;
+    let InstallChoices {
+        mcp: install_mcp,
+        skills: install_skills,
+        vault_snippets: install_vault_snippets,
+    } = installs;
     // An EXPLICIT `--transport` is honoured; anything else becomes HTTP.
     //
     // Forcing HTTP unconditionally is what this line used to do, and for a config that
@@ -1216,19 +1302,23 @@ pub fn setup_service(
     // Apply the auth choice before building the persisted config so it is
     // reflected in both the dry-run preview and the written file. A change here
     // forces a config write below even without `--overwrite`.
-    // The real store, always: `setup_service` is the flag-driven command and has no seam for
-    // an alternative one. The wizard's mount-table path provisions through its own injected
-    // resolver instead, which is what makes that path testable.
-    let auth_resolver = SecretResolver::new();
+    //
+    // Built unconditionally because it is free — two field-less stores and a `PathBuf` — which
+    // keeps the `match` below a pair of borrows rather than a lifetime puzzle.
+    let default_resolver = SecretResolver::new();
+    let (auth_resolver, prefer_os_keyring) = match auth_store {
+        AuthStore::Default => (&default_resolver, true),
+        AuthStore::Injected(resolver) => (resolver, false),
+    };
     match enable_auth {
         Some(true) => provision_auth_token(
             &mut service.auth,
             dry_run,
             interactive_auth,
-            &auth_resolver,
-            true,
+            auth_resolver,
+            prefer_os_keyring,
         )?,
-        Some(false) => deprovision_auth_token(&mut service.auth, dry_run, &auth_resolver),
+        Some(false) => deprovision_auth_token(&mut service.auth, dry_run, auth_resolver),
         None => {}
     }
     let auth_changed = enable_auth.is_some();
@@ -4116,8 +4206,9 @@ mod tests {
     use super::{
         check_vault, embedding_diagnostics, enable_obsidian_snippets, inspect_index,
         normalize_cli_args, normalize_cli_args_detailed, print_config, redact_config,
-        render_mount_line, setup_service, setup_vault_snippets, IndexDiagnostics, MountConfig,
-        INDEX_SQLITE_FILENAME, SUBCOMMAND_VALUE_FLAGS,
+        render_mount_line, setup_service, setup_vault_snippets, AuthStore, IndexDiagnostics,
+        InstallChoices, MountConfig, SetupServiceRequest, INDEX_SQLITE_FILENAME,
+        SUBCOMMAND_VALUE_FLAGS,
     };
     use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
     use deep_obsidian_config::secrets::SecretResolver;
@@ -4142,6 +4233,28 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    /// A `setup-service` request with what every test in this module shares.
+    ///
+    /// The load-bearing part is [`AuthStore::Injected`]: it is what keeps a test out of the
+    /// developer's login keychain even on the paths that provision a token, so no test here
+    /// can hang on a macOS authorization dialog by forgetting a flag.
+    fn setup_request<'a>(
+        resolved: &'a ResolvedRuntimeConfig,
+        overwrite: bool,
+        enable_auth: Option<bool>,
+        resolver: &'a SecretResolver,
+    ) -> SetupServiceRequest<'a> {
+        SetupServiceRequest {
+            resolved,
+            dry_run: false,
+            overwrite,
+            installs: InstallChoices::default(),
+            enable_auth,
+            interactive_auth: false,
+            auth_store: AuthStore::Injected(resolver),
+        }
     }
 
     /// A filesystem mount over a REAL directory, for the checks that touch the disk.
@@ -4325,6 +4438,7 @@ mod tests {
             "couchdb",
             "algolia",
             "mounts",
+            "secrets",
             "help",
             "version",
         ] {
@@ -4337,7 +4451,11 @@ mod tests {
         }
 
         // The shape that actually broke: a nested subcommand behind a global flag.
-        for (command, sub) in [("couchdb", "export"), ("algolia", "status")] {
+        for (command, sub) in [
+            ("couchdb", "export"),
+            ("algolia", "status"),
+            ("secrets", "set"),
+        ] {
             let args = vec![
                 "--config".to_string(),
                 "/tmp/config.json".to_string(),
@@ -4435,6 +4553,62 @@ mod tests {
                 "a mounts token was promoted to a vault path: {normalized:?}"
             );
         }
+    }
+
+    /// The `secrets` family survives two deep, values and all.
+    ///
+    /// The same class of bug as `couchdb export`, in a family whose flag VALUES are
+    /// especially easy to lose: `--field password` and `--target auth-token` are bare words
+    /// that would each be promoted to `--vault` if the flag were missing from
+    /// `SUBCOMMAND_VALUE_FLAGS`, and clap would then complain that the flag the operator did
+    /// pass has no value. Both `=` and space forms are covered.
+    #[test]
+    fn normalize_cli_args_keeps_the_secrets_subcommands_and_their_values() {
+        for args in [
+            vec!["secrets".to_string(), "check".to_string()],
+            vec![
+                "secrets".to_string(),
+                "set".to_string(),
+                "--mount".to_string(),
+                "team".to_string(),
+                "--field".to_string(),
+                "password".to_string(),
+                "--stdin".to_string(),
+            ],
+            vec![
+                "secrets".to_string(),
+                "set".to_string(),
+                "--target".to_string(),
+                "auth-token".to_string(),
+            ],
+            vec![
+                "secrets".to_string(),
+                "set".to_string(),
+                "--mount=team".to_string(),
+                "--field=e2ee-passphrase".to_string(),
+            ],
+        ] {
+            let normalized = normalize_cli_args(&args).expect("normalize args");
+            assert_eq!(normalized, args, "{args:?} must pass through untouched");
+            assert!(
+                !normalized.iter().any(|token| token == "--vault"),
+                "a secrets token was promoted to a vault path: {normalized:?}"
+            );
+        }
+
+        // A global flag before the family, which is how `--config` actually arrives.
+        let args = vec![
+            "--config".to_string(),
+            "/tmp/config.json".to_string(),
+            "secrets".to_string(),
+            "check".to_string(),
+            "--json".to_string(),
+        ];
+        assert_eq!(
+            normalize_cli_args(&args).expect("normalize args"),
+            args,
+            "a global flag before `secrets` must not change it"
+        );
     }
 
     /// `--vault-path` means the MOUNT's flag inside the `mounts` family, and the global
@@ -4881,34 +5055,27 @@ mod tests {
         let backup_path = config_path.with_extension("json.bak");
 
         let mut service = resolved_config(&vault, &index_dir);
+        let resolver = SecretResolver::with_encrypted_file_path(root.join("secrets.json"));
 
         // First write: nothing to back up.
-        let report = setup_service(
+        let report = setup_service(&setup_request(
             &resolved_runtime(config_path.clone(), service.clone()),
             false,
-            false,
-            false,
-            false,
-            false,
             None,
-            false,
-        )
+            &resolver,
+        ))
         .expect("first setup");
         assert!(report.written);
         assert!(!backup_path.exists(), "first write must not leave a backup");
         let first_text = fs::read_to_string(&config_path).expect("config written");
 
         // Rewriting identical content is not a clobber, so no backup either.
-        let report = setup_service(
+        let report = setup_service(&setup_request(
             &resolved_runtime(config_path.clone(), service.clone()),
-            false,
             true,
-            false,
-            false,
-            false,
             None,
-            false,
-        )
+            &resolver,
+        ))
         .expect("idempotent setup");
         assert!(report.written);
         assert!(
@@ -4918,16 +5085,12 @@ mod tests {
 
         // Overwrite with changed content -> .bak holds the previous file.
         service.http.port = 4200;
-        let report = setup_service(
+        let report = setup_service(&setup_request(
             &resolved_runtime(config_path.clone(), service),
-            false,
             true,
-            false,
-            false,
-            false,
             None,
-            false,
-        )
+            &resolver,
+        ))
         .expect("overwrite setup");
         assert!(report.written);
         assert!(report
@@ -5009,17 +5172,13 @@ mod tests {
             filesystem_mount("team", "Team", None),
         ];
 
-        let report = setup_service(
+        let report = setup_service(&setup_request(
             &resolved_runtime(config_path.clone(), service),
-            false,
             // --overwrite, deliberately: the point is that it does NOT apply here.
             true,
-            false,
-            false,
-            false,
             None,
-            false,
-        )
+            &SecretResolver::with_encrypted_file_path(root.join("secrets.json")),
+        ))
         .expect("setup-service must succeed on a mounts config, not refuse it");
 
         assert!(!report.written, "a mount table must never be rewritten");
@@ -5070,17 +5229,14 @@ mod tests {
         let mut service = resolved_config(&vault, &root.join("index"));
         service.mounts = vec![filesystem_mount_at("vault", "", &vault)];
 
+        let resolver = SecretResolver::with_encrypted_file_path(root.join("secrets.json"));
         for choice in [Some(true), Some(false)] {
-            let error = setup_service(
+            let error = setup_service(&setup_request(
                 &resolved_runtime(config_path.clone(), service.clone()),
-                false,
                 true,
-                false,
-                false,
-                false,
                 choice,
-                false,
-            )
+                &resolver,
+            ))
             .expect_err("an auth change on a mount table must be refused");
             let message = error.to_string();
             assert!(message.contains("cannot change auth"), "{message}");
@@ -5172,16 +5328,12 @@ mod tests {
             },
         ];
 
-        let report = setup_service(
+        let report = setup_service(&setup_request(
             &resolved_runtime(config_path.clone(), service),
-            false,
             true,
-            false,
-            false,
-            false,
             None,
-            false,
-        )
+            &SecretResolver::with_encrypted_file_path(root.join("secrets.json")),
+        ))
         .expect("setup");
 
         assert!(
