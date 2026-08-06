@@ -11,12 +11,21 @@ are `diff -r`. Run the round trip on a copy before you run it on your notes.
 
 ## Before You Start
 
-Multi-mount configs are edited **by hand**. `setup-service` refuses to rewrite a config
-that declares a `mounts` table — with or without `--overwrite` — and refuses an auth
-change on one, because it cannot write the reference a token would need. Use
-`deep-obsidian-mcp print-config` to see exactly what this build reads from your file.
+Build the mount table with **`deep-obsidian-mcp mounts`**, not an editor. It validates the
+whole table through the same loader the server uses, converts a legacy `vaultPath` config to
+an explicit root mount for you, prompts for the credential masked and stores only the
+reference, probes the mount before writing anything, and leaves the previous file at
+`config.json.bak`. See
+[§ Building the table](../CONFIGURATION.md#building-the-table-the-mounts-cli).
 
-Take a copy of the config before you edit it:
+Hand editing still works, and is still what you fall back to for the fields `mounts add`
+does not expose (`options`, `cache`, `retention`, `recallWeight`). What does **not** work is
+`setup-service`: it refuses to rewrite a config that declares a `mounts` table — with or
+without `--overwrite` — and refuses an auth change on one, because it cannot write the
+reference a token would need. Use `deep-obsidian-mcp print-config` to see exactly what this
+build reads from your file, and `deep-obsidian-mcp mounts list` for what is mounted where.
+
+Take a copy of the config before you change it:
 
 ```bash
 cp ~/.config/deep-obsidian-mcp/config.json ~/.config/deep-obsidian-mcp/config.json.pre-mounts
@@ -40,21 +49,35 @@ is not really a migration: you are mounting an existing vault, not converting a 
 into one. There is deliberately no "push my folder into CouchDB" command.
 
 1. Set up Self-hosted LiveSync in Obsidian and let it populate the database.
-2. Add the mount to `config.json` by hand. `experimental.couchdbVaults` is required, and
-   `experimental.multiVault` too whenever the table has more than one entry — a LiveSync
-   database mounted *as the whole vault* is a one-mount table and needs only the couchdb
-   flag. See [CONFIGURATION.md](../CONFIGURATION.md) for every field, and
+2. Add the mount. `experimental.couchdbVaults` is required, and `experimental.multiVault`
+   too whenever the table has more than one entry — a LiveSync database mounted *as the
+   whole vault* is a one-mount table and needs only the couchdb flag. `mounts add` names
+   each flag it needs and asks:
+
+   ```bash
+   deep-obsidian-mcp mounts add couchdb --id live --mount-at Live \
+     --url https://couch.example --database obsidian --username obsidian
+   ```
+
+   The password is prompted **masked** and stored in the OS keyring (or the encrypted
+   secrets file, reported); only the `passwordRef` lands in the config. The command then
+   performs the sidecar handshake and **refuses to write** unless the compatibility verdict
+   is `ok` — so step 4 below has already happened by the time it succeeds. Add `--e2ee` for
+   an encrypted vault (it prompts for the passphrase too) and `--writable` only after
+   step 5.
+
+   See [CONFIGURATION.md](../CONFIGURATION.md) for every field, and
    [§ A remote mount at the vault root](../CONFIGURATION.md#a-remote-mount-at-the-vault-root)
-   before you make it the root: there is then no `vaultPath` anywhere,
+   before you make it the root (`--mount-at ""`): there is then no `vaultPath` anywhere,
    `setup-service --vault-snippets` has nowhere to install, and an unreachable remote
    starts the service degraded rather than failing it.
-3. Store the password under the id your `passwordRef` names — in the OS keyring, or in the
-   encrypted secrets file. `options` (chunking/hashing) **must match how the vault was
-   written**, or content is reassembled wrongly.
+3. `options` (chunking/hashing) is **not** a `mounts add` flag: it must match how the vault
+   was written, or content is reassembled wrongly, and a value guessed from a command line
+   would fail silently. Add it to the mount by hand if your vault needs it.
 4. `deep-obsidian-mcp doctor --probe-remote` and confirm the mount's compatibility status
    is `ok`. Any other value (`locked`, `auth-failed`, `unknown-schema`, …) is the
    sidecar's own diagnosis of the remote, and the mount will not serve data until it reads
-   `ok`.
+   `ok`. (`mounts add` already refused anything else, unless you passed `--keep-anyway`.)
 5. **Take a snapshot before granting writes**, and verify the round trip:
 
 ```bash
@@ -84,11 +107,13 @@ ls -R ~/live-final          # ordinary files; manifest.json records revision + h
 mkdir -p ~/Vault/Live
 rsync -a --exclude manifest.json ~/live-final/ ~/Vault/Live/
 
-# 3. Change the mount kind to filesystem, or delete the mount entirely and let the root
-#    vault serve ~/Vault/Live as an ordinary folder.
-$EDITOR ~/.config/deep-obsidian-mcp/config.json
+# 3. Unmount, and let the root vault serve ~/Vault/Live as an ordinary folder. Nothing is
+#    deleted from CouchDB; the previous config is kept at config.json.bak, and the stored
+#    password is kept and named so you can clean your keyring yourself.
+deep-obsidian-mcp mounts remove --id live
 
 # 4. Confirm.
+deep-obsidian-mcp mounts list
 deep-obsidian-mcp print-config
 deep-obsidian-mcp doctor
 ```
@@ -114,15 +139,27 @@ index that several participants mount at once. Note bodies go to a hosted third-
 service. Read [algolia-mounts.md](./algolia-mounts.md) — especially the security section —
 before you put anything real in one.
 
-1. Add the mount by hand; `experimental.algoliaVaults` is required, and
-   `experimental.multiVault` too whenever the table has more than one entry. An algolia
-   mount *may* be the root, but think twice: an Algolia corpus has no local search index,
-   so a vault rooted on one loses `vault_info`, `build_index` and `recommend_folder` while
-   keeping reads, writes, listings and `grep_search`. Mounting it under a filesystem or
-   couchdb root keeps the whole surface — see
+1. Add the mount; `experimental.algoliaVaults` is required, and `experimental.multiVault`
+   too whenever the table has more than one entry. `mounts add` names each flag and asks:
+
+   ```bash
+   deep-obsidian-mcp mounts add algolia --id wiki --mount-at Wiki \
+     --app-id ABC1234XYZ --index-name team-wiki
+   ```
+
+   The API key is prompted **masked** and stored in the OS keyring (or the encrypted
+   secrets file, reported); only the `apiKeyRef` lands in the config. The command then
+   reads the index once and **refuses to write** if it cannot be reached, so steps 2 and 3
+   below are already done when it succeeds. Add `--writable` only after you have verified
+   the dump round trip.
+
+   An algolia mount *may* be the root (`--mount-at ""`), but think twice: an Algolia corpus
+   has no local search index, so a vault rooted on one loses `vault_info`, `build_index`
+   and `recommend_folder` while keeping reads, writes, listings and `grep_search`. Mounting
+   it under a filesystem or couchdb root keeps the whole surface — see
    [§ A remote mount at the vault root](../CONFIGURATION.md#a-remote-mount-at-the-vault-root).
-2. Store the API key under the id `apiKeyRef` names (or set
-   `$DEEP_OBSIDIAN_ALGOLIA_API_KEY`, which shadows it with a `warn`).
+2. `$DEEP_OBSIDIAN_ALGOLIA_API_KEY` still shadows the stored key, with a `warn`, if you
+   would rather supply it per-process than store it.
 3. Check it: `deep-obsidian-mcp algolia status --mount wiki`, or
    `deep-obsidian-mcp doctor --probe-remote`.
 4. Import the folder the mount shadows — **once**:
@@ -151,9 +188,10 @@ diff -r ~/wiki-final /tmp/wiki-again && echo "round trip verified"
 mkdir -p ~/Vault/Wiki
 rsync -a --exclude manifest.json ~/wiki-final/ ~/Vault/Wiki/
 
-# 3. Remove the mount from config.json and confirm.
-$EDITOR ~/.config/deep-obsidian-mcp/config.json
-deep-obsidian-mcp print-config && deep-obsidian-mcp doctor
+# 3. Unmount, and confirm. Nothing is deleted from the index (see below); the previous
+#    config is kept at config.json.bak, and the stored API key is kept and named.
+deep-obsidian-mcp mounts remove --id wiki
+deep-obsidian-mcp mounts list && deep-obsidian-mcp doctor
 ```
 
 `algolia restore` writes a dump back, with the same refuse-on-divergence rule as couchdb
@@ -168,7 +206,8 @@ dispose of the whole corpus, delete the index in the Algolia dashboard.
 
 ## Config Rollback
 
-A `setup-service` write that **changes** content backs the previous file up first (an
+Every write this binary makes to your config — `setup-service`, `mounts add`,
+`mounts remove` — backs the previous file up first **when the content changes** (an
 unchanged rewrite does not, so no spurious `.bak` appears):
 
 ```
@@ -185,8 +224,9 @@ deep-obsidian-mcp print-config     # confirm before restarting
 Only **one** generation is kept, and the next content-changing write replaces it. For a
 change you want to be able to undo later, take your own copy — as at the top of this page.
 
-There is no `.bak` for a mounts config, because `setup-service` never writes one. Version
-control or your own copy is the rollback for a hand-edited file.
+A config you edited **by hand** has no `.bak`, because nothing wrote it: version control
+or your own copy is the rollback there. `setup-service` still refuses to rewrite a mounts
+config at all, so its `.bak` never appears for one; the `mounts` family's does.
 
 ### Downgrading The Binary
 

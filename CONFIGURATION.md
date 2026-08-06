@@ -163,7 +163,8 @@ prefixes lives in different places.
 A config sets **either** `vaultPath` **or** `mounts`, never both: both spell "where the
 vault root is", and silently preferring one would let someone who added `mounts` to an
 existing config keep serving the old vault with no signal at all. Migrating means moving
-`vaultPath` into the root mount, as below.
+`vaultPath` into the root mount — which is what `mounts add` does for you (see
+[Building the table](#building-the-table-the-mounts-cli) below).
 
 ```json
 {
@@ -205,6 +206,84 @@ existing config keep serving the old vault with no signal at all. Migrating mean
   ]
 }
 ```
+
+### Building the table: the `mounts` CLI
+
+**Use `deep-obsidian-mcp mounts` rather than an editor.** The JSON above is the reference
+for what the fields *mean*; it is not the recommended way to produce one. A mount table has
+invariants a text editor cannot check — unique ids and prefixes, exactly one root mount, an
+`experimental` flag per remote backend, a credential that belongs in the secret store rather
+than in the file — and `setup-service` deliberately refuses to rewrite a config that has one
+(a mount table is the one thing it cannot reproduce faithfully). The `mounts` family is that
+gap closed:
+
+```bash
+# What is mounted where, and which experimental flags are on. Works on a legacy
+# vaultPath-only config too, where it shows the implicit root as such.
+deep-obsidian-mcp mounts list
+
+# Graft a second local vault onto /Team.
+deep-obsidian-mcp mounts add filesystem --id team --mount-at Team --vault-path ~/TeamVault
+
+# A LiveSync vault. The password is PROMPTED masked; --password-stdin for scripts.
+deep-obsidian-mcp mounts add couchdb --id phone --mount-at LiveSync \
+  --url https://couch.example --database obsidian --username obsidian
+
+# A shared Algolia corpus, writable. The API key is prompted masked.
+deep-obsidian-mcp mounts add algolia --id team-wiki --mount-at _Wiki \
+  --app-id ABC1234XYZ --index-name team-wiki --writable
+
+# Unmount. Nothing is deleted from the remote.
+deep-obsidian-mcp mounts remove --id phone
+```
+
+Add `--json` to any of them for a structured report, and `--dry-run` to validate without
+writing. `deep-obsidian-mcp mounts add --help` lists every kind's flags.
+
+What `mounts add` does, in order:
+
+1. **Migrates a legacy config.** A `vaultPath`-only config is first converted to an explicit
+   root mount (`id: "vault"`, `mountAt: ""`, the same path), which resolves to exactly the
+   same vault path and index directory the `vaultPath` did — then the new mount is appended.
+   The conversion is reported, not silent.
+2. **Validates the whole table** through the same loader the server uses at startup, before
+   anything is written. So this command cannot produce a config the server would then refuse
+   to load, and a duplicate id costs you nothing but the error message.
+3. **Asks before enabling an experimental flag.** A couchdb or algolia mount, or a second
+   mount of any kind, needs the relevant `experimental.*` flag. The command names the flag,
+   says what it turns on, says that it is experimental and may change, and asks. It never
+   enables one silently. `--yes` answers every prompt, for scripting.
+4. **Stores the credential in the secret store**, OS keyring first and the encrypted secrets
+   file as a reported fallback, and puts only the [reference](#secrets-are-references-never-values)
+   in the config. **There is no `--password` or `--api-key` flag**: a credential passed as a
+   flag value lands in `ps` output and in your shell history, so the only two ways in are a
+   masked prompt and `--password-stdin` / `--api-key-stdin` (one line per secret; with
+   `--e2ee`, the password first and the E2EE passphrase second).
+5. **Probes the mount before writing** — a directory read, one sidecar handshake, or one
+   index read; nothing that can mutate anything. On failure it writes **nothing** and removes
+   the credential it had just stored, so a typo'd URL leaves no orphan in your keyring.
+   `--keep-anyway` writes the mount regardless and tells you `doctor --probe-remote` will
+   report it degraded.
+6. **Writes with a backup.** A content-changing write leaves the previous file at
+   `config.json.bak`, and any key this build does not understand is carried across untouched.
+
+`mounts remove` **unmounts**; it is not a delete. Nothing is ever removed from a couchdb or
+algolia backing store (`couchdb export` / `algolia dump` remain the ways to take a copy). The
+mount's local index stays unless you pass `--purge-index`, and the stored credential is
+**always** kept and named in the output — a reference can be shared by more than one mount,
+so deleting one silently could break the other. Two removals are refused: the **root mount**
+while other mounts exist (they resolve by longest prefix beneath it), and the **last** mount
+(a config needs a root mount, so there would be no valid table to write — edit the file
+directly to start over).
+
+`mounts list` and `mounts remove` also work on a config the loader **refuses** — a duplicate
+prefix, a missing root, an `experimental` flag someone deleted. `list` prints the table with a
+warning and the loader's reason rather than going dark on the file that most needs reading
+(index directories are omitted, because they derive from the resolved root), and `remove` is
+one of the ways to fix such a table: it validates the table it is about to *write*, not the
+one it started from.
+
+Editing the file by hand still works, and `deep-obsidian-mcp doctor` still checks the result.
 
 ### The table
 
