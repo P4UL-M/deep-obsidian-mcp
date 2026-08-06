@@ -1,0 +1,40 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"children\": [\n    {\n      \"isMarkdown\": false,\n      \"kind\": \"directory\",\n      \"name\": \"Artifacts\",\n      \"path\": \"Artifacts\",\n      \"sizeBytes\": null\n    },\n    {\n      \"isMarkdown\": false,\n      \"kind\": \"directory\",\n      \"name\": \"Folder\",\n      \"path\": \"Folder\",\n      \"sizeBytes\": null\n    },\n    {\n      \"isMarkdown\": true,\n      \"kind\": \"file\",\n      \"name\": \"Root.md\",\n      \"path\": \"Root.md\",\n      \"sizeBytes\": 240\n    }\n  ],\n  \"count\": 3,\n  \"foldersOnly\": false,\n  \"path\": null\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "children": [
+        {
+          "isMarkdown": false,
+          "kind": "directory",
+          "name": "Artifacts",
+          "path": "Artifacts",
+          "sizeBytes": null
+        },
+        {
+          "isMarkdown": false,
+          "kind": "directory",
+          "name": "Folder",
+          "path": "Folder",
+          "sizeBytes": null
+        },
+        {
+          "isMarkdown": true,
+          "kind": "file",
+          "name": "Root.md",
+          "path": "Root.md",
+          "sizeBytes": 240
+        }
+      ],
+      "count": 3,
+      "foldersOnly": false,
+      "path": null
+    }
+  }
+}

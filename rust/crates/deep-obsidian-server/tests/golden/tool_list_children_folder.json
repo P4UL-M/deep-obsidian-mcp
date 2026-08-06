@@ -1,0 +1,33 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"children\": [\n    {\n      \"isMarkdown\": false,\n      \"kind\": \"directory\",\n      \"name\": \"Nested\",\n      \"path\": \"Folder/Nested\",\n      \"sizeBytes\": null\n    },\n    {\n      \"isMarkdown\": true,\n      \"kind\": \"file\",\n      \"name\": \"Child.md\",\n      \"path\": \"Folder/Child.md\",\n      \"sizeBytes\": 88\n    }\n  ],\n  \"count\": 2,\n  \"foldersOnly\": false,\n  \"path\": \"Folder\"\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "children": [
+        {
+          "isMarkdown": false,
+          "kind": "directory",
+          "name": "Nested",
+          "path": "Folder/Nested",
+          "sizeBytes": null
+        },
+        {
+          "isMarkdown": true,
+          "kind": "file",
+          "name": "Child.md",
+          "path": "Folder/Child.md",
+          "sizeBytes": 88
+        }
+      ],
+      "count": 2,
+      "foldersOnly": false,
+      "path": "Folder"
+    }
+  }
+}

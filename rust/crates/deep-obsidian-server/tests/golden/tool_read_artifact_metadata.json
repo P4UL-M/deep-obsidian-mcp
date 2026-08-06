@@ -1,0 +1,21 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"includeBase64\": false,\n  \"kind\": \"image\",\n  \"maxBytes\": 0,\n  \"mimeType\": \"image/png\",\n  \"path\": \"Artifacts/diagram.png\",\n  \"resourceUri\": \"obsidian://artifact?path=Artifacts%2Fdiagram.png\",\n  \"size\": 67\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "includeBase64": false,
+      "kind": "image",
+      "maxBytes": 0,
+      "mimeType": "image/png",
+      "path": "Artifacts/diagram.png",
+      "resourceUri": "obsidian://artifact?path=Artifacts%2Fdiagram.png",
+      "size": 67
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"curlExample\": \"curl -X PUT --data-binary @YOUR_FILE \\\"http://127.0.0.1:7777/upload/<TOKEN>\\\"\",\n  \"expiresAt\": \"<EPOCH>\",\n  \"maxBytes\": 104857600,\n  \"mimeType\": \"image/png\",\n  \"path\": \"Artifacts/upload.png\",\n  \"uploadUrl\": \"http://127.0.0.1:7777/upload/<TOKEN>\"\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "curlExample": "curl -X PUT --data-binary @YOUR_FILE \"http://127.0.0.1:7777/upload/<TOKEN>\"",
+      "expiresAt": "<EPOCH>",
+      "maxBytes": 104857600,
+      "mimeType": "image/png",
+      "path": "Artifacts/upload.png",
+      "uploadUrl": "http://127.0.0.1:7777/upload/<TOKEN>"
+    }
+  }
+}

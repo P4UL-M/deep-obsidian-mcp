@@ -1,0 +1,17 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"hash\": \"fnv1a64:8f57a59c5ff19006\",\n  \"path\": \"Root.md\",\n  \"unchanged\": true\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "hash": "fnv1a64:8f57a59c5ff19006",
+      "path": "Root.md",
+      "unchanged": true
+    }
+  }
+}

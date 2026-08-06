@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32000,
+    "message": "invalid vault-relative path: ../escape.md"
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

@@ -1,0 +1,65 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"blockCount\": 0,\n  \"blocks\": [],\n  \"headingCount\": 3,\n  \"headings\": [\n    {\n      \"endLine\": 18,\n      \"includeText\": false,\n      \"level\": 1,\n      \"maxTextChars\": 4000,\n      \"resourceUri\": \"obsidian://heading?path=Root.md&slug=root\",\n      \"slug\": \"root\",\n      \"startLine\": 7,\n      \"textOmitted\": true,\n      \"title\": \"Root\"\n    },\n    {\n      \"endLine\": 14,\n      \"includeText\": false,\n      \"level\": 2,\n      \"maxTextChars\": 4000,\n      \"resourceUri\": \"obsidian://heading?path=Root.md&slug=overview\",\n      \"slug\": \"overview\",\n      \"startLine\": 11,\n      \"textOmitted\": true,\n      \"title\": \"Overview\"\n    },\n    {\n      \"endLine\": 18,\n      \"includeText\": false,\n      \"level\": 2,\n      \"maxTextChars\": 4000,\n      \"resourceUri\": \"obsidian://heading?path=Root.md&slug=details\",\n      \"slug\": \"details\",\n      \"startLine\": 15,\n      \"textOmitted\": true,\n      \"title\": \"Details\"\n    }\n  ],\n  \"lineCount\": 18,\n  \"linkCount\": 2,\n  \"outgoingLinks\": [\n    {\n      \"target\": \"Folder/Child\"\n    },\n    {\n      \"target\": \"Missing Note\"\n    }\n  ],\n  \"path\": \"Root.md\",\n  \"resourceUri\": \"obsidian://note?path=Root.md\",\n  \"title\": \"Root\"\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "blockCount": 0,
+      "blocks": [],
+      "headingCount": 3,
+      "headings": [
+        {
+          "endLine": 18,
+          "includeText": false,
+          "level": 1,
+          "maxTextChars": 4000,
+          "resourceUri": "obsidian://heading?path=Root.md&slug=root",
+          "slug": "root",
+          "startLine": 7,
+          "textOmitted": true,
+          "title": "Root"
+        },
+        {
+          "endLine": 14,
+          "includeText": false,
+          "level": 2,
+          "maxTextChars": 4000,
+          "resourceUri": "obsidian://heading?path=Root.md&slug=overview",
+          "slug": "overview",
+          "startLine": 11,
+          "textOmitted": true,
+          "title": "Overview"
+        },
+        {
+          "endLine": 18,
+          "includeText": false,
+          "level": 2,
+          "maxTextChars": 4000,
+          "resourceUri": "obsidian://heading?path=Root.md&slug=details",
+          "slug": "details",
+          "startLine": 15,
+          "textOmitted": true,
+          "title": "Details"
+        }
+      ],
+      "lineCount": 18,
+      "linkCount": 2,
+      "outgoingLinks": [
+        {
+          "target": "Folder/Child"
+        },
+        {
+          "target": "Missing Note"
+        }
+      ],
+      "path": "Root.md",
+      "resourceUri": "obsidian://note?path=Root.md",
+      "title": "Root"
+    }
+  }
+}

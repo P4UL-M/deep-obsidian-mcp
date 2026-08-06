@@ -1,0 +1,26 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"autoReindex\": false,\n  \"chunkCount\": 4,\n  \"indexGeneratedAt\": \"<TIMESTAMP>\",\n  \"markdownFileCount\": 3,\n  \"noteCount\": 3,\n  \"rebuilt\": \"<BOOL>\",\n  \"reindexDebounceMs\": 0,\n  \"reindexIntervalMs\": 0,\n  \"semanticBackend\": \"sparse\",\n  \"storageBackend\": \"sqlite\",\n  \"vaultPath\": \"<VAULT>\",\n  \"vectorSearchBackend\": \"sparse-terms\"\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "autoReindex": false,
+      "chunkCount": 4,
+      "indexGeneratedAt": "<TIMESTAMP>",
+      "markdownFileCount": 3,
+      "noteCount": 3,
+      "rebuilt": "<BOOL>",
+      "reindexDebounceMs": 0,
+      "reindexIntervalMs": 0,
+      "semanticBackend": "sparse",
+      "storageBackend": "sqlite",
+      "vaultPath": "<VAULT>",
+      "vectorSearchBackend": "sparse-terms"
+    }
+  }
+}

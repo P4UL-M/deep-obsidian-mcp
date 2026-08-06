@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32000,
+    "message": "hash conflict for Folder/New Note.md: expected fnv1a64:8776213799c39cdf, found fnv1a64:a7a1c3921a793535"
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32000,
+    "message": "missing required argument 'path' (vault-relative file path, e.g. \"Projets/A2A/Current Sprint.md\")"
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

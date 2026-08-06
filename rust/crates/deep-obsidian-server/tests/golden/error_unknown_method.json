@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32601,
+    "message": "unsupported method: no/such/method"
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

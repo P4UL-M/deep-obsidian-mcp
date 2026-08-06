@@ -1,0 +1,23 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"base64\": \"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==\",\n  \"hash\": \"fnv1a64:ad48c1765eb1b87d\",\n  \"includeBase64\": true,\n  \"kind\": \"image\",\n  \"maxBytes\": 4096,\n  \"mimeType\": \"image/png\",\n  \"path\": \"Artifacts/diagram.png\",\n  \"resourceUri\": \"obsidian://artifact?path=Artifacts%2Fdiagram.png\",\n  \"size\": 67\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==",
+      "hash": "fnv1a64:ad48c1765eb1b87d",
+      "includeBase64": true,
+      "kind": "image",
+      "maxBytes": 4096,
+      "mimeType": "image/png",
+      "path": "Artifacts/diagram.png",
+      "resourceUri": "obsidian://artifact?path=Artifacts%2Fdiagram.png",
+      "size": 67
+    }
+  }
+}

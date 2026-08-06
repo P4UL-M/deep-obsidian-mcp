@@ -1,0 +1,16 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "capabilities": {
+      "prompts": {},
+      "resources": {},
+      "tools": {}
+    },
+    "protocolVersion": "2025-03-26",
+    "serverInfo": {
+      "name": "deep-obsidian-mcp",
+      "version": "0.1.0"
+    }
+  }
+}

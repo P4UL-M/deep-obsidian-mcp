@@ -1,0 +1,25 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"endLine\": 18,\n  \"hash\": \"fnv1a64:8f57a59c5ff19006\",\n  \"includeText\": true,\n  \"lineCount\": 18,\n  \"maxTextChars\": 20000,\n  \"path\": \"Root.md\",\n  \"resourceUri\": \"obsidian://note?path=Root.md\",\n  \"startLine\": 1,\n  \"text\": \"---\\ntitle: Root\\ntags:\\n  - contract\\n---\\n\\n# Root\\n\\nRoot preamble text linking to [[Folder/Child]] and [[Missing Note]].\\n\\n## Overview\\n\\nOverview body about the vault backend contract.\\n\\n## Details\\n\\nDetails body mentioning ripgrep and embeddings.\\n\",\n  \"textTruncated\": false,\n  \"unchanged\": false\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "endLine": 18,
+      "hash": "fnv1a64:8f57a59c5ff19006",
+      "includeText": true,
+      "lineCount": 18,
+      "maxTextChars": 20000,
+      "path": "Root.md",
+      "resourceUri": "obsidian://note?path=Root.md",
+      "startLine": 1,
+      "text": "---\ntitle: Root\ntags:\n  - contract\n---\n\n# Root\n\nRoot preamble text linking to [[Folder/Child]] and [[Missing Note]].\n\n## Overview\n\nOverview body about the vault backend contract.\n\n## Details\n\nDetails body mentioning ripgrep and embeddings.\n",
+      "textTruncated": false,
+      "unchanged": false
+    }
+  }
+}

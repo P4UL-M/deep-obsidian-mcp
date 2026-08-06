@@ -1,0 +1,21 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"count\": 2,\n  \"folders\": [\n    \"Artifacts\",\n    \"Folder\"\n  ],\n  \"foldersOnly\": true,\n  \"path\": null\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "count": 2,
+      "folders": [
+        "Artifacts",
+        "Folder"
+      ],
+      "foldersOnly": true,
+      "path": null
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32000,
+    "message": "update_note_section requires 'heading' (the exact heading title) when target is 'heading' (the default). To edit the note preamble instead, set target to 'preamble'."
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

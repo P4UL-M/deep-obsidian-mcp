@@ -1,0 +1,358 @@
+[
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "load_knowledge",
+    "properties": [
+      "format",
+      "graphDepth",
+      "includeGraph",
+      "includeText",
+      "limitChunks",
+      "limitNotes",
+      "maxTextChars",
+      "project",
+      "subject"
+    ],
+    "required": [
+      "subject"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "recommend_folder",
+    "properties": [
+      "project",
+      "topic"
+    ],
+    "required": [
+      "topic"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "type"
+    ],
+    "name": "vault_info",
+    "properties": [],
+    "required": null
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "upsert_session_note",
+    "properties": [
+      "content",
+      "dryRun",
+      "expectedHash",
+      "folder",
+      "path",
+      "preserveManualNotes",
+      "topic"
+    ],
+    "required": [
+      "content"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "oneOf",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "upsert_note",
+    "properties": [
+      "body",
+      "content",
+      "dryRun",
+      "expectedHash",
+      "frontmatter",
+      "path",
+      "preserveManualNotes",
+      "title"
+    ],
+    "required": [
+      "path"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "allOf",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "update_note_section",
+    "properties": [
+      "content",
+      "createIfMissing",
+      "dryRun",
+      "expectedHash",
+      "heading",
+      "level",
+      "path",
+      "target"
+    ],
+    "required": [
+      "path",
+      "content"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "request_vault_upload",
+    "properties": [
+      "expectedHash",
+      "mimeType",
+      "path"
+    ],
+    "required": [
+      "path"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "type"
+    ],
+    "name": "list_children",
+    "properties": [
+      "foldersOnly",
+      "includeHidden",
+      "includeIgnored",
+      "path"
+    ],
+    "required": null
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "read_file",
+    "properties": [
+      "endLine",
+      "format",
+      "includeText",
+      "knownHash",
+      "maxTextChars",
+      "path",
+      "startLine"
+    ],
+    "required": [
+      "path"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "read_artifact",
+    "properties": [
+      "format",
+      "includeBase64",
+      "maxBytes",
+      "path"
+    ],
+    "required": [
+      "path"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "find_files",
+    "properties": [
+      "limit",
+      "mode",
+      "query"
+    ],
+    "required": [
+      "query"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "note_outline",
+    "properties": [
+      "format",
+      "includeText",
+      "maxTextChars",
+      "path"
+    ],
+    "required": [
+      "path"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "type"
+    ],
+    "name": "build_index",
+    "properties": [],
+    "required": null
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "hybrid_search",
+    "properties": [
+      "bm25Weight",
+      "format",
+      "includeText",
+      "limit",
+      "maxTextChars",
+      "query",
+      "semanticWeight"
+    ],
+    "required": [
+      "query"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "search_artifacts",
+    "properties": [
+      "format",
+      "limit",
+      "query"
+    ],
+    "required": [
+      "query"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "related_notes",
+    "properties": [
+      "limit",
+      "path"
+    ],
+    "required": [
+      "path"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "graph_traverse",
+    "properties": [
+      "depth",
+      "direction",
+      "limit",
+      "path"
+    ],
+    "required": [
+      "path"
+    ]
+  }
+]

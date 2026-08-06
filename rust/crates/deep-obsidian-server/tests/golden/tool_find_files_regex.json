@@ -1,0 +1,29 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"count\": 2,\n  \"matches\": [\n    {\n      \"matchedOn\": \"regex\",\n      \"path\": \"Folder/Child.md\",\n      \"resourceUri\": \"obsidian://note?path=Folder%2FChild.md\"\n    },\n    {\n      \"matchedOn\": \"regex\",\n      \"path\": \"Folder/Nested/Deep.md\",\n      \"resourceUri\": \"obsidian://note?path=Folder%2FNested%2FDeep.md\"\n    }\n  ],\n  \"mode\": \"regex\",\n  \"query\": \"^Folder/.*\\\\.md$\"\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "count": 2,
+      "matches": [
+        {
+          "matchedOn": "regex",
+          "path": "Folder/Child.md",
+          "resourceUri": "obsidian://note?path=Folder%2FChild.md"
+        },
+        {
+          "matchedOn": "regex",
+          "path": "Folder/Nested/Deep.md",
+          "resourceUri": "obsidian://note?path=Folder%2FNested%2FDeep.md"
+        }
+      ],
+      "mode": "regex",
+      "query": "^Folder/.*\\.md$"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32000,
+    "message": "request_vault_upload requires the HTTP service transport"
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

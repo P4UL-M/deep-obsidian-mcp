@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32000,
+    "message": "artifact payload for Artifacts/diagram.png is 67 bytes, above maxBytes 8"
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

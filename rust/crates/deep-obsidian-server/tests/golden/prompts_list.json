@@ -1,0 +1,56 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "prompts": [
+      {
+        "arguments": [
+          {
+            "description": "Topic, question, or working context to retrieve from the vault.",
+            "name": "subject",
+            "required": true
+          },
+          {
+            "description": "Optional project, repository, product, or domain hint.",
+            "name": "project",
+            "required": false
+          }
+        ],
+        "description": "Retrieve compact, relevant vault context before answering, planning, or coding.",
+        "name": "obsidian-load-context"
+      },
+      {
+        "arguments": [
+          {
+            "description": "Optional project, repository, product, or domain hint.",
+            "name": "project",
+            "required": false
+          },
+          {
+            "description": "Topic, question, or working context to retrieve from the vault.",
+            "name": "subject",
+            "required": true
+          }
+        ],
+        "description": "Build a project briefing from recent sessions, decisions, open questions, and related notes.",
+        "name": "obsidian-project-briefing"
+      },
+      {
+        "arguments": [
+          {
+            "description": "Topic, question, or working context to retrieve from the vault.",
+            "name": "subject",
+            "required": true
+          },
+          {
+            "description": "Optional project, repository, product, or domain hint.",
+            "name": "project",
+            "required": false
+          }
+        ],
+        "description": "Review recent daily/session notes and surface carry-over tasks, decisions, and follow-ups.",
+        "name": "obsidian-daily-review"
+      }
+    ]
+  }
+}
