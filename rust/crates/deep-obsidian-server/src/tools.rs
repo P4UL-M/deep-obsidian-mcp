@@ -6,8 +6,8 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use deep_obsidian_backend::{
-    BackendRequest, BaseVersion, Capability, GrepContextLine, GrepMatch, RecallRequest,
-    VaultChildEntry, VaultEntryKind, RIPGREP_UNAVAILABLE_MESSAGE,
+    BackendKind, BackendRequest, BaseVersion, Capability, GrepContextLine, GrepMatch,
+    RecallRequest, VaultChildEntry, VaultEntryKind, RIPGREP_UNAVAILABLE_MESSAGE,
 };
 use deep_obsidian_core::text::{
     extract_block_sections, extract_heading_sections, extract_wiki_links, normalize_heading_slug,
@@ -916,8 +916,12 @@ fn insert_resolve_divergence_argument(definitions: &mut [ToolDefinition]) {
 /// advertises [`Capability::VersionHistory`].
 ///
 /// The two capabilities are checked SEPARATELY rather than as one "shared mount" flag,
-/// because they genuinely come apart: a read-only shared mount has a version history and
-/// no soft delete, and `delete_note` must not appear for it.
+/// because they genuinely come apart IN BOTH DIRECTIONS: a read-only Algolia mount has a
+/// version history and no soft delete, so `delete_note` must not appear for it; a writable
+/// couchdb mount has a soft delete and no version history, so `delete_note` must appear
+/// while the three history tools must not. The second case is why `delete_note`'s
+/// description and its `howToRecover` cannot assume a history exists — see
+/// [`NO_HISTORY_RECOVERY`].
 ///
 /// # Why the four tools are not `scope`-routed
 ///
@@ -928,7 +932,7 @@ fn insert_capability_tools(definitions: &mut Vec<ToolDefinition>, capabilities: 
     if capabilities.soft_delete {
         definitions.push(ToolDefinition {
             name: "delete_note".to_string(),
-            description: "Soft-delete a note on a mount whose removal is observable and recoverable: it stops appearing in listings and search, its previous version moves to history, and the content stays readable via note_history/read_version. Only mounts advertising 'soft-delete' in vault_info.mounts[].capabilities — local vault files are NOT deletable through MCP.".to_string(),
+            description: "Soft-delete a note on a mount whose removal is observable and recoverable: it stops appearing in listings and search, and the response's 'howToRecover' says how to get it back on that mount. How recovery works depends on the mount: one that also advertises 'version-history' moves the previous version to history and names it as 'recoverableFrom' for read_version; a CouchDB (LiveSync) mount keeps no history, but the note's last content stays readable at the same path and writing it back with upsert_note resurrects it. Only mounts advertising 'soft-delete' in vault_info.mounts[].capabilities — local vault files are NOT deletable through MCP.".to_string(),
             annotations: Some(tool_annotations(false, Some(false), Some(true))),
             execution: Some(json!({"taskSupport":"forbidden"})),
             input_schema: object_schema(
@@ -3672,18 +3676,40 @@ fn refuse_incapable_mount(
     } else {
         format!("Mounts that do support it: {}.", capable.join(", "))
     };
+    let kind = resolved.mount.backend.descriptor().kind;
     Err(format!(
         "{tool} cannot be used on {path}: it is served by mount '{}' (backend: {}), which does not \
          support this operation. {} {alternatives} See vault_info.mounts[].capabilities.",
         resolved.mount.id,
-        resolved.mount.backend.descriptor().kind.as_str(),
-        match capability {
-            Capability::SoftDelete => {
+        kind.as_str(),
+        match (capability, kind) {
+            // A remote mount that lacks `soft-delete` lacks it for ONE reason — it was not
+            // opted in to writes — and the reason is a setting the reader can change. The
+            // local-deletion sentence below would be a false claim here: the removal WOULD
+            // be observable to every other participant and recoverable, which is exactly
+            // why these backends implement it. This is the lesson the couchdb read-only
+            // refusal already carries: a refusal that misstates its own cause sends the
+            // reader looking in the wrong place.
+            (Capability::SoftDelete, BackendKind::Couchdb | BackendKind::Algolia) => {
+                "This backend CAN soft-delete — the removal is observable to every other \
+                 participant and it is recoverable — but this mount is read-only: its mount \
+                 configuration does not set \"writable\": true, so it advertises no delete and \
+                 accepts none. Set it and restart the service to allow deletes here."
+            }
+            (Capability::SoftDelete, _) => {
                 "Removing a note here would be an ordinary file deletion, which is observable to \
                  nobody and recoverable from nothing, and this MCP surface deliberately exposes \
                  no deletion of local vault files — delete the note yourself instead."
             }
-            Capability::VersionHistory =>
+            // Same discipline in the other direction: CouchDB genuinely retains revisions,
+            // so "one content per note by construction" would be false. What is missing is a
+            // way to reach them, and no setting adds one.
+            (Capability::VersionHistory, BackendKind::Couchdb) =>
+                "This storage does retain revisions, but nothing can enumerate or fetch one \
+                 through this server (the sidecar protocol has no such call, and CouchDB's \
+                 compaction removes older revisions anyway), so there is no version to list, \
+                 read or reconcile. No configuration turns this on.",
+            (Capability::VersionHistory, _) =>
                 "This storage keeps one content per note by construction, so there is no \
                  superseded version to list, read or reconcile.",
             _ => "",
@@ -3699,6 +3725,10 @@ fn refuse_incapable_mount(
 /// gained no destructive local capability by existing.
 async fn delete_note_payload(state: &AppState, path: &str) -> Result<Value, String> {
     refuse_incapable_mount(state, "delete_note", path, Capability::SoftDelete)?;
+    // Read BEFORE the delete, because the answer decides the wording below and a mount's
+    // descriptor is a pure function of its configuration — but reading it first also means
+    // a failure here cannot leave a caller with a tombstone and no guidance.
+    let has_history = mount_supports(state, path, Capability::VersionHistory);
     let outcome = backend_call(state, BackendRequest::soft_delete(path))
         .await?
         .into_soft_delete()
@@ -3711,15 +3741,70 @@ async fn delete_note_payload(state: &AppState, path: &str) -> Result<Value, Stri
     ]);
     if let Some(recoverable) = &outcome.recoverable_from {
         payload.insert("recoverableFrom".to_string(), json!(recoverable));
-        payload.insert(
-            "howToRecover".to_string(),
-            json!(format!(
+    }
+    payload.insert(
+        "howToRecover".to_string(),
+        json!(match (&outcome.recoverable_from, has_history) {
+            // Byte-identical to what this has always emitted for a history-keeping mount.
+            (Some(recoverable), true) => format!(
                 "read_version with versionId {recoverable} returns the removed content; \
                  upsert_note it back to undelete the note."
-            )),
-        );
-    }
+            ),
+            _ => NO_HISTORY_RECOVERY.to_string(),
+        }),
+    );
     Ok(Value::Object(payload))
+}
+
+/// How to undo a delete on a mount with no version history.
+///
+/// # Why this is not "the content is gone"
+///
+/// It would be the safe-sounding thing to say and it is not true. A CouchDB (LiveSync)
+/// tombstone is the entry document with `deleted: true` set on it; its `children` list is
+/// untouched, so the chunks the note was made from are still stored and still referenced.
+/// A read of the path therefore still returns the last content — that is pre-existing,
+/// documented behaviour of this mount, not something a delete changed — and writing it
+/// back resurrects the note. Telling a caller the content was destroyed would send them
+/// off to a CouchDB backup for something a read will hand them.
+///
+/// Both read tools are named because a delete here can reach an ATTACHMENT: this mount
+/// stores binaries, so removing one is legitimate, and a `newnote` entry read as text is
+/// refused by design. Naming only `read_file` would point half of the callers at a tool
+/// that refuses. See `couchdb_sidecar.rs::an_attachment_can_be_tombstoned_and_its_bytes_survive`.
+///
+/// # Why it is not `read_version` either
+///
+/// That is the sentence this exists to avoid. A mount can have `soft-delete` and NOT
+/// `version-history`, and a couchdb mount is exactly that: CouchDB keeps older revisions
+/// but compaction deletes them and the sidecar protocol cannot fetch one, so there is no
+/// versionId to hand back. Pointing at `read_version` would name a tool that is not even
+/// registered for such a vault.
+///
+/// What IS lost is everything older than the last content, which the message says rather
+/// than leaving the reader to assume a history exists.
+///
+/// The couchdb mount is the ONLY backend that reaches this today, which is why the wording
+/// is concrete about what survives rather than hedging. A future backend with `soft-delete`
+/// and no `version-history` whose tombstone keeps nothing would need its own sentence here,
+/// not this one.
+const NO_HISTORY_RECOVERY: &str = "this mount keeps no version history, so there is no \
+versionId to read back and nothing older than the note's last content survives. That last \
+content is still there: reading this path still returns it (the tombstone keeps the stored \
+content) — read_file for a note, read_artifact for an attachment — and writing it back with \
+upsert_note resurrects it at this path, on every device that syncs this vault.";
+
+/// Whether the mount owning `path` advertises `capability`.
+///
+/// A resolution failure answers `false` rather than propagating: every caller uses this to
+/// choose WORDING, and a path that does not resolve has already failed for a better reason
+/// somewhere else.
+fn mount_supports(state: &AppState, path: &str, capability: Capability) -> bool {
+    state
+        .router
+        .resolve(path)
+        .map(|resolved| resolved.mount.backend.descriptor().supports(capability))
+        .unwrap_or(false)
 }
 
 /// One version, rendered.

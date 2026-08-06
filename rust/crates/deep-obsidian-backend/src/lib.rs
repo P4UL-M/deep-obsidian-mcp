@@ -47,8 +47,8 @@ pub use algolia::{
 };
 pub use couchdb::{
     CouchDbVaultBackend, EntryContent, COUCHDB_NATIVE_RECALL_UNSUPPORTED_MESSAGE,
-    COUCHDB_READ_ONLY_MESSAGE, COUCHDB_SOFT_DELETE_UNSUPPORTED_MESSAGE,
-    COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE, UPLOAD_COLLECT_ADVISORY_BYTES,
+    COUCHDB_READ_ONLY_MESSAGE, COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE,
+    UPLOAD_COLLECT_ADVISORY_BYTES,
 };
 pub use deep_obsidian_core::vault::{VaultChildEntry, VaultEntryKind, VaultError};
 pub use filesystem::{
@@ -74,8 +74,8 @@ pub use watch::{should_ignore_watch_path, watch_reason, ChangeEvent, ChangeStrea
 pub enum BackendKind {
     Filesystem,
     InMemory,
-    /// A read-only Self-hosted LiveSync vault in CouchDB, behind the supervised
-    /// Node sidecar.
+    /// A Self-hosted LiveSync vault in CouchDB, behind the supervised Node sidecar.
+    /// Read-only unless the mount set `writable`.
     Couchdb,
     /// A shared, Markdown-only corpus stored as records in an Algolia index. Has no
     /// local copy of its content and no local search index — see
@@ -719,8 +719,16 @@ pub enum MutationResponse {
         /// non-idempotent for no gain.
         already_deleted: bool,
         /// The version still holding the content that was just removed. Feed it to a
-        /// versioned read to recover it. `None` only when the storage could not name
-        /// one, which is what makes the removal unrecoverable and worth surfacing.
+        /// versioned read to recover it.
+        ///
+        /// `None` means there is no version a versioned read could serve — NOT
+        /// necessarily that the content is gone. A mount may keep the removed content
+        /// somewhere a `read_version` cannot address it: the couchdb mount's tombstone
+        /// still names the chunks it was made from, so an ordinary read of the path
+        /// returns the last content and writing it back resurrects the note. What `None`
+        /// says precisely is "do not send the caller to the history tools", and the tool
+        /// layer is where the per-mount recovery route is spelled out. See
+        /// [`CouchDbVaultBackend::soft_delete`].
         recoverable_from: Option<String>,
     },
     UploadCommitted {

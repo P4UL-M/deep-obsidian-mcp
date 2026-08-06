@@ -1147,12 +1147,13 @@ async fn template_protection_still_applies_on_a_non_root_mount() {
 /// triple fails this test too.
 ///
 /// It also models the parts of the write surface this suite needs to observe through
-/// the MCP tools: `initialize.mode` (refusing `write` with `read-only`/-32009 unless
-/// `read-write` was asked for), and a real revision-guarded compare-and-swap on
-/// `write` (-32008 with `data.conflict.currentRev`). Revisions are a counter rather
-/// than CouchDB hashes -- what this suite asserts is that the REVISION THREADING is
-/// wired end to end, not how CouchDB derives a rev, which `couchdb_sidecar.rs` covers
-/// against the real thing.
+/// the MCP tools: `initialize.mode` (refusing `write` and `delete` with
+/// `read-only`/-32009 unless `read-write` was asked for), a real revision-guarded
+/// compare-and-swap on both (-32008 with `data.conflict.currentRev`), and LiveSync's
+/// SOFT delete -- a tombstone that keeps the entry readable at its path, so writing it
+/// back resurrects the note. Revisions are a counter rather than CouchDB hashes -- what
+/// this suite asserts is that the REVISION THREADING is wired end to end, not how CouchDB
+/// derives a rev, which `couchdb_sidecar.rs` covers against the real thing.
 const STUB_SIDECAR: &str = r##"
 import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
@@ -1186,6 +1187,16 @@ const REVS = { "Charter.md": "1-stub", "Deep/Nested.md": "1-stub" };
 const KINDS = { "Charter.md": "markdown", "Deep/Nested.md": "markdown" };
 /** Binary bodies, kept as base64 exactly as they arrived. */
 const BINARIES = {};
+/**
+ * Paths that are LiveSync TOMBSTONES.
+ *
+ * A set rather than a deletion from `NOTES`, because that is what the storage does: a
+ * soft-deleted entry is still a document, its chunks are still there, and `read`/`stat`
+ * still answer for it. Modelling it as a removal would make the stub agree with the Rust
+ * side about listings while silently disagreeing about everything else — and the
+ * resurrection path, which writes over a tombstone, would have nothing to write over.
+ */
+const DELETED = new Set();
 let revSeed = 1;
 let mode = "read-only";
 const rl = createInterface({ input: process.stdin });
@@ -1234,7 +1245,10 @@ rl.on("line", (line) => {
                     ...entry,
                     mtimeMs: 1700000000000,
                     ctimeMs: 1700000000000,
-                    deleted: false,
+                    // A tombstone IS listed by the manifest, carrying the flag. Excluding
+                    // it is the Rust side's job (`is_listable`), and a stub that hid it
+                    // here would make that filter untestable.
+                    deleted: DELETED.has(entry.path),
                     conflicted: false,
                 })),
                 exhausted: true,
@@ -1249,7 +1263,7 @@ rl.on("line", (line) => {
                     size: Buffer.from(base64, "base64").length,
                     mtimeMs: 1700000000000,
                     ctimeMs: 1700000000000,
-                    deleted: false,
+                    deleted: DELETED.has(message.params.path),
                     conflicted: false,
                     rev: REVS[message.params.path],
                 });
@@ -1263,7 +1277,7 @@ rl.on("line", (line) => {
                 size: Buffer.byteLength(body),
                 mtimeMs: 1700000000000,
                 ctimeMs: 1700000000000,
-                deleted: false,
+                deleted: DELETED.has(message.params.path),
                 conflicted: false,
                 rev: REVS[message.params.path],
             });
@@ -1277,7 +1291,7 @@ rl.on("line", (line) => {
                     size: Buffer.from(base64, "base64").length,
                     mtimeMs: 1700000000000,
                     ctimeMs: 1700000000000,
-                    deleted: false,
+                    deleted: DELETED.has(message.params.path),
                     conflicted: false,
                     rev: REVS[message.params.path],
                 });
@@ -1290,7 +1304,7 @@ rl.on("line", (line) => {
                 size: Buffer.byteLength(body),
                 mtimeMs: 1700000000000,
                 ctimeMs: 1700000000000,
-                deleted: false,
+                deleted: DELETED.has(message.params.path),
                 conflicted: false,
                 rev: REVS[message.params.path],
             });
@@ -1334,6 +1348,9 @@ rl.on("line", (line) => {
                 if (current !== baseRev) return conflict(baseRev);
             }
             const created = current === undefined;
+            // Writing over a tombstone brings the entry back, and the flag is simply not
+            // carried over -- resurrection is structural, exactly as upstream's is.
+            const resurrected = DELETED.delete(path);
             revSeed += 1;
             REVS[path] = `${revSeed}-stub`;
             const isText = message.params.content.kind === "text";
@@ -1359,8 +1376,55 @@ rl.on("line", (line) => {
                 ctimeMs: 1700000000000,
                 kind: message.params.content.kind === "text" ? "markdown" : "binary",
                 created,
-                resurrected: false,
+                resurrected,
             });
+        }
+        case "delete": {
+            // The same config-level refusal `write` gets, with the same code: a delete is
+            // a write, and the sidecar that owns the mode is what enforces it.
+            if (mode !== "read-write") {
+                return fail(-32009, "read-only", "this sidecar was initialized read-only");
+            }
+            const path = message.params.path;
+            const current = REVS[path];
+            // A path with no document at all. NOT the same as a tombstone, which is a
+            // document and is deleted again quite happily -- see below.
+            if (current === undefined) return fail(-32004, "not-found", "no entry at this path");
+            const baseRev = message.params.baseRev;
+            // `null` and absent both mean unguarded; only a string is a precondition.
+            // Create-only is meaningless for a delete, so there is no third case.
+            if (typeof baseRev === "string" && current !== baseRev) {
+                return process.stdout.write(
+                    JSON.stringify({
+                        jsonrpc: "2.0",
+                        id: message.id,
+                        error: {
+                            code: -32008,
+                            message: "conflict",
+                            data: {
+                                kind: "conflict",
+                                detail: "guarded delete refused: the remote revision moved",
+                                conflict: {
+                                    currentRev: current,
+                                    expected: baseRev,
+                                    deleted: DELETED.has(path),
+                                    conflicted: false,
+                                },
+                            },
+                        },
+                    }) + "\n"
+                );
+            }
+            // Deleting a tombstone is accepted and produces a FRESH revision, which is
+            // what the real sidecar does (it re-sets `deleted` and puts the document). The
+            // Rust side is what makes a repeated delete cost nothing, by answering from
+            // its `stat` instead of asking -- so this arm must stay permissive, or that
+            // short-circuit would be untestable and the stub would be asserting a fiction.
+            revSeed += 1;
+            REVS[path] = `${revSeed}-stub`;
+            DELETED.add(path);
+            // The content and the chunks stay: the entry is still readable at this path.
+            return reply({ path, rev: REVS[path], deleted: true });
         }
         case "changesSince":
             return reply({ changes: [], nextCursor: "c1", exhausted: true });
@@ -1738,6 +1802,316 @@ async fn the_write_tools_work_end_to_end_on_a_writable_couchdb_mount() {
     assert!(root.get("result").is_some(), "{root}");
 }
 
+/// Every path an unscoped-by-mount `grep_search` reports for `needle`.
+async fn grepped_paths(state: &AppState, needle: &str) -> Vec<String> {
+    let response = tool_call(
+        state,
+        "grep_search",
+        json!({"query": needle, "scope": "LiveSync"}),
+    )
+    .await;
+    structured(&response)["matches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry["path"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// `delete_note` on a WRITABLE couchdb mount, end to end: the tombstone leaves every
+/// enumeration, the payload says how to undo it WITHOUT naming the history tools, a second
+/// delete is a no-op, and `upsert_note` brings the note back.
+///
+/// # What this adds over the backend suite
+///
+/// `couchdb_sidecar.rs` proves the storage semantics against the real sidecar. What only
+/// this level can show is the SURFACE: that the tool is registered at all for a vault whose
+/// only capable mount is couchdb, that the payload's `howToRecover` is built for a mount
+/// with no version history rather than assuming one, and that the recovery it describes is
+/// something a caller can actually perform with the tools this vault advertises — which for
+/// a couchdb mount means `read_file` and `upsert_note`, because `read_version` is not even
+/// registered.
+#[tokio::test]
+async fn delete_note_tombstones_a_couchdb_note_and_says_how_to_undo_it() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-delete");
+    let state = fixture.state_writable(true).await;
+    let path = "LiveSync/Deep/Nested.md";
+
+    // The tool exists BECAUSE the couchdb mount advertises `soft-delete`, and the three
+    // history tools do not exist, because no mount advertises `version-history`. This
+    // combination is the one the Algolia mount never produces.
+    let names = tool_names(&request(&state, "tools/list", json!({})).await);
+    assert!(
+        names.contains(&"delete_note".to_string()),
+        "a writable couchdb mount must advertise delete_note: {names:?}"
+    );
+    for absent in ["note_history", "read_version", "resolve_divergence"] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "{absent} must stay absent: CouchDB retains revisions but nothing here can \
+             fetch one: {names:?}"
+        );
+    }
+
+    let original = structured(&tool_call(&state, "read_file", json!({"path": path})).await)["text"]
+        .as_str()
+        .expect("the note's text")
+        .to_string();
+
+    // The needle the negative assertions below are about, checked POSITIVE first. Without
+    // this every "the tombstone is gone" assertion would also pass against a grep that
+    // never matched anything.
+    let needle = "nested LiveSync note";
+    let before = grepped_paths(&state, needle).await;
+    assert_eq!(
+        before,
+        vec![path.to_string()],
+        "precondition: exactly this note carries the needle"
+    );
+
+    let deleted =
+        structured(&tool_call(&state, "delete_note", json!({"path": path})).await).clone();
+    assert_eq!(deleted["deleted"], json!(true), "{deleted}");
+    assert_eq!(deleted["alreadyDeleted"], json!(false), "{deleted}");
+    assert!(
+        deleted["versionId"]
+            .as_str()
+            .is_some_and(|rev| !rev.is_empty()),
+        "the tombstone's revision is reported: {deleted}"
+    );
+    // NO `recoverableFrom`: there is no versionId a versioned read could serve here, and
+    // inventing one would name a tool this vault does not even advertise.
+    assert!(
+        deleted.get("recoverableFrom").is_none(),
+        "a mount with no version history must not name a recoverable version: {deleted}"
+    );
+    let recovery = deleted["howToRecover"]
+        .as_str()
+        .expect("recovery guidance is present on every delete, recoverable version or not");
+    assert!(
+        !recovery.contains("read_version"),
+        "the guidance must not point at a tool that is not registered for this vault: \
+         {recovery}"
+    );
+    assert!(
+        recovery.contains("read_file") && recovery.contains("upsert_note"),
+        "it must name the two tools that DO recover the note here: {recovery}"
+    );
+    assert!(
+        recovery.contains("no version history"),
+        "and say why the history route is unavailable: {recovery}"
+    );
+
+    // The tombstone is gone from every enumeration, with no rebuild and no wait: all three
+    // of these are answered from the mount's manifest.
+    let listed = tool_call(&state, "list_children", json!({"path": "LiveSync/Deep"})).await;
+    let names: Vec<String> = structured(&listed)["children"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !names.contains(&"Nested.md".to_string()),
+        "a tombstone is not a file: {names:?}"
+    );
+    let found = tool_call(&state, "find_files", json!({"query": "Nested"})).await;
+    let paths: Vec<String> = structured(&found)["matches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry["path"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !paths.contains(&path.to_string()),
+        "find_files walks the manifest, so it must not enumerate a tombstone: {paths:?}"
+    );
+    assert!(
+        grepped_paths(&state, needle).await.is_empty(),
+        "an exhaustive grep must not report a line from a tombstone"
+    );
+
+    // Recall is the one enumeration a delete does NOT reach synchronously, and that is the
+    // shape of this mount rather than a bug in the delete: a couchdb mount has a LOCAL
+    // index built by walking the manifest, so the tombstone leaves recall when the index is
+    // next built — which the manifest walk, now excluding it, is what feeds. Asserted after
+    // an explicit rebuild rather than assumed, because the alternative (the index keeps
+    // serving a deleted note forever) would be the real defect.
+    tool_call(&state, "build_index", json!({})).await;
+    let recall = tool_call(
+        &state,
+        "hybrid_search",
+        json!({"query": "LiveSync", "scope": "LiveSync"}),
+    )
+    .await;
+    let recall_paths: Vec<String> = structured(&recall)["matches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry["path"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !recall_paths.contains(&path.to_string()),
+        "a rebuilt index must not still rank a tombstoned note: {recall_paths:?}"
+    );
+    assert!(
+        recall_paths.contains(&"LiveSync/Charter.md".to_string()),
+        "...while the mount's surviving notes are still ranked, so the assertion above is \
+         about the tombstone rather than about an empty answer: {recall_paths:?}"
+    );
+
+    // `read_file` still serves it, which is NOT an oversight: it is pre-existing behaviour
+    // of this mount (a tombstone keeps its stored content, so a caller holding a stale path
+    // gets the content rather than a lie) and it is the recovery route the payload just
+    // described. The Algolia mount differs here — its tombstone carries no body and a read
+    // of one fails — and the difference is real rather than a bug on either side.
+    let still = tool_call(&state, "read_file", json!({"path": path})).await;
+    assert_eq!(
+        structured(&still)["text"],
+        json!(original),
+        "the tombstone's content is what `howToRecover` sends the caller to read: {still}"
+    );
+
+    // A second delete is a successful no-op.
+    let again = structured(&tool_call(&state, "delete_note", json!({"path": path})).await).clone();
+    assert_eq!(again["alreadyDeleted"], json!(true), "{again}");
+    assert_eq!(
+        again["versionId"], deleted["versionId"],
+        "an unchanged entry reports the revision it already had, so a repeated delete \
+         replicates nothing: {again}"
+    );
+
+    // Recovery, exactly as `howToRecover` describes it: write the content back.
+    let restored = tool_call(
+        &state,
+        "upsert_note",
+        json!({"path": path, "content": original}),
+    )
+    .await;
+    assert!(
+        restored.get("result").is_some(),
+        "writing over a tombstone must land: {restored}"
+    );
+    let listed = tool_call(&state, "list_children", json!({"path": "LiveSync/Deep"})).await;
+    let names: Vec<String> = structured(&listed)["children"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.contains(&"Nested.md".to_string()),
+        "the resurrected note is listed again: {names:?}"
+    );
+
+    // The one thing this must not have granted: deletion of a LOCAL file. The tool now
+    // EXISTS in this vault, which is exactly when that guarantee is worth re-checking.
+    let refused =
+        error_message(&tool_call(&state, "delete_note", json!({"path": "Root.md"})).await)
+            .to_string();
+    assert!(
+        refused.contains("mount 'vault'") && refused.contains("filesystem"),
+        "the refusal names the mount and its backend: {refused}"
+    );
+    assert!(
+        refused.contains("no deletion of local vault files"),
+        "and says the omission is deliberate: {refused}"
+    );
+    assert!(
+        refused.contains("'LiveSync/'"),
+        "and names the mount that does support it: {refused}"
+    );
+    assert!(
+        fixture.inner.root_vault.join("Root.md").exists(),
+        "a refused delete must not have removed anything"
+    );
+}
+
+/// On a READ-ONLY couchdb mount `delete_note` is not advertised, and calling it anyway is
+/// refused by naming `writable` — not by claiming the backend cannot delete.
+///
+/// The refusal's wording is the whole point. This backend CAN soft-delete; the reason this
+/// mount cannot is a setting in the mount table. The generic "removing a note here would be
+/// an ordinary file deletion" sentence is true of a filesystem mount and false of this one,
+/// and a refusal that misstates its own cause sends the reader looking in the wrong place —
+/// the lesson the read-only write refusal already carries.
+#[tokio::test]
+async fn a_read_only_couchdb_mount_refuses_a_delete_by_naming_writable() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-delete-read-only");
+    let state = fixture.state().await;
+
+    let names = tool_names(&request(&state, "tools/list", json!({})).await);
+    assert!(
+        !names.contains(&"delete_note".to_string()),
+        "a read-only vault must not advertise delete_note at all: {names:?}"
+    );
+
+    let message = error_message(
+        &tool_call(
+            &state,
+            "delete_note",
+            json!({"path": "LiveSync/Charter.md"}),
+        )
+        .await,
+    )
+    .to_string();
+    assert!(
+        message.contains("mount 'live'") && message.contains("couchdb"),
+        "the refusal names the mount and its backend: {message}"
+    );
+    assert!(
+        message.contains("\"writable\": true"),
+        "and the exact setting that changes it: {message}"
+    );
+    assert!(
+        !message.contains("ordinary file deletion"),
+        "and must NOT claim this removal would be a local unlink: {message}"
+    );
+    assert!(
+        message.contains("No mount in this vault supports it."),
+        "with no capable mount there is nothing to suggest: {message}"
+    );
+
+    // The note is untouched, and still readable.
+    let read = tool_call(&state, "read_file", json!({"path": "LiveSync/Charter.md"})).await;
+    assert!(read.get("result").is_some(), "{read}");
+
+    // And the history tools refuse a couchdb path with ITS reason, not the filesystem's.
+    // "One content per note by construction" is false of CouchDB — it retains revisions —
+    // and the whole point of the per-backend refusals is that neither of them says something
+    // untrue about the other's storage.
+    let message = error_message(
+        &tool_call(
+            &state,
+            "note_history",
+            json!({"path": "LiveSync/Charter.md"}),
+        )
+        .await,
+    )
+    .to_string();
+    assert!(
+        message.contains("does retain revisions"),
+        "the refusal must not claim this storage keeps one content per note: {message}"
+    );
+    assert!(
+        message.contains("No configuration turns this on."),
+        "and must separate this from `writable`, which cannot help here: {message}"
+    );
+}
+
 /// A stale `expectedHash` on a couchdb mount is refused with the SAME error taxonomy a
 /// filesystem mount produces, and nothing is written.
 ///
@@ -2032,6 +2406,21 @@ async fn vault_info_reports_write_capabilities_per_mount() {
             writable,
             "upload must be advertised iff the mount is writable: {live}"
         );
+        // A delete is a write, so it rides the same axis — and the server registers
+        // `delete_note` from this very capability, so a read-only mount advertising it
+        // would put a tool on the surface that could only ever refuse.
+        assert_eq!(
+            capabilities.contains(&json!("soft-delete")),
+            writable,
+            "soft-delete must be advertised iff the mount is writable: {live}"
+        );
+        // ...while `version-history` is absent in BOTH modes. This mount has a soft delete
+        // and no history, which is the combination that stops `delete_note`'s payload
+        // assuming a `read_version` exists.
+        assert!(
+            !capabilities.contains(&json!("version-history")),
+            "nothing here can enumerate or fetch a CouchDB revision: {live}"
+        );
 
         // Conflict surfacing rides on the same per-mount detail. The couchdb mount CAN
         // hold sibling revisions, so it reports a count even when that count is zero —
@@ -2228,6 +2617,7 @@ async fn a_read_only_couchdb_mount_advertises_grep_search_in_vault_info() {
     // ...while the write capabilities stay absent, which is the axis `writable` gates.
     assert!(!capabilities.contains(&"binary-write"), "{capabilities:?}");
     assert!(!capabilities.contains(&"upload"), "{capabilities:?}");
+    assert!(!capabilities.contains(&"soft-delete"), "{capabilities:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -4213,7 +4603,17 @@ async fn a_federated_answer_stops_being_degraded_once_the_algolia_mount_returns(
 /// itself between runs. The default derivation is asserted where it belongs — as a pure
 /// function, in the config crate's own tests.
 fn couchdb_root_config(fixture: &CouchdbFixture, mount_id: &str) -> ResolvedServiceConfig {
-    let mut config = fixture.config();
+    couchdb_root_config_writable(fixture, mount_id, false)
+}
+
+/// The same root table, with the mount opted in to writes. `writable` is per mount and does
+/// not become implicit by being at the root.
+fn couchdb_root_config_writable(
+    fixture: &CouchdbFixture,
+    mount_id: &str,
+    writable: bool,
+) -> ResolvedServiceConfig {
+    let mut config = fixture.config_writable(writable);
     config.vault_path = None;
     config.experimental = ExperimentalConfig {
         // NOT set: a one-mount table is the legacy shape spelled out longhand, so the
@@ -4345,6 +4745,58 @@ async fn a_couchdb_root_serves_the_whole_vault() {
     let payload = build_readiness_payload(&state.config, &diagnostics);
     assert_eq!(payload["vaultPath"], json!("http://couch.invalid/vault"));
     assert_eq!(payload["ready"], json!(true));
+}
+
+/// `delete_note` works on a couchdb mount that IS the vault root.
+///
+/// The refusal `delete_note` carries for a local path keys on the mount's CAPABILITY, not on
+/// whether it is the root — so a fully-remote LiveSync vault must be deletable at
+/// unprefixed paths, with no `LiveSync/` prefix anywhere to make the path look remote. This
+/// is the topology where a capability check written as "is this the root?" would silently
+/// give the wrong answer, so it gets its own test rather than riding on the two-mount one.
+#[tokio::test]
+async fn delete_note_works_on_a_couchdb_root() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-root-delete");
+    let config = couchdb_root_config_writable(&fixture, "live", true);
+    assert_eq!(config.vault_path, None);
+    let state = couchdb_state_from(&fixture, config).await;
+
+    let names = tool_names(&request(&state, "tools/list", json!({})).await);
+    assert!(
+        names.contains(&"delete_note".to_string()),
+        "a writable couchdb ROOT must advertise delete_note: {names:?}"
+    );
+
+    // An UNPREFIXED path: there is no mount prefix, because the remote is the root.
+    let deleted =
+        structured(&tool_call(&state, "delete_note", json!({"path": "Charter.md"})).await).clone();
+    assert_eq!(deleted["deleted"], json!(true), "{deleted}");
+    assert_eq!(deleted["alreadyDeleted"], json!(false), "{deleted}");
+    assert!(
+        deleted.get("recoverableFrom").is_none(),
+        "a root couchdb mount has no more version history than a nested one: {deleted}"
+    );
+    assert!(deleted["howToRecover"]
+        .as_str()
+        .expect("recovery guidance")
+        .contains("upsert_note"));
+
+    // The root listing no longer offers it.
+    let listed = tool_call(&state, "list_children", json!({"path": ""})).await;
+    let names: Vec<&str> = structured(&listed)["children"]
+        .as_array()
+        .expect("children")
+        .iter()
+        .filter_map(|child| child["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Charter.md"),
+        "the tombstone must leave the ROOT listing: {names:?}"
+    );
 }
 
 /// An ALGOLIA ROOT serves reads and writes, and refuses the index-backed tools with the

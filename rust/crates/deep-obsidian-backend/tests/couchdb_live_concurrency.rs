@@ -424,3 +424,107 @@ async fn a_write_by_one_client_becomes_visible_to_the_other() {
     supervisor_a.shutdown().await;
     supervisor_b.shutdown().await;
 }
+
+/// The soft-delete round trip against REAL CouchDB: delete, observe the tombstone from the
+/// other client, resurrect, observe it back.
+///
+/// # Why this needs a real server
+///
+/// `couchdb_sidecar.rs` proves the same sequence against the mock, so what is left is the
+/// two things a mock cannot show. First, that a LiveSync tombstone made by the Rust path is
+/// a tombstone as far as a REAL CouchDB is concerned — the document is still in `_all_docs`
+/// with real revision hashes, not a `_deleted` stub that would be gone. Second, that the
+/// removal is what a SECOND, independent client sees: it drops out of that client's
+/// manifest (which is what its index walks) while a read by path still returns the content,
+/// which is exactly the pair `delete_note`'s `howToRecover` promises.
+#[tokio::test]
+async fn a_delete_tombstones_the_note_for_both_clients_and_a_write_brings_it_back() {
+    let target = require_live!();
+    let vault = ScratchVault::create(&target);
+    let (supervisor_a, alice) = client(&target, &vault);
+    let (supervisor_b, bob) = client(&target, &vault);
+
+    let path = "Notes/Doomed.md";
+    let body = "# Doomed\n\nwritten by A, deleted by A, seen gone by B\n";
+    alice
+        .execute(BackendRequest::write_text_guarded(
+            path,
+            body,
+            BaseVersion::Absent,
+        ))
+        .await
+        .expect("A's create must land");
+
+    let outcome = alice
+        .execute(BackendRequest::soft_delete(path))
+        .await
+        .expect("A's delete must land")
+        .into_soft_delete()
+        .expect("a soft-delete outcome");
+    assert!(!outcome.already_deleted, "{outcome:?}");
+    assert_eq!(
+        outcome.recoverable_from, None,
+        "no version history exists on this backend, and a versionId nothing can read would \
+         be worse than none: {outcome:?}"
+    );
+    // A REAL CouchDB revision — `<generation>-<32 hex>` — which is the half the mock's
+    // fabricated counter cannot assert.
+    let (generation, hash) = outcome
+        .version_id
+        .split_once('-')
+        .unwrap_or_else(|| panic!("a CouchDB revision is <generation>-<hash>: {outcome:?}"));
+    assert!(generation.parse::<u32>().is_ok(), "{outcome:?}");
+    assert!(
+        hash.len() == 32 && hash.chars().all(|character| character.is_ascii_hexdigit()),
+        "{outcome:?}"
+    );
+
+    // B sees it leave the manifest. Polled, because the honest contract for a replicated
+    // store is "eventually", and because B's own manifest cache has a reuse window.
+    let mut gone = false;
+    for _ in 0..40 {
+        let entries = bob
+            .manifest_entries()
+            .await
+            .expect("B must be able to list the vault");
+        if !entries
+            .iter()
+            .any(|entry| entry.path == path && !entry.deleted)
+        {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        gone,
+        "A's delete must leave B's manifest within 20s — that walk is what B's index reads"
+    );
+
+    // ...and the content is still THERE for B, at the tombstone's revision. This is the
+    // recovery route, verified from the client that did not perform the delete.
+    let (seen, tombstone_rev) = read_versioned(&bob, path).await;
+    assert_eq!(
+        seen, body,
+        "a real CouchDB tombstone keeps the chunks it names, so the last content survives"
+    );
+
+    // Resurrection, guarded by the tombstone's own revision.
+    bob.execute(BackendRequest::write_text_guarded(
+        path,
+        &seen,
+        BaseVersion::from_read(tombstone_rev),
+    ))
+    .await
+    .expect("writing a tombstone's content back must resurrect the note");
+    let stat = bob.stat_entry(path).await.expect("stat");
+    assert!(
+        !stat.deleted,
+        "the resurrection is structural: the flag is not carried over: {stat:?}"
+    );
+    let (back, _) = read_versioned(&alice, path).await;
+    assert_eq!(back, body, "and A reads the resurrected note too");
+
+    supervisor_a.shutdown().await;
+    supervisor_b.shutdown().await;
+}

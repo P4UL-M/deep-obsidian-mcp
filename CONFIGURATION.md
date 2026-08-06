@@ -260,7 +260,7 @@ supervised Node sidecar. Needs `experimental.couchdbVaults`. See
 | `e2ee` | `{ "passphraseRef": …, "obfuscatePassphraseRef": … }` when the vault is encrypted or path-obfuscated. |
 | `sidecarPath` | Explicit path to the built sidecar bundle. |
 | `options` | Chunking / hashing knobs forwarded to the sidecar. **Must match how the vault was written.** |
-| `writable` | **Defaults to `false`.** Setting it is what makes the sidecar initialize read-write; nothing else unlocks a write. |
+| `writable` | **Defaults to `false`.** Setting it is what makes the sidecar initialize read-write; nothing else unlocks a write. It gates `delete_note` too — a delete is a write, and a read-only mount advertises no `soft-delete` capability. |
 | `indexDir` | Defaults to `<root indexDir>/mounts/<id>`. |
 
 **`algolia`** — a shared, **Markdown-only** corpus stored as records in an Algolia

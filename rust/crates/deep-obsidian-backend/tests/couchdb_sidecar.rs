@@ -621,11 +621,23 @@ async fn write_capabilities_follow_the_mounts_mode() {
     assert!(!descriptor.supports(Capability::BinaryWrite));
     assert!(!descriptor.supports(Capability::Upload));
 
+    assert!(!descriptor.supports(Capability::SoftDelete));
+
     let (writable_supervisor, writable) = writable_backend(&couch);
     assert!(writable.is_writable());
     let descriptor = writable.descriptor();
     assert!(descriptor.supports(Capability::BinaryWrite));
     assert!(descriptor.supports(Capability::Upload));
+    // A delete is a write, so it rides the same axis. The server registers `delete_note`
+    // from this capability, so a read-only mount advertising it would put a tool on the
+    // surface that could only ever refuse.
+    assert!(descriptor.supports(Capability::SoftDelete));
+    // ...and `SoftDelete` without `VersionHistory` is the shape this mount has, in BOTH
+    // modes. It is the combination the Algolia mount never produces, and the reason
+    // `delete_note`'s payload cannot assume a `read_version` exists: CouchDB retains
+    // revisions but nothing here can enumerate or fetch one.
+    assert!(!descriptor.supports(Capability::VersionHistory));
+    assert!(!read_only.descriptor().supports(Capability::VersionHistory));
     // Reads are unchanged by the mode, and so is grep: both are reads, and `writable`
     // gates writes. A mount that lost line search by staying read-only would be a
     // capability set that describes the wrong axis.
@@ -827,6 +839,17 @@ async fn protected_template_paths_are_refused_with_cores_wording() {
             format!("writes to protected template folders are forbidden: {path}"),
             "for {path}"
         );
+        // The same policy for a DELETE, which is a write. A surface where a template
+        // cannot be overwritten but can be tombstoned would protect nothing.
+        let error = backend
+            .execute(BackendRequest::soft_delete(path))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("writes to protected template folders are forbidden: {path}"),
+            "deleting {path}"
+        );
     }
 
     // Refused ABOVE the remote: not one write request was issued.
@@ -934,6 +957,413 @@ async fn an_ambiguous_conflict_whose_content_differs_is_still_a_conflict() {
     // The other client's content is intact.
     let (after, _) = read_versioned(&backend, "Beta.md").await;
     assert_eq!(after, "the other client's content\n");
+
+    supervisor.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Soft delete
+// ---------------------------------------------------------------------------
+//
+// The semantics asserted here are the REAL sidecar's against the REAL LiveSync storage
+// format, which is the only place they can be established: a LiveSync tombstone is the
+// entry document with `deleted: true` set on it and its `children` untouched, and every
+// claim `delete_note`'s payload makes to a caller follows from that one fact.
+
+/// One soft delete, and the four things it does.
+///
+/// The note leaves the manifest (and therefore every listing, the virtual grep and the
+/// index built over it), the outcome names the tombstone's revision, it reports no
+/// `recoverable_from` — and the content is still THERE, readable at the same path. The
+/// last one is not an accident to be tidied up later: it is what makes the removal
+/// recoverable on a mount with no version history, and the tool payload's
+/// `howToRecover` promises exactly it.
+#[tokio::test]
+async fn a_soft_delete_tombstones_the_note_and_keeps_its_content_readable() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    let (before_text, before_rev) = read_versioned(&backend, "Beta.md").await;
+    let before_rev = before_rev.expect("a revision");
+    assert!(listed_paths(&backend)
+        .await
+        .iter()
+        .any(|path| path == "Beta.md"));
+
+    let outcome = backend
+        .execute(BackendRequest::soft_delete("Beta.md"))
+        .await
+        .expect("a delete on a writable mount must land")
+        .into_soft_delete()
+        .expect("a soft-delete outcome");
+    assert!(
+        !outcome.already_deleted,
+        "a live note's first delete is not a no-op: {outcome:?}"
+    );
+    assert_ne!(
+        outcome.version_id, before_rev,
+        "the tombstone is a new revision of the entry: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.recoverable_from, None,
+        "this mount has no version history, so there is no versionId a versioned read \
+         could serve — and naming one that cannot be read would be worse than naming \
+         none: {outcome:?}"
+    );
+
+    // Gone from the manifest, with no wait: see the freshness test further down.
+    let listed = listed_paths(&backend).await;
+    assert!(
+        !listed.iter().any(|path| path == "Beta.md"),
+        "a tombstone is not a file and must leave every listing: {listed:?}"
+    );
+
+    // ...and still readable, at the tombstone's own revision. The chunks were left
+    // behind, which is what a LiveSync deletion does and what makes it recoverable.
+    let (after_text, after_rev) = read_versioned(&backend, "Beta.md").await;
+    assert_eq!(
+        after_text, before_text,
+        "the tombstone keeps the note's last content: a caller holding this path gets the \
+         content rather than a lie, and writing it back is how the note comes back"
+    );
+    assert_eq!(
+        after_rev.as_deref(),
+        Some(outcome.version_id.as_str()),
+        "and the read reports the tombstone's revision, which is the one a resurrecting \
+         write must be guarded by"
+    );
+    let stat = backend
+        .stat_entry("Beta.md")
+        .await
+        .expect("stat must answer on a tombstone");
+    assert!(stat.deleted, "and it says so: {stat:?}");
+
+    supervisor.shutdown().await;
+}
+
+/// Deleting something that is already a tombstone changes nothing, says so, and does not
+/// ask the remote.
+///
+/// # The sidecar would happily do it, and that is the point
+///
+/// This test pins BOTH halves. The protocol's `delete` has no notion of "already deleted":
+/// asked to delete a tombstone it re-sets the flag and puts the document, producing a
+/// fresh `deleted: true` revision — asserted below against the real sidecar, because the
+/// mapping above is only honest if this is what it is choosing not to do. That revision
+/// would replicate to every device syncing the vault and mean nothing the previous one did
+/// not, so the backend answers from the `stat` it already needed for the guard and issues
+/// no delete at all.
+#[tokio::test]
+async fn deleting_a_tombstone_changes_nothing_and_says_so() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+    supervisor.ensure_ready().await.expect("handshake");
+
+    // `Removed.md` is a tombstone in the fixture vault, so this is the state a caller
+    // reaches by deleting twice — or by deleting a note Obsidian already removed.
+    let existing = backend
+        .stat_entry("Removed.md")
+        .await
+        .expect("stat the fixture tombstone");
+    assert!(existing.deleted, "fixture precondition: {existing:?}");
+
+    let before_requests = supervisor.request_count();
+    let outcome = backend
+        .execute(BackendRequest::soft_delete("Removed.md"))
+        .await
+        .expect("deleting a tombstone is a successful no-op, not an error")
+        .into_soft_delete()
+        .expect("a soft-delete outcome");
+    let cost = supervisor.request_count() - before_requests;
+
+    assert!(outcome.already_deleted, "{outcome:?}");
+    assert_eq!(
+        outcome.version_id, existing.rev,
+        "an unchanged entry reports the revision it already had, not a new one: {outcome:?}"
+    );
+    assert_eq!(outcome.recoverable_from, None);
+    assert_eq!(
+        cost, 1,
+        "one `stat` and nothing else: the delete must not be issued at all, or every \
+         repeated delete would replicate a fresh tombstone revision to every device"
+    );
+
+    // The other half: the sidecar itself does NOT refuse it. Driven straight at the
+    // protocol, because nothing above it will ever ask.
+    let direct = supervisor
+        .delete("Removed.md", Some(&existing.rev))
+        .await
+        .expect("the protocol accepts a delete of a tombstone");
+    assert!(direct.deleted);
+    assert_ne!(
+        direct.rev, existing.rev,
+        "and it produces a FRESH revision, which is exactly the write the mapping above \
+         declines to make: {direct:?}"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// Two deletes racing one revision: exactly one tombstones the note, and the loser is told
+/// it lost rather than being retried.
+///
+/// # Why this is the only way to reach the conflict
+///
+/// `soft_delete` takes ONE `stat` and guards the delete with the revision it returned, so
+/// the window between the two is internal to the call — nothing a test can inject into.
+/// Two concurrent calls close over the same revision and are what open it: both observe
+/// the entry live, both send a delete guarded on that revision, and CouchDB adjudicates.
+///
+/// The loser is NOT retried at the fresh revision, and that is the doctrine rather than an
+/// omission: re-deleting at whatever revision is current now would discard whatever the
+/// concurrent writer stored there. A `write` has one narrow exception for an unobserved
+/// outcome (it can compare the bytes it wanted); a delete has no bytes to compare, so it
+/// has no exception.
+///
+/// # Why the conflict is asserted unconditionally rather than as one acceptable outcome
+///
+/// The interleaving is deterministic, not lucky. `#[tokio::test]` runs a CURRENT-THREAD
+/// runtime, so `join!` polls both futures — each of which writes its `stat` request to the
+/// child's stdin and then awaits — before the reactor can process a single reply. Both
+/// `stat`s are therefore on the wire before either delete is issued, both deletes carry the
+/// same `baseRev`, and the second one CANNOT win. Accepting "the other call just saw the
+/// tombstone" as an alternative would make this test pass while proving nothing about the
+/// mapping it exists for.
+#[tokio::test]
+async fn two_deletes_racing_one_revision_produce_exactly_one_tombstone() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+    supervisor.ensure_ready().await.expect("handshake");
+
+    let (_, base) = read_versioned(&backend, "Beta.md").await;
+    let base = base.expect("a revision");
+
+    let (first, second) = tokio::join!(
+        backend.execute(BackendRequest::soft_delete("Beta.md")),
+        backend.execute(BackendRequest::soft_delete("Beta.md")),
+    );
+
+    // One of the two tombstones the entry; the other loses the compare-and-swap. See the
+    // note above on why that split is deterministic here.
+    let rendered = format!("{first:?} / {second:?}");
+    let outcomes: Vec<Result<deep_obsidian_backend::SoftDeleteOutcome, BackendError>> =
+        vec![first, second]
+            .into_iter()
+            .map(|result| result.and_then(|response| response.into_soft_delete()))
+            .collect();
+    let deletes = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Ok(outcome) if !outcome.already_deleted))
+        .count();
+    assert_eq!(
+        deletes, 1,
+        "exactly one delete may tombstone the entry: {rendered}"
+    );
+    let error = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().err())
+        .unwrap_or_else(|| panic!("the second delete must LOSE, not be answered: {rendered}"));
+    assert!(
+        matches!(error, BackendError::VersionConflict { .. }),
+        "a lost compare-and-swap on a delete must be a version conflict, not something \
+         generic: {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.starts_with("hash conflict for Beta.md:"),
+        "and it lands in the taxonomy a caller already handles: {message}"
+    );
+    assert!(
+        message.contains(&base),
+        "naming the precondition it was guarded by: {message}"
+    );
+    assert!(
+        message.contains("soft-deleted"),
+        "and describing where the entry actually is now — a tombstone, which a bare revision \
+         cannot convey: {message}"
+    );
+
+    // Either way, the note is a tombstone exactly once and its content survived.
+    let stat = backend.stat_entry("Beta.md").await.expect("stat");
+    assert!(stat.deleted, "{stat:?}");
+    let conflicts = backend.conflicts("Beta.md").await.expect("conflicts");
+    assert!(
+        conflicts.conflicts.is_empty(),
+        "a lost compare-and-swap must not fork the revision tree: {conflicts:?}"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// A delete on a READ-ONLY mount is refused by naming the setting, and never reaches the
+/// remote.
+///
+/// The wording is [`COUCHDB_READ_ONLY_MESSAGE`] — the same refusal every other mutation
+/// gets — because the cause is the same: this mount was not opted in to writes. What it
+/// must NOT say is that deleting is impossible or unimplemented here, which is the stale
+/// claim the previous refusal for this operation carried and this slice removed.
+#[tokio::test]
+async fn a_delete_on_a_read_only_mount_is_refused_by_naming_writable() {
+    require_prerequisites!();
+    let mut couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = backend(&couch);
+
+    let error = backend
+        .execute(BackendRequest::soft_delete("Beta.md"))
+        .await
+        .expect_err("a read-only mount must refuse a delete");
+    assert_eq!(error.to_string(), COUCHDB_READ_ONLY_MESSAGE);
+    assert!(error.to_string().contains("\"writable\": true"));
+
+    // Refused before the remote is touched, and the entry is untouched.
+    let stat = backend.stat_entry("Beta.md").await.expect("stat");
+    assert!(!stat.deleted, "{stat:?}");
+    supervisor.shutdown().await;
+    assert_eq!(couch.writes(), Vec::<serde_json::Value>::new());
+}
+
+/// Deleting a path with no entry at all is a NOT-FOUND, in the taxonomy the tool layer
+/// already branches on.
+///
+/// Distinct from deleting a tombstone, which is a no-op: a tombstone is a document and a
+/// missing path is not, so conflating them would tell a caller that a typo'd path had been
+/// removed.
+#[tokio::test]
+async fn deleting_a_path_with_no_entry_is_a_not_found() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    let error = backend
+        .execute(BackendRequest::soft_delete("Nope.md"))
+        .await
+        .expect_err("a missing note cannot be deleted");
+    assert_eq!(
+        error.io_kind(),
+        Some(std::io::ErrorKind::NotFound),
+        "the server branches on `io_kind()` rather than on wording: {error}"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// An ATTACHMENT can be deleted too, and its bytes are still there afterwards.
+///
+/// # Why this is not refused
+///
+/// The Algolia mount refuses a delete on a binary path before anything else, because it
+/// cannot store an attachment at all — the refusal is about the storage, not about deleting.
+/// This mount stores attachments (it advertises `BinaryWrite` and `Upload`), so refusing to
+/// remove one would be a restriction nothing justifies. What that means for the tool payload
+/// is asserted here rather than assumed: the recovery route for an attachment is
+/// `read_artifact`, not `read_file`, because a `newnote` entry read as text is refused by
+/// design — so the guidance must name both.
+#[tokio::test]
+async fn an_attachment_can_be_tombstoned_and_its_bytes_survive() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    let before = backend
+        .execute(BackendRequest::read_bytes("assets/logo.png"))
+        .await
+        .expect("read the fixture attachment")
+        .into_bytes()
+        .expect("bytes");
+
+    let outcome = backend
+        .execute(BackendRequest::soft_delete("assets/logo.png"))
+        .await
+        .expect("an attachment is deletable on a mount that can store one")
+        .into_soft_delete()
+        .expect("a soft-delete outcome");
+    assert!(!outcome.already_deleted, "{outcome:?}");
+    assert_eq!(outcome.recoverable_from, None);
+
+    // Gone from the manifest as a listable entry...
+    let entries = backend
+        .manifest_entries()
+        .await
+        .expect("the manifest must still list the vault");
+    let entry = entries
+        .iter()
+        .find(|entry| entry.path == "assets/logo.png")
+        .expect("a tombstone is still a document, so the manifest still carries it");
+    assert!(entry.deleted, "...flagged deleted: {entry:?}");
+
+    // ...and the bytes are still readable, which is the attachment's recovery route.
+    let after = backend
+        .execute(BackendRequest::read_bytes("assets/logo.png"))
+        .await
+        .expect("a tombstoned attachment is still readable")
+        .into_bytes()
+        .expect("bytes");
+    assert_eq!(
+        after, before,
+        "the tombstone keeps the chunks, for a binary entry exactly as for a text one"
+    );
+
+    // Read as TEXT it is refused, for being binary rather than for being deleted — which is
+    // why the recovery guidance must name `read_artifact` and not only `read_file`.
+    let error = backend
+        .execute(BackendRequest::read_text("assets/logo.png"))
+        .await
+        .expect_err("a newnote entry is not text");
+    assert!(
+        error.to_string().contains("read_artifact"),
+        "the refusal must point at the tool that CAN read it: {error}"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// A tombstone can be written over, and the write brings the note back.
+///
+/// This is the recovery route `howToRecover` promises for a mount with no version history,
+/// so it is proved rather than asserted in prose: read the tombstone's content and its
+/// revision, write that content back guarded by it, and the entry is live again — same
+/// path, same content, listed again.
+#[tokio::test]
+async fn writing_over_a_tombstone_brings_the_note_back() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    let (original, _) = read_versioned(&backend, "Beta.md").await;
+    backend
+        .execute(BackendRequest::soft_delete("Beta.md"))
+        .await
+        .expect("the delete must land");
+
+    // One read serves the recovery: the content to write back, and the revision to guard
+    // it with. Exactly what a caller following `howToRecover` does through `read_file` and
+    // `upsert_note`.
+    let (content, rev) = read_versioned(&backend, "Beta.md").await;
+    assert_eq!(content, original);
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "Beta.md",
+            &content,
+            BaseVersion::from_read(rev),
+        ))
+        .await
+        .expect("writing a tombstone's own content back must resurrect it");
+
+    let stat = backend.stat_entry("Beta.md").await.expect("stat");
+    assert!(
+        !stat.deleted,
+        "the resurrection is structural: the flag is not carried over: {stat:?}"
+    );
+    let listed = listed_paths(&backend).await;
+    assert!(
+        listed.iter().any(|path| path == "Beta.md"),
+        "and the note is listed again: {listed:?}"
+    );
+    let (back, _) = read_versioned(&backend, "Beta.md").await;
+    assert_eq!(back, original);
 
     supervisor.shutdown().await;
 }
@@ -2770,6 +3200,26 @@ async fn listed_paths(backend: &CouchDbVaultBackend) -> Vec<String> {
         .expect("markdown files")
 }
 
+/// One unscoped, unfiltered virtual grep, for the freshness assertions.
+async fn grep_for(
+    backend: &CouchDbVaultBackend,
+    query: &str,
+) -> deep_obsidian_backend::GrepOutcome {
+    backend
+        .execute(BackendRequest::Recall(RecallRequest::Grep {
+            query: query.to_string(),
+            regex: false,
+            case_sensitive: false,
+            glob: None,
+            context_lines: 0,
+            limit: 10,
+        }))
+        .await
+        .expect("grep")
+        .into_grep_outcome()
+        .expect("outcome")
+}
+
 /// A write through this backend is visible to the very next manifest read, with NO wait.
 ///
 /// This is the invariant the manifest cache's whole design turns on. The cache is now
@@ -2863,6 +3313,68 @@ async fn a_grep_after_a_local_write_finds_the_written_line_with_no_wait() {
         "an exhaustive grep must never miss a note this backend just wrote"
     );
     assert!(outcome.exhausted);
+
+    supervisor.shutdown().await;
+}
+
+/// A DELETE is a write, so the very next listing and the very next grep must both see the
+/// tombstone with no wait.
+///
+/// Same invariant and same discipline as the two tests above, and it needs asserting
+/// separately because a delete reaches the epoch through its own call rather than through
+/// `SidecarSupervisor::write`: an invalidation wired for writes only would leave a deleted
+/// note in every listing and every grep result for up to the fallback reuse window, which
+/// is precisely the "did my delete work?" report that no sleep in a test would have caught.
+#[tokio::test]
+async fn a_listing_and_a_grep_after_a_delete_see_the_tombstone_with_no_wait() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+
+    // A note whose body carries a marker only it has, so the grep below is unambiguous.
+    let marker = "xyzzy-doomed-marker";
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "Doomed.md",
+            format!("# Doomed\n\nthe needle is {marker} here\n").as_str(),
+            BaseVersion::Absent,
+        ))
+        .await
+        .expect("the create must land");
+
+    // Warm both caches, so what follows tests invalidation rather than a cold read.
+    let before = listed_paths(&backend).await;
+    assert!(before.iter().any(|path| path == "Doomed.md"));
+    assert_eq!(
+        grep_for(&backend, marker).await.matches.len(),
+        1,
+        "precondition: the note is greppable before the delete"
+    );
+
+    backend
+        .execute(BackendRequest::soft_delete("Doomed.md"))
+        .await
+        .expect("the delete must land");
+
+    // No sleep, no poll, no retry. If the invalidation were asynchronous, these would fail.
+    let after = listed_paths(&backend).await;
+    assert!(
+        !after.iter().any(|path| path == "Doomed.md"),
+        "a manifest read after a local delete must see the tombstone with no wait: {after:?}"
+    );
+    assert_eq!(after.len(), before.len() - 1);
+    let outcome = grep_for(&backend, marker).await;
+    assert!(
+        outcome.matches.is_empty(),
+        "an exhaustive grep must not report a line from a note this backend just deleted: \
+         {:?}",
+        outcome.matches
+    );
+    assert!(
+        outcome.exhausted,
+        "and it must still claim exhaustiveness, because it is: the corpus it scanned is \
+         the post-delete one"
+    );
 
     supervisor.shutdown().await;
 }
