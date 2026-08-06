@@ -101,6 +101,7 @@ packaged path — see [docs/homebrew-service.md](./docs/homebrew-service.md).
 deep-obsidian-mcp doctor        # diagnose config, vault access, index, dependencies
 deep-obsidian-mcp probe         # exercise the HTTP health and MCP endpoints
 deep-obsidian-mcp print-config  # show the resolved configuration (secrets redacted)
+deep-obsidian-mcp mounts list   # what is mounted where (experimental multi-backend vaults)
 ```
 
 Health endpoints (no auth required):

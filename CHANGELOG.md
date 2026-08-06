@@ -105,6 +105,54 @@ All notable changes to deep-obsidian-mcp are documented here.
     `degradedMounts`) while the vault root keeps serving. A single fully-remote mount
     gets the additive `mounts[]` report too, so a LiveSync vault with no filesystem
     beside it still has a surface for its capabilities and its unreconciled conflicts.
+  - **`mounts add` / `mounts list` / `mounts remove`: a checkable way to build a mount
+    table.** Until now a mount table could only be written by hand — `setup-service`
+    refuses to rewrite one, because a mount table is the thing in that file it cannot
+    reproduce faithfully — so the invariants an editor cannot check (unique ids and
+    prefixes, exactly one root mount, an `experimental` flag per remote backend, a
+    credential that belongs in the secret store) were left to the operator to get right.
+
+    Every write now goes through the **same config loader the server uses at startup**,
+    so the command cannot produce a config the server would then refuse to load. On a
+    legacy `vaultPath`-only config, `mounts add` first converts the vault to an explicit
+    root mount (`id: "vault"`, `mountAt: ""`, the same path — it resolves to exactly the
+    same vault path and index directory) and reports the conversion, then appends. A flag
+    is never enabled silently: the command names the `experimental.*` flag, says what it
+    turns on and that it may change, and asks; `--yes` answers for a script.
+
+    Credentials are never flag values — a `--password` on the command line lands in `ps`
+    output and shell history — so the CouchDB password and the Algolia API key are
+    **prompted masked**, or read from stdin with `--password-stdin` / `--api-key-stdin`.
+    Only the `SecretRef` reaches the config file. The new mount is then **probed before
+    the config is written** (a directory read, one sidecar handshake, or one index read —
+    nothing that can mutate anything), and on failure nothing is written **and the
+    credential just stored is removed**, so a typo'd URL leaves no orphan in your keyring.
+    `--keep-anyway` writes it regardless and says `doctor --probe-remote` will report it
+    degraded. A content-changing write leaves the previous file at `config.json.bak` and
+    carries across any key this build does not understand.
+
+    `mounts remove` **unmounts**: nothing is ever deleted from a couchdb or algolia
+    backing store, the local index survives unless `--purge-index`, and the stored
+    credential is always kept and named — a reference can be shared by more than one
+    mount, so deleting one silently could break the other. Removing the root mount while
+    others exist is refused (they resolve beneath it), and so is removing the last one (a
+    config needs a root mount; edit the file directly to start over). `mounts list`
+    reports every mount with its writability and the flags currently on, and works on a
+    legacy config, where it shows the implicit root as such. All three take `--json` and
+    honour the global `--dry-run`.
+
+    Both `list` and `remove` also work on a config the loader **refuses** — a hand-edited
+    table with a duplicate prefix, or one whose `experimental` flag was deleted. That is
+    deliberate and it is the point: a broken table is exactly when you need to see what is
+    declared, and removing a mount is one of the ways to fix one. `list` prints the table
+    with a warning and the loader's reason (index directories omitted, since they derive
+    from the resolved root); `remove` still validates the table it is about to **write**.
+
+    One behaviour outside the new commands changed with them: a config backup is now named
+    after the file's own extension, so a `config.toml` is backed up to `config.toml.bak`
+    rather than to `config.json.bak`. The old name held valid TOML under a `.json` name,
+    which is a trap, because the obvious way to use a backup is to rename it back. A
+    `.json` config still gets exactly `config.json.bak`.
 
 ### Improved
 

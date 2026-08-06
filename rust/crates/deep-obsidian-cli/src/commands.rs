@@ -48,6 +48,11 @@ Usage:
   deep-obsidian-mcp algolia status --mount <id> [--json]
   deep-obsidian-mcp algolia retract --mount <id> --path <note> [--yes] [--json]
   deep-obsidian-mcp algolia key --mount <id> [--parent-key-ref <ref>] [--prefix <folder>] [--json]
+  deep-obsidian-mcp mounts add filesystem --id <id> --mount-at <prefix> --vault-path <dir> [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
+  deep-obsidian-mcp mounts add couchdb --id <id> --mount-at <prefix> --url <origin> --database <db> [--username <user>] [--password-stdin] [--writable] [--e2ee] [--sidecar-path <file>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
+  deep-obsidian-mcp mounts add algolia --id <id> --mount-at <prefix> --app-id <id> --index-name <index> [--base-url <url>] [--api-key-stdin] [--writable] [--participant-id <who>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
+  deep-obsidian-mcp mounts list [--json]
+  deep-obsidian-mcp mounts remove --id <id> [--purge-index] [--yes] [--json]
 
 Commands:
   serve          Start the MCP server using resolved config.
@@ -57,8 +62,37 @@ Commands:
   probe          Probe the configured HTTP health and MCP endpoints.
   couchdb        Snapshot (export) and restore a CouchDB (Self-hosted LiveSync) mount.
   algolia        Seed, dump, restore, inspect and scope an Algolia-backed shared corpus.
+  mounts         Build and inspect the config's mount table (add / list / remove).
   help           Show this help.
   version        Print the current version.
+
+mounts is the checkable way to build a mount table, which setup-service refuses to
+rewrite. Every write goes through the same config loader the server uses, so this
+command cannot produce a config the server would then refuse to load; run
+`deep-obsidian-mcp mounts add --help` for the per-kind flags.
+
+mounts add converts a legacy vaultPath-only config to an explicit root mount first
+(id `vault`, mountAt \"\", the same path -- it resolves identically), then appends. A
+couchdb or algolia mount, or a second mount of any kind, needs an experimental flag:
+the command names the flag, says what it turns on, and asks -- it never enables one
+silently. --yes answers every prompt for scripting.
+
+A credential is never a flag VALUE (that would put it in `ps` output and shell
+history): the couchdb password and the algolia API key are prompted MASKED, or read
+from stdin with --password-stdin / --api-key-stdin. Only the reference to the stored
+secret lands in the config file.
+
+mounts add then PROBES the new mount before writing -- a directory read, a sidecar
+handshake, or one index read -- and on failure writes nothing, removing the credential
+it had just stored so no orphan is left behind. --keep-anyway writes the mount anyway
+and warns that doctor --probe-remote will report it degraded. A content-changing write
+leaves the previous file at config.json.bak, and unknown keys are preserved.
+
+mounts remove UNMOUNTS: nothing is ever deleted from a couchdb or algolia backing
+store. The local index stays unless --purge-index, and the stored credential is always
+kept and named, because a reference can be shared by more than one mount. Removing the
+root while other mounts exist is refused (they resolve beneath it), and so is removing
+the last mount -- a config needs a root mount, so edit the file directly to start over.
 
 doctor prints one block of checks per declared mount. The local ones always run and
 contact nothing: a filesystem mount's directory, and for a couchdb mount whether the
@@ -69,9 +103,10 @@ A remote-backed mount that cannot be reached is a warn, never a fail: those moun
 experimental and non-root, so the vault root keeps serving without them.
 
 setup-service does NOT rewrite a config that declares a mount table, with or without
---overwrite, and refuses an auth change on one. Edit such a file by hand; --mcp,
---skills and --vault-snippets still work. A content-changing write of an ordinary config
-leaves the previous file at config.json.bak.
+--overwrite, and refuses an auth change on one. Use the `mounts` family for the table
+(see below) and edit the file directly for anything else; --mcp, --skills and
+--vault-snippets still work. A content-changing write leaves the previous file at
+config.json.bak.
 
 couchdb export writes every entry of one mount to a directory, plus a manifest.json
 recording each entry's revision, content hash and storage kind. Two exports of an
@@ -278,7 +313,17 @@ pub struct ServeReport {
 
 pub async fn run() -> Result<()> {
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
-    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    // `--help` prints the hand-written summary for every command EXCEPT `mounts`, whose
+    // help falls through to clap's derive.
+    //
+    // Why the exception rather than a rewrite: the `mounts` family is three subcommands
+    // with three kinds and about twenty flags between them, and restating that in
+    // `HELP_TEXT` would be a second surface to keep in sync — the kind of duplication that
+    // is wrong within a release of being added. Every other command keeps the summary it
+    // has always printed, so `doctor --help` is unchanged.
+    let (normalized_args, is_mounts_family) = normalize_cli_args_detailed(&raw_args)?;
+    let wants_help = raw_args.iter().any(|arg| arg == "--help" || arg == "-h");
+    if wants_help && !is_mounts_family {
         println!("{HELP_TEXT}");
         return Ok(());
     }
@@ -287,7 +332,6 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let normalized_args = normalize_cli_args(&raw_args)?;
     let cli = Cli::parse_from(iter::once("deep-obsidian-mcp".to_string()).chain(normalized_args));
     let json = cli.options.json && !cli.options.no_json;
     let dry_run = cli.options.dry_run && !cli.options.no_dry_run;
@@ -435,6 +479,13 @@ pub async fn run() -> Result<()> {
             let resolved = crate::config::resolve_runtime_config(&cli.options)?;
             run_algolia(&resolved.service, command, dry_run, json).await
         }
+        // Deliberately NOT preceded by `resolve_runtime_config`: this family edits the
+        // config FILE, and resolving first would let a stray `--vault` or
+        // `DEEP_OBSIDIAN_VAULT_PATH` decide what the legacy migration writes into the root
+        // mount. See `mounts_cmd::run`.
+        Command::Mounts { command } => {
+            crate::mounts_cmd::run(&cli.options, command, dry_run, json).await
+        }
         Command::Probe { timeout_ms } => {
             let resolved = crate::config::resolve_runtime_config(&cli.options)?;
             let report = probe(&resolved, timeout_ms).await?;
@@ -560,7 +611,7 @@ async fn run_algolia(
 }
 
 /// Print a report as JSON or as its rendered text.
-fn print_report<T: Serialize>(
+pub(crate) fn print_report<T: Serialize>(
     json: bool,
     report: &T,
     render: impl FnOnce() -> String,
@@ -574,7 +625,7 @@ fn print_report<T: Serialize>(
 }
 
 /// Ask a yes/no question on the terminal. Anything but an explicit yes is a no.
-fn confirm(question: &str) -> Result<bool> {
+pub(crate) fn confirm(question: &str) -> Result<bool> {
     print!("{question} [y/N] ");
     io::stdout().flush()?;
     let mut answer = String::new();
@@ -669,9 +720,9 @@ fn normalize_required_bool_flag(
 /// vault path, and its own subcommand then reaches clap at the top level and fails with
 /// "unrecognized subcommand". Every command in [`Command`](crate::cli::Command) must appear.
 ///
-/// `couchdb` and `algolia` are the two that take nested subcommands, which is exactly why
-/// forgetting them is easy: the failure surfaces as a complaint about `export` or `status`
-/// rather than about the word that was actually lost.
+/// `couchdb`, `algolia` and `mounts` are the ones that take nested subcommands, which is
+/// exactly why forgetting them is easy: the failure surfaces as a complaint about `export`
+/// or `status` rather than about the word that was actually lost.
 fn is_known_command(token: &str) -> bool {
     matches!(
         token,
@@ -682,19 +733,29 @@ fn is_known_command(token: &str) -> bool {
             | "probe"
             | "couchdb"
             | "algolia"
+            | "mounts"
             | "help"
             | "version"
     )
 }
 
-/// Whether this command is followed by a nested subcommand of its own.
+/// How many nested subcommand levels follow this command.
 ///
 /// Needed because the positional-vault-path promotion is otherwise indistinguishable from a
 /// nested subcommand: `doctor ~/Vault` and `couchdb export` are both "a known command then a
 /// bare word", and the second word must be promoted in the first case and kept in the
-/// second. So the FIRST positional after one of these is never a vault path.
-fn command_takes_subcommand(token: &str) -> bool {
-    matches!(token, "couchdb" | "algolia")
+/// second. So the first N positionals after one of these are never a vault path.
+///
+/// A COUNT rather than a bool because `mounts` nests twice: `mounts add filesystem` is
+/// command, subcommand, kind. With a bool, `filesystem` was the first unrecognized
+/// positional and got promoted to `--vault filesystem` — the exact failure mode that made
+/// `couchdb export` unreachable, one level deeper.
+fn subcommand_depth(token: &str) -> usize {
+    match token {
+        "mounts" => 2,
+        "couchdb" | "algolia" => 1,
+        _ => 0,
+    }
 }
 
 /// Value-taking flags that belong to a SUBCOMMAND rather than to `ServiceOptions`.
@@ -714,6 +775,19 @@ const SUBCOMMAND_VALUE_FLAGS: &[&str] = &[
     "--path",
     "--parent-key-ref",
     "--prefix",
+    // The `mounts` family. `--vault-path` is NOT here: it is rewritten to the global
+    // `--vault` by a dedicated branch above, which the `mounts` family suppresses — see
+    // `in_mounts_family` in `normalize_cli_args`.
+    "--id",
+    "--mount-at",
+    "--url",
+    "--database",
+    "--username",
+    "--sidecar-path",
+    "--app-id",
+    "--index-name",
+    "--base-url",
+    "--participant-id",
 ];
 
 fn normalize_value_flag(
@@ -738,17 +812,49 @@ fn normalize_value_flag(
     (normalized, index + 1)
 }
 
+/// Just the normalized argv, for the tests that only care about that half.
+///
+/// `#[cfg(test)]` because `run` needs both halves and there is no second production
+/// caller; keeping it means the normalizer's own tests read as they always did.
+#[cfg(test)]
 fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
+    normalize_cli_args_detailed(raw_args).map(|(normalized, _)| normalized)
+}
+
+/// The normalized argv, plus whether the COMMAND is the `mounts` family.
+///
+/// The flag exists for the `--help` gate in [`run`], and it comes from here rather than
+/// from a search of argv for the word `mounts` because a VALUE can be that word too:
+/// `algolia status --mount mounts --help` must still print `HELP_TEXT`. This scan already
+/// distinguishes a command from a flag's value — it has to, to decide what becomes
+/// `--vault` — so answering the question here costs one `bool` and duplicates nothing.
+fn normalize_cli_args_detailed(raw_args: &[String]) -> Result<(Vec<String>, bool)> {
     let mut normalized = Vec::with_capacity(raw_args.len() + 2);
     let mut index = 0;
     let mut pending_vault_path: Option<String> = None;
     let mut saw_vault_flag = false;
-    // Set by `couchdb` / `algolia`: the next bare word is their subcommand, not a path.
-    let mut awaiting_subcommand = false;
+    // How many bare words are still owed to nested subcommands. Set by `couchdb` /
+    // `algolia` (1) and `mounts` (2); see `subcommand_depth`.
+    let mut pending_subcommands = 0usize;
+    // True once the `mounts` token has been consumed. Two things change after it:
+    //
+    // * `--vault-path` stops being an alias for the global `--vault` and becomes the
+    //   `mounts add filesystem` flag of the same name, passed through with its value. This
+    //   is the 5d failure in a new costume: without it, `mounts add filesystem
+    //   --vault-path ~/Team` arrives at clap as `--vault ~/Team` and clap complains that
+    //   the REQUIRED `--vault-path` is missing — naming the flag the user did pass.
+    //   Order-based rather than pre-scanned, and correct because of it: a `--vault-path`
+    //   BEFORE the `mounts` token is in global position and really is the global flag.
+    //
+    // * A stray bare word is no longer promoted to `--vault <word>`. Nothing in the
+    //   `mounts` family takes a positional, so promotion could only ever hide a typo:
+    //   `--vault` is a valid global, so the mistake would be silently accepted. Pushed
+    //   through instead, clap rejects it and says which word it did not understand.
+    let mut in_mounts_family = false;
 
     while index < raw_args.len() {
         let token = &raw_args[index];
-        if token == "--vault-path" {
+        if !in_mounts_family && token == "--vault-path" {
             saw_vault_flag = true;
             let (replacement, next_index) =
                 normalize_value_flag(raw_args, index, "--vault-path", "--vault");
@@ -756,10 +862,20 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
             index = next_index;
             continue;
         }
-        if let Some(value) = token.strip_prefix("--vault-path=") {
+        if !in_mounts_family && token.starts_with("--vault-path=") {
+            let value = token
+                .strip_prefix("--vault-path=")
+                .expect("the prefix just matched");
             saw_vault_flag = true;
             normalized.push(format!("--vault={value}"));
             index += 1;
+            continue;
+        }
+        if in_mounts_family && (token == "--vault-path" || token.starts_with("--vault-path=")) {
+            let (replacement, next_index) =
+                normalize_value_flag(raw_args, index, "--vault-path", "--vault-path");
+            normalized.extend(replacement);
+            index = next_index;
             continue;
         }
         if token == "--vault" || token.starts_with("--vault=") {
@@ -911,11 +1027,15 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
         }
         if !token.starts_with('-') {
             if is_known_command(token) {
-                awaiting_subcommand = command_takes_subcommand(token);
+                pending_subcommands = subcommand_depth(token);
+                in_mounts_family = in_mounts_family || token == "mounts";
                 normalized.push(token.clone());
-            } else if awaiting_subcommand {
-                // The nested subcommand of `couchdb` / `algolia`, never a vault path.
-                awaiting_subcommand = false;
+            } else if pending_subcommands > 0 {
+                // A nested subcommand of `couchdb` / `algolia` / `mounts`, never a path.
+                pending_subcommands -= 1;
+                normalized.push(token.clone());
+            } else if in_mounts_family {
+                // Never promoted: see `in_mounts_family` above.
                 normalized.push(token.clone());
             } else if !saw_vault_flag && pending_vault_path.is_none() {
                 pending_vault_path = Some(token.clone());
@@ -934,7 +1054,7 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
         normalized.push(vault_path);
     }
 
-    Ok(normalized)
+    Ok((normalized, in_mounts_family))
 }
 
 pub fn setup_service(
@@ -978,8 +1098,9 @@ pub fn setup_service(
     if declared_mounts {
         vault_access_messages.push(format!(
             "mounts config detected ({} mounts): leaving {} untouched. setup-service does not \
-             rewrite a declared mount table — edit the file by hand to change mounts, index \
-             directories or per-mount settings.",
+             rewrite a declared mount table — use `deep-obsidian-mcp mounts add` / `mounts \
+             remove` to change it, which validates the whole table before writing, or edit the \
+             file directly for the per-mount settings those commands do not expose.",
             service.mounts.len(),
             config_path.display()
         ));
@@ -1125,8 +1246,9 @@ pub fn setup_service(
         // that this command cannot reproduce faithfully.
         final_messages.push(format!(
             "config not written: {} declares a mount table, which setup-service does not \
-             rewrite (--overwrite does not apply). Edit it by hand; `deep-obsidian-mcp \
-             print-config` shows what this build reads from it.",
+             rewrite (--overwrite does not apply). Use `deep-obsidian-mcp mounts add` / \
+             `mounts remove` to change the table; `deep-obsidian-mcp print-config` shows what \
+             this build reads from the file.",
             config_path.display()
         ));
         // `auth_changed` cannot be true here: an auth change on a mounts config is
@@ -1147,22 +1269,11 @@ pub fn setup_service(
         // Never clobber silently: when replacing an existing config with
         // different content, keep the previous file next to the new one so a
         // wrong wizard answer stays recoverable.
-        if config_path.exists() {
-            let new_text = render_config_text(&config_path, &config)?;
-            let old_text = fs::read_to_string(&config_path).unwrap_or_default();
-            if old_text != new_text {
-                let backup_path = config_path.with_extension("json.bak");
-                fs::copy(&config_path, &backup_path).with_context(|| {
-                    format!(
-                        "failed to back up existing config to {}",
-                        backup_path.display()
-                    )
-                })?;
-                final_messages.push(format!(
-                    "backed up previous config: {}",
-                    backup_path.display()
-                ));
-            }
+        if let Some(backup_path) = back_up_config_before_overwrite(&config_path, &config)? {
+            final_messages.push(format!(
+                "backed up previous config: {}",
+                backup_path.display()
+            ));
         }
         write_config_file(&config_path, &config)?;
         wrote_config = true;
@@ -1199,6 +1310,67 @@ pub fn setup_service(
     })
 }
 
+/// Back up `config_path` before a CONTENT-CHANGING overwrite; return the backup path when
+/// one was written.
+///
+/// `None` means nothing needed backing up: either there is no file yet, or the text about
+/// to be written is byte-identical to what is already there. Both are deliberate — a
+/// `.bak` next to a file that did not change would be noise, and would overwrite the
+/// backup of the last change that DID happen, which is the one worth keeping.
+///
+/// # Why this is a shared helper
+///
+/// Two commands now replace an existing config in place: `setup-service` (whose wizard
+/// can be answered wrongly) and `mounts add` / `mounts remove` (which edit a mount table
+/// no other command will rewrite). A second copy of the rule would be a second chance to
+/// get "content-changing" wrong, and the safety net is only worth having if it is the
+/// same net in both places.
+fn back_up_config_before_overwrite(
+    config_path: &Path,
+    config: &PersistedServiceConfig,
+) -> Result<Option<PathBuf>> {
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let new_text = render_config_text(config_path, config)?;
+    let old_text = fs::read_to_string(config_path).unwrap_or_default();
+    if old_text == new_text {
+        return Ok(None);
+    }
+    // `<name>.<ext>.bak`, keyed off the file's OWN extension rather than hard-coded to
+    // `json.bak`. Both formats are supported (`read_config_file` and `write_config_file`
+    // dispatch on the extension), and a `config.json.bak` holding TOML is a trap: the
+    // obvious way to use a backup is to rename it back, and that rename would then be to
+    // the wrong format. A `.json` config still gets exactly `config.json.bak`, byte for
+    // byte what `setup-service` has always written.
+    let backup_extension = match config_path.extension().and_then(|ext| ext.to_str()) {
+        Some(extension) => format!("{extension}.bak"),
+        None => "bak".to_string(),
+    };
+    let backup_path = config_path.with_extension(backup_extension);
+    fs::copy(config_path, &backup_path).with_context(|| {
+        format!(
+            "failed to back up existing config to {}",
+            backup_path.display()
+        )
+    })?;
+    Ok(Some(backup_path))
+}
+
+/// Write `config` to `config_path`, backing up a differing previous file first.
+///
+/// The `mounts` family's single write path. Returns the `.bak` path when one was written
+/// so the caller can report it — an operator who has just had a mount table rewritten
+/// needs to be told where the previous one went.
+pub(crate) fn write_config_with_backup(
+    config_path: &Path,
+    config: &PersistedServiceConfig,
+) -> Result<Option<PathBuf>> {
+    let backup_path = back_up_config_before_overwrite(config_path, config)?;
+    write_config_file(config_path, config)?;
+    Ok(backup_path)
+}
+
 /// Refuse the wizard on a config that declares a mount table, before the first prompt.
 ///
 /// The wizard exists to write a config, and `setup_service` never writes one that declares
@@ -1223,9 +1395,10 @@ fn refuse_wizard_on_a_mounts_config(
     Err(anyhow!(
         "the setup wizard cannot edit {}: it declares a mount table, and setup-service does not \
          rewrite one (a mount table is the one thing in this file it cannot reproduce \
-         faithfully). Edit the file by hand — `deep-obsidian-mcp print-config` shows what this \
-         build reads from it, and `deep-obsidian-mcp doctor` checks each mount. The non-config \
-         installers still work: `setup-service --mcp --skills --vault-snippets`.",
+         faithfully). Use `deep-obsidian-mcp mounts add` / `mounts list` / `mounts remove` for \
+         the table — they validate it through the same loader the server uses — and \
+         `deep-obsidian-mcp print-config` for what this build reads from the file. The \
+         non-config installers still work: `setup-service --mcp --skills --vault-snippets`.",
         config_path.display()
     ))
 }
@@ -1498,7 +1671,7 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
     }
 }
 
-fn prompt_optional_secret(label: &str) -> Result<Option<SecretString>> {
+pub(crate) fn prompt_optional_secret(label: &str) -> Result<Option<SecretString>> {
     let value = rpassword::prompt_password(format!("{label}: "))
         .context("failed to read secret prompt input")?;
     if value.trim().is_empty() {
@@ -3711,7 +3884,7 @@ fn redact_config(config: &PersistedServiceConfig) -> PersistedServiceConfig {
 ///
 /// Only reached for a config that DECLARED a mount table, so a legacy `vaultPath`
 /// install's `doctor` output is unchanged.
-fn render_mount_line(mount: &MountConfig, root_index_dir: Option<&Path>) -> String {
+pub(crate) fn render_mount_line(mount: &MountConfig, root_index_dir: Option<&Path>) -> String {
     let mount_at = if mount.mount_at.is_empty() {
         "/".to_string()
     } else {
@@ -3936,9 +4109,9 @@ fn render_probe_report(report: &ProbeReport) -> String {
 mod tests {
     use super::{
         check_vault, embedding_diagnostics, enable_obsidian_snippets, inspect_index,
-        normalize_cli_args, print_config, redact_config, render_mount_line, setup_service,
-        setup_vault_snippets, IndexDiagnostics, MountConfig, INDEX_SQLITE_FILENAME,
-        SUBCOMMAND_VALUE_FLAGS,
+        normalize_cli_args, normalize_cli_args_detailed, print_config, redact_config,
+        render_mount_line, setup_service, setup_vault_snippets, IndexDiagnostics, MountConfig,
+        INDEX_SQLITE_FILENAME, SUBCOMMAND_VALUE_FLAGS,
     };
     use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
     use deep_obsidian_types::{
@@ -4132,6 +4305,7 @@ mod tests {
             "probe",
             "couchdb",
             "algolia",
+            "mounts",
             "help",
             "version",
         ] {
@@ -4213,6 +4387,126 @@ mod tests {
             !normalized.iter().any(|token| token == "--vault"),
             "{normalized:?}"
         );
+    }
+
+    /// `mounts` nests TWICE, and the third bare word must survive.
+    ///
+    /// `mounts add filesystem` is command, subcommand, kind. With the old boolean
+    /// `awaiting_subcommand`, `filesystem` was the first unrecognized positional and became
+    /// `--vault filesystem`, after which clap rejected the whole invocation — the `couchdb
+    /// export` failure one level deeper. Hence `subcommand_depth`.
+    #[test]
+    fn normalize_cli_args_keeps_the_mounts_kind_subcommand() {
+        for (sub, kind) in [
+            ("add", Some("filesystem")),
+            ("add", Some("couchdb")),
+            ("add", Some("algolia")),
+            ("list", None),
+            ("remove", None),
+        ] {
+            let mut args = vec!["mounts".to_string(), sub.to_string()];
+            args.extend(kind.map(str::to_string));
+            let normalized = normalize_cli_args(&args).expect("normalize args");
+            assert_eq!(
+                normalized, args,
+                "mounts {sub} {kind:?} must pass through untouched"
+            );
+            assert!(
+                !normalized.iter().any(|token| token == "--vault"),
+                "a mounts token was promoted to a vault path: {normalized:?}"
+            );
+        }
+    }
+
+    /// `--vault-path` means the MOUNT's flag inside the `mounts` family, and the global
+    /// `--vault` outside it.
+    ///
+    /// The normalizer rewrites `--vault-path` to `--vault` unconditionally, which is
+    /// exactly right for `deep-obsidian-mcp --vault-path ~/Vault serve` and exactly wrong
+    /// for `mounts add filesystem --vault-path ~/Team`: the rewritten form leaves clap
+    /// complaining that the REQUIRED `--vault-path` is missing, naming the flag the user
+    /// did pass. Order-based, and correct because of it — a `--vault-path` before the
+    /// `mounts` token is in global position and really is the global flag.
+    #[test]
+    fn normalize_cli_args_passes_mount_vault_path_through_but_still_rewrites_the_global() {
+        for args in [
+            vec![
+                "mounts".to_string(),
+                "add".to_string(),
+                "filesystem".to_string(),
+                "--id".to_string(),
+                "team".to_string(),
+                "--mount-at".to_string(),
+                "Team".to_string(),
+                "--vault-path".to_string(),
+                "/tmp/team".to_string(),
+            ],
+            vec![
+                "mounts".to_string(),
+                "add".to_string(),
+                "filesystem".to_string(),
+                "--vault-path=/tmp/team".to_string(),
+            ],
+        ] {
+            let normalized = normalize_cli_args(&args).expect("normalize args");
+            assert_eq!(normalized, args, "the mount's --vault-path was rewritten");
+        }
+
+        // Outside the family, and BEFORE the `mounts` token, the rewrite still happens.
+        assert_eq!(
+            normalize_cli_args(&["--vault-path".to_string(), "/tmp/v".to_string()])
+                .expect("normalize args"),
+            vec!["--vault".to_string(), "/tmp/v".to_string()]
+        );
+        assert_eq!(
+            normalize_cli_args(&[
+                "--vault-path".to_string(),
+                "/tmp/v".to_string(),
+                "mounts".to_string(),
+                "list".to_string(),
+            ])
+            .expect("normalize args"),
+            vec![
+                "--vault".to_string(),
+                "/tmp/v".to_string(),
+                "mounts".to_string(),
+                "list".to_string(),
+            ]
+        );
+    }
+
+    /// Inside the `mounts` family a stray bare word is NOT promoted to `--vault`.
+    ///
+    /// Nothing in the family takes a positional, and `--vault` is a valid global — so
+    /// promotion could only ever swallow a typo silently. Pushed through, clap names the
+    /// word it did not understand.
+    #[test]
+    fn normalize_cli_args_does_not_promote_a_stray_word_in_the_mounts_family() {
+        let args = vec!["mounts".to_string(), "list".to_string(), "oops".to_string()];
+        let normalized = normalize_cli_args(&args).expect("normalize args");
+        assert_eq!(normalized, args);
+        assert!(!normalized.iter().any(|token| token == "--vault"));
+    }
+
+    /// The `mounts`-family flag the `--help` gate reads is about the COMMAND, not about the
+    /// word appearing anywhere in argv.
+    ///
+    /// `algolia status --mount mounts --help` must still print `HELP_TEXT`: `mounts` is a
+    /// flag VALUE there. A gate that searched argv for the token would have flipped, and the
+    /// user would have got clap's top-level help for a command that has none.
+    #[test]
+    fn the_mounts_family_flag_tracks_the_command_not_the_word() {
+        for (args, expected) in [
+            (vec!["mounts", "list"], true),
+            (vec!["--config", "/tmp/c.json", "mounts", "list"], true),
+            (vec!["algolia", "status", "--mount", "mounts"], false),
+            (vec!["--vault", "mounts", "doctor"], false),
+            (vec!["doctor"], false),
+        ] {
+            let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            let (_, is_mounts) = normalize_cli_args_detailed(&owned).expect("normalize args");
+            assert_eq!(is_mounts, expected, "{args:?}");
+        }
     }
 
     #[test]

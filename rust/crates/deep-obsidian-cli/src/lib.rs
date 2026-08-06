@@ -3,6 +3,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod couchdb_transfer;
+pub mod mounts_cmd;
 
 pub use cli::{Cli, Command, ServiceOptions, StdioMode, TransportMode};
 pub use commands::{
