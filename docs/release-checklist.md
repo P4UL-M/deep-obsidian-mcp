@@ -62,6 +62,35 @@ the `brew services` plist. The env var stays a user-facing override.
     in the same commit that introduces it — a formula needs the asset's `sha256`, which
     does not exist until the release is cut.
 
+## The Container Image (not published yet)
+
+The `docker` job in `.github/workflows/ci.yml` builds the image natively on
+`ubuntu-24.04` + `ubuntu-24.04-arm` and runs `scripts/docker-smoke-test.sh` against
+it on every PR that touches `Dockerfile`, `docker/**`, `rust/**` or `sidecar/**`. It
+publishes **nothing**: the GHCR steps are present but commented out, pending the
+decision to start releasing images. Full deployment docs: [docker.md](./docker.md).
+
+- [ ] **Decide whether this release publishes an image.** If yes, uncomment the two
+      GHCR steps at the bottom of the `docker` job and add `packages: write` to the
+      workflow's `permissions`.
+- [ ] **Tag policy, same shape as the `.deb` channel:** `ghcr.io/p4ul-m/deep-obsidian-mcp:vX.Y.Z`
+      plus `:latest`, on `v*` tags only — never from a branch or a PR.
+- [ ] **Multi-arch is a manifest list, not a `platforms:` build.** The CI job uses
+      `load: true` and is single-arch per runner on purpose (QEMU would make the Rust
+      release build take tens of minutes, and a cross-built image cannot be
+      smoke-tested on the builder). Publishing therefore means pushing one digest per
+      runner and joining them with `docker/metadata-action` + a `merge` job — not
+      switching the existing job to `platforms: linux/amd64,linux/arm64`.
+- [ ] **The bundle, in this channel: automatic.** A dedicated `node:20-slim` stage
+      runs `npm ci && npm run build` and the runtime stage copies `dist/sidecar.mjs`
+      to `/opt/deep-obsidian-mcp/share/deep-obsidian-mcp/...`, i.e. to the same
+      exe-relative path the `.deb` uses. `scripts/docker-smoke-test.sh` asserts
+      `doctor` (run from `/`) finds it there, which is the parity check that keeps the
+      second build path honest.
+- [ ] **If the image is published, say in the release notes** that it requires a
+      bearer-token secret (it refuses to start otherwise), terminates no TLS, and
+      starts *degraded* against a CouchDB database no Obsidian client has synced yet.
+
 ## Homebrew Smoke Test
 
 - [ ] `brew install <formula>`

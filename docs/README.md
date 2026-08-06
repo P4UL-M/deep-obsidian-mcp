@@ -16,6 +16,7 @@ the top-level guides instead:** [README](../README.md) ·
 
 - [homebrew-service.md](./homebrew-service.md) — full Homebrew service model and troubleshooting.
 - [debian-package.md](./debian-package.md) — Debian/Ubuntu `.deb` and APT repository details.
+- [docker.md](./docker.md) — the container image and `docker-compose.example.yml`: env matrix, config precedence, the ephemeral-secret model, the CouchDB pairing flow.
 
 ## Maintainer / internal
 

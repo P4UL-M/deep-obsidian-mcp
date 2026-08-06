@@ -38,6 +38,14 @@ curl -fsSL https://p4ul-m.github.io/deep-obsidian-mcp/install.sh | sudo bash
 
 **From source:** `cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp`
 
+**Docker** — for a server rather than a laptop, and the natural home for a
+CouchDB-backed vault: `docker build -t deep-obsidian-mcp .` plus the ready-made
+[docker-compose.example.yml](./docker-compose.example.yml) brings up CouchDB and the
+MCP server together. The container is bearer-authenticated by default (it refuses to
+start without a token), runs as a non-root user, keeps its index on a volume and its
+credentials nowhere — they are re-injected from `/run/secrets` on every boot and
+never written to the volume. See [docs/docker.md](./docs/docker.md).
+
 Full install options, manual apt steps, updating, and uninstalling are in
 [INSTALL.md](./INSTALL.md).
 
@@ -92,6 +100,7 @@ its versioning model, and its limits.
 | [INSTALL.md](./INSTALL.md) | Install on macOS, Debian/Ubuntu, or from source |
 | [USAGE.md](./USAGE.md) | Set up your vault, connect an agent, run the service, troubleshoot |
 | [CONFIGURATION.md](./CONFIGURATION.md) | Embeddings, authentication, reindexing, mounts |
+| [docs/docker.md](./docs/docker.md) | Run it in a container: env matrix, secrets, CouchDB compose |
 | [docs/mcp-reference.md](./docs/mcp-reference.md) | MCP tools, resources, and prompts |
 | [docs/algolia-mounts.md](./docs/algolia-mounts.md) | Shared Algolia corpus (experimental) |
 | [docs/architecture.md](./docs/architecture.md) | Indexing model and internals |
