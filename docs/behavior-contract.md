@@ -189,8 +189,12 @@ what it contains. Everything else about it is frozen.
      adds the `resolveDivergence` argument to `upsert_note`;
    - `soft-delete` adds `delete_note`.
 
-   The two are checked separately, because they come apart: a read-only shared mount has a
-   version history and no soft delete.
+   The two are checked separately, because they come apart IN BOTH DIRECTIONS: a read-only
+   Algolia mount has a version history and no soft delete, so `delete_note` must not appear
+   for it; a writable CouchDB mount has a soft delete and no version history, so
+   `delete_note` must appear while the three history tools must not. The second case is why
+   `delete_note`'s payload cannot assume a `read_version` exists — see "What a delete leaves
+   behind" below.
 
 The same discipline governs all three: a tool that could only ever refuse is not
 advertised. A tool that IS advertised may still refuse for a particular `path` — the mount
@@ -198,9 +202,33 @@ that owns it may lack the capability — and that refusal names the mount, its b
 the mounts that do support the operation.
 
 This surface must never gain deletion of local vault files. `delete_note` exists only for a
-backend whose removal is observable to other participants and recoverable from the note's
-own version history; a filesystem mount refuses it, and a single-mount vault does not
-advertise it at all.
+backend whose removal is observable to other participants and recoverable; a filesystem mount
+refuses it, and a single-mount filesystem vault does not advertise it at all. A read-only
+remote mount refuses it too, and the refusal must name `"writable"` rather than reusing the
+filesystem sentence — a mount whose backend CAN soft-delete must not be told its removal
+would be a local unlink.
+
+### What a delete leaves behind
+
+`delete_note` means the same thing to a caller on every mount that has it — the note leaves
+every listing, every enumeration and every search on that mount, and the removal replicates
+to the other participants rather than merely going missing — but what remains to recover
+FROM is a property of the storage, so the payload states it per call.
+
+| Mount | Tombstone | `recoverableFrom` | Recovery route |
+| --- | --- | --- | --- |
+| Filesystem | n/a — refused | n/a | n/a. No deletion of local vault files. |
+| CouchDB (LiveSync) | The entry document with `deleted: true`; its `children` are untouched, so the stored content is still there. Never a CouchDB `_deleted` tombstone, which would leave `_all_docs` and be unrecoverable | **Absent** | Reading the path still returns its LAST content (`read_file` for a note, `read_artifact` for an attachment — a delete here may target either, because this mount stores binaries), and `upsert_note` writing it back resurrects it. Nothing older survives: CouchDB retains revisions, but nothing here can enumerate or fetch one and compaction removes them, so no `versionId` is offered. |
+| Algolia | A head record with no body, keeping the note's identity and folder facets | The version the tombstone superseded | `read_version`, then `upsert_note`. The whole retained history survives the delete. |
+
+Two consequences that are contract, not incidental:
+
+- an absent `recoverableFrom` means "there is no version a versioned read could serve", NOT
+  "the content is destroyed". `howToRecover` is present on every successful delete and is
+  the field a client follows;
+- a repeated delete is a successful no-op carrying `alreadyDeleted: true`, and must not cost
+  a write. On a CouchDB mount it reports the revision the tombstone already had — issuing
+  the delete anyway would replicate a fresh, meaningless revision to every device.
 
 ### Line search per backend
 

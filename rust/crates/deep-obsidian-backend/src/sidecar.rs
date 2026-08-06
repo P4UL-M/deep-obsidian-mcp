@@ -1256,6 +1256,28 @@ pub struct WriteResult {
     pub resurrected: bool,
 }
 
+/// What a `delete` landed.
+///
+/// Deliberately thin, and thinner than [`WriteResult`]: the sidecar's soft delete edits
+/// the entry document in place and reports only where the path now is. It carries no
+/// `size` and no `kind` because the tombstone keeps the entry's own — a LiveSync deletion
+/// leaves `children` alone — and no `already_deleted`, because the sidecar has no such
+/// concept: deleting a tombstone is simply another accepted write. The caller establishes
+/// that from the `stat` it took for the guard; see
+/// [`crate::CouchDbVaultBackend::soft_delete`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteResult {
+    pub path: String,
+    /// The revision of the tombstone this delete produced.
+    pub rev: String,
+    /// Always `true` on the wire (the protocol types it as the literal), echoed rather
+    /// than assumed so a sidecar that stopped setting it cannot be mistaken for one that
+    /// did.
+    #[serde(default)]
+    pub deleted: bool,
+}
+
 /// One sibling revision of a conflicted entry.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2375,6 +2397,56 @@ impl SidecarSupervisor {
             }),
             outcome_unknown,
         }
+    }
+
+    /// Soft-delete one entry, guarded by the revision the caller observed.
+    ///
+    /// Refused with [`SidecarErrorKind::ReadOnly`] by the sidecar unless it was
+    /// initialized `read-write`, for the same reason [`Self::write`] is: the process that
+    /// owns the mode is the one that enforces it.
+    ///
+    /// # Why `Option<&str>` and not a [`WriteGuard`]
+    ///
+    /// A `WriteGuard` has three cases and only two of them mean anything here: the
+    /// protocol defines `baseRev: null` and an absent `baseRev` as the SAME thing for a
+    /// delete (create-only is meaningless — there is nothing to create), so a guard type
+    /// that can express create-only would let a call site ask for something the wire
+    /// cannot carry. `Some(rev)` is a guarded delete, `None` an unguarded one.
+    ///
+    /// # Why this does NOT retry, unlike `write`
+    ///
+    /// `write` retries once on [`SidecarError::is_retryable_remote`] and reports the
+    /// ambiguity through [`WriteAttempt::outcome_unknown`], which is only safe because a
+    /// caller holding the desired BYTES can tell "my write landed and I never heard" from
+    /// "someone else won" by comparing content. A delete has no bytes to compare: the two
+    /// are indistinguishable, so a retry whose first attempt actually landed would lose
+    /// the compare-and-swap and surface as a conflict against a delete that succeeded. One
+    /// attempt, and a conflict means a conflict.
+    pub async fn delete(
+        &self,
+        path: &str,
+        base_rev: Option<&str>,
+    ) -> Result<DeleteResult, SidecarError> {
+        let mut params = Map::new();
+        params.insert("path".to_string(), json!(path));
+        if let Some(base_rev) = base_rev {
+            params.insert("baseRev".to_string(), json!(base_rev));
+        }
+        let raw = self.call("delete", Value::Object(params)).await;
+
+        // The local half of cache invalidation, and the reason a delete-then-list needs no
+        // sleep. UNCONDITIONAL, including on the error path, for the same reason
+        // `write`'s is: a delete reported as failed may still have landed (the transport
+        // can die after the remote accepted it), and bumping only on success would leave
+        // exactly that case serving a manifest that predates a tombstone that exists. The
+        // cost of being wrong the other way is one manifest walk.
+        self.bump_change_epoch();
+
+        raw.and_then(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                SidecarError::Protocol(format!("could not read the delete result: {error}"))
+            })
+        })
     }
 
     /// The winning revision and every sibling conflict revision for one path.

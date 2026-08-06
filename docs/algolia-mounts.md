@@ -141,7 +141,10 @@ _Wiki/Decisions/Foo.md
   `read_version` reads it back.
 - **Deleting is soft.** `delete_note` replaces the head with a tombstone: the note leaves
   every listing and every search, other participants can tell it was *removed* rather than
-  merely find it missing, and `recoverableFrom` names a version that can still be read.
+  merely find it missing, and `recoverableFrom` names a version that can still be read. A
+  writable CouchDB mount also has `soft-delete`, but only this backend can name a recoverable
+  version — see the per-backend table in
+  [docs/mcp-reference.md](./mcp-reference.md#what-a-delete-leaves-behind-per-backend).
 
 The precise scope of "nothing is destroyed": it is a guarantee about **overwrites**, not a
 promise of permanence. `algolia retract` deliberately destroys a note and its whole history,

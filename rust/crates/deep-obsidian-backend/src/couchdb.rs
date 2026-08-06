@@ -12,7 +12,11 @@
 //! * **Deletes are soft.** A deleted entry is still a readable document with
 //!   `deleted: true`. Listings exclude them — a tombstone is not a file — while
 //!   `read`/`stat` on one still answers, so a caller holding a stale path gets the
-//!   content rather than a lie.
+//!   content rather than a lie. That is also what makes
+//!   [`CouchDbVaultBackend::soft_delete`] recoverable at all: the tombstone keeps the
+//!   entry's `children`, so its last content survives the delete and writing it back
+//!   resurrects the note. There is no revision history behind it — see
+//!   [`COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE`].
 //! * **There is no ripgrep.** `grep_search` is served by an IMITATION of ripgrep
 //!   ([`crate::virtual_grep`]) running over note text read back through the sidecar:
 //!   the manifest supplies the corpus, the caller's glob pre-filters it by path, and
@@ -24,9 +28,10 @@
 //!   `size_bytes`, so the flag cannot be surfaced through the public MCP schema
 //!   this slice without changing it; it is logged instead. See
 //!   [`CouchDbVaultBackend::stat`].
-//! * **Nothing can be written.** Every mutation is refused with
-//!   [`COUCHDB_READ_ONLY_MESSAGE`], which names the experimental read-only state
-//!   explicitly rather than reporting a generic capability error.
+//! * **Writes need opting in.** On a mount that did not set `writable` every mutation —
+//!   including a delete — is refused with [`COUCHDB_READ_ONLY_MESSAGE`], which names the
+//!   experimental read-only state and the exact setting that changes it rather than
+//!   reporting a generic capability error.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -126,20 +131,6 @@ the sidecar protocol has no call to enumerate or fetch a revision, so the server
 ask. No configuration turns this on. Until it exists, recover a previous version through Obsidian's \
 own file recovery or a CouchDB backup; vault_info reports which notes have unreconciled sibling \
 revisions.";
-
-/// Refusal for deleting a note on a CouchDB mount.
-///
-/// Honest about being unimplemented rather than impossible — LiveSync's own tombstones
-/// are exactly this mechanism — and explicit that the safe-looking fallback (writing an
-/// empty note) is not the same thing, because a reader who assumes it is would replicate
-/// an empty note to every one of their devices.
-pub const COUCHDB_SOFT_DELETE_UNSUPPORTED_MESSAGE: &str = "deleting a note is NOT IMPLEMENTED for \
-this mount yet. It is not impossible: this is an EXPERIMENTAL CouchDB (Self-hosted LiveSync) vault \
-and LiveSync represents a deletion as a tombstone entry, which is precisely what this operation \
-means — but the sidecar protocol has no delete call, so the server has nothing to ask. No \
-configuration turns this on, and writing an empty note is NOT a substitute: it would replicate an \
-empty note to every device rather than remove one. Delete the note in Obsidian and let LiveSync \
-replicate the removal.";
 
 /// How long a collected manifest may be reused **while we are blind**.
 ///
@@ -275,6 +266,12 @@ impl HashCache {
         if self.entries.len() > HASH_CACHE_CAPACITY {
             self.evict();
         }
+    }
+
+    /// Forget one path entirely, for a mutation that ended its content rather than
+    /// replacing it. See [`CouchDbVaultBackend::soft_delete`].
+    fn remove(&mut self, path: &str) {
+        self.entries.remove(path);
     }
 
     fn evict(&mut self) {
@@ -496,8 +493,7 @@ impl CouchDbVaultBackend {
         let epoch = self.supervisor.change_epoch();
         let slot = self.manifest.lock().ok()?;
         let cached = slot.as_ref()?;
-        (cached.epoch == epoch && cached.feed_live_when_collected)
-            .then(|| cached.entries.clone())
+        (cached.epoch == epoch && cached.feed_live_when_collected).then(|| cached.entries.clone())
     }
 
     async fn manifest_request(
@@ -571,13 +567,7 @@ impl CouchDbVaultBackend {
                         // above is about to compute the identical hash with the identical
                         // function anyway — so this is not extra work, it is the same
                         // work done where its result can be kept.
-                        self.remember_hash(
-                            &path,
-                            &result.rev,
-                            &text,
-                            epoch,
-                            feed_live_when_read,
-                        );
+                        self.remember_hash(&path, &result.rev, &text, epoch, feed_live_when_read);
                         Ok(ContentResponse::Text { text, version })
                     }
                     // A `newnote` entry read as text. Refused rather than
@@ -804,6 +794,115 @@ impl CouchDbVaultBackend {
         Ok(MutationResponse::Written {
             created: result.created,
         })
+    }
+
+    /// `SoftDelete`: turn the entry into a LiveSync tombstone, guarded by its own revision.
+    ///
+    /// # What "soft" means here, and how it differs from the Algolia mount's
+    ///
+    /// The sidecar sets `deleted: true` on the entry document and leaves `children`
+    /// alone — it never sends `_deleted`, which would take the document out of
+    /// `_all_docs` entirely. So three things are true afterwards, and the tool payload
+    /// above depends on all three:
+    ///
+    /// * the note is GONE from every listing, from the manifest, from the virtual grep and
+    ///   from the local index built over that manifest ([`is_listable`]);
+    /// * other devices SEE the removal — LiveSync replicates the tombstone, which is what
+    ///   makes this a delete rather than a local hide;
+    /// * the last content is still THERE, because the chunks the tombstone still names are
+    ///   untouched. `read`/`stat` answer on a tombstone, so the content can be read back
+    ///   and written again, and the write resurrects the note.
+    ///
+    /// What is NOT true is Algolia's story: there is no readable revision history behind
+    /// the tombstone, so `recoverable_from` is `None` — not because the removal is
+    /// unrecoverable, but because no `read_version` exists here to name a version for. See
+    /// [`COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE`]. CouchDB's own older revisions are
+    /// not an answer either: they die on compaction, so naming one would promise a read
+    /// that may already be impossible.
+    ///
+    /// # The guard, and the delete that is not issued
+    ///
+    /// ONE `stat` serves both questions — is this already a tombstone, and what revision
+    /// must the delete be guarded on — because taking two reads would open a window
+    /// between them. A `conflict` from the delete therefore means the entry moved after
+    /// that `stat`, and it is REPORTED rather than retried, exactly as a lost write is:
+    /// re-deleting at the fresh revision would discard whatever that concurrent writer
+    /// stored. See [`Self::resolve_write_conflict`] for the one exception a WRITE has and
+    /// this deliberately does not.
+    ///
+    /// An entry that is already a tombstone is answered from the `stat` alone, with
+    /// `already_deleted: true` and no request issued. The sidecar would happily accept the
+    /// delete — verified against the real one in
+    /// `couchdb_sidecar.rs::deleting_a_tombstone_changes_nothing_and_says_so`, where it
+    /// produces a fresh `deleted: true` revision — and that is precisely why the request is
+    /// not made: the new revision would replicate to every device that syncs this vault
+    /// and mean nothing that the old one did not.
+    async fn soft_delete(&self, path: &str) -> Result<MutationResponse, BackendError> {
+        self.ensure_writable()?;
+        // The protected-path rule, and not just `ensure_vault_relative`: `write_text` and
+        // `commit_upload` both refuse `Templates/`, and a surface where a template cannot
+        // be overwritten but can be tombstoned would protect nothing.
+        ensure_writable_path(path)?;
+        // A missing entry arrives as an IO `NotFound`, which is the taxonomy the tool layer
+        // already branches on for a read of a missing note.
+        let stat = map_sidecar(self.supervisor.stat(path).await)?;
+        if stat.deleted {
+            debug!(
+                "delete of {path} was asked of an entry that is already a livesync tombstone at \
+                 revision {}; answered from the stat, with no request issued",
+                stat.rev
+            );
+            return Ok(MutationResponse::SoftDeleted {
+                version_id: stat.rev,
+                already_deleted: true,
+                recoverable_from: None,
+            });
+        }
+        // Empty only if a sidecar omitted it, which is "no observation" rather than a
+        // revision — so the delete goes out unguarded rather than guarded on nothing.
+        let base_rev = (!stat.rev.is_empty()).then(|| stat.rev.clone());
+        let result = match self.supervisor.delete(path, base_rev.as_deref()).await {
+            Ok(result) => result,
+            Err(error) if error.rpc_kind() == Some(SidecarErrorKind::Conflict) => {
+                let detail = error.conflict().cloned().unwrap_or_default();
+                let expected = match &base_rev {
+                    Some(rev) => WriteGuard::Revision(rev.clone()),
+                    None => WriteGuard::Unguarded,
+                };
+                warn!(
+                    "livesync delete of {path} lost its compare-and-swap ({}); nothing was \
+                     deleted",
+                    describe_conflict(&detail)
+                );
+                return Err(BackendError::VersionConflict {
+                    path: path.to_string(),
+                    expected: expected.describe(),
+                    found: describe_conflict(&detail),
+                });
+            }
+            Err(error) => return Err(map_sidecar_error(error)),
+        };
+        // The hash cache is a cache of LIVE content keyed by revision, and the revision has
+        // just moved, so nothing it holds for this path can answer `unchanged` any more.
+        // The rev-keyed lookup and the epoch stamp would already refuse it — this is the
+        // same belt-and-braces the Algolia mount's `cache().remove()` is on a delete, and
+        // it costs one map removal.
+        self.forget_hash(path);
+        Ok(MutationResponse::SoftDeleted {
+            version_id: result.rev,
+            already_deleted: false,
+            // Deliberately `None`. See the "What 'soft' means here" note above: the
+            // content is recoverable, but not through a version a versioned read could
+            // serve, and naming one that cannot be read would be worse than naming none.
+            recoverable_from: None,
+        })
+    }
+
+    /// Drop whatever the cache holds for `path`. See [`HashCache`].
+    fn forget_hash(&self, path: &str) {
+        if let Ok(mut cache) = self.hashes.lock() {
+            cache.remove(path);
+        }
     }
 
     /// `CommitUploadStream`: collect the body, verify `expected_hash`, write binary.
@@ -1211,6 +1310,18 @@ impl VaultBackend for CouchDbVaultBackend {
     ///   sidecar behind it was initialized `read-write`. A read-only mount advertises
     ///   neither and refuses both with [`COUCHDB_READ_ONLY_MESSAGE`], exactly as
     ///   before.
+    /// * `SoftDelete` — only when `writable`, gated identically to the two above and for
+    ///   the reason the Algolia mount states: a delete is a write, the server registers
+    ///   the `delete_note` tool from this capability, and advertising it on a read-only
+    ///   mount would put a tool on the surface that could only ever refuse. A LiveSync
+    ///   tombstone is exactly what this capability means — see [`Self::soft_delete`].
+    /// * NO `VersionHistory`, even though this mount HAS a soft delete. The two come
+    ///   apart in the direction the Algolia mount does not: CouchDB retains revisions but
+    ///   the sidecar protocol cannot enumerate or fetch one, and compaction may have
+    ///   removed them anyway, so there is nothing `note_history` could honestly list. The
+    ///   consequence for a caller is that a delete here reports no `recoverableFrom`; the
+    ///   tool payload says what to do instead. See
+    ///   [`COUCHDB_VERSION_HISTORY_UNSUPPORTED_MESSAGE`].
     fn descriptor(&self) -> BackendDescriptor {
         let mut capabilities = vec![
             Capability::GrepSearch,
@@ -1220,6 +1331,7 @@ impl VaultBackend for CouchDbVaultBackend {
         if self.writable {
             capabilities.push(Capability::BinaryWrite);
             capabilities.push(Capability::Upload);
+            capabilities.push(Capability::SoftDelete);
         }
         BackendDescriptor::new(BackendKind::Couchdb, capabilities)
     }
@@ -1254,9 +1366,9 @@ impl VaultBackend for CouchDbVaultBackend {
                 .write_text(&path, &content, base_version)
                 .await
                 .map(BackendResponse::Mutation),
-            BackendRequest::Mutation(MutationRequest::SoftDelete { .. }) => Err(
-                BackendError::Unsupported(COUCHDB_SOFT_DELETE_UNSUPPORTED_MESSAGE.to_string()),
-            ),
+            BackendRequest::Mutation(MutationRequest::SoftDelete { path }) => {
+                self.soft_delete(&path).await.map(BackendResponse::Mutation)
+            }
             BackendRequest::Mutation(MutationRequest::CommitUploadStream {
                 path,
                 expected_hash,

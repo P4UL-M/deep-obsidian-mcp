@@ -53,6 +53,17 @@ All notable changes to deep-obsidian-mcp are documented here.
     actually serve them, and refuse per-path by naming the mount, its backend, and
     the mounts that do support the operation. A tool that could only ever refuse is
     not advertised at all.
+  - **`delete_note` works on a writable CouchDB mount**, as a LiveSync tombstone:
+    the note leaves every listing, enumeration and search immediately, the removal
+    replicates to your other devices, and a repeated delete is a no-op that costs no
+    write. Recovery differs from an Algolia mount and the payload says so per call
+    rather than assuming a history exists: a LiveSync vault has no readable revision
+    history, so no `recoverableFrom` is offered — instead the tombstone keeps the
+    note's last content, so reading the path still returns it (`read_file`, or
+    `read_artifact` for an attachment) and `upsert_note` writing it back resurrects
+    it. A read-only CouchDB mount refuses the delete by naming
+    `"writable"`, and a filesystem mount still refuses it outright: this surface
+    exposes no deletion of local vault files.
   - **Any backend can be the vault ROOT, including a fully-remote vault.** A
     `couchdb` or `algolia` mount may sit at `mountAt: ""`, so a vault can have no
     local directory in it at all — a LiveSync database on its own, or a LiveSync
