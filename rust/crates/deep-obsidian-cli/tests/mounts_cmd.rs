@@ -27,8 +27,9 @@
 use std::path::{Path, PathBuf};
 
 use deep_obsidian_algolia::mock::spawn_mock;
-use deep_obsidian_cli::cli::{MountsAddCommon, MountsAddKind};
-use deep_obsidian_cli::mounts_cmd::{add_with_resolver, list, remove, SecretReader};
+use deep_obsidian_cli::mounts_cmd::{
+    add_with_resolver, list, remove, MountCommon, MountSpec, SecretReader,
+};
 use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_types::SecretRef;
 
@@ -105,8 +106,8 @@ fn json_string(path: &Path) -> String {
     serde_json::to_string(&path.display().to_string()).expect("json string")
 }
 
-fn common(id: &str, mount_at: &str) -> MountsAddCommon {
-    MountsAddCommon {
+fn common(id: &str, mount_at: &str) -> MountCommon {
+    MountCommon {
         id: id.to_string(),
         mount_at: mount_at.to_string(),
         keep_anyway: false,
@@ -117,15 +118,15 @@ fn common(id: &str, mount_at: &str) -> MountsAddCommon {
     }
 }
 
-fn filesystem(id: &str, mount_at: &str, vault_path: &Path) -> MountsAddKind {
-    MountsAddKind::Filesystem {
+fn filesystem(id: &str, mount_at: &str, vault_path: &Path) -> MountSpec {
+    MountSpec::Filesystem {
         common: common(id, mount_at),
         vault_path: vault_path.to_path_buf(),
     }
 }
 
-fn algolia(id: &str, mount_at: &str, base_url: &str, index_name: &str) -> MountsAddKind {
-    MountsAddKind::Algolia {
+fn algolia(id: &str, mount_at: &str, base_url: &str, index_name: &str) -> MountSpec {
+    MountSpec::Algolia {
         common: common(id, mount_at),
         app_id: "TESTAPP".to_string(),
         index_name: index_name.to_string(),
@@ -430,8 +431,8 @@ async fn a_missing_directory_fails_the_probe_and_aborts() {
 #[tokio::test]
 async fn keep_anyway_writes_a_mount_that_failed_its_probe() {
     let fixture = Fixture::legacy("keep-anyway");
-    let kind = MountsAddKind::Filesystem {
-        common: MountsAddCommon {
+    let kind = MountSpec::Filesystem {
+        common: MountCommon {
             keep_anyway: true,
             ..common("gone", "Gone")
         },
@@ -576,7 +577,7 @@ async fn an_unreachable_remote_aborts_and_removes_the_credential_it_stored() {
 async fn keep_anyway_on_an_unreachable_remote_keeps_the_credential() {
     let fixture = Fixture::legacy("algolia-keep");
     let mut kind = algolia("wiki", "_Wiki", "http://127.0.0.1:1/", "wiki-keep");
-    if let MountsAddKind::Algolia { common, .. } = &mut kind {
+    if let MountSpec::Algolia { common, .. } = &mut kind {
         common.keep_anyway = true;
     }
     let report = add_with_resolver(
@@ -614,8 +615,8 @@ async fn keep_anyway_on_an_unreachable_remote_keeps_the_credential() {
 #[tokio::test]
 async fn a_couchdb_mount_reads_password_then_passphrase_and_persists_only_references() {
     let fixture = Fixture::legacy("couchdb-secrets");
-    let kind = MountsAddKind::Couchdb {
-        common: MountsAddCommon {
+    let kind = MountSpec::Couchdb {
+        common: MountCommon {
             keep_anyway: true,
             ..common("archive", "Archive")
         },
@@ -693,7 +694,7 @@ async fn a_couchdb_mount_reads_password_then_passphrase_and_persists_only_refere
 async fn a_couchdb_mount_that_cannot_handshake_removes_both_secrets() {
     let fixture = Fixture::legacy("couchdb-abort");
     let original = fixture.config_text();
-    let kind = MountsAddKind::Couchdb {
+    let kind = MountSpec::Couchdb {
         common: common("archive", "Archive"),
         url: "http://127.0.0.1:1".to_string(),
         database: "vault".to_string(),
@@ -738,7 +739,7 @@ async fn a_couchdb_mount_that_cannot_handshake_removes_both_secrets() {
 #[tokio::test]
 async fn a_missing_stdin_line_names_the_secret_it_was_waiting_for() {
     let fixture = Fixture::legacy("stdin-short");
-    let kind = MountsAddKind::Couchdb {
+    let kind = MountSpec::Couchdb {
         common: common("archive", "Archive"),
         url: "https://couch.invalid".to_string(),
         database: "vault".to_string(),
@@ -1433,6 +1434,9 @@ fn cli_argv_mounts_help_is_claps_and_the_rest_is_unchanged() {
         text.starts_with("Usage:\n  deep-obsidian-mcp [serve]"),
         "{text}"
     );
-    assert!(text.contains("mounts add filesystem --id"), "{text}");
+    // `[--id <id>]` rather than `--id <id>`: the identifying flags are OPTIONAL now, because
+    // an omitted one is a question the guided mode asks. The summary has to say so, or it
+    // documents a usage error that no longer happens.
+    assert!(text.contains("mounts add filesystem [--id <id>]"), "{text}");
     assert!(text.contains("mounts remove --id <id>"), "{text}");
 }
