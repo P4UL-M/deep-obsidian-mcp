@@ -6,6 +6,23 @@ use crate::runtime::{
     RuntimeReadiness,
 };
 
+/// The `vaultPath` every payload here reports: WHERE THE VAULT ROOT IS, as one
+/// secret-free string.
+///
+/// A filesystem root renders its directory exactly as `PathBuf::display()` always
+/// rendered it, so every existing payload and every test asserting on `vaultPath` is
+/// byte-identical. A remote root renders `url/database` or `appId/indexName` — see
+/// [`deep_obsidian_types::MountBackendConfig::location`] for why that carries no secret.
+///
+/// The field is NOT renamed and NOT made nullable. `vaultPath` is a published health
+/// field that monitoring reads; dropping it for a fully-remote vault would make the
+/// payload say the server has no vault, and adding a second field beside it would leave
+/// consumers to guess which one is authoritative. Its meaning was always "where the root
+/// is", and that is what it still says.
+fn root_location(config: &ResolvedServiceConfig) -> String {
+    config.root_location()
+}
+
 fn insert_optional_value<T>(map: &mut Map<String, Value>, key: &str, value: &Option<T>)
 where
     T: serde::Serialize,
@@ -25,7 +42,7 @@ pub fn build_health_payload(
     payload.insert("status".to_string(), Value::String("ok".to_string()));
     payload.insert(
         "vaultPath".to_string(),
-        Value::String(config.vault_path.to_string_lossy().to_string()),
+        Value::String(root_location(config)),
     );
     payload.insert(
         "ready".to_string(),
@@ -77,7 +94,7 @@ pub fn build_readiness_payload(
     );
     payload.insert(
         "vaultPath".to_string(),
-        Value::String(config.vault_path.to_string_lossy().to_string()),
+        Value::String(root_location(config)),
     );
     payload.insert(
         "refreshInFlight".to_string(),
@@ -304,15 +321,56 @@ fn mount_count(summary: &MountIndexSummary, key: &str) -> u64 {
     }
 }
 
+/// Whether the additive per-mount detail belongs in a payload.
+///
+/// The test used to be simply "more than one mount", and that was the same thing as "not
+/// the shape a golden freezes" only because the one shape a golden freezes — a single
+/// mount at the vault root — could only ever be a filesystem directory. A remote backend
+/// may now be the root, so a table can have exactly one mount and still be a
+/// fully-remote CouchDB or Algolia vault, which is emphatically not what any golden
+/// describes.
+///
+/// So the condition is: **more than one mount, OR one mount that is not a local
+/// directory.**
+///
+/// # Why a lone remote mount deserves the detail
+///
+/// `mounts[]` is where a caller finds a mount's `capabilities` and, on a couchdb mount,
+/// its `conflictedCount`. Withholding it from a single-mount fully-remote vault would
+/// mean a LiveSync vault with no filesystem mount beside it had NO surface at all for
+/// unreconciled sibling revisions, and no way to discover that `note_history` and
+/// `delete_note` work on it — for the sole reason that the operator did not also mount a
+/// local folder. That is an accident of the old restriction, not a decision.
+///
+/// # Why no golden can move
+///
+/// A single FILESYSTEM mount still returns early, which is every legacy `vaultPath`
+/// config and the fixture behind every frozen payload. And the aggregation is a no-op for
+/// one mount anyway (a one-element sum is the element), so even the counts a lone remote
+/// mount now recomputes come out to the values it already had.
+fn mount_detail_applies(summaries: &[MountIndexSummary]) -> bool {
+    if summaries.len() > 1 {
+        return true;
+    }
+    summaries
+        .first()
+        .is_some_and(|summary| summary.backend_kind != FILESYSTEM_BACKEND_KIND)
+}
+
+/// The `backendKind` string a local-directory mount reports. A literal so
+/// [`mount_detail_applies`] can name it; it is
+/// `deep_obsidian_backend::BackendKind::Filesystem::as_str()`, asserted below.
+const FILESYSTEM_BACKEND_KIND: &str = "filesystem";
+
 /// Add per-mount index detail to a health, readiness or vault-overview payload,
 /// and make its whole-vault counts cover every mount.
 ///
-/// **Additive, and multi-mount only.** A single-mount config returns immediately,
-/// so every payload it produces — and every golden that freezes one — is
-/// untouched. This is the same discipline as `vault_info.mounts`: the multi-mount
-/// shape is a superset, never a reshaping.
+/// **Additive.** Every payload this skips — and every golden that freezes one — is
+/// untouched. This is the same discipline as `vault_info.mounts`: the richer shape is a
+/// superset, never a reshaping. See [`mount_detail_applies`] for exactly when it applies
+/// and why "multi-mount" is no longer quite the right test.
 ///
-/// What it does on a multi-mount config:
+/// What it does when it applies:
 ///
 /// * replaces each already-present count in [`AGGREGATE_COUNT_KEYS`] with the sum
 ///   over mounts, so `markdownFileCount` means the whole logical vault rather than
@@ -324,7 +382,7 @@ fn mount_count(summary: &MountIndexSummary, key: &str) -> u64 {
 ///   says nothing about mounts, so the mount is NAMED here instead of another
 ///   mount's message being laundered into `lastError`.
 pub fn insert_mount_index_detail(payload: &mut Value, summaries: &[MountIndexSummary]) {
-    if summaries.len() < 2 {
+    if !mount_detail_applies(summaries) {
         return;
     }
     let Some(object) = payload.as_object_mut() else {
@@ -406,7 +464,7 @@ pub fn build_vault_overview_payload(
     let mut payload = Map::new();
     payload.insert(
         "vaultPath".to_string(),
-        Value::String(config.vault_path.to_string_lossy().to_string()),
+        Value::String(root_location(config)),
     );
     payload.insert(
         "markdownFileCount".to_string(),
@@ -481,7 +539,7 @@ mod tests {
     fn test_config() -> ResolvedServiceConfig {
         ResolvedServiceConfig {
             federated_rerank: true,
-            vault_path: PathBuf::from("/tmp/deep-obsidian-test-vault"),
+            vault_path: Some(PathBuf::from("/tmp/deep-obsidian-test-vault")),
             index_dir: PathBuf::from("/tmp/deep-obsidian-test-index"),
             mounts: Vec::new(),
             experimental: Default::default(),
@@ -538,5 +596,42 @@ mod tests {
             readiness_status_code(&diagnostics),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    /// The literal [`FILESYSTEM_BACKEND_KIND`] against the enum it transcribes.
+    ///
+    /// [`mount_detail_applies`] compares a `backendKind` STRING, because that is what a
+    /// [`MountIndexSummary`] carries. Renaming the variant's `as_str()` without this
+    /// assertion would silently make every filesystem mount look remote, and the only
+    /// symptom would be a golden breaking somewhere else entirely.
+    #[test]
+    fn the_filesystem_backend_kind_literal_matches_the_enum() {
+        assert_eq!(
+            FILESYSTEM_BACKEND_KIND,
+            deep_obsidian_backend::BackendKind::Filesystem.as_str()
+        );
+    }
+
+    /// The exact boundary [`mount_detail_applies`] draws.
+    ///
+    /// The `false` case is the load-bearing one: it is every legacy config and therefore
+    /// every frozen golden. The single-remote `true` case is what this slice adds.
+    #[test]
+    fn per_mount_detail_applies_to_a_lone_remote_mount_but_not_a_lone_local_one() {
+        let summary = |backend_kind: &'static str| MountIndexSummary {
+            id: "root".to_string(),
+            mount_at: String::new(),
+            backend_kind,
+            diagnostics: None,
+        };
+
+        assert!(!mount_detail_applies(&[]));
+        assert!(!mount_detail_applies(&[summary(FILESYSTEM_BACKEND_KIND)]));
+        assert!(mount_detail_applies(&[summary("couchdb")]));
+        assert!(mount_detail_applies(&[summary("algolia")]));
+        assert!(mount_detail_applies(&[
+            summary(FILESYSTEM_BACKEND_KIND),
+            summary(FILESYSTEM_BACKEND_KIND),
+        ]));
     }
 }

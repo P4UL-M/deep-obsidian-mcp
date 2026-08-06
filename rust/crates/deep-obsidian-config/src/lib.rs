@@ -60,10 +60,15 @@ pub enum ConfigError {
     /// treated as absent.
     #[error("config sets both 'vaultPath' and 'mounts'; use one or the other (move the vault path into a mount with mountAt \"\", or drop the mounts array)")]
     VaultPathAndMountsBothSet,
-    /// A mount table with no mount at the vault root. Rejected this slice:
-    /// `vaultPath` is the root mount's path and feeds the runtime watcher, the
-    /// search index, and `doctor`, so a rootless table would leave it undefined.
-    /// Lifting this requires those consumers to become per-mount first.
+    /// A mount table with no mount at the vault root.
+    ///
+    /// Still rejected now that the root mount may be ANY backend kind, and for a
+    /// reason that has nothing to do with `vaultPath`: the router resolves a logical
+    /// path by longest matching prefix, and `""` is the only prefix that matches
+    /// everything. Without a mount there, every path outside every declared prefix
+    /// resolves to nothing — `list_children("")` has no answer, and a typo in a prefix
+    /// silently becomes "no such path" instead of landing in the root vault. A rootless
+    /// table is therefore not a vault with a hole in it, it is a vault with no floor.
     #[error("mount table has no root mount; exactly one mount must have mountAt \"\" (or \"/\")")]
     MissingRootMount,
     /// A mount id outside the accepted slug shape.
@@ -99,26 +104,19 @@ pub enum ConfigError {
     MultiVaultNotEnabled { count: usize },
     /// A `couchdb` mount without the opt-in flag.
     ///
-    /// Checked BEFORE [`Self::MultiVaultNotEnabled`]: a couchdb mount is
-    /// non-root-only, so it always makes the table multi-mount and both gates
-    /// would fire. The couchdb message is the more specific and more actionable
-    /// of the two, and it names the flag the user has actually not set yet for
-    /// the feature they were trying to use.
+    /// Checked BEFORE [`Self::MultiVaultNotEnabled`]: a couchdb mount used to be
+    /// non-root-only, so it always made the table multi-mount and both gates would
+    /// fire. It can now be the root — in which case a single-mount fully-remote table
+    /// needs only THIS flag — but the ordering is kept: when both gates do apply, the
+    /// couchdb message is the more specific and more actionable of the two, and it
+    /// names the flag the user has actually not set yet for the feature they were
+    /// trying to use.
     /// The wording says EXPERIMENTAL but no longer says READ-ONLY: a couchdb mount is
     /// read-only unless it sets `writable`, so the flag this error is about gates the
     /// mount existing, not the mount being written. Saying otherwise would tell a user
     /// that enabling the flag cannot give them writes, which is not true.
     #[error("couchdb (Self-hosted LiveSync) vaults are EXPERIMENTAL: set {{\"experimental\": {{\"couchdbVaults\": true}}}} in the config to resolve mount {id:?} (the mount is read-only unless it also sets \"writable\": true)")]
     CouchdbVaultsNotEnabled { id: String },
-    /// A `couchdb` mount at the vault root.
-    ///
-    /// `ResolvedServiceConfig::vault_path` is the ROOT mount's local directory and
-    /// still feeds `doctor`, the packaged index-dir derivation and the vault
-    /// overview. A CouchDB vault has no local directory, so a couchdb root mount
-    /// would leave it undefined. Lifting this needs those consumers to stop
-    /// requiring a root vault path first.
-    #[error("mount {id:?} is a couchdb backend at the vault root, which is not supported: a CouchDB vault has no local directory to serve as 'vaultPath'. Mount it at a non-root mountAt (e.g. \"LiveSync\") alongside a filesystem root mount.")]
-    CouchdbRootMountUnsupported { id: String },
     /// A CouchDB URL carrying `user:password@` userinfo.
     ///
     /// Rejected at validation rather than stripped at render time: the URL is
@@ -134,21 +132,11 @@ pub enum ConfigError {
     /// An `algolia` mount without the opt-in flag.
     ///
     /// Checked before [`Self::MultiVaultNotEnabled`] for the same reason the
-    /// couchdb gate is: an algolia mount is non-root-only, so it always makes the
-    /// table multi-mount and both gates would fire. This one names the flag the
-    /// user has actually not set for the feature they were reaching for.
+    /// couchdb gate is; see [`Self::CouchdbVaultsNotEnabled`] for the ordering
+    /// argument. This one names the flag the user has actually not set for the
+    /// feature they were reaching for.
     #[error("algolia (shared Markdown corpus) vaults are EXPERIMENTAL: set {{\"experimental\": {{\"algoliaVaults\": true}}}} in the config to resolve mount {id:?} (the mount is read-only unless it also sets \"writable\": true)")]
     AlgoliaVaultsNotEnabled { id: String },
-    /// An `algolia` mount at the vault root.
-    ///
-    /// Same cause as [`Self::CouchdbRootMountUnsupported`]:
-    /// `ResolvedServiceConfig::vault_path` is the ROOT mount's local directory and
-    /// still feeds `doctor`, the packaged index-dir derivation and the vault
-    /// overview. An Algolia corpus has no local directory, so a root algolia mount
-    /// would leave it undefined. Lifting BOTH restrictions is one piece of work and
-    /// belongs where those consumers stop requiring a root vault path.
-    #[error("mount {id:?} is an algolia backend at the vault root, which is not supported: a shared Algolia corpus has no local directory to serve as 'vaultPath'. Mount it at a non-root mountAt (e.g. \"_Shared\") alongside a filesystem root mount.")]
-    AlgoliaRootMountUnsupported { id: String },
     /// An Algolia `baseUrl` carrying `user:password@` userinfo.
     ///
     /// Refused rather than stripped, exactly as for a couchdb `url`: `baseUrl` is
@@ -200,6 +188,61 @@ pub fn default_packaged_index_dir(vault_path: &Path) -> PathBuf {
 /// Directory component under a root index dir reserved for non-root mounts.
 /// A literal, so the collision argument below can name it.
 pub const MOUNT_INDEX_DIR_SEGMENT: &str = "mounts";
+
+/// Where the ROOT mount's index lives when the root has no local directory to hang it
+/// off — i.e. when the root mount is a couchdb or algolia backend.
+///
+/// # Why it must be anchored outside any vault
+///
+/// [`default_index_dir`] puts the index INSIDE the vault (`<vault>/.deep-obsidian-mcp`),
+/// which is the right default precisely because a filesystem vault is a directory the
+/// user already owns. A remote root has no such directory, so the index has to live
+/// somewhere else, and the only somewhere-else this codebase already trusts is
+/// [`packaged_data_dir`] — macOS Application Support, otherwise `XDG_DATA_HOME`. That
+/// is the same anchor [`default_packaged_index_dir`] uses, for the same reason.
+///
+/// # Keyed by MOUNT ID, and why the extra `mounts/` segment is load-bearing
+///
+/// Id keying rather than hash keying, exactly as [`default_mount_index_dir`] chose and
+/// for the identical reason: ids are unique per config
+/// ([`ConfigError::DuplicateMountId`]) and constrained to `[a-z0-9][a-z0-9-]*`, so they
+/// are 1:1 with the runtime that owns the directory, whereas a hash of the remote's url
+/// would give two mounts naming the same database one index directory and therefore two
+/// `RuntimeState`s writing one SQLite file.
+///
+/// But the id CANNOT go directly under `indexes/`, and this is a real collision rather
+/// than a theoretical one: [`stable_vault_hash`] renders 16 lowercase hex characters,
+/// and `[a-z0-9][a-z0-9-]*` accepts every one of those strings. A mount id of
+/// `"abcdef0123456789"` would land on `indexes/abcdef0123456789`, which is also the
+/// packaged index directory of whichever filesystem vault happens to hash to it — two
+/// unrelated vaults, one `index.sqlite`. Interposing the reserved
+/// [`MOUNT_INDEX_DIR_SEGMENT`] makes that structurally impossible: a 16-hex-char hash
+/// can never be the literal `"mounts"`, so the two namespaces are disjoint by shape and
+/// not by luck.
+///
+/// # Non-collision, in full
+///
+/// * with a filesystem root's packaged index (`indexes/<16 hex>`) — different first
+///   segment under `indexes/`, as argued above;
+/// * with a filesystem root's in-vault index (`<vault>/.deep-obsidian-mcp`) — a
+///   different tree entirely;
+/// * between two remote roots in two different configs — distinct ids give distinct
+///   directories; identical ids in two configs pointing at two different remotes DO
+///   collide, which is the same exposure a hand-written `indexDir` has always had and
+///   the same one [`default_mount_index_dir`] carries. An operator running two services
+///   over two remotes sets an explicit `indexDir` on one, exactly as they must today for
+///   two mounts that share an id across configs;
+/// * with this config's NON-root mounts — their default is
+///   `<root index_dir>/mounts/<id>`, i.e. nested INSIDE the directory this function
+///   returns, and their ids differ from the root's. So the root's `index.sqlite` and
+///   each non-root mount's subdirectory are siblings under one anchor, which is exactly
+///   the arrangement a filesystem root already produces. One rule to remember, not two.
+pub fn default_remote_root_index_dir(mount_id: &str) -> PathBuf {
+    packaged_data_dir()
+        .join("indexes")
+        .join(MOUNT_INDEX_DIR_SEGMENT)
+        .join(mount_id)
+}
 
 /// Where a NON-ROOT mount's index lives when its own `indexDir` is unset.
 ///
@@ -605,11 +648,11 @@ pub fn normalize_service_config(
                 return Err(ConfigError::VaultPathAndMountsBothSet);
             }
             let (mounts, root) = normalize_mounts(mounts)?;
-            // Per-backend gates first: every non-filesystem backend is non-root-only,
-            // so it always makes the table multi-mount and BOTH its own gate and
-            // `MultiVaultNotEnabled` would fire. The backend-specific errors are the
-            // more actionable ones, so they win — see
-            // `ConfigError::CouchdbVaultsNotEnabled`.
+            // Per-backend gates first. A remote backend can now be the ROOT mount, so
+            // it no longer forces the table multi-mount and `MultiVaultNotEnabled` no
+            // longer necessarily also applies — but where both do apply the
+            // backend-specific error still wins, because it is the more actionable one.
+            // See `ConfigError::CouchdbVaultsNotEnabled`.
             for mount in &mounts {
                 match &mount.backend {
                     MountBackendConfig::Filesystem { .. } => continue,
@@ -619,21 +662,11 @@ pub fn normalize_service_config(
                                 id: mount.id.clone(),
                             });
                         }
-                        if mount.mount_at.is_empty() {
-                            return Err(ConfigError::CouchdbRootMountUnsupported {
-                                id: mount.id.clone(),
-                            });
-                        }
                         validate_couchdb_backend(mount)?;
                     }
                     MountBackendConfig::Algolia { .. } => {
                         if !experimental.algolia_vaults {
                             return Err(ConfigError::AlgoliaVaultsNotEnabled {
-                                id: mount.id.clone(),
-                            });
-                        }
-                        if mount.mount_at.is_empty() {
-                            return Err(ConfigError::AlgoliaRootMountUnsupported {
                                 id: mount.id.clone(),
                             });
                         }
@@ -648,24 +681,26 @@ pub fn normalize_service_config(
                     count: mounts.len(),
                 });
             }
-            let (vault_path, mount_index_dir) = match &mounts[root].backend {
+            let root_mount = &mounts[root];
+            // A filesystem root resolves EXACTLY as it always has: its `vaultPath`
+            // becomes the top-level one and its `indexDir` becomes the fallback for the
+            // top-level `indexDir`. A remote root has no vault path at all, and its
+            // index-dir fallback is the XDG-anchored, id-keyed directory — see
+            // `default_remote_root_index_dir`.
+            let (vault_path, mount_index_dir) = match &root_mount.backend {
                 MountBackendConfig::Filesystem {
                     vault_path,
                     index_dir,
-                } => (vault_path.clone(), index_dir.clone()),
-                // Unreachable: `CouchdbRootMountUnsupported` above rejects exactly
-                // this shape, which is what keeps `vault_path` well-defined.
-                MountBackendConfig::Couchdb { .. } => {
-                    return Err(ConfigError::CouchdbRootMountUnsupported {
-                        id: mounts[root].id.clone(),
-                    });
-                }
-                // Likewise unreachable, via `AlgoliaRootMountUnsupported`.
-                MountBackendConfig::Algolia { .. } => {
-                    return Err(ConfigError::AlgoliaRootMountUnsupported {
-                        id: mounts[root].id.clone(),
-                    });
-                }
+                } => (Some(vault_path.clone()), index_dir.clone()),
+                MountBackendConfig::Couchdb { index_dir, .. }
+                | MountBackendConfig::Algolia { index_dir, .. } => (
+                    None,
+                    Some(
+                        index_dir
+                            .clone()
+                            .unwrap_or_else(|| default_remote_root_index_dir(&root_mount.id)),
+                    ),
+                ),
             };
             (mounts, vault_path, mount_index_dir)
         }
@@ -673,7 +708,9 @@ pub fn normalize_service_config(
         // config back cannot invent a mount table the user never wrote.
         None => (
             Vec::new(),
-            expand_home_path(input.vault_path.ok_or(ConfigError::MissingVaultPath)?),
+            Some(expand_home_path(
+                input.vault_path.ok_or(ConfigError::MissingVaultPath)?,
+            )),
             None,
         ),
     };
@@ -682,7 +719,16 @@ pub fn normalize_service_config(
         .index_dir
         .map(expand_home_path)
         .or(mount_index_dir)
-        .unwrap_or_else(|| default_index_dir(&vault_path));
+        // Infallible: `mount_index_dir` above is `Some` for every root that has no
+        // `vault_path`, so this fallback is only reached with a filesystem root — where
+        // it is the same in-vault derivation it always was.
+        .unwrap_or_else(|| {
+            default_index_dir(
+                vault_path
+                    .as_deref()
+                    .expect("a root mount with no local vault path to have resolved an index dir"),
+            )
+        });
     let transport = input.transport.unwrap_or(TransportMode::Http);
     let stdio_mode = input.stdio_mode.unwrap_or(StdioMode::Auto);
     let http = normalize_http_input(input.http);
@@ -755,10 +801,13 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
     // file this same function's input validation rejects as ambiguous.
     let declared_mounts = !config.mounts.is_empty();
     PersistedServiceConfig {
+        // A declared mount table never writes a top-level `vaultPath` (the two are
+        // mutually exclusive on input), and a legacy config always has one — see the
+        // invariant on `ResolvedServiceConfig::vault_path`.
         vault_path: if declared_mounts {
             None
         } else {
-            Some(config.vault_path.clone())
+            config.vault_path.clone()
         },
         mounts: if declared_mounts {
             Some(config.mounts.clone())
@@ -1059,15 +1108,16 @@ pub mod secrets;
 mod tests {
     use super::{
         carry_unknown_fields, default_mount_index_dir, default_packaged_index_dir,
-        expand_home_path, is_loopback_host, normalize_persisted_config, normalize_service_config,
-        read_config_file, to_persisted_config, write_config_file, ConfigError,
-        DEFAULT_CONFIG_APP_DIR,
+        default_remote_root_index_dir, expand_home_path, is_loopback_host, is_valid_mount_id,
+        normalize_persisted_config, normalize_service_config, read_config_file,
+        to_persisted_config, write_config_file, ConfigError, DEFAULT_CONFIG_APP_DIR,
+        MOUNT_INDEX_DIR_SEGMENT,
     };
     use deep_obsidian_types::{
         AuthConfigInput, CouchdbE2eeConfig, CouchdbOptions, ExperimentalConfig, MountBackendConfig,
         MountConfig, PersistedServiceConfig, SecretRef, ServiceConfigInput,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// A process- and test-unique scratch directory. The config crate has no
     /// `tempfile` dependency and does not need one: nothing here races on a name that
@@ -1177,7 +1227,7 @@ mod tests {
             ..ServiceConfigInput::default()
         })
         .expect("normalize");
-        assert_eq!(resolved.vault_path, PathBuf::from("/tmp/vault"));
+        assert_eq!(resolved.vault_path, Some(PathBuf::from("/tmp/vault")));
         assert!(resolved.mounts.is_empty());
     }
 
@@ -1212,7 +1262,7 @@ mod tests {
 
         let resolved = normalize_service_config(mounts_input(mounts, true)).expect("flag set");
         assert!(resolved.is_multi_mount());
-        assert_eq!(resolved.vault_path, PathBuf::from("/tmp/vault"));
+        assert_eq!(resolved.vault_path, Some(PathBuf::from("/tmp/vault")));
     }
 
     #[test]
@@ -1380,7 +1430,7 @@ mod tests {
             true,
         ))
         .expect("normalize");
-        assert_eq!(resolved.vault_path, PathBuf::from("/tmp/vault"));
+        assert_eq!(resolved.vault_path, Some(PathBuf::from("/tmp/vault")));
         assert_eq!(resolved.index_dir, PathBuf::from("/tmp/root-index"));
 
         // An explicit top-level indexDir still wins over the root mount's.
@@ -1470,7 +1520,7 @@ mod tests {
             false,
         ))
         .expect("normalize");
-        assert_eq!(resolved.vault_path, home.join("Vault"));
+        assert_eq!(resolved.vault_path, Some(home.join("Vault")));
         assert_eq!(
             resolved.mounts[0].backend,
             MountBackendConfig::Filesystem {
@@ -1649,7 +1699,7 @@ mod tests {
             normalize_service_config(couchdb_input(couchdb_mount("live", "LiveSync"), true, true))
                 .expect("a gated couchdb mount resolves");
 
-        assert_eq!(resolved.vault_path, PathBuf::from("/tmp/root-vault"));
+        assert_eq!(resolved.vault_path, Some(PathBuf::from("/tmp/root-vault")));
         assert_eq!(resolved.mounts.len(), 2);
         assert_eq!(resolved.mounts[1].backend.kind_name(), "couchdb");
         assert!(resolved.experimental.couchdb_vaults);
@@ -1705,27 +1755,126 @@ mod tests {
         ));
     }
 
-    /// A couchdb mount cannot be the ROOT mount: `vault_path` would have nothing to
-    /// point at.
+    /// A couchdb mount CAN be the root mount, and a table consisting of nothing but
+    /// one is a fully-remote vault with no filesystem anywhere in it.
+    ///
+    /// Two things are asserted beyond acceptance, and both are the point of the slice:
+    /// `vault_path` resolves to `None` rather than to some invented placeholder, and
+    /// the index dir lands on the XDG-anchored id-keyed default rather than inside a
+    /// vault that does not exist. Note that only `couchdbVaults` is needed here —
+    /// a single-mount table is the legacy shape spelled out longhand, so `multiVault`
+    /// does not apply.
     #[test]
-    fn a_couchdb_root_mount_is_refused() {
+    fn a_couchdb_root_mount_resolves_with_no_vault_path() {
         let input = ServiceConfigInput {
             mounts: Some(vec![couchdb_mount("live", "")]),
             experimental: Some(ExperimentalConfig {
-                multi_vault: true,
                 couchdb_vaults: true,
                 ..ExperimentalConfig::default()
             }),
             ..ServiceConfigInput::default()
         };
-        let error = normalize_service_config(input).expect_err("a couchdb root must be refused");
-        assert!(matches!(
-            error,
-            ConfigError::CouchdbRootMountUnsupported { ref id } if id == "live"
-        ));
-        // The message says WHY, and what to do instead.
-        assert!(error.to_string().contains("no local directory"));
-        assert!(error.to_string().contains("non-root mountAt"));
+        let resolved = normalize_service_config(input).expect("a couchdb root resolves");
+        assert_eq!(resolved.vault_path, None);
+        assert_eq!(resolved.mounts.len(), 1);
+        assert_eq!(resolved.index_dir, default_remote_root_index_dir("live"));
+        // The root's location is nameable without a directory, which is what lets
+        // `doctor` and the health payload keep reporting a `vaultPath` at all.
+        assert_eq!(resolved.root_location(), "https://couch.example/vault");
+    }
+
+    /// An explicit top-level `indexDir` still wins over the remote-root default, and
+    /// so does the root mount's own `indexDir`. Both matter: the packaged installer
+    /// expresses packaged mode by writing the top-level one.
+    #[test]
+    fn an_explicit_index_dir_overrides_the_remote_root_default() {
+        let mut mount = couchdb_mount("live", "");
+        if let MountBackendConfig::Couchdb { index_dir, .. } = &mut mount.backend {
+            *index_dir = Some(PathBuf::from("/var/lib/mount-index"));
+        }
+        let resolved = normalize_service_config(ServiceConfigInput {
+            mounts: Some(vec![mount.clone()]),
+            experimental: Some(ExperimentalConfig {
+                couchdb_vaults: true,
+                ..ExperimentalConfig::default()
+            }),
+            ..ServiceConfigInput::default()
+        })
+        .expect("a couchdb root resolves");
+        assert_eq!(resolved.index_dir, PathBuf::from("/var/lib/mount-index"));
+
+        let resolved = normalize_service_config(ServiceConfigInput {
+            mounts: Some(vec![mount]),
+            index_dir: Some(PathBuf::from("/var/lib/top-level")),
+            experimental: Some(ExperimentalConfig {
+                couchdb_vaults: true,
+                ..ExperimentalConfig::default()
+            }),
+            ..ServiceConfigInput::default()
+        })
+        .expect("a couchdb root resolves");
+        assert_eq!(resolved.index_dir, PathBuf::from("/var/lib/top-level"));
+    }
+
+    /// The collision `default_remote_root_index_dir`'s reserved `mounts/` segment
+    /// exists to prevent, asserted on the exact shape that would collide without it.
+    ///
+    /// `stable_vault_hash` renders 16 lowercase hex characters and every such string is
+    /// a legal mount id, so a remote root keyed directly under `indexes/` could land on
+    /// a filesystem vault's packaged index directory. Nothing about that would be
+    /// visible: two unrelated vaults would share one `index.sqlite`.
+    #[test]
+    fn a_hex_shaped_mount_id_cannot_collide_with_a_packaged_vault_index() {
+        // A real hash, so the test cannot pass by picking a string no hash produces.
+        let hashed = default_packaged_index_dir(Path::new("/tmp/some-vault"));
+        let hash_segment = hashed
+            .file_name()
+            .expect("a hash segment")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(hash_segment.len(), 16);
+        assert!(hash_segment.chars().all(|c| c.is_ascii_hexdigit()));
+        // ...and it is a legal mount id, which is precisely why the segment is needed.
+        assert!(is_valid_mount_id(&hash_segment));
+
+        let remote = default_remote_root_index_dir(&hash_segment);
+        assert_ne!(remote, hashed);
+        assert_eq!(
+            remote,
+            hashed
+                .parent()
+                .expect("indexes/")
+                .join(MOUNT_INDEX_DIR_SEGMENT)
+                .join(&hash_segment)
+        );
+        // Two remote roots with different ids stay apart, and a non-root mount's
+        // default nests inside the root's rather than beside it.
+        assert_ne!(
+            default_remote_root_index_dir("live"),
+            default_remote_root_index_dir("archive")
+        );
+        assert_eq!(
+            default_mount_index_dir(&default_remote_root_index_dir("live"), "shared"),
+            default_remote_root_index_dir("live")
+                .join(MOUNT_INDEX_DIR_SEGMENT)
+                .join("shared")
+        );
+    }
+
+    /// A rootless table stays refused. The reason changed — it is the ROUTER's floor,
+    /// not `vaultPath`'s definition — but the answer did not.
+    #[test]
+    fn a_rootless_mount_table_is_still_refused_now_that_the_root_may_be_remote() {
+        let input = ServiceConfigInput {
+            mounts: Some(vec![couchdb_mount("live", "LiveSync")]),
+            experimental: Some(ExperimentalConfig {
+                couchdb_vaults: true,
+                ..ExperimentalConfig::default()
+            }),
+            ..ServiceConfigInput::default()
+        };
+        let error = normalize_service_config(input).expect_err("a rootless table must be refused");
+        assert!(matches!(error, ConfigError::MissingRootMount));
     }
 
     /// Embedded `user:password@` credentials in the url are refused, because the url
@@ -1865,25 +2014,54 @@ mod tests {
         );
     }
 
-    /// An algolia mount cannot be the ROOT mount: `vault_path` would have nothing to
-    /// point at, exactly as for a couchdb one.
+    /// An algolia mount can be the ROOT mount too, and resolves the same way a couchdb
+    /// root does: no `vault_path`, an XDG-anchored index dir, a nameable location.
+    ///
+    /// Such a mount has no LOCAL index by design (the remote index is the corpus), so
+    /// the directory this resolves is where its hydrated-note cache lives rather than a
+    /// SQLite index — the derivation is deliberately the same one either way, so an
+    /// operator has one rule to remember. See `default_remote_root_index_dir`.
     #[test]
-    fn an_algolia_root_mount_is_refused() {
+    fn an_algolia_root_mount_resolves_with_no_vault_path() {
         let input = ServiceConfigInput {
             mounts: Some(vec![algolia_mount("shared", "")]),
             experimental: Some(ExperimentalConfig {
-                multi_vault: true,
                 algolia_vaults: true,
                 ..ExperimentalConfig::default()
             }),
             ..ServiceConfigInput::default()
         };
-        let error = normalize_service_config(input).expect_err("an algolia root is refused");
-        assert!(
-            matches!(error, ConfigError::AlgoliaRootMountUnsupported { ref id } if id == "shared"),
-            "{error}"
-        );
-        assert!(error.to_string().contains("no local directory"), "{error}");
+        let resolved = normalize_service_config(input).expect("an algolia root resolves");
+        assert_eq!(resolved.vault_path, None);
+        assert_eq!(resolved.index_dir, default_remote_root_index_dir("shared"));
+        assert_eq!(resolved.root_location(), "ABC1234XYZ/team-wiki");
+    }
+
+    /// A fully-remote TWO-mount table: a couchdb root with an algolia mount grafted
+    /// under it. The shape the multi-backend docs now describe, and the one that proves
+    /// the non-root default still nests under the root's own resolved index dir even
+    /// when that dir was itself derived rather than declared.
+    #[test]
+    fn a_fully_remote_two_mount_table_resolves() {
+        let resolved = normalize_service_config(ServiceConfigInput {
+            mounts: Some(vec![
+                couchdb_mount("live", ""),
+                algolia_mount("shared", "_Shared"),
+            ]),
+            // Every field named, so no `..default()` — which clippy would flag as
+            // having no effect.
+            experimental: Some(ExperimentalConfig {
+                multi_vault: true,
+                couchdb_vaults: true,
+                algolia_vaults: true,
+            }),
+            ..ServiceConfigInput::default()
+        })
+        .expect("a fully-remote table resolves");
+        assert_eq!(resolved.vault_path, None);
+        assert_eq!(resolved.index_dir, default_remote_root_index_dir("live"));
+        assert_eq!(resolved.mounts.len(), 2);
+        assert!(resolved.is_multi_mount());
     }
 
     #[test]

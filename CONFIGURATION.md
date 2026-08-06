@@ -219,9 +219,15 @@ Three rules the config validator enforces:
 
 - **`vaultPath` and `mounts` are mutually exclusive** (an empty `mounts` array counts as
   absent). See above.
-- **Exactly one mount has `mountAt: ""`,** and it must be a `filesystem` one. A
-  CouchDB or Algolia mount cannot be the vault root — the root is what stays serving
-  when a remote mount is unreachable.
+- **Exactly one mount has `mountAt: ""`.** It may be **any** kind, so a vault can be
+  fully remote with no local directory in it at all. What is rejected is a table with *no*
+  root mount: routing is longest-prefix and `""` is the only prefix that matches
+  everything, so without it a path outside every declared prefix would resolve to nothing
+  and a typo in a prefix would become "no such path" instead of landing in the root vault.
+  A rootless table is not a vault with a hole in it, it is a vault with no floor.
+
+  A one-mount table needs only that backend's own experimental flag; `multiVault` does not
+  apply, because one mount is the legacy shape spelled out longhand.
 - **Ids and prefixes are unique.** Routing is longest-prefix, so `_Wiki` and
   `_Wiki/Decisions` can both be mounts and the more specific one wins; two mounts at
   the same prefix are rejected.
@@ -232,9 +238,8 @@ Three rules the config validator enforces:
 
 ### Backend kinds
 
-**`filesystem`** — a vault rooted at a local directory. The only kind that may be the
-root mount, the only one that stores binary attachments, and the only one with no
-experimental gate.
+**`filesystem`** — a vault rooted at a local directory. The only one that stores binary
+attachments, and the only one with no experimental gate.
 
 | Field | Meaning |
 |---|---|
@@ -287,12 +292,59 @@ thing to want, and a single global flag could not express it.
 Both default to off, so every pre-existing config keeps exactly the behaviour it has
 today.
 
+### A remote mount at the vault root
+
+The root mount is where the vault "is", so putting a remote backend there changes three
+things worth knowing before you do it.
+
+**There is no `vaultPath` anywhere.** Everywhere the vault's location is *reported* —
+`doctor`'s `vault:` line, the `vaultPath` field in `healthz`, `readyz` and `vault_info` —
+a remote root renders `url/database` (couchdb) or `appId/indexName` (algolia) instead of a
+directory. None of that carries a credential. `print-config` writes `"vaultPath": null`,
+exactly as it already did for a filesystem-rooted `mounts` table.
+
+Two commands lose something they cannot do without a local directory, and both say so
+rather than pretending:
+
+- `setup-service --vault-snippets` reports `skip`. The snippets are files Obsidian reads
+  out of `<vault>/.obsidian/snippets`, and a LiveSync vault's `.obsidian` folder lives on
+  each syncing *device*. Install them into the local vault of each device instead. The
+  `--mcp` and `--skills` installs are unaffected.
+- `doctor`'s `vault` check reports `ok` with the root's location and points at
+  `--probe-remote`, which is what actually contacts the remote. It is deliberately not
+  `fail` — a fully-remote vault is a supported configuration, and `doctor`'s exit code
+  gates on `fail`.
+
+**An unreachable remote root starts the service DEGRADED rather than killing it.** A
+missing local directory is a permanent mistake and still aborts startup; a remote that is
+down is an outage, and a service that refused to start would be bricked by a network blip.
+So `/readyz` answers 503 naming the mount, every path refuses with the backend's own
+reason, and a CouchDB mount re-hand-shakes in the background until the remote answers — no
+restart needed. A verdict only a config change could fix (rejected credentials, a wrong
+E2EE passphrase) is *not* retried, because a running process cannot re-read its config.
+
+**An `algolia` root has no local search index at all**, so the index-derived tools
+(`vault_info`, `build_index`, `recommend_folder`) refuse on such a vault while reads,
+writes, listings, outlines and `grep_search` all work. A `couchdb` root does have one, so
+a fully-remote LiveSync vault keeps every tool. If you want the whole surface over a
+shared Algolia corpus, mount it under a filesystem or couchdb root instead of at `""`.
+
 ### `indexDir` per mount
 
 Each mount gets its own index directory, defaulting to `<root indexDir>/mounts/<id>`
 — keyed by mount id so two mounts cannot collide. The **root** mount uses the
 top-level `indexDir`, which is what keeps a single-mount config's index exactly where
 it has always been.
+
+When the root mount is **remote**, there is no vault directory to put an index inside, so
+its default moves out of the vault and under the same application data directory packaged
+mode uses — macOS `Application Support`, otherwise `$XDG_DATA_HOME` — at
+`indexes/mounts/<id>`, keyed by the root mount's id. The `mounts/` segment is not
+decoration: a filesystem vault's packaged index lands at `indexes/<16 hex characters>`, and
+every one of those strings is also a legal mount id, so without the reserved segment a
+mount called `abcdef0123456789` could quietly share one `index.sqlite` with an unrelated
+vault. Set an explicit `indexDir` if you run two services over two different remotes whose
+root mounts share an id.
 
 An Algolia mount is the exception: it has no local search index (the remote index *is*
 the corpus), so its directory holds only the hydrated-note cache. The derivation is

@@ -1005,12 +1005,22 @@ pub fn setup_service(
             ));
         }
     } else {
-        service.vault_path = absolute_path(&service.vault_path)?;
+        // No declared mount table means a legacy `vaultPath` config, which always has a
+        // local vault path — see the invariant on `ResolvedServiceConfig::vault_path`. So
+        // this whole branch, and every path-based step in it, is unchanged: a REMOTE root
+        // can only be expressed through a mount table and therefore only ever takes the
+        // branch above, which already skips all three of these.
+        let vault_path = service
+            .vault_path
+            .clone()
+            .expect("a config with no mount table to carry a root vault path");
+        let vault_path = absolute_path(&vault_path)?;
+        service.vault_path = Some(vault_path.clone());
         if matches!(resolved.sources.index_dir, ResolvedSource::Default) {
-            service.index_dir = default_packaged_index_dir(&service.vault_path);
+            service.index_dir = default_packaged_index_dir(&vault_path);
         }
         validate_vault(&service)?;
-        vault_access_messages = macos_vault_access_preflight(&service.vault_path, dry_run)?;
+        vault_access_messages = macos_vault_access_preflight(&vault_path, dry_run)?;
     }
     let config_dir = config_path
         .parent()
@@ -1054,7 +1064,11 @@ pub fn setup_service(
     // deletes every setting this build has never heard of.
     carry_unknown_fields(&mut config, resolved.config_file.as_ref());
     let mut messages = vec![
-        format!("vault: {}", service.vault_path.display()),
+        // `root_location()` rather than `vault_path.display()`: identical output for a
+        // filesystem root (the same path through the same `Display`), and a secret-free
+        // `url/database` or `appId/indexName` for a remote one, instead of an empty line
+        // that would read as "no vault configured".
+        format!("vault: {}", service.root_location()),
         format!("index: {}", service.index_dir.display()),
         format!("config: {}", config_path.display()),
     ];
@@ -1076,7 +1090,7 @@ pub fn setup_service(
             Vec::new()
         };
         let vault_snippets = if install_vault_snippets {
-            setup_vault_snippets(&service.vault_path, true, overwrite)?
+            setup_vault_snippets(service.vault_path.as_deref(), true, overwrite)?
         } else {
             Vec::new()
         };
@@ -1167,7 +1181,7 @@ pub fn setup_service(
         Vec::new()
     };
     let vault_snippets = if install_vault_snippets {
-        setup_vault_snippets(&service.vault_path, false, overwrite)?
+        setup_vault_snippets(service.vault_path.as_deref(), false, overwrite)?
     } else {
         Vec::new()
     };
@@ -1673,11 +1687,40 @@ fn setup_agent_skills(dry_run: bool, overwrite: bool) -> Result<Vec<SetupActionR
     ])
 }
 
+/// Install the packaged Obsidian CSS snippets into the ROOT vault's `.obsidian`
+/// directory.
+///
+/// # Why a remote root is a REFUSAL and not a no-op
+///
+/// The snippets are files Obsidian reads out of `<vault>/.obsidian/snippets`, and
+/// enabling them means editing `<vault>/.obsidian/appearance.json`. A remote root has no
+/// such directory: a CouchDB LiveSync vault's `.obsidian` folder lives on each syncing
+/// DEVICE, and an Algolia corpus has no notion of one at all. There is nowhere to write
+/// and nothing to enable.
+///
+/// So `--vault-snippets` on a remote-rooted config reports `skip` with the reason and the
+/// remedy, rather than either (a) silently succeeding, which would tell the operator their
+/// snippets are installed when nothing happened, or (b) failing the whole `setup-service`
+/// run, which would take `--mcp` and `--skills` down with it — the same argument that made
+/// a declared mount table stop being an outright refusal.
 fn setup_vault_snippets(
-    vault_path: &Path,
+    vault_path: Option<&Path>,
     dry_run: bool,
     overwrite: bool,
 ) -> Result<Vec<SetupActionReport>> {
+    let Some(vault_path) = vault_path else {
+        return Ok(vec![SetupActionReport {
+            target: "vault snippets".into(),
+            path: None,
+            changed: false,
+            status: "skip".into(),
+            message: "the vault root is a remote backend, which has no .obsidian directory \
+                      to install CSS snippets into. Install them into the local vault of \
+                      each device that syncs this vault instead — the snippet files ship \
+                      alongside this binary under share/deep-obsidian-mcp/obsidian-snippets."
+                .into(),
+        }]);
+    };
     let source_dir = packaged_obsidian_snippets_dir()?;
     Ok(vec![install_vault_snippets_for_target(
         vault_path,
@@ -2298,23 +2341,37 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     Ok(())
 }
 
+/// Assert the ROOT vault is a readable local directory.
+///
+/// A remote root has no directory to validate, so there is nothing here that could be
+/// true or false about it and it passes. This is not a hole: a remote root's
+/// reachability is a RUNTIME readiness fact — the mount's handshake or its `get_settings`
+/// probe — and a config must still load and a service must still install while the remote
+/// is down. `doctor --probe-remote` is what actually contacts it.
+///
+/// Reached only from the non-mount-table branch of `setup_service` today, where the root
+/// is a filesystem mount by construction; the `None` arm is what keeps that a property of
+/// the type rather than of the call site.
 fn validate_vault(config: &ResolvedServiceConfig) -> Result<()> {
-    match fs::metadata(&config.vault_path) {
+    let Some(vault_path) = config.vault_path.as_deref() else {
+        return Ok(());
+    };
+    match fs::metadata(vault_path) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(anyhow!(
             "vault path is not a directory: {}",
-            config.vault_path.display()
+            vault_path.display()
         )),
         Err(error) if is_permission_denied(&error) => {
             let privacy_opened = open_macos_full_disk_access_panel();
             Err(anyhow!(macos_vault_access_guidance(
-                &config.vault_path,
+                vault_path,
                 privacy_opened
             )))
         }
         Err(_) => Err(anyhow!(
             "vault path does not exist or is not a directory: {}",
-            config.vault_path.display()
+            vault_path.display()
         )),
     }
 }
@@ -3025,8 +3082,32 @@ fn embedding_diagnostics(
     }
 }
 
+/// The `vault` check: is the ROOT vault a readable local directory?
+///
+/// For a REMOTE root there is no directory to read, so the check reports `ok` with the
+/// root's secret-free location and says where the real answer comes from. Deliberately
+/// not `fail` (nothing is wrong) and deliberately not omitted (`doctor` output is a fixed
+/// set of check names, and a missing `vault` line would read as "not checked" — the same
+/// argument the algolia mount's `.local` check already makes). Deliberately not `skip`
+/// either, because `doctor`'s exit code gates on `fail` and a fully-remote vault is a
+/// supported configuration, not a partially-checked one.
 fn check_vault(config: &ResolvedServiceConfig) -> CheckReport {
-    let resolved = match absolute_path(&config.vault_path) {
+    let Some(vault_path) = config.vault_path.as_deref() else {
+        let root = config.root_mount();
+        return CheckReport {
+            name: "vault".into(),
+            status: "ok".into(),
+            message: format!(
+                "the vault root is mount '{}', a {} backend with no local directory; its \
+                 reachability is a runtime fact rather than a filesystem one — use \
+                 --probe-remote to contact it",
+                root.id,
+                root.backend.kind_name()
+            ),
+            details: Some(serde_json::json!({ "location": root.backend.location() })),
+        };
+    };
+    let resolved = match absolute_path(vault_path) {
         Ok(path) => path,
         Err(error) => {
             return CheckReport {
@@ -3636,51 +3717,32 @@ fn render_mount_line(mount: &MountConfig, root_index_dir: Option<&Path>) -> Stri
     } else {
         format!("/{}", mount.mount_at)
     };
-    let (location, declared_index_dir) = match &mount.backend {
-        MountBackendConfig::Filesystem {
-            vault_path,
-            index_dir,
-        } => (vault_path.display().to_string(), index_dir.clone()),
-        // `url` and `database` only: no credential, and no `passwordRef`
-        // identifier either. The url is validated at config load to carry no
-        // userinfo (`ConfigError::CouchdbUrlHasUserinfo`), which is what makes
-        // printing it verbatim safe.
-        MountBackendConfig::Couchdb {
-            url,
-            database,
-            writable,
-            index_dir,
-            ..
-        } => (
-            format!(
-                "{url}/{database}{}",
-                if *writable { "" } else { " (read-only)" }
-            ),
-            index_dir.clone(),
-        ),
-        // `appId`, `indexName` and — when set — `baseUrl`. No key, and no `apiKeyRef`
-        // identifier either. `baseUrl` is validated at config load to carry no userinfo
-        // (`ConfigError::AlgoliaBaseUrlHasUserinfo`), which is what makes printing it
-        // verbatim safe; the default endpoint is derived from `appId` and named as such
-        // rather than invented here, so this line never implies a url nobody configured.
-        MountBackendConfig::Algolia {
-            app_id,
-            index_name,
-            base_url,
-            writable,
-            index_dir,
-            ..
-        } => (
-            format!(
-                "{app_id}/{index_name}{}{}",
-                match base_url {
-                    Some(base_url) => format!(" via {base_url}"),
-                    None => String::new(),
-                },
-                if *writable { "" } else { " (read-only)" }
-            ),
-            index_dir.clone(),
-        ),
+    // The LOCATION comes from `MountBackendConfig::location`, which is the one
+    // secret-free rendering shared with `doctor`'s `vault:` line and the health payload's
+    // `vaultPath` — see there for why each backend's string is safe to print verbatim.
+    // The `(read-only)` marker is appended HERE rather than living in that helper, because
+    // writability is a property of the mount and not of its location: folding it in would
+    // have put `(read-only)` into a health field consumers read as a location. The
+    // concatenation is byte-identical to what this function built inline before.
+    //
+    // A filesystem mount has never carried the marker and still does not: its writability
+    // is not a per-mount setting.
+    let read_only_marker = match &mount.backend {
+        MountBackendConfig::Filesystem { .. } => "",
+        MountBackendConfig::Couchdb { writable, .. }
+        | MountBackendConfig::Algolia { writable, .. } => {
+            if *writable {
+                ""
+            } else {
+                " (read-only)"
+            }
+        }
+    };
+    let location = format!("{}{read_only_marker}", mount.backend.location());
+    let declared_index_dir = match &mount.backend {
+        MountBackendConfig::Filesystem { index_dir, .. }
+        | MountBackendConfig::Couchdb { index_dir, .. }
+        | MountBackendConfig::Algolia { index_dir, .. } => index_dir.clone(),
     };
     let index_dir = if mount.mount_at.is_empty() {
         root_index_dir.map(Path::to_path_buf)
@@ -3718,18 +3780,14 @@ fn render_doctor_report(report: &DoctorReport) -> String {
                 .as_ref()?
                 .iter()
                 .find(|mount| mount.mount_at.is_empty())
-                .map(|mount| match &mount.backend {
-                    MountBackendConfig::Filesystem { vault_path, .. } => {
-                        vault_path.display().to_string()
-                    }
-                    // Unreachable: neither a couchdb nor an algolia mount can be the
-                    // root mount (`ConfigError::CouchdbRootMountUnsupported`,
-                    // `ConfigError::AlgoliaRootMountUnsupported`), which is precisely
-                    // what keeps this line able to name a directory.
-                    MountBackendConfig::Couchdb { .. } | MountBackendConfig::Algolia { .. } => {
-                        "(missing)".to_string()
-                    }
-                })
+                // The root mount can now be ANY backend kind, so this names its location
+                // with the same secret-free rendering the per-mount lines use rather than
+                // reporting `(missing)` for a vault that is perfectly well configured. For
+                // a filesystem root it is the vault directory, byte-identical to before.
+                // The `(read-only)` marker is deliberately NOT here: this line answers
+                // "where is the vault", and the mount line below already reports
+                // writability.
+                .map(|mount| mount.backend.location())
         })
         .unwrap_or_else(|| "(missing)".to_string());
     let transport = report
@@ -3877,9 +3935,10 @@ fn render_probe_report(report: &ProbeReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        embedding_diagnostics, enable_obsidian_snippets, inspect_index, normalize_cli_args,
-        redact_config, render_mount_line, setup_service, IndexDiagnostics, MountConfig,
-        INDEX_SQLITE_FILENAME, SUBCOMMAND_VALUE_FLAGS,
+        check_vault, embedding_diagnostics, enable_obsidian_snippets, inspect_index,
+        normalize_cli_args, print_config, redact_config, render_mount_line, setup_service,
+        setup_vault_snippets, IndexDiagnostics, MountConfig, INDEX_SQLITE_FILENAME,
+        SUBCOMMAND_VALUE_FLAGS,
     };
     use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
     use deep_obsidian_types::{
@@ -3924,7 +3983,7 @@ mod tests {
     fn resolved_config(vault_path: &Path, index_dir: &Path) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
             federated_rerank: true,
-            vault_path: vault_path.to_path_buf(),
+            vault_path: Some(vault_path.to_path_buf()),
             index_dir: index_dir.to_path_buf(),
             mounts: Vec::new(),
             experimental: Default::default(),
@@ -4385,6 +4444,112 @@ mod tests {
         assert_eq!(
             render_mount_line(&couchdb(true), None),
             "mount team at /Team (couchdb): http://127.0.0.1:5984/vault"
+        );
+    }
+
+    /// A REMOTE root: `doctor`'s `vault:` line, the `vault` check and `print-config` all
+    /// answer without a local directory, and none of them leaks a secret.
+    ///
+    /// The three surfaces that used to read `vault_path` unconditionally, asserted
+    /// together because they are the same question asked three ways — and because a
+    /// regression in any one of them would be an operator staring at a blank `vault:`
+    /// line or a `doctor` that reports `fail` on a correctly configured vault.
+    #[test]
+    fn a_remote_root_renders_a_location_rather_than_a_missing_vault_path() {
+        let mount = MountConfig {
+            id: "live".to_string(),
+            mount_at: String::new(),
+            backend: deep_obsidian_types::MountBackendConfig::Couchdb {
+                url: "https://couch.example".to_string(),
+                database: "vault".to_string(),
+                username: Some("vaultuser".to_string()),
+                password_ref: deep_obsidian_types::SecretRef::OsKeyring {
+                    service: "deep-obsidian-mcp".to_string(),
+                    account: "live-password".to_string(),
+                },
+                e2ee: None,
+                sidecar_path: None,
+                index_dir: None,
+                options: None,
+                writable: false,
+            },
+            recall_weight: None,
+            unknown: Default::default(),
+        };
+        let mut service = resolved_config(Path::new("/unused"), Path::new("/data/index"));
+        service.vault_path = None;
+        service.mounts = vec![mount.clone()];
+
+        // The `vault:` line and the mount line agree on the location, and only the mount
+        // line carries writability — see `MountBackendConfig::location`.
+        assert_eq!(service.root_location(), "https://couch.example/vault");
+        assert_eq!(
+            render_mount_line(&mount, Some(Path::new("/data/index"))),
+            "mount live at / (couchdb): https://couch.example/vault (read-only) \
+[index: /data/index]"
+        );
+
+        // The `vault` check is `ok`, not `fail`: a fully-remote vault is a supported
+        // configuration, and `doctor`'s exit code gates on `fail`.
+        let report = check_vault(&service);
+        assert_eq!(report.status, "ok", "{report:?}");
+        assert!(report.message.contains("no local directory"), "{report:?}");
+        assert!(report.message.contains("--probe-remote"), "{report:?}");
+
+        // Nothing anywhere names the keyring account or a password.
+        let rendered = format!(
+            "{} {} {}",
+            service.root_location(),
+            report.message,
+            render_mount_line(&mount, None)
+        );
+        assert!(!rendered.contains("live-password"), "{rendered}");
+
+        // `print-config` writes `vaultPath: null` rather than an invented path — and it
+        // does so through the SAME branch a filesystem-rooted mount table has always
+        // taken, because `to_persisted_config` already emitted `None` for any declared
+        // table. So a remote root changes nothing about this output's shape, and a legacy
+        // `vaultPath` config still prints its path.
+        let printed = print_config(
+            &resolved_runtime(PathBuf::from("/tmp/none.json"), service),
+            true,
+        )
+        .expect("print-config");
+        assert_eq!(printed.config.vault_path, None);
+        assert!(
+            printed.text.contains("\"vaultPath\": null"),
+            "{}",
+            printed.text
+        );
+        // `print-config` DOES echo the `passwordRef` — a keyring service and account name
+        // are how an operator finds the entry, not the secret behind it, and this command
+        // exists to show what the file says. It is `location()` that omits them, because a
+        // line answering "where is my vault" has no use for them. Asserted here so the two
+        // different-by-design behaviours are recorded side by side.
+        assert!(printed.text.contains("live-password"), "{}", printed.text);
+    }
+
+    /// `--vault-snippets` on a remote-rooted config reports `skip` with a reason, and
+    /// does not fail the rest of `setup-service`.
+    ///
+    /// A skip rather than an error because the snippets are one of three independent
+    /// installs, and taking `--mcp` and `--skills` down with them would be a worse answer
+    /// than doing the two that are possible and saying why the third was not.
+    #[test]
+    fn vault_snippets_are_skipped_for_a_remote_root_with_a_reason() {
+        let reports = setup_vault_snippets(None, true, false).expect("a skip is not an error");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, "skip");
+        assert!(!reports[0].changed);
+        assert!(
+            reports[0].message.contains(".obsidian"),
+            "the reason must say what is missing: {:?}",
+            reports[0]
+        );
+        assert!(
+            reports[0].message.contains("each device"),
+            "the remedy must say where they DO belong: {:?}",
+            reports[0]
         );
     }
 

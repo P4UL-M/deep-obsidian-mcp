@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Config keys this build does not know, kept verbatim so a load→save round trip
 /// cannot delete them.
@@ -371,6 +371,70 @@ impl MountBackendConfig {
             MountBackendConfig::Algolia { .. } => "algolia",
         }
     }
+
+    /// Where this mount's content lives, as one operator-facing string with **no
+    /// secret in it**.
+    ///
+    /// The single source for every place that has to name a mount's location:
+    /// `doctor`'s per-mount lines, `doctor`'s and `setup-service`'s `vault:` line, and
+    /// the health / readiness / vault-overview `vaultPath` field. Before a remote
+    /// backend could be the ROOT mount those were two unrelated renderings — a path
+    /// for the root, a provider string per mount — and they can no longer be, because
+    /// the root's location may now be a url.
+    ///
+    /// # Why printing this verbatim is safe
+    ///
+    /// Nothing here is a credential and nothing here is even a secret IDENTIFIER:
+    ///
+    /// * a filesystem mount renders its `vaultPath`, exactly as the top-level
+    ///   `vaultPath` has always been rendered — **byte for byte**, which is what keeps
+    ///   every legacy config's `doctor` output and health payload unchanged;
+    /// * a couchdb mount renders `url/database`, and `url` is validated at config load
+    ///   to carry no `user:password@` userinfo
+    ///   ([`deep_obsidian_config::ConfigError::CouchdbUrlHasUserinfo`]);
+    /// * an algolia mount renders `appId/indexName` plus an explicit `baseUrl`, which
+    ///   is validated the same way
+    ///   ([`deep_obsidian_config::ConfigError::AlgoliaBaseUrlHasUserinfo`]).
+    ///
+    /// `passwordRef` / `apiKeyRef` are deliberately absent: they are not secret, but a
+    /// keyring service name is noise in a line an operator reads to find out where
+    /// their vault is.
+    ///
+    /// # Why the `(read-only)` marker is NOT here
+    ///
+    /// Writability is a property of the mount, not of its location, and only
+    /// `doctor`'s per-mount line reports it. Appending it here would have put
+    /// `(read-only)` into the health payload's `vaultPath` — a field consumers read as
+    /// a location — so the marker stays at that one call site.
+    pub fn location(&self) -> String {
+        match self {
+            MountBackendConfig::Filesystem { vault_path, .. } => vault_path.display().to_string(),
+            MountBackendConfig::Couchdb { url, database, .. } => format!("{url}/{database}"),
+            MountBackendConfig::Algolia {
+                app_id,
+                index_name,
+                base_url,
+                ..
+            } => format!(
+                "{app_id}/{index_name}{}",
+                match base_url {
+                    Some(base_url) => format!(" via {base_url}"),
+                    None => String::new(),
+                }
+            ),
+        }
+    }
+
+    /// The local directory this mount reads, or `None` for a backend that has none.
+    ///
+    /// The one predicate that separates "there is a filesystem here" from "there is
+    /// not", so callers stop pattern-matching the variant to find out.
+    pub fn local_vault_path(&self) -> Option<&Path> {
+        match self {
+            MountBackendConfig::Filesystem { vault_path, .. } => Some(vault_path),
+            MountBackendConfig::Couchdb { .. } | MountBackendConfig::Algolia { .. } => None,
+        }
+    }
 }
 
 /// Bounded LRU cache of hydrated note bodies for an Algolia mount.
@@ -599,10 +663,32 @@ pub struct PersistedServiceConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedServiceConfig {
-    /// The ROOT mount's vault path. Unchanged meaning: the runtime watcher, the
-    /// search index, and `doctor` all still consume exactly this. A resolved
-    /// config always has a root mount, so this always has a meaning.
-    pub vault_path: PathBuf,
+    /// The ROOT mount's LOCAL vault directory, when it has one.
+    ///
+    /// `Some` for a filesystem root — which is every legacy `vaultPath` config and
+    /// every mount table whose `mountAt: ""` entry is a filesystem backend — and it
+    /// then carries exactly the path it always carried, resolved by exactly the same
+    /// code. `None` when the root mount is a couchdb or algolia backend, because such
+    /// a vault has no local directory at all.
+    ///
+    /// # Why `Option` rather than a `RootLocation` enum
+    ///
+    /// The question every consumer actually asks is "is there a directory here?", and
+    /// an `Option<PathBuf>` asks it in the type. The alternative — an enum carrying the
+    /// remote's url or app id — would duplicate what the root mount's own
+    /// [`MountBackendConfig`] already holds, and the two copies could disagree. The
+    /// callers that need to NAME a remote root (doctor, health) read
+    /// [`MountBackendConfig::location`] off the mount table instead, which is where
+    /// that information lives.
+    ///
+    /// # The invariant
+    ///
+    /// `mounts.is_empty()` ⇒ `vault_path.is_some()`. A legacy config's root mount is
+    /// implicit and its only expression is this field, so a rootless legacy config
+    /// cannot exist; `normalize_service_config` is the gate that guarantees it, and
+    /// [`ResolvedServiceConfig::mount_table`] is the one place that relies on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_path: Option<PathBuf>,
     /// The mount table AS DECLARED, normalized.
     ///
     /// Empty means the config declared no `mounts` at all — i.e. it is a legacy
@@ -683,7 +769,16 @@ impl ResolvedServiceConfig {
                 id: IMPLICIT_ROOT_MOUNT_ID.to_string(),
                 mount_at: String::new(),
                 backend: MountBackendConfig::Filesystem {
-                    vault_path: self.vault_path.clone(),
+                    // The one place the `mounts.is_empty() ⇒ vault_path.is_some()`
+                    // invariant is relied on, and it is asserted rather than papered
+                    // over: an empty path here would be normalized against the
+                    // process working directory by `ensure_vault_path`, so the server
+                    // would silently index and serve its own CWD. See
+                    // [`ResolvedServiceConfig::vault_path`].
+                    vault_path: self
+                        .vault_path
+                        .clone()
+                        .expect("a config with no mount table to carry a root vault path"),
                     index_dir: None,
                 },
                 // Empty by construction, not by omission: this mount is SYNTHESIZED
@@ -701,6 +796,27 @@ impl ResolvedServiceConfig {
     /// "not federated yet" guard: single-mount configs must never take one.
     pub fn is_multi_mount(&self) -> bool {
         self.mounts.len() > 1
+    }
+
+    /// The ROOT mount. Infallible for the same reason [`Self::mount_table`] is.
+    pub fn root_mount(&self) -> MountConfig {
+        let table = self.mount_table();
+        table
+            .into_iter()
+            .find(|mount| mount.mount_at.is_empty())
+            .expect("a resolved config to declare a root mount")
+    }
+
+    /// Where the vault ROOT lives, as one secret-free string.
+    ///
+    /// What the health / readiness / vault-overview `vaultPath` field reports and what
+    /// `doctor` prints on its `vault:` line. For a filesystem root this is the vault
+    /// directory rendered exactly as it always was — `Path::display()` on the same
+    /// path — so every legacy payload and every golden is unchanged. For a remote root
+    /// it is `url/database` or `appId/indexName`; see
+    /// [`MountBackendConfig::location`] for why that is safe to print.
+    pub fn root_location(&self) -> String {
+        self.root_mount().backend.location()
     }
 
     pub fn service_endpoints(&self) -> ServiceEndpoints {

@@ -356,14 +356,50 @@ pub async fn run_http_service(
     let state = AppState::with_backends(config.clone(), runtimes.clone(), &backends)
         .with_upload_base(upload_base_url(&config));
 
-    // Startup validation gate. Every mount must be reachable, and the backend
-    // reports unreachability with core's wording, so the failure a user sees for a
-    // single-mount config is unchanged.
-    state
-        .router
-        .execute(deep_obsidian_backend::BackendRequest::health_overview())
-        .await
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // Startup validation gate, applied PER MOUNT rather than through the router's
+    // all-mounts overview.
+    //
+    // # Why the loop is here and not delegated
+    //
+    // `VaultRouter`'s `Health::Overview` fails on the FIRST mount that errors, whichever
+    // mount that is. That was the right gate while every mount was a local directory: a
+    // missing directory is a permanent configuration error and fail-fast puts it in front
+    // of the operator. It is the wrong gate now that a mount can be remote, because a
+    // remote backend that could not even be CONSTRUCTED — a missing secret, a missing
+    // sidecar bundle — becomes an `UnavailableBackend` that errors on every request
+    // including this one. Under the old gate that made such a mount fatal, which
+    // contradicted the very message it logs ("the vault root keeps serving and readiness
+    // reports the server as degraded") and which for a REMOTE ROOT would mean an
+    // unreachable remote can brick a service.
+    //
+    // So the failure a mount is allowed to cause is decided by
+    // [`crate::runtime::root_failure_is_fatal`] — the same predicate the index bootstrap
+    // uses, so the two gates cannot drift. A local root still fails startup with the
+    // backend's own wording, so the failure a user sees for a single-mount config is
+    // unchanged. Anything else degrades: the mount is left in the router refusing its own
+    // paths with its own reason, `/readyz` reports 503 naming it, and every healthy mount
+    // serves normally.
+    //
+    // Note that a couchdb mount whose remote is merely DOWN never reached this branch even
+    // before: its `Health::Overview` answers `Ok(reachable: false)` rather than erroring,
+    // precisely so an outage is a readiness fact instead of a startup failure.
+    for entry in backends.entries() {
+        let Err(error) = entry
+            .backend
+            .execute(deep_obsidian_backend::BackendRequest::health_overview())
+            .await
+        else {
+            continue;
+        };
+        if crate::runtime::root_failure_is_fatal(&entry.mount) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
+        }
+        warn!(
+            "mount '{}' is not serveable at startup: {error}; the server starts DEGRADED and \
+readiness reports it as such",
+            entry.mount.id
+        );
+    }
 
     let auth_state = resolve_auth_state(&config)?;
     enforce_auth_exposure(&config, auth_state.enabled)?;
@@ -443,7 +479,7 @@ mod tests {
     fn config_with(host: &str, auth_enabled: bool) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
             federated_rerank: true,
-            vault_path: PathBuf::from("/tmp/vault"),
+            vault_path: Some(PathBuf::from("/tmp/vault")),
             index_dir: PathBuf::from("/tmp/index"),
             mounts: Vec::new(),
             experimental: Default::default(),

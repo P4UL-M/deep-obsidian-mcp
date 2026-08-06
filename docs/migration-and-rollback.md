@@ -40,9 +40,14 @@ is not really a migration: you are mounting an existing vault, not converting a 
 into one. There is deliberately no "push my folder into CouchDB" command.
 
 1. Set up Self-hosted LiveSync in Obsidian and let it populate the database.
-2. Add the mount to `config.json` by hand. `experimental.multiVault` and
-   `experimental.couchdbVaults` are both required; the mount cannot be the root. See
-   [CONFIGURATION.md](../CONFIGURATION.md) for every field.
+2. Add the mount to `config.json` by hand. `experimental.couchdbVaults` is required, and
+   `experimental.multiVault` too whenever the table has more than one entry — a LiveSync
+   database mounted *as the whole vault* is a one-mount table and needs only the couchdb
+   flag. See [CONFIGURATION.md](../CONFIGURATION.md) for every field, and
+   [§ A remote mount at the vault root](../CONFIGURATION.md#a-remote-mount-at-the-vault-root)
+   before you make it the root: there is then no `vaultPath` anywhere,
+   `setup-service --vault-snippets` has nowhere to install, and an unreachable remote
+   starts the service degraded rather than failing it.
 3. Store the password under the id your `passwordRef` names — in the OS keyring, or in the
    encrypted secrets file. `options` (chunking/hashing) **must match how the vault was
    written**, or content is reassembled wrongly.
@@ -109,8 +114,13 @@ index that several participants mount at once. Note bodies go to a hosted third-
 service. Read [algolia-mounts.md](./algolia-mounts.md) — especially the security section —
 before you put anything real in one.
 
-1. Add the mount by hand; `experimental.multiVault` and `experimental.algoliaVaults` are
-   both required, and the mount cannot be the root.
+1. Add the mount by hand; `experimental.algoliaVaults` is required, and
+   `experimental.multiVault` too whenever the table has more than one entry. An algolia
+   mount *may* be the root, but think twice: an Algolia corpus has no local search index,
+   so a vault rooted on one loses `vault_info`, `build_index` and `recommend_folder` while
+   keeping reads, writes, listings and `grep_search`. Mounting it under a filesystem or
+   couchdb root keeps the whole surface — see
+   [§ A remote mount at the vault root](../CONFIGURATION.md#a-remote-mount-at-the-vault-root).
 2. Store the API key under the id `apiKeyRef` names (or set
    `$DEEP_OBSIDIAN_ALGOLIA_API_KEY`, which shadows it with a `warn`).
 3. Check it: `deep-obsidian-mcp algolia status --mount wiki`, or

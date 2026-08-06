@@ -43,7 +43,16 @@ Resolution precedence:
 
 Rules:
 
-- `vaultPath` is required before service startup.
+- A vault ROOT is required before service startup, and it may be any backend kind. A legacy
+  config expresses it as `vaultPath`; a mount table expresses it as the mount with
+  `mountAt: ""`. Exactly one of the two, never both, and never neither: a table with no root
+  mount is refused, because `""` is the only prefix that matches every path and without it a
+  path outside every declared prefix would resolve to nothing.
+- `vaultPath` is therefore absent from a config whose root mount is a CouchDB or Algolia
+  backend — such a vault has no local directory at all. Everywhere a vault location is
+  REPORTED (`doctor`'s `vault:` line, `healthz`/`readyz`/`vault_info`'s `vaultPath`) a remote
+  root renders `url/database` or `appId/indexName`, which carries no credential. A filesystem
+  root renders the same path it always did, byte for byte.
 - `transport` must default to `stdio` for subprocess use and `http` for service wrappers.
 - `http.mcpPath` and `http.healthPath` must normalize to leading-slash paths.
 - `embedding.apiKeyRef` stores a reference to a secret, not the secret itself.
@@ -72,6 +81,34 @@ The health endpoint must be lightweight and read-only. It must not trigger index
 
 Readiness is distinct from health. The service should expose a readiness endpoint, currently `/readyz`, that reports whether the index is usable, still loading, or degraded. Packaging and service managers should use readiness, not health alone, as the MCP usability gate.
 
+### Startup failure: fail fast, or start degraded
+
+Which of the two a failing mount causes depends on the KIND of failure, not on where the
+mount sits:
+
+- **A mount backed by a LOCAL DIRECTORY at the vault root fails startup.** A directory that
+  is missing, misspelled or unreadable is a permanent configuration error; nothing about
+  waiting improves it, and a green process serving errors for the whole vault would hide the
+  mistake. This is unchanged, and it covers every legacy `vaultPath` config. It applies to
+  stdio too, where a client can show a startup failure but has nowhere to show a readiness
+  probe.
+- **Everything else starts DEGRADED.** Any non-root mount, and a REMOTE mount at the vault
+  root. An unreachable remote is an outage: the url and credentials are right and the server
+  is down, slow, or mid-rebuild. Making that fatal would let a network blip brick a service a
+  supervisor then restart-loops, and would take the healthy mounts down with it.
+
+A degraded start is honest, not silent. Readiness answers 503, the failing mount is named,
+health says so, and every path on that mount refuses with the backend's own reason — never
+with an empty result, which a caller could not distinguish from an empty vault. Other mounts
+serve normally.
+
+A degraded remote mount must also be able to RECOVER without a process restart. A CouchDB
+mount re-hand-shakes on a bounded backoff until its remote answers, so a service that came up
+while CouchDB was down comes back by itself; an Algolia mount probes its index on every call,
+so it never caches a stale verdict. The retry stops when the remedy is in the mount's own
+configuration — rejected credentials, a wrong passphrase — because a running process cannot
+re-read its config, and retrying would be a stream of failed logins that can never succeed.
+
 ## Agent Workflows
 
 The MCP API may expose additive prompts for common Obsidian workflows. These prompts must not replace or rename existing tools. They should guide clients toward safe tool use: narrow retrieval, outline-first inspection, graph-aware context, dry-run for broad writes, and hash guards for existing-note updates.
@@ -80,7 +117,7 @@ Packaged skill templates are documentation-like agent instructions, not runtime 
 
 `doctor` should also report non-secret local diagnostics, including config source attribution, auto-reindex settings, MCP/health/readiness endpoint URLs, index SQLite path and size, index schema metadata when available, and the latest health/readiness payload when service endpoints respond.
 
-The service should fail fast when required config is missing or the vault cannot be read.
+The service should fail fast when required config is missing or a LOCAL root vault cannot be read. A root vault that is remote and unreachable is an outage rather than a missing config, and starts degraded instead — see "Startup failure" above.
 
 ## MCP Contract
 
@@ -110,18 +147,34 @@ Conditionally advertised (see "Tool availability" below): `grep_search`, `delete
 `tools/list` is computed once per process. Three inputs, and only these three, may change
 what it contains. Everything else about it is frozen.
 
-1. **Environment — ripgrep.** `grep_search` is advertised if and only if the ROOT mount
-   declares `grep-search`, which on a filesystem root means a working `rg` was resolved.
-   "rg works or `grep_search` does not exist": it is omitted rather than
-   advertised-and-failing.
+1. **Environment and mounts — line search.** `grep_search` is advertised **if and only if
+   at least one mount declares `grep-search`**. A filesystem mount declares it only when a
+   working `rg` was resolved; a CouchDB mount and an Algolia mount always declare it, since
+   they imitate ripgrep above their own storage rather than spawning one (see "Line search
+   per backend" below). "Some mount can serve line search, or `grep_search` does not exist":
+   it is omitted rather than advertised-and-failing.
 
-   Keyed on the root deliberately. A non-root mount may declare `grep-search` without any
-   `rg` on the host — a CouchDB mount serves line search by imitating ripgrep in-process
-   over note text it reads back (see "Line search per backend" below) — but `tools/list` is
-   computed once per process and cannot say "available for some paths". Advertising the tool
-   because a non-root mount can serve it would advertise a tool that then fails on the rest
-   of the vault. Per-mount truth is in `vault_info.mounts[].capabilities`; a caller that has
-   read `grep-search` there can scope a grep to that mount.
+   This used to be keyed on the ROOT mount, which was defensible only while the root was
+   guaranteed to be a local directory. It no longer is — a CouchDB or Algolia backend may be
+   the vault root — and asking the root would then answer for the wrong thing entirely,
+   reporting no line search for a fully-remote vault that greps perfectly well.
+
+   The widened rule changes exactly one configuration that could already exist: a filesystem
+   root on a host with no `rg`, plus a remote mount. That used to hide `grep_search` and now
+   advertises it. Advertising is the honest answer, because an unscoped grep FEDERATES and
+   tolerates a mount that cannot serve it — the capable mounts return their matches and the
+   incapable ones are named in the payload's `missingMounts` with `exhausted: false`. A
+   caller gets real matches plus an explicit statement of what was not searched, instead of a
+   tool that does not exist for a vault where most of it works. The converse — hiding the
+   tool because SOME mount cannot grep — is rejected for the same reason: it would remove
+   line search from a vault it works on.
+
+   A vault with no grep-capable mount at all still gets no `grep_search`, which is what keeps
+   the frozen single-mount tool list unchanged: one filesystem mount with no `rg` declares
+   no capability, so the tool is absent exactly as before.
+
+   Per-mount truth stays in `vault_info.mounts[].capabilities`; a caller that has read
+   `grep-search` there can scope a grep to that mount.
 2. **Configuration — multiple mounts.** A multi-mount vault adds an OPTIONAL `scope`
    argument to the recall tools that rank (`hybrid_search`, `load_knowledge`,
    `search_artifacts`). It adds no tool and removes none. A single-mount vault's list is
@@ -224,7 +277,13 @@ Resources must preserve:
 A vault may be composed of several **mounts**, each a prefix of the logical namespace
 served by its own storage backend. This is experimental and off by default: a config with
 no `mounts` table resolves to exactly one filesystem mount at the root and every rule
-below collapses to what it has always been. The shape of the config, and the per-backend
+below collapses to what it has always been.
+
+Any mount may be the ROOT, including a remote one, so a vault may have no filesystem in it at
+all — a CouchDB root on its own, or a CouchDB root with an Algolia mount under it. Such a
+table needs no `multiVault` flag when it has one entry: a one-mount table is the legacy shape
+spelled out longhand. The rules below apply to a fully-remote vault exactly as written; the
+only thing that changes is which mount is at `""`. The shape of the config, and the per-backend
 setup, live in [CONFIGURATION.md § Multiple vaults](../CONFIGURATION.md#multiple-vaults-mounts)
 and [docs/algolia-mounts.md](./algolia-mounts.md); this section states only the rules a
 *client* can rely on, and it is a reference — the per-doc details are not repeated here.
@@ -263,10 +322,18 @@ become reachable at once:
 - **Enumeration refuses rather than under-reporting.** A whole-vault listing that cannot
   reach a mount fails, naming the mount. A listing that silently omitted it would assert
   those notes do not exist.
-- **Readiness names the mount.** A failing non-root mount degrades readiness (`503`,
-  `degradedMounts`) while the root keeps serving. The frozen top-level wording is unchanged;
-  the mount id appears in the additive per-mount detail rather than being laundered into
-  `lastError`.
+- **Readiness names the mount.** A failing mount degrades readiness (`503`,
+  `degradedMounts`); when it is a non-root mount the vault root keeps serving, and when it is
+  a remote root the server still starts so it can say so. The frozen top-level wording is
+  unchanged; the mount id appears in the additive per-mount detail rather than being laundered
+  into `lastError`.
+- **No local index is not a degraded index.** An Algolia mount has none by design, so it
+  reports `indexStatus: "none"` and `localIndex: false` and never appears in
+  `degradedMounts`. When such a mount is the vault ROOT there is no root index at all: the
+  index-derived tools (`vault_info`, `build_index`, `recommend_folder`, the vault-overview
+  resource) refuse with the reason a scoped call on an index-less mount already gives, reads
+  and writes work normally, and readiness stays green with no index statistics in the
+  payload rather than another mount's numbers presented as the vault's.
 
 ### Capability gating, and its one exception
 
@@ -296,9 +363,12 @@ fix it sends the reader to the wrong place. See
 - **Change cursors are not persisted.** A backend rebuilt from config starts with no cursor
   and replays from the beginning, so it misses nothing but does more work. Cursors survive a
   child-process restart within one supervisor's life, not a server restart.
-- **A cached compatibility verdict needs a restart.** A CouchDB mount whose remote was
-  unreachable when the sidecar hand-shook stays degraded until the child re-hand-shakes;
-  bringing the remote back does not by itself clear it.
+- **Recovery is eventual, not immediate.** A CouchDB mount whose remote was unreachable when
+  the sidecar hand-shook re-hand-shakes on a bounded backoff (capped at 30s) until the remote
+  answers, with no process restart — but the verdict is cached between attempts, so there is a
+  window after the remote returns in which the mount still refuses. A mount whose verdict
+  could only be fixed by editing the config is not retried at all; see "Startup failure"
+  above.
 
 ## Fixture Vault Contract
 

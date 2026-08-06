@@ -53,9 +53,47 @@ All notable changes to deep-obsidian-mcp are documented here.
     actually serve them, and refuse per-path by naming the mount, its backend, and
     the mounts that do support the operation. A tool that could only ever refuse is
     not advertised at all.
+  - **Any backend can be the vault ROOT, including a fully-remote vault.** A
+    `couchdb` or `algolia` mount may sit at `mountAt: ""`, so a vault can have no
+    local directory in it at all — a LiveSync database on its own, or a LiveSync
+    root with a shared Algolia corpus grafted under it. A one-mount table needs only
+    that backend's own experimental flag. What is still refused is a table with *no*
+    root mount: `""` is the only prefix that matches every path, and without it a
+    typo in a prefix would silently become "no such path". Nothing changes for a
+    filesystem-rooted config, and every frozen payload is byte-identical: `vaultPath`
+    still renders the same directory through the same code, and a remote root renders
+    a secret-free `url/database` or `appId/indexName` instead of an empty line.
+    `setup-service --vault-snippets` reports `skip` on a remote root (there is no
+    `.obsidian` folder to install into) without taking `--mcp` and `--skills` down
+    with it, `doctor`'s `vault` check reports `ok` and points at `--probe-remote`, and
+    a remote root's index defaults to the application data directory rather than
+    inside a vault that does not exist. An `algolia` root has no local search index by
+    design, so the index-derived tools refuse on such a vault while reads, writes,
+    listings and `grep_search` all work; a `couchdb` root has one, so a fully-remote
+    LiveSync vault keeps the whole surface.
+  - **An unreachable remote root starts DEGRADED and recovers by itself.** A missing
+    *local* root directory still aborts startup — it is a permanent mistake, and a
+    green process serving errors for the whole vault would hide it. A remote root that
+    cannot be reached is an outage instead, so the service starts, `/readyz` answers
+    503 naming the mount, and every path refuses with the backend's own reason rather
+    than with an empty result. A CouchDB mount then **re-hand-shakes on a bounded
+    backoff until its remote answers, with no process restart** — previously the
+    compatibility verdict was decided once per child and an operator whose CouchDB was
+    down at startup had to restart the service. A verdict only a config change could
+    fix (rejected credentials, a wrong E2EE passphrase) is not retried, because a
+    running process cannot re-read its config.
+  - **`grep_search` is advertised when ANY mount can serve it**, rather than only when
+    the root can. Keying it on the root was defensible only while the root was
+    guaranteed to be a local directory. One pre-existing configuration changes: a
+    filesystem root on a host with no `rg`, plus a remote mount, now advertises the
+    tool — honestly, because an unscoped grep federates and names the mounts it could
+    not search in `missingMounts`. A vault with no grep-capable mount still gets no
+    `grep_search`.
   - **Packaging and diagnostics.** The sidecar ships in the `.deb`, `doctor`
     reports per-mount status, and readiness degrades by mount name (`503`,
-    `degradedMounts`) while the vault root keeps serving.
+    `degradedMounts`) while the vault root keeps serving. A single fully-remote mount
+    gets the additive `mounts[]` report too, so a LiveSync vault with no filesystem
+    beside it still has a surface for its capabilities and its unreconciled conflicts.
 
 ### Improved
 

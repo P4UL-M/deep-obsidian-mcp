@@ -109,7 +109,7 @@ impl Fixture {
     fn config(&self) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
             federated_rerank: true,
-            vault_path: self.vault_path.clone(),
+            vault_path: Some(self.vault_path.clone()),
             index_dir: self.index_dir.clone(),
             // Legacy shape: no declared mounts, so the router synthesizes the one
             // implicit root mount. Every golden below is therefore asserting the
@@ -432,7 +432,16 @@ async fn initialized_notification_produces_no_response() {
 ///
 /// `tools/list` is computed per process from exactly three things:
 ///
-/// 1. **`rg_available`** (environment) — adds `grep_search`. Asserted below.
+/// 1. **`rg_available`** — adds `grep_search`. Asserted below.
+///
+///    Named for the environment fact it started as, but it is now a MOUNT-TABLE fact:
+///    `AppState` computes it as "at least one mount's descriptor carries
+///    `Capability::GrepSearch`", because a couchdb or algolia mount serves line search
+///    with no `rg` anywhere on the host. On this fixture the two coincide — a single
+///    filesystem mount declares the capability only when `rg` resolved — and
+///    `Fixture::state` pins the flag to `false` regardless, which is what makes the
+///    golden independent of whether the machine running the suite happens to have
+///    ripgrep installed. The `true` case is exercised below by setting the flag.
 /// 2. **multi-mount** (configuration) — adds the `scope` ARGUMENT to the routed recall
 ///    tools, never a tool. Asserted in `multi_vault.rs`.
 /// 3. **mount capabilities** (configuration) — a mount advertising `version-history` adds
