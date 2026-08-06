@@ -44,9 +44,13 @@
 //!
 //! # What is deliberately not here
 //!
-//! No `secrets set`. [`store_mount_secret`] is the one place such a command would have to
-//! agree with about ref shapes; [`SecretReader`] is the injection point both the wizard and
-//! the tests drive instead of a tty.
+//! Rotation. This module DECIDES where a new credential goes — [`store_mount_secret`] prefers
+//! the OS keyring and falls back to the encrypted file — and it may, because it also writes
+//! the reference it chose into the config in the same run. Changing the value behind a
+//! reference that is already in the file is [`crate::secrets_cmd`], which has the opposite
+//! rule: it never modifies the config, so it must write to the reference the file already
+//! contains and must never fall back. [`SecretReader`] is the seam both share, and the
+//! injection point the wizard and the tests drive instead of a tty.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -332,12 +336,22 @@ impl SecretReader {
     }
 
     /// The next secret, prompting masked when this reader is interactive.
-    fn next(&mut self, label: &str) -> Result<SecretString> {
+    ///
+    /// `pub` for [`crate::secrets_cmd`], which reads exactly one secret through the same
+    /// seam: the blank-is-an-error rule is the one a rotation wants too, since an empty
+    /// CouchDB password stored over a working one fails later as an authentication error
+    /// rather than now as a typo.
+    pub fn next(&mut self, label: &str) -> Result<SecretString> {
         let value = match &mut self.lines {
+            // Worded for BOTH callers: `mounts add` may need two lines, `secrets set` needs
+            // exactly one, and a message naming only the first would read as nonsense on an
+            // empty stdin from the second.
             Some(lines) => lines.pop_front().ok_or_else(|| {
                 anyhow!(
                     "no value left on stdin for {label}: pass one line per secret, in the \
-                     documented order (password, then E2EE passphrase)"
+                     documented order (`secrets set --stdin` reads one line; `mounts add \
+                     --password-stdin --e2ee` reads the password first, then the E2EE \
+                     passphrase)"
                 )
             })?,
             None => crate::commands::prompt_optional_secret(label)?
@@ -399,7 +413,9 @@ fn derived_secret_ref(mount_id: &str, purpose: &str, prefer_os_keyring: bool) ->
 /// one a script drives with `--yes`, and a headless machine with no keyring daemon must
 /// not block on a question. It is reported rather than silent.
 ///
-/// This is the function a future `secrets set` command must agree with about ref shapes.
+/// This is the function [`crate::secrets_cmd`] agrees with about ref shapes — but only for
+/// the DERIVED case. A rotation reads the ref out of the config rather than deriving it, so a
+/// hand-written ref keeps working; see that module's docs.
 fn store_mount_secret(
     resolver: &SecretResolver,
     mount_id: &str,
@@ -655,8 +671,10 @@ fn build_mount(
                     passphrase_ref,
                     // Left unset: path obfuscation is a second, independent passphrase, and
                     // guessing that a vault has it enabled would make every read fail in a
-                    // way that looks like corruption. The `secrets set` slice is where a
-                    // second passphrase gets a home.
+                    // way that looks like corruption. So it stays a hand-written config key;
+                    // `secrets check` reports such a ref, and `secrets set` deliberately has
+                    // no `--field` for it, because creating one is a config change and that
+                    // command never writes the config.
                     obfuscate_passphrase_ref: None,
                 }),
             sidecar_path: sidecar_path.clone(),

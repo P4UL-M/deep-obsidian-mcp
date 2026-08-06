@@ -160,8 +160,106 @@ pub enum Command {
         #[command(subcommand)]
         command: MountsCommand,
     },
+    /// Rotate and verify the secrets the config REFERENCES.
+    Secrets {
+        #[command(subcommand)]
+        command: SecretsCommand,
+    },
     Help,
     Version,
+}
+
+/// Which of a mount's credentials `secrets set` addresses.
+///
+/// A fixed vocabulary, and the same one
+/// [`crate::mounts_cmd::store_mount_secret`](crate::mounts_cmd) keys its accounts by, so the
+/// two commands cannot disagree about what a mount's secrets are called.
+///
+/// The obfuscation passphrase (`e2ee.obfuscatePassphraseRef`) is deliberately absent: no
+/// command in this binary ever creates that reference, so a mount only has one if it was
+/// hand-written, and `secrets set` cannot invent one because it never modifies the config.
+/// `secrets check` still REPORTS it — see [`SecretsCommand::Check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SecretField {
+    /// A couchdb mount's `passwordRef`.
+    #[value(name = "password")]
+    Password,
+    /// A couchdb mount's `e2ee.passphraseRef`. Never defaulted to; see
+    /// [`SecretsCommand::Set`].
+    #[value(name = "e2ee-passphrase")]
+    E2eePassphrase,
+    /// An algolia mount's `apiKeyRef`.
+    #[value(name = "api-key")]
+    ApiKey,
+}
+
+/// The secrets that belong to the config as a whole rather than to a mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SecretTarget {
+    /// `auth.tokenRef` — the HTTP bearer token.
+    #[value(name = "auth-token")]
+    AuthToken,
+    /// `embedding.apiKeyRef` — the embedding provider's API key.
+    #[value(name = "embedding-api-key")]
+    EmbeddingApiKey,
+}
+
+/// Rotate the VALUE behind a reference the config already holds, and report where every
+/// reference resolves.
+///
+/// # Why this is a separate family from `mounts`
+///
+/// `mounts add` decides where a NEW credential goes; this family changes the value an
+/// EXISTING reference points at. The two are different operations with different safety
+/// rules, and conflating them is how a rotation silently orphans a reference: `mounts add`
+/// prefers the OS keyring and falls back to the encrypted file, because it also writes the
+/// reference it chose into the config. `secrets set` writes no config, so it has no such
+/// freedom — it must write to the reference the file already contains, whatever kind that
+/// is, or the config would keep pointing at a value nobody updated. See
+/// [`crate::secrets_cmd`].
+#[derive(Debug, Clone, Subcommand)]
+pub enum SecretsCommand {
+    /// Replace the value one reference points at. The config file is never modified.
+    ///
+    /// The new value is never a flag VALUE, for the reason a mount's password is not: it is
+    /// prompted MASKED, or read from the first line of stdin with `--stdin`.
+    ///
+    /// `--field` defaults by backend kind — a couchdb mount's `password`, an algolia
+    /// mount's `api-key`. `e2ee-passphrase` is never the default: a mount that has one also
+    /// has a password, so guessing would rotate the wrong secret and the failure would
+    /// surface as "cannot decrypt" rather than as a wrong answer here.
+    #[command(group(
+        clap::ArgGroup::new("subject")
+            .required(true)
+            .args(["mount", "target"])
+    ))]
+    Set {
+        /// The mount id, as it appears in the config's `mounts` table.
+        #[arg(long)]
+        mount: Option<String>,
+        /// Which of that mount's credentials to rotate. Defaults by backend kind.
+        #[arg(long, value_enum, requires = "mount")]
+        field: Option<SecretField>,
+        /// A secret that belongs to the config rather than to a mount.
+        #[arg(long, value_enum)]
+        target: Option<SecretTarget>,
+        /// Read the new value from stdin instead of prompting. For scripts and for tests.
+        ///
+        /// The FIRST line, with its newline stripped and nothing else changed: leading and
+        /// trailing spaces are part of the value, because a credential may legitimately end
+        /// in one and silently trimming it would store a secret nobody typed. A blank line
+        /// is refused rather than stored. Same contract as `mounts add --password-stdin`.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        stdin: bool,
+    },
+    /// One line per reference the config holds: where it resolves, or MISSING.
+    ///
+    /// Never prints a value, and never resolves one it does not have to — the check is
+    /// "does the store hold something under this reference", nothing more. Reports every
+    /// reference the file declares, including `e2ee.obfuscatePassphraseRef` and
+    /// `artifactEmbedding.apiKeyRef`, which `set` cannot address; the line names what would
+    /// rotate it, or says the reference is hand-configured only.
+    Check,
 }
 
 /// Editing operations on the config's `mounts` table.

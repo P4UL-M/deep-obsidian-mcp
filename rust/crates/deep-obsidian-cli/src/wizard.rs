@@ -1367,16 +1367,23 @@ async fn finish_through_setup_service(
     // So the installers are run HERE, with `request.overwrite`, and `setup_service` is asked
     // for none of them — which also makes this path structurally the same as the mount-table
     // one below, where the installers were always the wizard's own to run.
-    let report = crate::commands::setup_service(
-        &resolved,
-        request.dry_run,
-        true,
-        false,
-        false,
-        false,
-        transport.auth,
-        true,
-    )?;
+    let report = crate::commands::setup_service(&crate::commands::SetupServiceRequest {
+        resolved: &resolved,
+        dry_run: request.dry_run,
+        overwrite: true,
+        installs: InstallChoices::default(),
+        enable_auth: transport.auth,
+        interactive_auth: true,
+        // The wizard's OWN store, not the process default. This path used to be the one
+        // place a wizard run reached the real login keychain — the mount-table path below
+        // has always provisioned through `io.resolver` — so a test of "accept HTTP auth"
+        // could only be written against a remote root. See `WizardIo::prefer_os_keyring`.
+        auth_store: if io.prefer_os_keyring {
+            crate::commands::AuthStore::Default
+        } else {
+            crate::commands::AuthStore::Injected(&io.resolver)
+        },
+    })?;
     let (mcp, skills, vault_snippets) = crate::commands::run_installers(
         &report.endpoints,
         resolved.service.vault_path.as_deref(),
