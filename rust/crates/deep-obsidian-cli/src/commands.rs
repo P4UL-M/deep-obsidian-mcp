@@ -26,7 +26,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::cli::{Cli, Command, ServiceOptions};
+use crate::cli::{Cli, Command};
 use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -48,9 +48,9 @@ Usage:
   deep-obsidian-mcp algolia status --mount <id> [--json]
   deep-obsidian-mcp algolia retract --mount <id> --path <note> [--yes] [--json]
   deep-obsidian-mcp algolia key --mount <id> [--parent-key-ref <ref>] [--prefix <folder>] [--json]
-  deep-obsidian-mcp mounts add filesystem --id <id> --mount-at <prefix> --vault-path <dir> [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
-  deep-obsidian-mcp mounts add couchdb --id <id> --mount-at <prefix> --url <origin> --database <db> [--username <user>] [--password-stdin] [--writable] [--e2ee] [--sidecar-path <file>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
-  deep-obsidian-mcp mounts add algolia --id <id> --mount-at <prefix> --app-id <id> --index-name <index> [--base-url <url>] [--api-key-stdin] [--writable] [--participant-id <who>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
+  deep-obsidian-mcp mounts add filesystem [--id <id>] [--mount-at <prefix>] [--vault-path <dir>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
+  deep-obsidian-mcp mounts add couchdb [--id <id>] [--mount-at <prefix>] [--url <origin>] [--database <db>] [--username <user>] [--password-stdin] [--writable] [--e2ee] [--sidecar-path <file>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
+  deep-obsidian-mcp mounts add algolia [--id <id>] [--mount-at <prefix>] [--app-id <id>] [--index-name <index>] [--base-url <url>] [--api-key-stdin] [--writable] [--participant-id <who>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
   deep-obsidian-mcp mounts list [--json]
   deep-obsidian-mcp mounts remove --id <id> [--purge-index] [--yes] [--json]
 
@@ -66,10 +66,30 @@ Commands:
   help           Show this help.
   version        Print the current version.
 
+setup-service --wizard is the FIRST-INIT flow: it asks where your notes live (a local
+folder, or -- experimental -- a remote LiveSync/CouchDB vault or a shared Algolia index
+as the vault ROOT), offers to mount further vaults under subfolders, then asks about
+embeddings, transport (stdio by default; HTTP asks for a port and can generate a bearer
+token), and the --mcp/--skills/--vault-snippets installs. It ends by printing the
+resolved config with secrets shown only as references, asking once before writing it,
+and reporting the local doctor checks plus next steps. Every question can be answered
+with Enter to take the default, and prefills come from the config file that is already
+there, so a re-run is an edit. An interrupted run (^D, a closed pipe) writes nothing and
+removes any credential it had stored. It does NOT edit a config that already declares a
+mount table -- use the mounts family for that -- and it does not tune retention,
+recallWeight or cache.
+
 mounts is the checkable way to build a mount table, which setup-service refuses to
 rewrite. Every write goes through the same config loader the server uses, so this
 command cannot produce a config the server would then refuse to load; run
 `deep-obsidian-mcp mounts add --help` for the per-kind flags.
+
+mounts add is GUIDED when flags are missing: on a terminal it asks the same per-kind
+questions the wizard asks, treating the flags you did give as answers already supplied,
+so `mounts add couchdb --url https://couch.example` prompts only for the rest. With no
+terminal -- a script, a pipe, --yes, or --password-stdin/--api-key-stdin, which have
+already claimed stdin for the credential -- a missing required flag is an error naming
+every one of them at once, never a prompt that would hang.
 
 mounts add converts a legacy vaultPath-only config to an explicit root mount first
 (id `vault`, mountAt \"\", the same path -- it resolves identically), then appends. A
@@ -106,7 +126,9 @@ setup-service does NOT rewrite a config that declares a mount table, with or wit
 --overwrite, and refuses an auth change on one. Use the `mounts` family for the table
 (see below) and edit the file directly for anything else; --mcp, --skills and
 --vault-snippets still work. A content-changing write leaves the previous file at
-config.json.bak.
+config.json.bak. Without --transport the config it writes is HTTP, which is what the
+packaged service wants; an explicit --transport is honoured (the wizard uses this to
+write a stdio config).
 
 couchdb export writes every entry of one mount to a directory, plus a manifest.json
 recording each entry's revision, content hash and storage kind. Two exports of an
@@ -375,14 +397,20 @@ pub async fn run() -> Result<()> {
                 None
             };
             let report = if wizard {
-                setup_service_wizard(
-                    &cli.options,
+                // The wizard's own screens ask about auth, so `--auth` / `--no-auth` do not
+                // reach it: the transport screen is where authentication becomes a question
+                // at all (there is nothing to authenticate over stdio).
+                crate::wizard::run(&crate::wizard::WizardRequest {
+                    options: &cli.options,
                     dry_run,
                     overwrite,
-                    mcp,
-                    skills,
-                    vault_snippets,
-                )?
+                    installs: InstallChoices {
+                        mcp,
+                        skills,
+                        vault_snippets,
+                    },
+                })
+                .await?
             } else {
                 let resolved = crate::config::resolve_runtime_config(&cli.options)?;
                 setup_service(
@@ -398,7 +426,12 @@ pub async fn run() -> Result<()> {
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
+            } else if !wizard {
+                // The wizard has already printed this report, followed by its checks and its
+                // next steps — printing it again here would put the same block on screen
+                // twice, with the closing advice stranded in the middle. `--json` still
+                // renders, because a structured report is the one thing the wizard's own
+                // prose does not provide.
                 println!("{}", render_setup_service_report(&report));
             }
             Ok(())
@@ -1071,7 +1104,20 @@ pub fn setup_service(
     // (flag-driven), fall back automatically.
     interactive_auth: bool,
 ) -> Result<SetupServiceReport> {
-    let mut service = ensure_service_transport_http(resolved.service.clone())?;
+    // An EXPLICIT `--transport` is honoured; anything else becomes HTTP.
+    //
+    // Forcing HTTP unconditionally is what this line used to do, and for a config that
+    // never mentioned a transport that is still right: `setup-service` provisions the
+    // long-lived service, whose whole point is a stable endpoint. What it also did was
+    // silently discard `--transport stdio`, which is now a supported answer — the wizard's
+    // transport screen offers stdio as the default, since a client-launched subprocess is
+    // the simplest thing that works. A transport that came from the CONFIG FILE is still
+    // overridden, so every existing install keeps the behaviour it has today.
+    let mut service = if matches!(resolved.sources.transport, ResolvedSource::Cli) {
+        resolved.service.clone()
+    } else {
+        ensure_service_transport_http(resolved.service.clone())?
+    };
     // A DECLARED mount table is never rewritten — but the command no longer refuses
     // outright either, because refusing took `--mcp`, `--skills` and `--vault-snippets`
     // down with it and left the operator of a multi-mount install with no supported way
@@ -1137,9 +1183,7 @@ pub fn setup_service(
             .expect("a config with no mount table to carry a root vault path");
         let vault_path = absolute_path(&vault_path)?;
         service.vault_path = Some(vault_path.clone());
-        if matches!(resolved.sources.index_dir, ResolvedSource::Default) {
-            service.index_dir = default_packaged_index_dir(&vault_path);
-        }
+        apply_packaged_index_default(&mut service, &vault_path, resolved.sources.index_dir);
         validate_vault(&service)?;
         vault_access_messages = macos_vault_access_preflight(&vault_path, dry_run)?;
     }
@@ -1172,9 +1216,19 @@ pub fn setup_service(
     // Apply the auth choice before building the persisted config so it is
     // reflected in both the dry-run preview and the written file. A change here
     // forces a config write below even without `--overwrite`.
+    // The real store, always: `setup_service` is the flag-driven command and has no seam for
+    // an alternative one. The wizard's mount-table path provisions through its own injected
+    // resolver instead, which is what makes that path testable.
+    let auth_resolver = SecretResolver::new();
     match enable_auth {
-        Some(true) => provision_auth_token(&mut service.auth, dry_run, interactive_auth)?,
-        Some(false) => deprovision_auth_token(&mut service.auth, dry_run),
+        Some(true) => provision_auth_token(
+            &mut service.auth,
+            dry_run,
+            interactive_auth,
+            &auth_resolver,
+            true,
+        )?,
+        Some(false) => deprovision_auth_token(&mut service.auth, dry_run, &auth_resolver),
         None => {}
     }
     let auth_changed = enable_auth.is_some();
@@ -1194,27 +1248,24 @@ pub fn setup_service(
         format!("config: {}", config_path.display()),
     ];
     messages.extend(vault_access_messages);
+    let choices = InstallChoices {
+        mcp: install_mcp,
+        skills: install_skills,
+        vault_snippets: install_vault_snippets,
+    };
     if dry_run {
         if !declared_mounts {
             assert_creatable_directory(&service.index_dir)?;
         }
         assert_creatable_directory(&config_dir)?;
         let endpoints = endpoint_report(&build_service_endpoints(&service));
-        let mcp = if install_mcp {
-            setup_mcp_clients(&endpoints, true, overwrite)?
-        } else {
-            Vec::new()
-        };
-        let skills = if install_skills {
-            setup_agent_skills(true, overwrite)?
-        } else {
-            Vec::new()
-        };
-        let vault_snippets = if install_vault_snippets {
-            setup_vault_snippets(service.vault_path.as_deref(), true, overwrite)?
-        } else {
-            Vec::new()
-        };
+        let (mcp, skills, vault_snippets) = run_installers(
+            &endpoints,
+            service.vault_path.as_deref(),
+            choices,
+            true,
+            overwrite,
+        )?;
         return Ok(SetupServiceReport {
             config_file_path: config_path,
             written: false,
@@ -1281,21 +1332,13 @@ pub fn setup_service(
     }
 
     let endpoints = endpoint_report(&build_service_endpoints(&service));
-    let mcp = if install_mcp {
-        setup_mcp_clients(&endpoints, false, overwrite)?
-    } else {
-        Vec::new()
-    };
-    let skills = if install_skills {
-        setup_agent_skills(false, overwrite)?
-    } else {
-        Vec::new()
-    };
-    let vault_snippets = if install_vault_snippets {
-        setup_vault_snippets(service.vault_path.as_deref(), false, overwrite)?
-    } else {
-        Vec::new()
-    };
+    let (mcp, skills, vault_snippets) = run_installers(
+        &endpoints,
+        service.vault_path.as_deref(),
+        choices,
+        false,
+        overwrite,
+    )?;
 
     Ok(SetupServiceReport {
         config_file_path: config_path.clone(),
@@ -1308,6 +1351,26 @@ pub fn setup_service(
         skills,
         vault_snippets,
     })
+}
+
+/// Move a LOCAL root's index out of the vault when nothing chose a location for it.
+///
+/// The one rule `setup-service` applies to `indexDir` on a write, extracted so the wizard's
+/// recap can show the directory that will actually be persisted rather than the one the
+/// resolver happened to hand it. A recap that named a different index directory from the
+/// file written a second later would be worse than no recap.
+///
+/// Only for a local root: a remote one has no vault directory to move an index out of, and
+/// `normalize_service_config` has already anchored its default under the same application
+/// data directory.
+pub(crate) fn apply_packaged_index_default(
+    service: &mut ResolvedServiceConfig,
+    vault_path: &Path,
+    source: ResolvedSource,
+) {
+    if matches!(source, ResolvedSource::Default) {
+        service.index_dir = default_packaged_index_dir(vault_path);
+    }
 }
 
 /// Back up `config_path` before a CONTENT-CHANGING overwrite; return the backup path when
@@ -1382,7 +1445,17 @@ pub(crate) fn write_config_with_backup(
 /// Checked on the FILE rather than on the resolved config, because the file is what the
 /// wizard prefills from and what it would overwrite. Split out from the wizard so it is
 /// testable without a stdin.
-fn refuse_wizard_on_a_mounts_config(
+///
+/// # Why this survives a wizard that CREATES mount tables
+///
+/// The first-init wizard does build them — a remote root and any additional mount are mount
+/// table entries. What it still refuses is *editing* one that already exists, and the two are
+/// not in tension: writing a table it just assembled from answers is faithful by
+/// construction, while re-deriving an existing one from a fresh set of answers would silently
+/// drop every per-mount setting the wizard does not ask about (`options`, `cache`,
+/// `retention`, `recallWeight`, an explicit `indexDir`). `mounts add` / `mounts remove` change
+/// a table without touching the rest of it, which is why the refusal names them.
+pub(crate) fn refuse_wizard_on_a_mounts_config(
     config_path: &Path,
     existing: Option<&PersistedServiceConfig>,
 ) -> Result<()> {
@@ -1403,165 +1476,37 @@ fn refuse_wizard_on_a_mounts_config(
     ))
 }
 
-fn setup_service_wizard(
-    options: &ServiceOptions,
-    dry_run: bool,
-    overwrite: bool,
-    mcp: bool,
-    skills: bool,
-    vault_snippets: bool,
-) -> Result<SetupServiceReport> {
-    let mut options = options.clone();
-    // Prefill every prompt from the existing config file so re-running the
-    // wizard is an edit, not a from-scratch rewrite: pressing Enter keeps the
-    // current value instead of replacing it.
-    let config_path = options
-        .config
-        .clone()
-        .unwrap_or_else(deep_obsidian_config::default_config_path);
-    let existing = deep_obsidian_config::read_config_file(&config_path)
-        .ok()
-        .flatten();
-
-    // Refused HERE, before the first prompt, rather than after the last one.
-    //
-    // The wizard exists to write a config, and `setup_service` never writes one that
-    // declares a mount table. Left to fall through, the wizard would ask every question,
-    // provision nothing, and then fail on the auth guard — reporting an auth problem for
-    // what is really "this command does not edit this kind of file". Worse, it would have
-    // read as though answering differently could work.
-    //
-    // Checked on the FILE rather than on the resolved config because that is what the
-    // wizard prefills from and what it would overwrite.
-    refuse_wizard_on_a_mounts_config(&config_path, existing.as_ref())?;
-
-    if options.vault_path.is_none() {
-        let existing_vault = existing
-            .as_ref()
-            .and_then(|config| config.vault_path.as_ref())
-            .map(|path| path.display().to_string());
-        let answer = prompt_string("Vault path", existing_vault.as_deref())?;
-        if answer.trim().is_empty() {
-            return Err(anyhow!("vault path is required"));
-        }
-        options.vault_path = Some(PathBuf::from(answer));
-    }
-
-    let install_mcp = mcp || prompt_bool("Configure MCP clients?", false)?;
-    let install_skills = skills || prompt_bool("Install packaged skills?", false)?;
-    let install_vault_snippets = vault_snippets || prompt_bool("Install vault snippets?", false)?;
-    let existing_embedding = existing
-        .as_ref()
-        .and_then(|config| config.embedding.clone());
-    let has_embeddings = existing_embedding
-        .as_ref()
-        .map(|embedding| embedding.provider.is_some() || embedding.model.is_some())
-        .unwrap_or(false);
-    let enable_embeddings = prompt_bool("Enable embeddings?", has_embeddings)?;
-
-    if enable_embeddings {
-        options.embedding_provider = Some("openai-compatible".to_string());
-        let model = prompt_string(
-            "Embedding model",
-            existing_embedding
-                .as_ref()
-                .and_then(|embedding| embedding.model.as_deref()),
-        )?;
-        if !model.trim().is_empty() {
-            options.embedding_model = Some(model);
-        }
-        let base_url = prompt_string(
-            "Embedding base URL",
-            existing_embedding
-                .as_ref()
-                .and_then(|embedding| embedding.base_url.as_deref()),
-        )?;
-        if !base_url.trim().is_empty() {
-            options.embedding_base_url = Some(base_url);
-        }
-    }
-
-    let mut resolved = crate::config::resolve_runtime_config(&options)?;
-
-    if enable_embeddings {
-        let secret = prompt_optional_secret("Embedding API key (blank for no auth)")?;
-        if let Some(secret) = secret {
-            let reference = SecretRef::OsKeyring {
-                service: "deep-obsidian-mcp".to_string(),
-                account: "openai-embedding".to_string(),
-            };
-            if dry_run {
-                resolved.service.embedding.api_key_ref = Some(reference);
-            } else {
-                let resolver = SecretResolver::new();
-                match resolver.put(
-                    &reference,
-                    SecretString::from(secret.expose_secret().to_string()),
-                ) {
-                    Ok(()) => {
-                        resolved.service.embedding.api_key_ref = Some(reference);
-                    }
-                    Err(error) => {
-                        println!("OS keyring unavailable: {error}");
-                        if prompt_bool("Use encrypted local file fallback?", true)? {
-                            let fallback = SecretRef::EncryptedFile {
-                                id: "openai-embedding".to_string(),
-                            };
-                            resolver.put(&fallback, secret)?;
-                            resolved.service.embedding.api_key_ref = Some(fallback);
-                        } else {
-                            return Err(anyhow!("embedding API key was not stored"));
-                        }
-                    }
-                }
-            }
-        } else {
-            resolved.service.embedding.api_key_ref = None;
-        }
-    }
-
-    // This prompt is the one that made the wizard destructive: it is always
-    // answered, which sets `auth_changed` and bypasses the existing-config
-    // guard. Defaulting it from the current file means Enter keeps auth ENABLED
-    // on a vault that already had it, instead of silently deprovisioning the
-    // token. (The token itself is still regenerated and printed, so the change
-    // is visible rather than silent.)
-    let auth_enabled = existing
-        .as_ref()
-        .and_then(|config| config.auth.as_ref())
-        .and_then(|auth| auth.enabled)
-        .unwrap_or(false);
-    let enable_auth = prompt_bool(
-        "Enable HTTP bearer authentication (required for non-loopback exposure)?",
-        auth_enabled,
-    )?;
-
-    setup_service(
-        &resolved,
-        dry_run,
-        overwrite,
-        install_mcp,
-        install_skills,
-        install_vault_snippets,
-        Some(enable_auth),
-        true,
-    )
-}
-
 /// Generate an HTTP bearer token, store it through the shared secret store, and
 /// print it to stdout exactly once so the operator can configure their client.
 /// Wires the resulting reference into `auth`. In `dry_run` nothing is stored.
 /// When `interactive` is false the encrypted-file fallback is used automatically
 /// if the OS keyring is unavailable (no prompt), suiting flag-driven automation.
-fn provision_auth_token(
+///
+/// # Why the store is a parameter
+///
+/// It was not, and that made this function untestable: a `SecretResolver` routes by reference
+/// SHAPE, so the `osKeyring` reference below reached the developer's real login keychain
+/// whatever store the caller thought it was using — which on macOS means a GUI authorization
+/// dialog and a test run that hangs until someone clicks it. `prefer_os_keyring = false` keeps
+/// a test, and a headless CI runner, in the encrypted file. The same two parameters
+/// `add_with_resolver` takes, for the same reason.
+pub(crate) fn provision_auth_token(
     auth: &mut deep_obsidian_types::AuthConfig,
     dry_run: bool,
     interactive: bool,
+    resolver: &SecretResolver,
+    prefer_os_keyring: bool,
 ) -> Result<()> {
     let token = deep_obsidian_server::auth::generate_token();
-    let reference = SecretRef::OsKeyring {
-        service: "deep-obsidian-mcp".to_string(),
-        account: "http-auth-token".to_string(),
+    let reference = if prefer_os_keyring {
+        SecretRef::OsKeyring {
+            service: "deep-obsidian-mcp".to_string(),
+            account: "http-auth-token".to_string(),
+        }
+    } else {
+        SecretRef::EncryptedFile {
+            id: "http-auth-token".to_string(),
+        }
     };
 
     if dry_run {
@@ -1571,7 +1516,6 @@ fn provision_auth_token(
         return Ok(());
     }
 
-    let resolver = SecretResolver::new();
     let stored_reference = match resolver.put(&reference, SecretString::from(token.clone())) {
         Ok(()) => reference,
         Err(error) => {
@@ -1612,7 +1556,13 @@ fn provision_auth_token(
 /// it does not linger orphaned. Deletion is best-effort: a failure (e.g. a
 /// locked keyring) is reported but does not block disabling. In `dry_run`
 /// nothing is deleted.
-fn deprovision_auth_token(auth: &mut deep_obsidian_types::AuthConfig, dry_run: bool) {
+///
+/// Takes the store for the reason [`provision_auth_token`] does.
+pub(crate) fn deprovision_auth_token(
+    auth: &mut deep_obsidian_types::AuthConfig,
+    dry_run: bool,
+    resolver: &SecretResolver,
+) {
     let previous_ref = auth.token_ref.take();
     auth.enabled = false;
 
@@ -1626,7 +1576,7 @@ fn deprovision_auth_token(auth: &mut deep_obsidian_types::AuthConfig, dry_run: b
     }
 
     match previous_ref {
-        Some(reference) => match SecretResolver::new().delete(&reference) {
+        Some(reference) => match resolver.delete(&reference) {
             Ok(()) => {
                 println!("HTTP bearer authentication disabled; stored token deleted.")
             }
@@ -1690,6 +1640,59 @@ fn setup_mcp_clients(
         setup_codex_mcp(&endpoints.mcp, dry_run, overwrite)?,
         setup_claude_mcp(&endpoints.mcp, dry_run, overwrite),
     ])
+}
+
+/// Which of the three non-config installs to run.
+///
+/// A struct rather than three `bool` parameters because [`run_installers`] is called from
+/// three places (the dry-run preview, the real `setup-service`, and the wizard's own write
+/// path) and three positional booleans at a call site are three chances to transpose two of
+/// them silently.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InstallChoices {
+    pub mcp: bool,
+    pub skills: bool,
+    pub vault_snippets: bool,
+}
+
+/// Every install that is NOT the config file: MCP client entries, agent skills, vault
+/// snippets.
+///
+/// Extracted because it appeared verbatim twice in [`setup_service`] (dry-run and real) and
+/// is now needed a third time by the wizard, which writes a mount-table config itself and
+/// so cannot reach these through `setup_service`. Three copies of "which installer takes
+/// which flag" is three places for them to drift.
+///
+/// `vault_path` is `None` for a remote root; [`setup_vault_snippets`] turns that into a
+/// reported `skip` rather than an error, because the snippets are one of three independent
+/// installs and taking the other two down with them would be a worse answer.
+pub(crate) fn run_installers(
+    endpoints: &EndpointReport,
+    vault_path: Option<&Path>,
+    choices: InstallChoices,
+    dry_run: bool,
+    overwrite: bool,
+) -> Result<(
+    Vec<SetupActionReport>,
+    Vec<SetupActionReport>,
+    Vec<SetupActionReport>,
+)> {
+    let mcp = if choices.mcp {
+        setup_mcp_clients(endpoints, dry_run, overwrite)?
+    } else {
+        Vec::new()
+    };
+    let skills = if choices.skills {
+        setup_agent_skills(dry_run, overwrite)?
+    } else {
+        Vec::new()
+    };
+    let vault_snippets = if choices.vault_snippets {
+        setup_vault_snippets(vault_path, dry_run, overwrite)?
+    } else {
+        Vec::new()
+    };
+    Ok((mcp, skills, vault_snippets))
 }
 
 fn setup_codex_mcp(mcp_url: &str, dry_run: bool, overwrite: bool) -> Result<SetupActionReport> {
@@ -2525,7 +2528,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 /// Reached only from the non-mount-table branch of `setup_service` today, where the root
 /// is a filesystem mount by construction; the `None` arm is what keeps that a property of
 /// the type rather than of the call site.
-fn validate_vault(config: &ResolvedServiceConfig) -> Result<()> {
+pub(crate) fn validate_vault(config: &ResolvedServiceConfig) -> Result<()> {
     let Some(vault_path) = config.vault_path.as_deref() else {
         return Ok(());
     };
@@ -2549,7 +2552,10 @@ fn validate_vault(config: &ResolvedServiceConfig) -> Result<()> {
     }
 }
 
-fn macos_vault_access_preflight(vault_path: &Path, dry_run: bool) -> Result<Vec<String>> {
+pub(crate) fn macos_vault_access_preflight(
+    vault_path: &Path,
+    dry_run: bool,
+) -> Result<Vec<String>> {
     #[cfg(target_os = "macos")]
     {
         if dry_run {
@@ -2665,7 +2671,7 @@ fn open_macos_full_disk_access_panel() -> bool {
     }
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
     } else {
@@ -2703,12 +2709,12 @@ fn probe_directory_writable(directory: &Path, reported_path: &Path) -> Result<()
     Ok(())
 }
 
-fn ensure_writable_directory(directory: &Path) -> Result<()> {
+pub(crate) fn ensure_writable_directory(directory: &Path) -> Result<()> {
     fs::create_dir_all(directory).map_err(|_| writable_directory_error(directory))?;
     probe_directory_writable(directory, directory)
 }
 
-fn assert_creatable_directory(directory: &Path) -> Result<()> {
+pub(crate) fn assert_creatable_directory(directory: &Path) -> Result<()> {
     let resolved = absolute_path(directory)?;
     let mut current = resolved.clone();
     while !current.exists() {
@@ -2723,7 +2729,7 @@ fn assert_creatable_directory(directory: &Path) -> Result<()> {
     probe_directory_writable(&current, &resolved)
 }
 
-fn endpoint_report(endpoints: &ServiceEndpoints) -> EndpointReport {
+pub(crate) fn endpoint_report(endpoints: &ServiceEndpoints) -> EndpointReport {
     EndpointReport {
         mcp: endpoints.mcp.clone(),
         health: endpoints.health.clone(),
@@ -3869,7 +3875,7 @@ fn resolve_probe_token(service: &ResolvedServiceConfig) -> Option<String> {
         .map(|secret| secret.expose_secret().to_string())
 }
 
-fn redact_config(config: &PersistedServiceConfig) -> PersistedServiceConfig {
+pub(crate) fn redact_config(config: &PersistedServiceConfig) -> PersistedServiceConfig {
     config.clone()
 }
 
@@ -4056,7 +4062,7 @@ fn render_doctor_report(report: &DoctorReport) -> String {
     output.trim_end().to_string()
 }
 
-fn render_setup_service_report(report: &SetupServiceReport) -> String {
+pub(crate) fn render_setup_service_report(report: &SetupServiceReport) -> String {
     let mut output = String::new();
     for message in &report.messages {
         let _ = writeln!(&mut output, "{message}");
@@ -4114,6 +4120,7 @@ mod tests {
         INDEX_SQLITE_FILENAME, SUBCOMMAND_VALUE_FLAGS,
     };
     use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
+    use deep_obsidian_config::secrets::SecretResolver;
     use deep_obsidian_types::{
         AutoReindexConfig, EmbeddingConfig, EmbeddingConfigInput, EmbeddingProvider, HttpConfig,
         MountBackendConfig, PersistedServiceConfig, ResolvedServiceConfig, SecretRef, StdioMode,
@@ -4199,7 +4206,18 @@ mod tests {
     #[test]
     fn provision_auth_token_dry_run_sets_ref_without_storing() {
         let mut auth = deep_obsidian_types::AuthConfig::default();
-        super::provision_auth_token(&mut auth, true, false).expect("dry-run provision");
+        // A temp store and `prefer_os_keyring = false`: a dry run stores nothing, but the
+        // parameters must be the ones a real run would use or the test proves nothing.
+        super::provision_auth_token(
+            &mut auth,
+            true,
+            false,
+            &SecretResolver::with_encrypted_file_path(
+                std::env::temp_dir().join("deep-obsidian-provision-dry-run-secrets.json"),
+            ),
+            false,
+        )
+        .expect("dry-run provision");
         assert!(auth.enabled);
         assert!(auth.token_ref.is_some());
     }
@@ -4214,7 +4232,7 @@ mod tests {
             allowed_origins: Vec::new(),
         };
         // dry-run must not touch the secret store yet still clear the config.
-        super::deprovision_auth_token(&mut auth, true);
+        super::deprovision_auth_token(&mut auth, true, &SecretResolver::new());
         assert!(!auth.enabled);
         assert!(auth.token_ref.is_none());
     }
@@ -4222,7 +4240,8 @@ mod tests {
     #[test]
     fn deprovision_auth_token_on_already_disabled_is_noop() {
         let mut auth = deep_obsidian_types::AuthConfig::default();
-        super::deprovision_auth_token(&mut auth, false);
+        // No stored reference, so nothing is deleted and the real store is never touched.
+        super::deprovision_auth_token(&mut auth, false, &SecretResolver::new());
         assert!(!auth.enabled);
         assert!(auth.token_ref.is_none());
     }

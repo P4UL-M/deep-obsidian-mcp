@@ -153,6 +153,53 @@ All notable changes to deep-obsidian-mcp are documented here.
     rather than to `config.json.bak`. The old name held valid TOML under a `.json` name,
     which is a trap, because the obvious way to use a backup is to rename it back. A
     `.json` config still gets exactly `config.json.bak`.
+  - **`setup-service --wizard` is a first-init flow, and `mounts add` is guided.** The
+    wizard asked four questions, none of which could describe a vault that was not a single
+    local folder — so the one setup path a newcomer is told to run could not reach any of
+    the above. It now walks six screens: where your notes live (a local folder, or a remote
+    LiveSync/CouchDB vault or a shared Algolia index **as the vault root**), any further
+    vaults mounted under subfolders, embeddings, transport, the `--mcp`/`--skills`/
+    `--vault-snippets` installs, and a recap.
+
+    Each mount goes through the same sequence `mounts add` does, because it is the same
+    code: the legacy `vaultPath` is migrated to an explicit root mount, the
+    `experimental.*` flag is named and confirmed, the whole table is re-validated through
+    the server's own loader on every addition, the credential becomes a `SecretRef`, and
+    the mount is **probed before anything is written** — a failed probe stops and asks
+    whether to keep it anyway. The id of an additional mount is suggested as a slug of the
+    `mountAt` you type (`Team/Alpha` → `team-alpha`) and is editable.
+
+    The last screen prints the config it is about to write through the same renderer
+    `print-config` uses, with credentials shown only as references, and asks once; then it
+    reports the local `doctor` checks and your next steps. It does not re-probe the remote
+    mounts it contacted a few questions earlier. **An interrupted run leaves nothing
+    behind**: a probe has to happen after its credential reaches the store, so every later
+    exit — a failed probe, a declined recap, `Ctrl-D` at any question — deletes the
+    credentials that run stored and writes no config. `--dry-run` walks every screen and
+    stores, probes and writes nothing.
+
+    A local root with no further mounts is still written as a plain top-level `vaultPath`,
+    so the common case produces exactly the file it always did. The wizard still refuses to
+    **edit** a config that already declares a mount table, and now says so before its first
+    question: re-deriving one from fresh answers would drop every per-mount setting it never
+    asks about (`options`, `cache`, `retention`, `recallWeight`, an explicit `indexDir`).
+    `mounts add` / `mounts list` / `mounts remove` are named as the way to change one.
+
+    `mounts add`'s identifying flags are now optional, and an omitted one is a question:
+    `mounts add couchdb --url https://couch.example` on a terminal prompts for exactly the
+    rest, treating the flags you did give as answers already supplied. With no terminal — a
+    script, a pipe, `--yes`, or `--password-stdin`/`--api-key-stdin`, which have already
+    claimed stdin for the credential — a missing required flag is a clap-shaped error naming
+    every one of them at once, never a prompt that would hang.
+
+    Two smaller behaviours changed with it. `setup-service` now honours an explicit
+    `--transport` instead of silently overriding it (without one it still writes an HTTP
+    config, which is what the packaged service wants) — that is what lets the wizard offer
+    stdio, its default, since a client-launched subprocess is the simplest thing that
+    works. And the wizard's embedding API key now falls back to the encrypted secrets file
+    automatically, with a message, when the OS keyring is unavailable, instead of asking:
+    the only alternative was "no semantic search", and it is the rule `mounts add` already
+    applied to a mount's credential.
 
 ### Improved
 

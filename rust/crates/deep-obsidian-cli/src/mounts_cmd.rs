@@ -35,12 +35,18 @@
 //! 6. **Write**, with a `.bak` of a differing previous file and every unknown key
 //!    carried across.
 //!
+//! # Where the questions live
+//!
+//! Not here. A missing `--url` is answered by [`crate::wizard::resolve_mount_spec`], which
+//! owns the per-kind question sequences and is the SAME code `setup-service --wizard` walks
+//! — this module only ever sees a finished [`MountSpec`]. That split is what keeps one
+//! wording, one ordering and one set of defaults behind both entry points.
+//!
 //! # What is deliberately not here
 //!
-//! No interactive wizard, and no `secrets set`. Both are their own slices. The seams are
-//! left explicit: [`SecretReader`] is the injection point a wizard would drive instead of
-//! stdin, and [`store_mount_secret`] is the one place a `secrets set` command would have
-//! to agree with about ref shapes.
+//! No `secrets set`. [`store_mount_secret`] is the one place such a command would have to
+//! agree with about ref shapes; [`SecretReader`] is the injection point both the wizard and
+//! the tests drive instead of a tty.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -59,7 +65,60 @@ use deep_obsidian_types::{
 use secrecy::SecretString;
 use serde::Serialize;
 
-use crate::cli::{MountsAddCommon, MountsAddKind, MountsCommand, ServiceOptions};
+use crate::cli::{MountsCommand, ServiceOptions};
+
+// ---------------------------------------------------------------------------
+// The resolved mount specification
+// ---------------------------------------------------------------------------
+
+/// The settings every mount carries once every question has an answer.
+///
+/// Structurally [`crate::cli::MountsAddCommon`] with the `Option`s discharged. The
+/// duplication is the point: the clap type models *what the operator typed*, where a
+/// missing `--id` is normal and means "ask me"; this type models *a mount that can be
+/// built*, where a missing id is impossible. Collapsing the two would push
+/// `.expect("resolved")` into `build_mount`, i.e. would move a guarantee the type system
+/// can hold into a runtime panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountCommon {
+    pub id: String,
+    pub mount_at: String,
+    pub keep_anyway: bool,
+    pub yes: bool,
+}
+
+/// A mount, fully specified, ready to be validated and written.
+///
+/// Produced by [`crate::wizard::resolve_mount_spec`] from a
+/// [`crate::cli::MountsAddKind`]; consumed by [`add`] and by the wizard. Field names match
+/// the clap type's so the two read as one shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountSpec {
+    Filesystem {
+        common: MountCommon,
+        vault_path: PathBuf,
+    },
+    Couchdb {
+        common: MountCommon,
+        url: String,
+        database: String,
+        username: Option<String>,
+        /// The credential comes from stdin rather than a masked prompt.
+        password_stdin: bool,
+        writable: bool,
+        e2ee: bool,
+        sidecar_path: Option<PathBuf>,
+    },
+    Algolia {
+        common: MountCommon,
+        app_id: String,
+        index_name: String,
+        base_url: Option<String>,
+        api_key_stdin: bool,
+        writable: bool,
+        participant_id: Option<String>,
+    },
+}
 
 /// Id given to the root mount a legacy `vaultPath` is converted into.
 ///
@@ -252,6 +311,26 @@ impl SecretReader {
         }
     }
 
+    /// The next secret, where ABSENT is a legitimate answer.
+    ///
+    /// Exists for exactly one caller: the wizard's embedding API key, which a local Ollama
+    /// endpoint genuinely does not have. Every mount credential goes through [`Self::next`]
+    /// instead, which refuses a blank — a CouchDB password that turned out to be the empty
+    /// string would fail later as an authentication error rather than now as a typo.
+    pub fn next_optional(&mut self, label: &str) -> Result<Option<SecretString>> {
+        let value = match &mut self.lines {
+            // An exhausted script means "no key", not an error: a scripted wizard run that
+            // wants no embedding key should not have to supply a blank line for one.
+            Some(lines) => lines.pop_front().unwrap_or_default(),
+            None => crate::commands::prompt_optional_secret(label)?
+                .map(|secret| secrecy::ExposeSecret::expose_secret(&secret).to_string())
+                .unwrap_or_default(),
+        };
+        Ok(Some(value)
+            .filter(|value| !value.trim().is_empty())
+            .map(SecretString::from))
+    }
+
     /// The next secret, prompting masked when this reader is interactive.
     fn next(&mut self, label: &str) -> Result<SecretString> {
         let value = match &mut self.lines {
@@ -374,10 +453,10 @@ impl MountSecretRefs {
 }
 
 /// The refs the candidate mount is built with before anything is stored.
-fn derived_secret_refs(kind: &MountsAddKind, prefer_os_keyring: bool) -> MountSecretRefs {
+fn derived_secret_refs(kind: &MountSpec, prefer_os_keyring: bool) -> MountSecretRefs {
     match kind {
-        MountsAddKind::Filesystem { .. } => MountSecretRefs::default(),
-        MountsAddKind::Couchdb { common, e2ee, .. } => MountSecretRefs {
+        MountSpec::Filesystem { .. } => MountSecretRefs::default(),
+        MountSpec::Couchdb { common, e2ee, .. } => MountSecretRefs {
             password: Some(derived_secret_ref(
                 &common.id,
                 "password",
@@ -387,7 +466,7 @@ fn derived_secret_refs(kind: &MountsAddKind, prefer_os_keyring: bool) -> MountSe
                 .then(|| derived_secret_ref(&common.id, "e2ee-passphrase", prefer_os_keyring)),
             api_key: None,
         },
-        MountsAddKind::Algolia { common, .. } => MountSecretRefs {
+        MountSpec::Algolia { common, .. } => MountSecretRefs {
             password: None,
             e2ee_passphrase: None,
             api_key: Some(derived_secret_ref(&common.id, "api-key", prefer_os_keyring)),
@@ -400,7 +479,7 @@ fn derived_secret_refs(kind: &MountsAddKind, prefer_os_keyring: bool) -> MountSe
 /// Records what it stored in `stored` as it goes, so an abort can remove exactly the
 /// entries this run created and nothing else.
 fn store_secrets(
-    kind: &MountsAddKind,
+    kind: &MountSpec,
     resolver: &SecretResolver,
     prefer_os_keyring: bool,
     secrets: &mut SecretReader,
@@ -408,8 +487,8 @@ fn store_secrets(
     messages: &mut Vec<String>,
 ) -> Result<MountSecretRefs> {
     match kind {
-        MountsAddKind::Filesystem { .. } => Ok(MountSecretRefs::default()),
-        MountsAddKind::Couchdb { common, e2ee, .. } => {
+        MountSpec::Filesystem { .. } => Ok(MountSecretRefs::default()),
+        MountSpec::Couchdb { common, e2ee, .. } => {
             let password = secrets.next("CouchDB password")?;
             let password_ref = store_mount_secret(
                 resolver,
@@ -441,7 +520,7 @@ fn store_secrets(
                 api_key: None,
             })
         }
-        MountsAddKind::Algolia { common, .. } => {
+        MountSpec::Algolia { common, .. } => {
             let key = secrets.next("Algolia API key")?;
             let api_key_ref = store_mount_secret(
                 resolver,
@@ -465,12 +544,12 @@ fn store_secrets(
 // Mount construction
 // ---------------------------------------------------------------------------
 
-/// The flags every `mounts add <kind>` shares, whichever kind was chosen.
-fn common_of(kind: &MountsAddKind) -> &MountsAddCommon {
+/// The settings every mount shares, whichever kind was chosen.
+fn common_of(kind: &MountSpec) -> &MountCommon {
     match kind {
-        MountsAddKind::Filesystem { common, .. }
-        | MountsAddKind::Couchdb { common, .. }
-        | MountsAddKind::Algolia { common, .. } => common,
+        MountSpec::Filesystem { common, .. }
+        | MountSpec::Couchdb { common, .. }
+        | MountSpec::Algolia { common, .. } => common,
     }
 }
 
@@ -512,14 +591,25 @@ pub fn legacy_root_mount(vault_path: &Path) -> MountConfig {
 }
 
 /// The mount table to append to, plus the root mount a legacy config was converted into.
+///
+/// `allow_empty_base` decides what an empty config means. `mounts add` passes `false`: it
+/// EDITS a vault, and a file declaring neither `vaultPath` nor `mounts` has no vault to add
+/// a mount beside — refusing names the setup command that creates one. The first-init wizard
+/// passes `true`, because there the empty base is the whole point: its first mount IS the
+/// root, and the resulting one-entry table is exactly what a fully-remote vault looks like.
+/// A parameter rather than a behaviour change so `mounts add`'s refusal stays intact.
 fn base_mount_table(
     existing: &PersistedServiceConfig,
     config_path: &Path,
+    allow_empty_base: bool,
 ) -> Result<(Vec<MountConfig>, Option<MountConfig>)> {
     if let Some(mounts) = existing.mounts.as_ref().filter(|mounts| !mounts.is_empty()) {
         return Ok((mounts.clone(), None));
     }
     let Some(vault_path) = existing.vault_path.as_deref() else {
+        if allow_empty_base {
+            return Ok((Vec::new(), None));
+        }
         bail!(
             "{} declares neither `vaultPath` nor `mounts`, so there is no vault to add a mount \
              beside. Run `deep-obsidian-mcp setup-service --vault <path>` first.",
@@ -532,18 +622,18 @@ fn base_mount_table(
 
 /// Build the new mount from its flags and its (already decided) secret references.
 fn build_mount(
-    kind: &MountsAddKind,
+    kind: &MountSpec,
     index_dir: Option<&Path>,
     refs: &MountSecretRefs,
 ) -> Result<MountConfig> {
     let common = common_of(kind);
     let index_dir = index_dir.map(Path::to_path_buf);
     let backend = match kind {
-        MountsAddKind::Filesystem { vault_path, .. } => MountBackendConfig::Filesystem {
+        MountSpec::Filesystem { vault_path, .. } => MountBackendConfig::Filesystem {
             vault_path: vault_path.clone(),
             index_dir,
         },
-        MountsAddKind::Couchdb {
+        MountSpec::Couchdb {
             url,
             database,
             username,
@@ -577,7 +667,7 @@ fn build_mount(
             options: None,
             writable: *writable,
         },
-        MountsAddKind::Algolia {
+        MountSpec::Algolia {
             app_id,
             index_name,
             base_url,
@@ -660,7 +750,7 @@ fn input_from_persisted(config: PersistedServiceConfig, config_path: &Path) -> S
 /// top-level `vaultPath` are mutually exclusive on input
 /// (`ConfigError::VaultPathAndMountsBothSet`) — the legacy path's information has already
 /// moved into the root mount by the time this is called.
-fn candidate_config(
+pub(crate) fn candidate_config(
     existing: &PersistedServiceConfig,
     mounts: &[MountConfig],
     experimental: &ExperimentalConfig,
@@ -682,7 +772,7 @@ fn candidate_config(
 /// `main` prints only `{error}` — a `Caused by` chain never reaches the terminal, so a
 /// `with_context` here would replace "duplicate mount id 'team'" with "the mount table is
 /// not valid" and lose the only actionable half.
-fn validate(
+pub(crate) fn validate(
     candidate: PersistedServiceConfig,
     config_path: &Path,
 ) -> Result<ResolvedServiceConfig> {
@@ -727,7 +817,7 @@ fn with_narration<T>(result: Result<T>, messages: &[String]) -> Result<T> {
 
 /// The persisted form of a validated config, with the previous file's unknown keys
 /// restored.
-fn persist(
+pub(crate) fn persist(
     resolved: &ResolvedServiceConfig,
     previous: &PersistedServiceConfig,
 ) -> PersistedServiceConfig {
@@ -741,7 +831,10 @@ fn persist(
 /// Where a mount's index lives, by the same rule `render_mount_line` and the server use:
 /// the root's is the resolved top-level one, a non-root mount's is its explicit `indexDir`
 /// or the id-keyed default beneath the root's.
-fn resolved_mount_index_dir(resolved: &ResolvedServiceConfig, mount: &MountConfig) -> PathBuf {
+pub(crate) fn resolved_mount_index_dir(
+    resolved: &ResolvedServiceConfig,
+    mount: &MountConfig,
+) -> PathBuf {
     if mount.mount_at.is_empty() {
         return resolved.index_dir.clone();
     }
@@ -755,7 +848,7 @@ fn resolved_mount_index_dir(resolved: &ResolvedServiceConfig, mount: &MountConfi
 
 /// Whether a mount accepts writes. A filesystem mount always does; a remote one carries
 /// the flag.
-fn mount_is_writable(mount: &MountConfig) -> bool {
+pub(crate) fn mount_is_writable(mount: &MountConfig) -> bool {
     match &mount.backend {
         MountBackendConfig::Filesystem { .. } => true,
         MountBackendConfig::Couchdb { writable, .. }
@@ -773,12 +866,12 @@ fn mount_is_writable(mount: &MountConfig) -> bool {
 /// and whether the resulting table has more than one mount. `mount_count` is the size of
 /// the table AFTER the append, which is why a first explicit root mount needs no flag —
 /// a single root mount is the legacy shape spelled out longhand.
-fn required_experimental_flags(kind: &MountsAddKind, mount_count: usize) -> Vec<&'static str> {
+fn required_experimental_flags(kind: &MountSpec, mount_count: usize) -> Vec<&'static str> {
     let mut flags = Vec::new();
     match kind {
-        MountsAddKind::Filesystem { .. } => {}
-        MountsAddKind::Couchdb { .. } => flags.push(FLAG_COUCHDB_VAULTS),
-        MountsAddKind::Algolia { .. } => flags.push(FLAG_ALGOLIA_VAULTS),
+        MountSpec::Filesystem { .. } => {}
+        MountSpec::Couchdb { .. } => flags.push(FLAG_COUCHDB_VAULTS),
+        MountSpec::Algolia { .. } => flags.push(FLAG_ALGOLIA_VAULTS),
     }
     if mount_count > 1 {
         flags.push(FLAG_MULTI_VAULT);
@@ -805,7 +898,7 @@ fn set_experimental_flag(experimental: &mut ExperimentalConfig, flag: &str) {
 }
 
 /// The experimental flags currently enabled, by their config key.
-fn enabled_experimental_flags(experimental: &ExperimentalConfig) -> Vec<String> {
+pub(crate) fn enabled_experimental_flags(experimental: &ExperimentalConfig) -> Vec<String> {
     [
         (FLAG_MULTI_VAULT, experimental.multi_vault),
         (FLAG_COUCHDB_VAULTS, experimental.couchdb_vaults),
@@ -946,6 +1039,242 @@ async fn probe_mount(
 }
 
 // ---------------------------------------------------------------------------
+// The shared append core
+// ---------------------------------------------------------------------------
+
+/// The stores, streams and decisions one mount addition needs from its caller.
+///
+/// Bundled rather than passed as five parameters for two reasons. It keeps
+/// [`append_mount`] inside clippy's argument budget, and — the substantive one — it names
+/// the set of things that differ between `mounts add` and the wizard: where secrets go,
+/// where they come from, and who answers a yes/no question. Everything else about an
+/// addition is identical, which is exactly the claim this type makes checkable.
+pub(crate) struct MountIo<'a> {
+    pub resolver: &'a SecretResolver,
+    /// See [`add_with_resolver`]: `false` keeps a test out of the login keychain.
+    pub prefer_os_keyring: bool,
+    pub secrets: &'a mut SecretReader,
+    /// Answers the experimental-flag confirmation. `mounts add` reads the terminal; the
+    /// wizard reads its own answer stream, which is what makes the whole flow testable
+    /// without a tty.
+    pub confirm: &'a mut dyn FnMut(&str) -> Result<bool>,
+}
+
+/// One addition's inputs: the file it applies to, and the mount to add.
+pub(crate) struct AppendRequest<'a> {
+    pub existing: &'a PersistedServiceConfig,
+    /// Named in every message and in the validation error. Not read from.
+    pub config_path: &'a Path,
+    /// The NEW mount's own `indexDir`; the config's top-level one is never changed here.
+    pub index_dir: Option<&'a Path>,
+    pub spec: &'a MountSpec,
+    /// See [`base_mount_table`].
+    pub allow_empty_base: bool,
+    /// Stop after validation: store nothing, probe nothing.
+    pub dry_run: bool,
+}
+
+/// What [`append_mount`] produced. Nothing has been written.
+pub(crate) struct AppendedMount {
+    /// The table with the new mount in it, validated.
+    pub mounts: Vec<MountConfig>,
+    pub experimental: ExperimentalConfig,
+    /// The new mount, carrying the secret references that actually hold its credentials.
+    pub mount: MountConfig,
+    /// The whole config as the loader resolved it — the object to persist.
+    pub resolved: ResolvedServiceConfig,
+    pub migrated_root: Option<String>,
+    pub experimental_enabled: Vec<String>,
+    /// Every reference THIS call stored, for a caller that has to roll back.
+    pub stored: Vec<SecretRef>,
+    /// The same references rendered for an operator.
+    pub secret_refs: Vec<String>,
+    pub probe: MountProbeReport,
+    pub messages: Vec<String>,
+}
+
+/// Steps 1–5 of the module's ordering: migrate, confirm, validate, store, probe.
+///
+/// Deliberately stops short of both the write and the decision about a failed probe. The
+/// write is the caller's because the wizard writes ONCE at the end of six screens rather
+/// than once per mount. The probe decision is the caller's because the two entry points
+/// answer it differently — `mounts add` has already been told by `--keep-anyway`, while the
+/// wizard has to ask now that there is a verdict to show — and because a shared hook for it
+/// would hide which of the two wordings an operator is reading.
+///
+/// A caller that abandons the addition after this returns MUST call
+/// [`roll_back_stored_secrets`] with [`AppendedMount::stored`].
+pub(crate) async fn append_mount(
+    request: &AppendRequest<'_>,
+    io: &mut MountIo<'_>,
+) -> Result<AppendedMount> {
+    let AppendRequest {
+        existing,
+        config_path,
+        index_dir,
+        spec,
+        allow_empty_base,
+        dry_run,
+    } = *request;
+    let common = common_of(spec);
+    let mut messages = Vec::new();
+
+    // 1. Migrate or append.
+    let (mut mounts, migrated) = base_mount_table(existing, config_path, allow_empty_base)?;
+    if let Some(root) = &migrated {
+        messages.push(format!(
+            "converted the legacy `vaultPath` into an explicit root mount: id '{}', mountAt \"\" \
+             (the vault root), filesystem at {}. It resolves to exactly the same vault path and \
+             index directory, and `vaultPath` is dropped from the file because a declared mount \
+             table and a top-level `vaultPath` are mutually exclusive.",
+            root.id,
+            root.backend.location()
+        ));
+    }
+
+    // 2. Experimental gates, BEFORE validation: the loader refuses a table whose flag is
+    //    unset, so asking afterwards would report a decision as a config error.
+    let mut experimental = existing.experimental.clone().unwrap_or_default();
+    let mut experimental_enabled = Vec::new();
+    for flag in required_experimental_flags(spec, mounts.len() + 1) {
+        if experimental_flag_is_set(&experimental, flag) {
+            continue;
+        }
+        if !common.yes && !(io.confirm)(&experimental_confirmation(flag, config_path))? {
+            bail!(
+                "aborted: experimental.{flag} was not enabled, so mount '{}' was not added. \
+                 Nothing was written and no secret was stored.",
+                common.id
+            );
+        }
+        set_experimental_flag(&mut experimental, flag);
+        experimental_enabled.push(flag.to_string());
+        messages.push(format!("enabled experimental.{flag}"));
+    }
+
+    // 3. Full-table validation, before the credential is even asked for. A duplicate id or
+    //    a colliding `mountAt` therefore costs the operator nothing, and — the reason the
+    //    abort cleanup in step 5 is safe — guarantees the mount id is NEW, so the
+    //    id-keyed secret references below cannot belong to any other mount.
+    let candidate_mount = build_mount(
+        spec,
+        index_dir,
+        &derived_secret_refs(spec, io.prefer_os_keyring),
+    )?;
+    mounts.push(candidate_mount);
+    let validated = validate_for_write(
+        candidate_config(existing, &mounts, &experimental),
+        config_path,
+        &messages,
+    )?;
+
+    if dry_run {
+        let mount = mounts.last().expect("the mount just pushed").clone();
+        messages.push(format!(
+            "dry-run: the mount table is valid; no credential was stored, nothing was probed, \
+             and {} was not written",
+            config_path.display()
+        ));
+        return Ok(AppendedMount {
+            mounts,
+            experimental,
+            mount,
+            resolved: validated,
+            migrated_root: migrated.map(|root| root.id),
+            experimental_enabled,
+            stored: Vec::new(),
+            secret_refs: Vec::new(),
+            probe: MountProbeReport {
+                kind: "skipped".to_string(),
+                ok: true,
+                verdict: "dry-run".to_string(),
+            },
+            messages,
+        });
+    }
+
+    // 4. Credentials. Stored under references derived from the (now validated) mount id;
+    //    only the reference ever reaches the config file.
+    let mut stored = Vec::new();
+    let refs = store_secrets(
+        spec,
+        io.resolver,
+        io.prefer_os_keyring,
+        io.secrets,
+        &mut stored,
+        &mut messages,
+    )?;
+    for descriptor in refs.describe() {
+        messages.push(format!(
+            "stored credential at {descriptor} (the config holds this reference only)"
+        ));
+    }
+
+    // The final ref shapes may differ from the derived ones when the keyring was
+    // unavailable, so the table is rebuilt and re-validated rather than assumed. Cheap,
+    // and it keeps "what was validated" and "what is written" the same object.
+    let mount = build_mount(spec, index_dir, &refs)?;
+    let mounts = {
+        let mut mounts = mounts;
+        mounts.pop();
+        mounts.push(mount.clone());
+        mounts
+    };
+    // A failure here has already stored a credential, so the narration is carried and the
+    // caller's rollback still applies — `stored` travels out inside the error's sibling
+    // path only because this validation cannot fail in practice (the shapes are the ones
+    // just validated); if it ever does, the refusal names the file and writes nothing.
+    let resolved = validate_for_write(
+        candidate_config(existing, &mounts, &experimental),
+        config_path,
+        &messages,
+    )?;
+
+    // 5. Blocking probe. The VERDICT is the result; whether it blocks is the caller's.
+    let probe = probe_mount(&resolved, &mount, io.resolver).await;
+
+    Ok(AppendedMount {
+        mounts,
+        experimental,
+        mount,
+        resolved,
+        migrated_root: migrated.map(|root| root.id),
+        experimental_enabled,
+        stored,
+        secret_refs: refs.describe(),
+        probe,
+        messages,
+    })
+}
+
+/// Delete exactly the credentials one addition stored, narrating each outcome.
+///
+/// Safe because the full-table validation in [`append_mount`] step 3 proved the mount id is
+/// not already in the table, so an id-keyed reference cannot be a live mount's — the worst
+/// case is deleting a leftover from an earlier aborted attempt, which is the desired
+/// outcome. The alternative, leaving it, orphans a credential in the operator's keychain
+/// that nothing references and nothing will ever clean up.
+///
+/// Shared by every path that abandons an addition after step 4: a failed probe, a wizard
+/// recap the operator declined, and an end-of-input at any later question.
+pub(crate) fn roll_back_stored_secrets(
+    resolver: &SecretResolver,
+    stored: &[SecretRef],
+    messages: &mut Vec<String>,
+) {
+    for reference in stored {
+        let descriptor = describe_secret_ref(reference);
+        match resolver.delete(reference) {
+            Ok(()) => messages.push(format!("removed the credential stored at {descriptor}")),
+            Err(error) => messages.push(format!(
+                "could not remove the credential stored at {descriptor}: {error} — delete it by \
+                 hand"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // add
 // ---------------------------------------------------------------------------
 
@@ -953,7 +1282,7 @@ async fn probe_mount(
 pub async fn add(
     config_path: &Path,
     index_dir: Option<&Path>,
-    kind: &MountsAddKind,
+    kind: &MountSpec,
     dry_run: bool,
     secrets: &mut SecretReader,
 ) -> Result<MountsAddReport> {
@@ -982,7 +1311,7 @@ pub async fn add(
 pub async fn add_with_resolver(
     config_path: &Path,
     index_dir: Option<&Path>,
-    kind: &MountsAddKind,
+    kind: &MountSpec,
     dry_run: bool,
     resolver: &SecretResolver,
     prefer_os_keyring: bool,
@@ -998,140 +1327,64 @@ pub async fn add_with_resolver(
         )
     })?;
 
-    let mut messages = Vec::new();
+    let mut confirm = |question: &str| crate::commands::confirm(question);
+    let mut io = MountIo {
+        resolver,
+        prefer_os_keyring,
+        secrets,
+        confirm: &mut confirm,
+    };
+    let appended = append_mount(
+        &AppendRequest {
+            existing: &existing,
+            config_path,
+            index_dir,
+            spec: kind,
+            // `mounts add` edits an existing vault; an empty config has none to add beside.
+            allow_empty_base: false,
+            dry_run,
+        },
+        &mut io,
+    )
+    .await?;
 
-    // 1. Migrate or append.
-    let (mut mounts, migrated) = base_mount_table(&existing, config_path)?;
-    if let Some(root) = &migrated {
-        messages.push(format!(
-            "converted the legacy `vaultPath` into an explicit root mount: id '{}', mountAt \"\" \
-             (the vault root), filesystem at {}. It resolves to exactly the same vault path and \
-             index directory, and `vaultPath` is dropped from the file because a declared mount \
-             table and a top-level `vaultPath` are mutually exclusive.",
-            root.id,
-            root.backend.location()
-        ));
-    }
+    let AppendedMount {
+        mount,
+        resolved,
+        migrated_root,
+        experimental_enabled,
+        stored,
+        secret_refs,
+        probe,
+        mut messages,
+        ..
+    } = appended;
 
-    // 2. Experimental gates, BEFORE validation: the loader refuses a table whose flag is
-    //    unset, so asking afterwards would report a decision as a config error.
-    let mut experimental = existing.experimental.clone().unwrap_or_default();
-    let mut experimental_enabled = Vec::new();
-    for flag in required_experimental_flags(kind, mounts.len() + 1) {
-        if experimental_flag_is_set(&experimental, flag) {
-            continue;
-        }
-        if !common.yes && !crate::commands::confirm(&experimental_confirmation(flag, config_path))?
-        {
-            bail!(
-                "aborted: experimental.{flag} was not enabled, so mount '{}' was not added. \
-                 Nothing was written and no secret was stored.",
-                common.id
-            );
-        }
-        set_experimental_flag(&mut experimental, flag);
-        experimental_enabled.push(flag.to_string());
-        messages.push(format!("enabled experimental.{flag}"));
-    }
-
-    // 3. Full-table validation, before the credential is even asked for. A duplicate id or
-    //    a colliding `mountAt` therefore costs the operator nothing, and — the reason the
-    //    abort cleanup in step 5 is safe — guarantees the mount id is NEW, so the
-    //    id-keyed secret references below cannot belong to any other mount.
-    let candidate_mount = build_mount(
-        kind,
-        index_dir,
-        &derived_secret_refs(kind, prefer_os_keyring),
-    )?;
-    mounts.push(candidate_mount);
-    let validated = validate_for_write(
-        candidate_config(&existing, &mounts, &experimental),
-        config_path,
-        &messages,
-    )?;
-
-    if dry_run {
-        let resolved = validated;
-        let mount = mounts.last().expect("the mount just pushed");
-        messages.push(format!(
-            "dry-run: the mount table is valid; no credential was stored, nothing was probed, \
-             and {} was not written",
-            config_path.display()
-        ));
-        return Ok(MountsAddReport {
+    let report =
+        |written: bool, backup_path: Option<PathBuf>, messages: Vec<String>| MountsAddReport {
             config_path: config_path.to_path_buf(),
             mount: mount.id.clone(),
             mount_at: mount.mount_at.clone(),
             kind: mount.backend.kind_name().to_string(),
             location: mount.backend.location(),
-            index_dir: resolved_mount_index_dir(&resolved, mount),
-            writable: mount_is_writable(mount),
-            migrated_root: migrated.map(|root| root.id),
-            experimental_enabled,
-            secret_refs: Vec::new(),
-            probe: MountProbeReport {
-                kind: "skipped".to_string(),
-                ok: true,
-                verdict: "dry-run".to_string(),
-            },
-            written: false,
-            dry_run: true,
-            backup_path: None,
+            index_dir: resolved_mount_index_dir(&resolved, &mount),
+            writable: mount_is_writable(&mount),
+            migrated_root: migrated_root.clone(),
+            experimental_enabled: experimental_enabled.clone(),
+            secret_refs: secret_refs.clone(),
+            probe: probe.clone(),
+            written,
+            dry_run,
+            backup_path,
             messages,
-        });
+        };
+
+    if dry_run {
+        return Ok(report(false, None, messages));
     }
 
-    // 4. Credentials. Stored under references derived from the (now validated) mount id;
-    //    only the reference ever reaches the config file.
-    let mut stored = Vec::new();
-    let refs = store_secrets(
-        kind,
-        resolver,
-        prefer_os_keyring,
-        secrets,
-        &mut stored,
-        &mut messages,
-    )?;
-    for descriptor in refs.describe() {
-        messages.push(format!(
-            "stored credential at {descriptor} (the config holds this reference only)"
-        ));
-    }
-
-    // The final ref shapes may differ from the derived ones when the keyring was
-    // unavailable, so the table is rebuilt and re-validated rather than assumed. Cheap,
-    // and it keeps "what was validated" and "what is written" the same object.
-    let mount = build_mount(kind, index_dir, &refs)?;
-    let mounts = {
-        let mut mounts = mounts;
-        mounts.pop();
-        mounts.push(mount.clone());
-        mounts
-    };
-    let resolved = validate_for_write(
-        candidate_config(&existing, &mounts, &experimental),
-        config_path,
-        &messages,
-    )?;
-
-    // 5. Blocking probe.
-    let probe = probe_mount(&resolved, &mount, resolver).await;
     if !probe.ok && !common.keep_anyway {
-        // Remove exactly what THIS run stored. Safe because step 3 proved the mount id is
-        // not already in the table, so an id-keyed reference cannot be a live mount's — the
-        // worst case is deleting a leftover from an earlier aborted attempt, which is the
-        // desired outcome. The alternative, leaving it, orphans a credential in the
-        // operator's keychain that nothing references and nothing will ever clean up.
-        for reference in &stored {
-            let descriptor = describe_secret_ref(reference);
-            match resolver.delete(reference) {
-                Ok(()) => messages.push(format!("removed the credential stored at {descriptor}")),
-                Err(error) => messages.push(format!(
-                    "could not remove the credential stored at {descriptor}: {error} — delete it \
-                     by hand"
-                )),
-            }
-        }
+        roll_back_stored_secrets(io.resolver, &stored, &mut messages);
         let narration = if messages.is_empty() {
             String::new()
         } else {
@@ -1172,23 +1425,7 @@ pub async fn add_with_resolver(
     }
     messages.push(format!("wrote config: {}", config_path.display()));
 
-    Ok(MountsAddReport {
-        config_path: config_path.to_path_buf(),
-        mount: mount.id.clone(),
-        mount_at: mount.mount_at.clone(),
-        kind: mount.backend.kind_name().to_string(),
-        location: mount.backend.location(),
-        index_dir: resolved_mount_index_dir(&resolved, &mount),
-        writable: mount_is_writable(&mount),
-        migrated_root: migrated.map(|root| root.id),
-        experimental_enabled,
-        secret_refs: refs.describe(),
-        probe,
-        written: true,
-        dry_run: false,
-        backup_path,
-        messages,
-    })
+    Ok(report(true, backup_path, messages))
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,7 +1454,7 @@ pub fn list(config_path: &Path) -> Result<MountsListReport> {
         .mounts
         .as_ref()
         .is_some_and(|mounts| !mounts.is_empty());
-    let (mounts, _) = base_mount_table(&existing, config_path)?;
+    let (mounts, _) = base_mount_table(&existing, config_path, false)?;
     let experimental = existing.experimental.clone().unwrap_or_default();
     // Resolved through the loader rather than read off the file, so the reported index
     // directories are the ones the server will actually use — including the defaults a
@@ -1639,7 +1876,11 @@ pub async fn run(
 
     match command {
         MountsCommand::Add { kind } => {
-            let mut secrets = if uses_stdin_secret(&kind) {
+            // Guided mode FIRST: the flags are pre-answers, and anything they left out is
+            // asked here (or reported as missing, together, when there is no terminal to
+            // ask on). Everything below therefore works on a fully specified mount.
+            let spec = crate::wizard::resolve_mount_spec_from_flags(&kind)?;
+            let mut secrets = if uses_stdin_secret(&spec) {
                 SecretReader::from_stdin()?
             } else {
                 SecretReader::interactive()
@@ -1647,7 +1888,7 @@ pub async fn run(
             let report = add(
                 &config_path,
                 options.index_dir.as_deref(),
-                &kind,
+                &spec,
                 dry_run,
                 &mut secrets,
             )
@@ -1670,10 +1911,10 @@ pub async fn run(
 }
 
 /// Whether this add reads its credential from stdin rather than prompting.
-fn uses_stdin_secret(kind: &MountsAddKind) -> bool {
+pub(crate) fn uses_stdin_secret(kind: &MountSpec) -> bool {
     match kind {
-        MountsAddKind::Filesystem { .. } => false,
-        MountsAddKind::Couchdb { password_stdin, .. } => *password_stdin,
-        MountsAddKind::Algolia { api_key_stdin, .. } => *api_key_stdin,
+        MountSpec::Filesystem { .. } => false,
+        MountSpec::Couchdb { password_stdin, .. } => *password_stdin,
+        MountSpec::Algolia { api_key_stdin, .. } => *api_key_stdin,
     }
 }

@@ -214,19 +214,31 @@ pub enum MountsCommand {
 /// Flattened into each kind rather than declared on `Add` itself so they can be typed
 /// AFTER the kind (`mounts add filesystem --id team --yes`), which is the order the
 /// documented surface uses. A flag on `Add` would have to precede the kind subcommand.
+///
+/// # Why the identifying flags are `Option`
+///
+/// They are still REQUIRED — a mount without an id or a `mountAt` is not a thing the
+/// config can express. What changed is *who supplies them*: an omitted flag is a question
+/// the guided mode asks (see [`crate::wizard::resolve_mount_spec`]), so `mounts add
+/// couchdb` on a terminal walks the same per-kind sequence the first-init wizard walks
+/// rather than printing a usage error. With no terminal — or with `--yes`, which means
+/// "ask me nothing" — the missing flags are reported together in one clap-style error, so
+/// a script never hangs on a prompt it cannot answer. Marking them `required` in clap
+/// would take that decision away from the code that knows whether a prompt is possible.
 #[derive(Debug, Clone, Args)]
 pub struct MountsAddCommon {
     /// Stable identifier for the mount: `[a-z0-9][a-z0-9-]*`.
     ///
     /// Also names this mount's default index directory and, for a couchdb or algolia
-    /// mount, the account its credential is stored under.
+    /// mount, the account its credential is stored under. Prompted when omitted.
     #[arg(long)]
-    pub id: String,
+    pub id: Option<String>,
     /// Logical vault-relative prefix the mount appears at, e.g. `Team` or `Team/Alpha`.
     ///
     /// `""` or `/` means the vault ROOT. Forward slashes only; no `.`, `..` or `~`.
+    /// Prompted when omitted.
     #[arg(long = "mount-at")]
-    pub mount_at: String,
+    pub mount_at: Option<String>,
     /// Write the mount even though its probe failed.
     ///
     /// The mount lands in the config as configured and `doctor --probe-remote` will
@@ -248,6 +260,11 @@ pub struct MountsAddCommon {
 /// and "you passed `--url` to a filesystem mount" would have become a runtime check
 /// instead of a clap one.
 ///
+/// This type is the *pre-answers* to a per-kind question sequence, not the finished mount:
+/// [`crate::wizard::resolve_mount_spec`] turns it into a
+/// [`crate::mounts_cmd::MountSpec`], asking only for what was left out. The same sequences
+/// drive `setup-service --wizard`, which is why they live in one place.
+///
 /// `--index-dir` is deliberately NOT redeclared here: it is a GLOBAL flag (see
 /// [`ServiceOptions::index_dir`]) and clap propagates it into every subcommand, so
 /// `mounts add filesystem --index-dir <dir>` already reaches this command — declaring it
@@ -258,9 +275,9 @@ pub enum MountsAddKind {
     Filesystem {
         #[command(flatten)]
         common: MountsAddCommon,
-        /// The directory holding the vault. `~` is expanded.
+        /// The directory holding the vault. `~` is expanded. Prompted when omitted.
         #[arg(long = "vault-path")]
-        vault_path: PathBuf,
+        vault_path: Option<PathBuf>,
     },
     /// A Self-hosted LiveSync vault in CouchDB, reached through the Node sidecar.
     ///
@@ -273,12 +290,12 @@ pub enum MountsAddKind {
         #[command(flatten)]
         common: MountsAddCommon,
         /// CouchDB server origin WITHOUT the database path, e.g. `https://couch.example`.
-        /// Must not carry `user:password@` userinfo.
+        /// Must not carry `user:password@` userinfo. Prompted when omitted.
         #[arg(long)]
-        url: String,
-        /// The LiveSync database name.
+        url: Option<String>,
+        /// The LiveSync database name. Prompted when omitted.
         #[arg(long)]
-        database: String,
+        database: Option<String>,
         /// CouchDB user name. An identifier, not a credential.
         #[arg(long)]
         username: Option<String>,
@@ -305,12 +322,12 @@ pub enum MountsAddKind {
     Algolia {
         #[command(flatten)]
         common: MountsAddCommon,
-        /// Algolia application id, e.g. `ABC1234XYZ`. Not a secret.
+        /// Algolia application id, e.g. `ABC1234XYZ`. Not a secret. Prompted when omitted.
         #[arg(long = "app-id")]
-        app_id: String,
-        /// The index holding the shared corpus.
+        app_id: Option<String>,
+        /// The index holding the shared corpus. Prompted when omitted.
         #[arg(long = "index-name")]
-        index_name: String,
+        index_name: Option<String>,
         /// Override for the REST endpoint (`https://{appId}.algolia.net` by default).
         /// Must not carry userinfo.
         #[arg(long = "base-url")]

@@ -1,11 +1,58 @@
 # Configuring deep-obsidian-mcp
 
+- [The setup wizard](#the-setup-wizard)
 - [Config file & precedence](#config-file--precedence)
 - [Semantic search (embeddings)](#semantic-search-embeddings)
 - [Authentication](#authentication)
 - [Automatic reindexing](#automatic-reindexing)
 - [Transport & stdio modes](#transport--stdio-modes)
 - [Multiple vaults (mounts)](#multiple-vaults-mounts) — **experimental**
+
+## The setup wizard
+
+```bash
+deep-obsidian-mcp setup-service --wizard
+```
+
+The first-init flow. [USAGE.md](./USAGE.md#1-set-up-your-vault) lists the six screens;
+this section is about the decisions behind them.
+
+**It can produce a mount table, and it asks about remote roots up front.** Screen 1
+offers a local folder (the default), a remote LiveSync/CouchDB vault, or a shared
+Algolia index — because [any backend may be the root
+mount](#a-remote-mount-at-the-vault-root), and a wizard that only ever offered a folder
+would make the one path a LiveSync-only user needs look unsupported. A local root with
+no further mounts is still written as a plain top-level `vaultPath`, so the common case
+produces exactly the file it always did; anything else becomes a `mounts` table.
+
+**Each mount goes through the same sequence `mounts add` does**, in the same order and
+with the same wording, because it is [the same
+code](#building-the-table-the-mounts-cli): the legacy `vaultPath` is migrated to an
+explicit root mount on the first addition, the experimental flag is named and confirmed
+rather than assumed, the whole table is re-validated through the server's own loader on
+every addition, the credential goes to the secret store as a reference, and the mount is
+**probed** before anything is written. A failed probe stops the wizard and asks whether to
+keep the mount anyway.
+
+**Nothing is written until you have seen it.** The last screen prints the resolved config
+through the same renderer `print-config` uses — credentials appear only as
+[references](#secrets-are-references-never-values) — and asks once. The previous file, if
+there was one, goes to `config.json.bak`.
+
+**An interrupted run leaves nothing behind.** A probe has to happen *after* the
+credential reaches the store (that is what the probe authenticates with), so every later
+exit — a failed probe, a declined recap, `Ctrl-D` at any question — deletes the
+credentials that run stored and writes no config.
+
+**What it does not do.** It will not edit a config that already declares a mount table:
+re-deriving one from a fresh set of answers would silently drop every per-mount setting
+the wizard never asks about (`options`, `cache`, `retention`, `recallWeight`, an explicit
+`indexDir`). Use `mounts add` / `mounts list` / `mounts remove`, which change a table
+without touching the rest of the file. It also does not tune retention, `recallWeight` or
+the Algolia cache — those are file edits, documented below.
+
+`--dry-run` walks every screen, validates the config, and stores nothing, probes nothing
+and writes nothing.
 
 ## Config file & precedence
 
@@ -49,11 +96,17 @@ The server has two semantic modes:
 - **Embedding-backed** — an OpenAI-compatible `/embeddings` endpoint, with
   similarity ranking executed through `sqlite-vec`.
 
-Enable embeddings through the wizard (it also stores the API key securely):
+Enable embeddings through [the wizard](#the-setup-wizard), which offers an Ollama preset
+(a local endpoint and model, no account and no key) and stores any API key you do give as
+a reference rather than in the file:
 
 ```bash
 deep-obsidian-mcp setup-service --wizard
 ```
+
+Without an embedding endpoint, retrieval stays lexical and says so: results report
+`recallMode: "lexical"`. An Algolia mount is the exception — its recall is native to the
+index and unaffected either way.
 
 Or configure them with flags / environment variables:
 
@@ -240,6 +293,27 @@ deep-obsidian-mcp mounts remove --id phone
 Add `--json` to any of them for a structured report, and `--dry-run` to validate without
 writing. `deep-obsidian-mcp mounts add --help` lists every kind's flags.
 
+**Leave a flag out and `mounts add` asks for it.** On a terminal, the flags you did give
+are treated as answers already supplied and only the gaps are prompted for — the same
+questions, in the same order, that [the wizard](#the-setup-wizard) asks, because it is one
+implementation:
+
+```bash
+# Prompts for --id, --mount-at and --database; --url is already answered.
+deep-obsidian-mcp mounts add couchdb --url https://couch.example
+```
+
+The id is suggested as a slug of the `mountAt` you type (`Team/Alpha` → `team-alpha`) and
+is editable. Optional flags with documented defaults — `--username`, `--writable`,
+`--e2ee`, `--participant-id` — are *not* asked: they have working defaults, and filling in
+two forgotten flags should not turn into a five-question interrogation. The wizard does ask
+them, because there were no flags for it to default from.
+
+With **no terminal** — a script, a pipe, `--yes` (which means "ask me nothing"), or
+`--password-stdin` / `--api-key-stdin` (which have already claimed stdin for the
+credential) — a missing required flag is an error naming every one of them at once. Never a
+prompt that would hang a script forever.
+
 What `mounts add` does, in order:
 
 1. **Migrates a legacy config.** A `vaultPath`-only config is first converted to an explicit
@@ -388,7 +462,8 @@ rather than pretending:
 - `setup-service --vault-snippets` reports `skip`. The snippets are files Obsidian reads
   out of `<vault>/.obsidian/snippets`, and a LiveSync vault's `.obsidian` folder lives on
   each syncing *device*. Install them into the local vault of each device instead. The
-  `--mcp` and `--skills` installs are unaffected.
+  `--mcp` and `--skills` installs are unaffected. [The wizard](#the-setup-wizard) does not
+  even offer the snippets for a remote root, and says why.
 - `doctor`'s `vault` check reports `ok` with the root's location and points at
   `--probe-remote`, which is what actually contacts the remote. It is deliberately not
   `fail` — a fully-remote vault is a supported configuration, and `doctor`'s exit code
