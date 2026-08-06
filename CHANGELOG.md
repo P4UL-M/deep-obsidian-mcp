@@ -272,6 +272,52 @@ All notable changes to deep-obsidian-mcp are documented here.
 - **The black-box MCP surface is frozen** by a golden-based contract suite, so a
   single-mount vault's `tools/list` and payloads cannot drift while multi-mount
   work lands. Unknown config fields are retained rather than dropped on rewrite.
+- **Docker packaging: an image, a compose deployment, and a parity smoke test.** A
+  multi-stage `Dockerfile` builds the release binary and the LiveSync sidecar bundle
+  from sources into a `node:20-slim` runtime carrying `ripgrep`, `curl` and the
+  packaged skills/snippets/assets — nothing else. The install prefix is
+  `/opt/deep-obsidian-mcp`, chosen so the binary's own exe-relative probe finds the
+  bundle at exactly the path `PACKAGED_BUNDLE_PREFIX` derives, i.e. the same
+  arrangement the `.deb` and Homebrew use, with no environment variable pointing at
+  it in any of the three.
+
+  `docker-compose.example.yml` is a runnable deployment: CouchDB, a one-shot job that
+  applies the settings Self-hosted LiveSync requires (CORS for the Obsidian origins,
+  `require_valid_user`, the size ceilings) and finishes single-node cluster setup, and
+  the MCP server reading that database **as its vault root**. The settings go through
+  CouchDB's `_config` API rather than a mounted `local.ini` because the official
+  image's entrypoint chowns everything under `/opt/couchdb` before starting: a
+  read-only bind mount makes that fail and the container exits 1 with no log output at
+  all.
+
+  Three container behaviours are worth stating, because each is a decision rather
+  than a default:
+
+  - **Auth is required.** No `/run/secrets/auth_token` and no explicit
+    `DO_INSECURE_NO_AUTH=1` is a refusal to start, with a message naming the missing
+    file — before anything binds. The image runs as a non-root user, `/healthz` stays
+    open for the `HEALTHCHECK`, and TLS is delegated to a reverse proxy.
+  - **Config: both ways, with a stated precedence.** A mounted
+    `/etc/deep-obsidian/config.json` WINS and is only validated (through
+    `print-config`, i.e. the real loader); otherwise a config is derived from `DO_*`
+    variables once, onto the volume, and later boots reuse it. Host and port are the
+    documented exception: the container forces them, because a config written on a
+    laptop says `127.0.0.1` and a drifting port would silently break the healthcheck.
+  - **Secrets never touch the volume.** `XDG_CONFIG_HOME` is inside the container, so
+    the encrypted store dies with it; the entrypoint deletes it and re-injects every
+    secret from `/run/secrets` on every boot. The volume holds an index and a config
+    and no credential, which is also what makes the file store's derived-key weakness
+    irrelevant in this deployment.
+
+  A CI `docker` job builds natively on `ubuntu-24.04` and `ubuntu-24.04-arm` (a
+  matrix, not a QEMU cross-build, so each leg can *run* what it built) and executes
+  `scripts/docker-smoke-test.sh`: the same assertions `scripts/linux-smoke-test.sh`
+  makes about the `.deb` — including `doctor` run from `/` locating the packaged
+  bundle — plus the entrypoint contract and a live-CouchDB proof that a remote root
+  starts degraded on a database no client has synced and readies itself, with no
+  restart, once the LiveSync documents appear. Nothing is published: the GHCR push
+  and its tag policy are present but commented out. See
+  [docs/docker.md](./docs/docker.md).
 
 ### Fixed
 

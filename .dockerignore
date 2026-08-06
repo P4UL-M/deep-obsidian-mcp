@@ -1,0 +1,27 @@
+# Build context for `Dockerfile`. Everything the image needs is listed in the
+# Dockerfile's COPY lines: the Rust workspace, `sidecar/livesync-sidecar`, and the
+# packaged data directories (skills, obsidian-snippets, assets). Nothing else has
+# any business travelling to the daemon.
+#
+# `target/` is the expensive one: a local `cargo build` leaves gigabytes there, and
+# shipping it would both slow every build and invalidate the layer cache on each
+# host-side rebuild. The image builds Rust in its own stage, from sources, so the
+# host's artifacts are not merely unnecessary — they must not be reachable.
+target/
+**/node_modules/
+sidecar/livesync-sidecar/dist/
+
+.git/
+.github/
+.claude/
+outputs/
+**/.DS_Store
+**/.deep-obsidian-mcp/
+
+# Docs and other packaging channels the image does not use. `*.md` has no `**/`
+# prefix on purpose: it drops the root-level documents (README, CHANGELOG, ...) and
+# leaves `skills/**/SKILL.md` — which the image does install — untouched.
+*.md
+docs/
+Formula/
+packaging/

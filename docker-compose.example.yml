@@ -1,0 +1,217 @@
+# A complete, copy-paste-runnable deployment: CouchDB (Self-hosted LiveSync's
+# server) + deep-obsidian-mcp reading that same database as its ROOT vault.
+#
+# ===========================================================================
+# Quickstart
+# ===========================================================================
+#
+#   cp docker-compose.example.yml docker-compose.yml
+#   mkdir -p secrets
+#   openssl rand -hex 24 > secrets/couchdb_password
+#   openssl rand -hex 32 > secrets/auth_token
+#   printf 'COUCHDB_USER=obsidian\nCOUCHDB_PASSWORD=%s\n' "$(cat secrets/couchdb_password)" > .env
+#   # 700 on the directory, 644 on the files: a bind-mounted secret keeps its HOST
+#   # permissions, and the container runs as uid 10001, so `chmod 600` would leave a
+#   # file only the host owner can read and the entrypoint would refuse to start.
+#   # The directory is what keeps other host users out.
+#   chmod 700 secrets && chmod 644 secrets/* && chmod 600 .env
+#   docker compose up -d --build
+#   curl -s localhost:4100/healthz | head -c 200
+#   curl -s -H "Authorization: Bearer $(cat secrets/auth_token)" \
+#        -H 'Content-Type: application/json' \
+#        -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}' \
+#        localhost:4100/mcp | head -c 300
+#
+# Why the password appears in two places: the official `couchdb` image reads its
+# admin credentials from COUCHDB_USER/COUCHDB_PASSWORD and supports no `*_FILE`
+# variant, while deep-obsidian-mcp deliberately takes credentials from files under
+# /run/secrets (never from its environment, so they cannot show up in `docker
+# inspect`). The `.env` line above is generated FROM the secret file so there is
+# still one source of truth.
+#
+# ===========================================================================
+# Pairing your Obsidian client — and why the MCP starts DEGRADED
+# ===========================================================================
+#
+# In Obsidian, install "Self-hosted LiveSync" and point it at the SAME database:
+#
+#   URI:       http://localhost:5984      (or https://... through your proxy)
+#   Username:  the COUCHDB_USER above
+#   Password:  the contents of secrets/couchdb_password
+#   Database:  obsidian                   (DO_COUCHDB_DATABASE below)
+#
+# Until a LiveSync client has synced at least once, the database has no
+# `obsydian_livesync_version` document and no `_local/obsydian_livesync_milestone`,
+# so the sidecar's compatibility gate answers `unknown-schema` and the mount starts
+# DEGRADED: `/healthz` is 200 (the server is alive), `/readyz` is 503 and names the
+# mount, and vault tools over that mount refuse rather than return wrong answers.
+# This is the honest expected flow, not a misconfiguration — nothing here can invent
+# a LiveSync vault, only Obsidian can. The supervisor re-runs its handshake on a
+# backoff (`unknown-schema` is classified as recoverable-without-reconfiguration),
+# so the mount readies itself minutes after the first sync with no restart.
+#
+# If you want the MCP to serve a plain directory instead, delete the couchdb
+# services, mount your vault at /vault and drop the DO_COUCHDB_* variables: the
+# entrypoint's default is DO_ROOT_KIND=filesystem.
+#
+# ===========================================================================
+# TLS
+# ===========================================================================
+#
+# Neither service terminates TLS. Both ports are published on 127.0.0.1 only, which
+# is the right default for a single host; to expose either one, put a reverse proxy
+# (Caddy, Traefik, nginx) in front and let it hold the certificate. See the
+# "Reverse-proxy TLS" section of docs/docker.md.
+
+name: deep-obsidian
+
+services:
+  couchdb:
+    image: couchdb:3
+    restart: unless-stopped
+    environment:
+      COUCHDB_USER: ${COUCHDB_USER:?set COUCHDB_USER in .env}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?set COUCHDB_PASSWORD in .env}
+    volumes:
+      - couchdb-data:/opt/couchdb/data
+    ports:
+      # Loopback only: your Obsidian client on this machine can reach it, the
+      # internet cannot. Change to "5984:5984" only behind a TLS proxy.
+      - "127.0.0.1:5984:5984"
+    healthcheck:
+      # `-u` is not optional: couchdb-init turns on require_valid_user, after which
+      # even an unauthenticated /_up answers 401 — so a check without credentials
+      # would go RED the moment provisioning finishes, taking the service with it.
+      test:
+        - CMD-SHELL
+        - curl -fsS -u "$$COUCHDB_USER:$$COUCHDB_PASSWORD" http://127.0.0.1:5984/_up > /dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  # One-shot provisioning, in three parts: the CouchDB settings Self-hosted LiveSync
+  # requires, single-node cluster setup (which creates _users/_replicator — a fresh
+  # couchdb:3 with only COUCHDB_USER set does NOT have them), and the LiveSync
+  # database. Idempotent throughout, so `docker compose up` can be re-run at will.
+  #
+  # # Why the settings go through the HTTP _config API and not a mounted local.ini
+  #
+  # An ini file under /opt/couchdb/etc/local.d/ is the tidier-looking option and it
+  # does not work: the couchdb image's entrypoint runs
+  # `find /opt/couchdb \! -user couchdb -exec chown couchdb:couchdb {} +` before
+  # starting, which fails on a read-only bind mount, and because that runs under
+  # `set -e` the container exits 1 **with no log output at all**. Mounting it
+  # read-write instead makes the chown rewrite the ownership of a file in your git
+  # checkout. So the settings are applied the way the LiveSync maintainer's own
+  # provisioning script applies them (vrtmrz/obsidian-livesync,
+  # utils/couchdb/provision.ts): as PUTs to /_node/_local/_config.
+  #
+  # Consequence to know: CouchDB persists a runtime config change into the ini file
+  # it loaded last, which lives in the image layer rather than in the data volume. So
+  # a RECREATED couchdb container starts without these settings — which is fine
+  # precisely because this job is part of every `up` and re-applies them.
+  couchdb-init:
+    image: couchdb:3
+    restart: "no"
+    depends_on:
+      couchdb:
+        condition: service_healthy
+    environment:
+      COUCHDB_USER: ${COUCHDB_USER:?}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?}
+      COUCHDB_DATABASE: ${COUCHDB_DATABASE:-obsidian}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        base="http://couchdb:5984"
+        auth="$$COUCHDB_USER:$$COUCHDB_PASSWORD"
+        put() {
+          curl -fsS -u "$$auth" -X PUT "$$base/_node/_local/_config/$$1/$$2" \
+            -H 'Content-Type: application/json' -d "$$3" > /dev/null
+          echo "config: $$1/$$2 set"
+        }
+        # No anonymous access. This is why the healthcheck above passes credentials.
+        put chttpd require_valid_user '"true"'
+        put chttpd_auth require_valid_user '"true"'
+        # A login prompt instead of an opaque failure, for a browser or the desktop app.
+        put httpd WWW-Authenticate '"Basic realm=\"couchdb\""'
+        # CORS for the three origins an Obsidian client can present. The MCP server is
+        # not a browser and needs none of them; the LiveSync plugin does.
+        put httpd enable_cors '"true"'
+        put chttpd enable_cors '"true"'
+        put cors credentials '"true"'
+        put cors origins '"app://obsidian.md,capacitor://localhost,http://localhost"'
+        # Upstream's ceilings: 50 MB per document, 4 GiB per request.
+        put couchdb max_document_size '"50000000"'
+        put chttpd max_http_request_size '"4294967296"'
+        echo "enabling single-node cluster setup"
+        curl -sS -u "$$auth" -X POST "$$base/_cluster_setup" \
+          -H 'Content-Type: application/json' \
+          -d "{\"action\":\"enable_single_node\",\"bind_address\":\"0.0.0.0\",\"username\":\"$$COUCHDB_USER\",\"password\":\"$$COUCHDB_PASSWORD\",\"singlenode\":true}" || true
+        echo "creating database $$COUCHDB_DATABASE (409 = already there)"
+        curl -sS -u "$$auth" -X PUT "$$base/$$COUCHDB_DATABASE" || true
+        echo "couchdb is provisioned"
+
+  deep-obsidian:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Once images are published this becomes, with the same environment:
+    #   image: ghcr.io/p4ul-m/deep-obsidian-mcp:latest
+    restart: unless-stopped
+    # The server spawns the Node sidecar as a child process; `init: true` gives the
+    # container a real init to reap it if it ever outlives a handshake.
+    init: true
+    depends_on:
+      couchdb:
+        condition: service_healthy
+      couchdb-init:
+        condition: service_completed_successfully
+    environment:
+      # --- the root vault: this CouchDB database ---
+      DO_ROOT_KIND: couchdb
+      DO_ROOT_ID: vault
+      DO_COUCHDB_URL: http://couchdb:5984
+      DO_COUCHDB_DATABASE: ${COUCHDB_DATABASE:-obsidian}
+      DO_COUCHDB_USERNAME: ${COUCHDB_USER:?}
+      # Read-only by default. Set to "true" to let the agent write notes back into
+      # the LiveSync database (your Obsidian clients will then receive them).
+      DO_COUCHDB_WRITABLE: "false"
+      # Set to "true" AND provide secrets/e2ee_passphrase if the vault is
+      # end-to-end encrypted in the LiveSync plugin.
+      DO_COUCHDB_E2EE: "false"
+      # --- transport ---
+      DO_HTTP_HOST: 0.0.0.0
+      DO_HTTP_PORT: "4100"
+    secrets:
+      # Mounted at /run/secrets/<name>, re-injected into the container's ephemeral
+      # encrypted store on every boot and never written to the volume.
+      - couchdb_password
+      - auth_token
+      # Uncomment together with DO_COUCHDB_E2EE=true:
+      # - e2ee_passphrase
+    volumes:
+      # Index + derived config. Deleting this volume costs a reindex, nothing else:
+      # it holds no credential.
+      - deep-obsidian-state:/var/lib/deep-obsidian-mcp
+      # A mounted config WINS over every DO_* variable above; the entrypoint then
+      # only validates it and injects secrets into the references it declares.
+      # Generate one with `deep-obsidian-mcp setup-service --wizard` on your laptop.
+      # - ./config.json:/etc/deep-obsidian/config.json:ro
+    ports:
+      - "127.0.0.1:4100:4100"
+
+volumes:
+  couchdb-data:
+  deep-obsidian-state:
+
+secrets:
+  couchdb_password:
+    file: ./secrets/couchdb_password
+  auth_token:
+    file: ./secrets/auth_token
+  # e2ee_passphrase:
+  #   file: ./secrets/e2ee_passphrase
