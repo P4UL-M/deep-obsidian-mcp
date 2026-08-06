@@ -203,7 +203,7 @@ impl Fixture {
     fn config(&self, couch: &MockCouch, writable: bool) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
             federated_rerank: true,
-            vault_path: self.base.join("root-vault"),
+            vault_path: Some(self.base.join("root-vault")),
             mounts: vec![
                 MountConfig {
                     unknown: Default::default(),

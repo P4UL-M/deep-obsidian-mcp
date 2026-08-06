@@ -35,7 +35,8 @@ pub struct AppState {
     /// All vault IO for tool and resource handling goes through here.
     ///
     /// `config.vault_path` deliberately stays available alongside it: it is the
-    /// ROOT mount's path, which is what `vaultPath` has always meant. Each mount's
+    /// ROOT mount's LOCAL directory when the root has one, which is what `vaultPath`
+    /// has always meant — and `None` when the root is a remote backend. Each mount's
     /// own vault path now reaches the index crate through that mount's
     /// [`RuntimeState`] instead (see [`MountRuntimes`]).
     pub router: Arc<VaultRouter>,
@@ -47,27 +48,43 @@ pub struct AppState {
     /// on a non-root mount would silently be read from the root vault.
     pub backend: Arc<dyn VaultBackend>,
     /// Whether line search can be served. Derived from [`Capability::GrepSearch`]
-    /// on the ROOT mount at construction; drives both conditional `grep_search`
-    /// registration and the defensive call guard.
+    /// across the WHOLE mount table at construction; drives both conditional
+    /// `grep_search` registration and the defensive call guard.
     ///
-    /// # Still keyed on the ROOT mount, now that a non-root mount can also serve grep
+    /// # Why this is now ANY mount rather than the ROOT mount
     ///
-    /// A CouchDB mount advertises `GrepSearch` (it imitates ripgrep in-process rather
-    /// than spawning one), so "the root supports grep" and "some mount supports grep"
-    /// are no longer the same predicate. This deliberately stays the former:
+    /// It used to be keyed on the root, and that was defensible only while the root was
+    /// guaranteed to be a filesystem mount. It no longer is: a couchdb or algolia
+    /// backend can be the vault root, and a remote root has no `rg` and no files, so
+    /// "does the root support grep" would answer for the wrong thing entirely — it would
+    /// say `false` for a couchdb root that greps perfectly well (in-process, over note
+    /// text) and `false` for an algolia root that greps a bounded candidate set.
     ///
-    /// * A mount is never the root unless it is the vault root, and a CouchDB or
-    ///   Algolia mount is required to have a non-empty prefix — so on every
-    ///   configuration that can exist, the root mount IS a filesystem one and this flag
-    ///   means exactly what it has always meant. Nothing changes for any real config.
-    /// * `tools/list` is computed once per process and cannot say "available for some
-    ///   paths". Registering `grep_search` because a NON-root mount can serve it would
-    ///   advertise a tool that then fails on most of the vault, on a host with no `rg`
-    ///   — which is the capability lie the conditional registration exists to prevent.
+    /// So the rule is: **advertise `grep_search` iff at least one mount's descriptor
+    /// carries [`Capability::GrepSearch`]**. Filesystem mounts contribute it only when
+    /// `rg` is on `PATH`; couchdb mounts always; algolia mounts always.
     ///
-    /// Per-mount truth is already reachable: `vault_info.mounts[].capabilities` carries
-    /// each mount's own `grep-search`, and a caller can scope a grep to a mount whose
-    /// capability it has read there.
+    /// # What this widens, and why the widening is honest rather than a capability lie
+    ///
+    /// On existing configs it changes exactly one shape: a filesystem root on a host
+    /// with no `rg`, PLUS a remote mount. That used to hide `grep_search`; it now
+    /// advertises it. That is the honest answer, because the router's unscoped grep
+    /// FEDERATES and tolerates a mount that cannot serve it — the capable mounts return
+    /// their matches and the incapable ones are named in the payload's `missingMounts`
+    /// with `exhausted: false`. A caller therefore gets real matches plus an explicit
+    /// statement of what was not searched, rather than a tool that does not exist for a
+    /// vault where most of it works.
+    ///
+    /// The converse — hiding the tool when SOME mount cannot grep — was rejected for the
+    /// same reason: it would remove line search from a vault it works on.
+    ///
+    /// A config with no grep-capable mount at all still gets no `grep_search`, which is
+    /// what keeps the frozen single-mount `tools_list` golden (filesystem root,
+    /// `rg_available: false`) byte-identical: one mount, no capability, tool absent.
+    ///
+    /// Per-mount truth stays reachable either way: `vault_info.mounts[].capabilities`
+    /// carries each mount's own `grep-search`, and a caller can scope a grep to a mount
+    /// whose capability it has read there.
     pub rg_available: bool,
     /// Shared store of pending out-of-band uploads. Both the `request_vault_upload`
     /// tool handler (mint) and the `PUT /upload/{token}` endpoint (consume) share it.
@@ -104,7 +121,11 @@ impl AppState {
             .root()
             .expect("resolved config to declare a root mount");
         let backend = root.backend.clone();
-        let rg_available = backend.descriptor().supports(Capability::GrepSearch);
+        // ANY mount, not the root's. See the field docs for the rule and what it widens.
+        let rg_available = router
+            .mounts()
+            .iter()
+            .any(|mount| mount.backend.descriptor().supports(Capability::GrepSearch));
         Self {
             config: Arc::new(config),
             runtimes,
@@ -117,13 +138,26 @@ impl AppState {
         }
     }
 
-    /// The ROOT mount's index runtime.
+    /// The ROOT mount's index runtime, when the root mount HAS one.
     ///
     /// The right handle for anything that is about the vault root itself — health,
     /// readiness, the vault overview. NOT the right handle for a caller-supplied
     /// path on a multi-mount config; route that through
     /// [`MountRuntimes::for_mount`].
-    pub fn runtime(&self) -> &Arc<RuntimeState> {
+    ///
+    /// # Why this is fallible now
+    ///
+    /// `None` for exactly one shape: an ALGOLIA root mount. An Algolia-backed mount has
+    /// no local search index by design — the remote index is the corpus — so it gets no
+    /// [`RuntimeState`] at all (see [`crate::runtime::mount_has_local_index`]), and when
+    /// such a mount is the root there is no root runtime to hand back. A couchdb root
+    /// DOES have a local index, so a fully-remote couchdb-rooted vault still answers
+    /// `Some` and every index-backed tool keeps working on it.
+    ///
+    /// Callers turn `None` into the SAME refusal a scoped call on an index-less mount
+    /// already produces (`tools::mount_index`), rather than inventing a second wording
+    /// for the same fact.
+    pub fn runtime(&self) -> Option<&Arc<RuntimeState>> {
         self.runtimes.root()
     }
 

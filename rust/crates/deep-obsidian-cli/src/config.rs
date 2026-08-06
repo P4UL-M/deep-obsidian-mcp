@@ -281,8 +281,16 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
         config_file_path: Some(config_path.clone()),
     };
     let mut service = normalize_service_config(input)?;
+    // Packaged mode moves the index out of the vault and keys it by the vault PATH. A
+    // remote root has no path to key by — and needs no move, because
+    // `normalize_service_config` already anchored its default index dir under the same
+    // packaged data directory (`default_remote_root_index_dir`). So this rewrite applies
+    // to a local root only; leaving it out for a remote one is not a gap, it is the
+    // packaged default already being in force.
     if packaged_mode && matches!(index_dir_source, ResolvedSource::Default) {
-        service.index_dir = default_packaged_index_dir(&service.vault_path);
+        if let Some(vault_path) = service.vault_path.as_deref() {
+            service.index_dir = default_packaged_index_dir(vault_path);
+        }
     }
 
     Ok(ResolvedRuntimeConfig {

@@ -267,25 +267,34 @@ pub fn list_resource_templates() -> ResourceTemplateListResult {
 /// string for a path containing `.`/`..` or a trailing slash. The read itself, and
 /// only the read, crosses the boundary.
 ///
-/// `vault_path` is the ROOT mount's path. On a multi-mount config the pre-guard
-/// therefore still checks the root vault even for a path that routes elsewhere.
-/// That is deliberate rather than overlooked: the check's wording is frozen by the
-/// `error_path_traversal` and `error_missing_file` goldens, the startup gate
-/// already requires every mount to be reachable, and making the guard per-mount
+/// `vault_path` is the ROOT mount's LOCAL directory. On a multi-mount config the
+/// pre-guard therefore still checks the root vault even for a path that routes
+/// elsewhere. That is deliberate rather than overlooked: the check's wording is frozen
+/// by the `error_path_traversal` and `error_missing_file` goldens, the startup gate
+/// already requires every local mount to be reachable, and making the guard per-mount
 /// would change a public error string for zero practical gain.
+///
+/// `None` — a REMOTE root — skips the directory pre-guard entirely, because there is no
+/// directory to stat and a `metadata()` call on nothing could only ever fail. The
+/// lexical guards below still run in the same order, and the read still goes through the
+/// router, so the only thing that changes for a remote root is that a check which could
+/// not have said anything true is not made. A filesystem root takes the identical path it
+/// always did, which is what keeps both goldens byte-identical.
 async fn read_note_text(
-    vault_path: &Path,
+    vault_path: Option<&Path>,
     router: &VaultRouter,
     relative_path: &str,
 ) -> Result<String, String> {
-    if !fs::metadata(vault_path)
-        .map(|metadata| metadata.is_dir())
-        .unwrap_or(false)
-    {
-        return Err(format!(
-            "vault path does not exist or is not a directory: {}",
-            vault_path.display()
-        ));
+    if let Some(vault_path) = vault_path {
+        if !fs::metadata(vault_path)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "vault path does not exist or is not a directory: {}",
+                vault_path.display()
+            ));
+        }
     }
 
     let normalized = relative_path.trim_start_matches('/');
@@ -322,8 +331,11 @@ async fn read_note_text(
 
 pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadResult, String> {
     if uri == VAULT_INFO_URI {
-        let snapshot = state
-            .runtime()
+        // The ROOT mount's index, or the honest no-local-index refusal — see
+        // `tools::root_index`. An algolia-rooted vault has no root index and this
+        // resource is index-derived, so refusing is the only true answer; its per-mount
+        // detail is still reachable through `vault_info`'s `mounts[]`.
+        let snapshot = crate::tools::root_index(state, "the vault overview resource")?
             .fresh_snapshot("resources/read:vault-info")
             .await?;
         let mut payload = build_vault_overview_payload(&state.config, &snapshot);
@@ -374,7 +386,12 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let path = params
             .get("path")
             .ok_or_else(|| "missing note path".to_string())?;
-        let text = read_note_text(&state.config.vault_path, state.router.as_ref(), path).await?;
+        let text = read_note_text(
+            state.config.vault_path.as_deref(),
+            state.router.as_ref(),
+            path,
+        )
+        .await?;
         return Ok(ResourceReadResult {
             contents: vec![ResourceContents {
                 uri: note_uri(path),
@@ -391,7 +408,12 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let slug = params
             .get("slug")
             .ok_or_else(|| "missing heading slug".to_string())?;
-        let text = read_note_text(&state.config.vault_path, state.router.as_ref(), path).await?;
+        let text = read_note_text(
+            state.config.vault_path.as_deref(),
+            state.router.as_ref(),
+            path,
+        )
+        .await?;
         let heading = extract_heading_sections(&text)
             .into_iter()
             .find(|section| section.slug == *slug)
@@ -412,7 +434,12 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         let id = params
             .get("id")
             .ok_or_else(|| "missing block id".to_string())?;
-        let text = read_note_text(&state.config.vault_path, state.router.as_ref(), path).await?;
+        let text = read_note_text(
+            state.config.vault_path.as_deref(),
+            state.router.as_ref(),
+            path,
+        )
+        .await?;
         let block = extract_block_sections(&text)
             .into_iter()
             .find(|section| section.id == *id)
@@ -490,29 +517,33 @@ mod tests {
         let backend = single_mount_router(&vault);
 
         assert_eq!(
-            read_note_text(&vault, &backend, "Home.md").await.unwrap(),
+            read_note_text(Some(vault.as_path()), &backend, "Home.md")
+                .await
+                .unwrap(),
             "home"
         );
 
         assert_eq!(
-            read_note_text(&vault, &backend, "../escape.md")
+            read_note_text(Some(vault.as_path()), &backend, "../escape.md")
                 .await
                 .unwrap_err(),
             "path escapes the vault: ../escape.md"
         );
         // Stricter than core, which would normalize this to `Home.md`.
         assert_eq!(
-            read_note_text(&vault, &backend, "Notes/../Home.md")
+            read_note_text(Some(vault.as_path()), &backend, "Notes/../Home.md")
                 .await
                 .unwrap_err(),
             "path escapes the vault: Notes/../Home.md"
         );
         assert_eq!(
-            read_note_text(&vault, &backend, "/").await.unwrap_err(),
+            read_note_text(Some(vault.as_path()), &backend, "/")
+                .await
+                .unwrap_err(),
             "invalid vault-relative path: /"
         );
         // A missing note keeps the enriched IO wording from core.
-        let missing = read_note_text(&vault, &backend, "Missing.md")
+        let missing = read_note_text(Some(vault.as_path()), &backend, "Missing.md")
             .await
             .unwrap_err();
         assert!(
@@ -526,7 +557,7 @@ mod tests {
         let absent = temp_dir("resources-read-note-absent");
         let absent_backend = single_mount_router(&absent);
         assert_eq!(
-            read_note_text(&absent, &absent_backend, "Home.md")
+            read_note_text(Some(absent.as_path()), &absent_backend, "Home.md")
                 .await
                 .unwrap_err(),
             format!(
@@ -550,7 +581,7 @@ mod tests {
         let backend = single_mount_router(&vault);
 
         assert_eq!(
-            read_note_text(&vault, &backend, "escape/secret.md")
+            read_note_text(Some(vault.as_path()), &backend, "escape/secret.md")
                 .await
                 .unwrap_err(),
             "path escapes the vault: escape/secret.md"

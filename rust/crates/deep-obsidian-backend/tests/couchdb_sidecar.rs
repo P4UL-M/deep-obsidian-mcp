@@ -123,7 +123,21 @@ impl MockCouch {
         Self::start_with(vault, true)
     }
 
+    /// A fixture that answers every authenticated request with `status`.
+    ///
+    /// The one way to reach a PERMANENT compatibility verdict from outside: 401 makes
+    /// the sidecar classify the remote `auth-failed`, which the supervisor must NOT
+    /// retry, because the credentials it would retry with are the ones already
+    /// rejected. See `an_auth_failure_is_not_retried_because_the_credentials_cannot_change`.
+    fn start_with_auth_status(vault: &str, status: u16) -> Self {
+        Self::start_inner(vault, false, Some(status))
+    }
+
     fn start_with(vault: &str, writable: bool) -> Self {
+        Self::start_inner(vault, writable, None)
+    }
+
+    fn start_inner(vault: &str, writable: bool, auth_status: Option<u16>) -> Self {
         let mut command = Command::new("node");
         command
             .arg("test/mock-couch-server.mjs")
@@ -131,6 +145,9 @@ impl MockCouch {
             .arg(vault);
         if writable {
             command.arg("--writable");
+        }
+        if let Some(auth_status) = auth_status {
+            command.arg("--auth-status").arg(auth_status.to_string());
         }
         let mut child = command
             .current_dir(sidecar_dir())
@@ -229,9 +246,15 @@ impl MockCouch {
 
 /// The deadline every recovery assertion in this file is bounded by.
 ///
-/// Recovery here is never a background loop -- the supervisor restarts lazily, inside
-/// the next call -- so the poll below RE-ISSUES the operation each time rather than
-/// watching a status field, which would never flip on its own.
+/// Recovery from a DEAD child is lazy -- the supervisor restarts inside the next call --
+/// so those polls RE-ISSUE the operation each time rather than watching a status field,
+/// which would never flip on its own.
+///
+/// Recovery from a non-`ok` compatibility verdict is the opposite: the supervisor's
+/// readiness-recovery loop re-hand-shakes in the background with nothing calling it, so
+/// the poll for THAT one deliberately watches `health()` -- a purely local read that
+/// issues no request -- because a poll that re-issued a read could not distinguish a
+/// background loop from a caller prodding it awake.
 const RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Poll `attempt` until it succeeds, or panic naming the last failure.
@@ -1852,26 +1875,45 @@ async fn a_rebuilt_backend_has_no_cursor_and_replays_everything_rather_than_miss
     second.shutdown().await;
 }
 
-/// A remote that was DOWN at handshake time leaves the mount degraded, and bringing
-/// the remote back does not by itself fix it -- the child has to re-handshake.
+/// A remote that was DOWN at handshake time leaves the mount degraded, and the mount
+/// HEALS BY ITSELF once the remote returns -- no service restart, nobody killing the
+/// child, and nothing calling the mount to prod it awake.
 ///
-/// # Why this is asserted as a limit rather than as a recovery
+/// # What used to be asserted here, and why it changed
 ///
-/// The compatibility verdict is decided once, by `initialize`, and cached on BOTH
-/// sides: the sidecar answers `health` from `state.vault.compatibilityStatus` rather
-/// than re-probing, and the supervisor answers `ready_connection` from the health it
-/// recorded. Nothing re-runs `initialize` while the child is alive, and the restart
-/// backoff only runs when the connection has DIED -- an unreachable remote does not kill
-/// the child, it only makes its verdict useless.
+/// This test previously asserted the OPPOSITE, as a documented limit: the compatibility
+/// verdict is decided once by `initialize` and cached on both sides (the sidecar answers
+/// `health` from its recorded status rather than re-probing; the supervisor answers
+/// `ready_connection` from the health it recorded), nothing re-ran `initialize` while the
+/// child was alive, and the restart backoff only runs when the connection has DIED --
+/// which an unreachable remote does not cause. An operator whose CouchDB was down at
+/// startup therefore had to restart the service.
 ///
-/// So the honest claim is the narrow one, and both halves of it are asserted below: an
-/// outage at startup degrades the mount rather than failing the server, and the mount
-/// comes back exactly when the child does. An operator whose CouchDB was down when the
-/// service started has to restart the service (or wait for a transport failure to
-/// recycle the child); that is a real limitation, and a test that polled until the mount
-/// healed by itself would have been asserting something this code does not do.
+/// That was a real limitation and it is now fixed, because it had become
+/// unaffordable: a couchdb mount may be the vault ROOT, and a root that is merely
+/// unreachable at startup degrades rather than fails (see
+/// `deep_obsidian_server::runtime::root_failure_is_fatal`). Without background recovery,
+/// a network blip at startup would leave a fully-remote vault permanently unserveable
+/// with the process up and healthy -- exactly the state the degraded start exists to
+/// avoid.
+///
+/// # The two halves, and why the poll watches `health()`
+///
+/// * **Degraded, not fatal.** The handshake COMPLETES against a remote answering 500 to
+///   everything, the verdict is `unreachable`, and reads refuse with it instead of
+///   answering an empty vault.
+/// * **Healed by itself.** The poll below reads `supervisor.health()`, which is local
+///   state and issues no request to the child. Nothing in this test touches the backend
+///   between the outage ending and the mount reporting ready, so the ONLY thing that
+///   could have changed the verdict is the supervisor's own readiness-recovery loop. A
+///   poll that re-issued a read would have proved something weaker -- a lazily
+///   recovering supervisor would pass it too.
+///
+/// `starts` growing is the evidence of the mechanism, not an incidental detail: the
+/// sidecar refuses a second `initialize` on one connection (`already-initialized`), so a
+/// fresh verdict requires a fresh child. See `SidecarSupervisor::rehandshake`.
 #[tokio::test]
-async fn a_remote_down_at_handshake_time_recovers_when_the_child_restarts_and_not_before() {
+async fn a_remote_down_at_handshake_time_recovers_by_itself_when_the_remote_returns() {
     require_prerequisites!();
     let mut couch = MockCouch::start("small");
     // The outage is in place BEFORE the first handshake, so `initialize` never sees a
@@ -1887,14 +1929,12 @@ async fn a_remote_down_at_handshake_time_recovers_when_the_child_restarts_and_no
         .await
         .expect("an unreachable remote must still complete the handshake");
     let degraded = supervisor.health();
-    assert_eq!(degraded.starts, 1);
     assert!(
         !degraded.is_ready(),
         "a remote answering 500 to everything must not be reported serveable: {degraded:?}"
     );
-    let status = degraded.compatibility.as_ref().expect("a verdict").status;
     assert_eq!(
-        status,
+        degraded.compatibility.as_ref().expect("a verdict").status,
         CompatibilityStatus::Unreachable,
         "a remote answering 500 to every request classifies as unreachable: {degraded:?}"
     );
@@ -1905,47 +1945,95 @@ async fn a_remote_down_at_handshake_time_recovers_when_the_child_restarts_and_no
         .expect_err("a degraded mount must refuse reads");
     assert!(!error.to_string().is_empty());
 
+    // Whatever the recovery loop has done so far while the remote was still down: every
+    // one of those attempts got `unreachable` again, which is what the assertions above
+    // just confirmed. The count is the baseline the recovery is measured against rather
+    // than a fixed number, because the loop is retrying on its own schedule and pinning
+    // it to `1` would be racing that schedule.
+    let starts_while_down = supervisor.health().starts;
+    assert!(starts_while_down >= 1, "{starts_while_down}");
+
+    // The remote comes back. NOTHING else happens: no kill, no restart, and no call
+    // against the backend until the poll below has already seen the mount go ready.
     couch.fail_next_requests(0);
 
-    // The remote is back, and the mount is STILL degraded -- repeatedly, including
-    // through `probe_health`, which is the one call that refreshes the verdict from the
-    // child and therefore the most likely place for a self-heal to happen if there were
-    // one. A bounded number of attempts, because the assertion is that nothing changes.
-    for attempt in 0..10 {
-        let health = supervisor.probe_health().await;
-        assert!(
-            !health.is_ready(),
-            "attempt {attempt}: the verdict is cached until a re-handshake, so it must \
-             not flip on its own: {health:?}"
-        );
-        assert_eq!(
-            health.compatibility.as_ref().expect("a verdict").status,
-            status,
-            "attempt {attempt}: the cached verdict must not drift either"
-        );
-        assert_eq!(health.starts, 1, "nothing may restart the child implicitly");
-    }
-
-    // Killing the child is what forces a fresh `initialize` -- and against the recovered
-    // remote that one reports `ok`, so the mount serves again with no server restart.
-    let pid = supervisor.child_pid().expect("a running child has a pid");
-    kill_child(pid);
-
-    let text = poll_until_ok(
-        "a read after the child re-handshook a recovered remote",
-        || backend.execute(BackendRequest::read_text("Notes/Alpha.md")),
+    let recovered = poll_until_ok(
+        "the mount to become serveable with nothing calling it",
+        || {
+            let supervisor = supervisor.clone();
+            async move {
+                let health = supervisor.health();
+                if health.is_ready() {
+                    Ok(health)
+                } else {
+                    Err(format!(
+                        "still {:?}",
+                        health
+                            .compatibility
+                            .map(|compatibility| compatibility.status)
+                    ))
+                }
+            }
+        },
     )
-    .await
-    .into_text()
-    .expect("text");
+    .await;
+    assert!(
+        recovered.starts > starts_while_down,
+        "the recovery is a re-handshake, so a child must have started for it: {recovered:?}"
+    );
+
+    // And the mount really serves, not merely reports itself ready.
+    let text = backend
+        .execute(BackendRequest::read_text("Notes/Alpha.md"))
+        .await
+        .expect("a healed mount must serve reads")
+        .into_text()
+        .expect("text");
     assert_eq!(text, "# Alpha\n\nFirst note body.\n");
 
-    let recovered = supervisor.health();
-    assert!(recovered.is_ready(), "{recovered:?}");
+    supervisor.shutdown().await;
+}
+
+/// The other half of the recovery rule: a verdict whose remedy lives in the MOUNT
+/// CONFIG is never retried, because a running supervisor cannot re-read its config.
+///
+/// `auth-failed` is the sharpest case. The credentials are resolved once, into
+/// `SidecarConfig`, before the supervisor exists; every re-handshake would present the
+/// same username and the same password to a CouchDB that has already rejected them. So
+/// the loop must not start, and `starts` must not move -- a retry here would be a
+/// perfectly regular stream of failed logins against somebody's server, forever.
+///
+/// Bounded polling with the assertion that NOTHING changes, which is the only shape
+/// available for proving an absence.
+#[tokio::test]
+async fn an_auth_failure_is_not_retried_because_the_credentials_cannot_change() {
+    require_prerequisites!();
+    let couch = MockCouch::start_with_auth_status("small", 401);
+    let (supervisor, _backend) = backend(&couch);
+
+    supervisor
+        .ensure_started()
+        .await
+        .expect("rejected credentials must still complete the handshake");
+    let degraded = supervisor.health();
     assert_eq!(
-        recovered.starts, 2,
-        "the recovery is the RESTART, and health says so: {recovered:?}"
+        degraded.compatibility.as_ref().expect("a verdict").status,
+        CompatibilityStatus::AuthFailed,
+        "a remote answering 401 classifies as auth-failed: {degraded:?}"
     );
+    assert_eq!(degraded.starts, 1);
+
+    // Long enough for many ticks of a 20ms-based backoff, had one been started.
+    for attempt in 0..10 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let health = supervisor.health();
+        assert_eq!(
+            health.starts, 1,
+            "attempt {attempt}: nothing may retry a verdict only a config change could \
+             fix: {health:?}"
+        );
+        assert!(!health.is_ready(), "attempt {attempt}: {health:?}");
+    }
 
     supervisor.shutdown().await;
 }
@@ -2991,7 +3079,10 @@ async fn a_conditional_read_that_cannot_short_circuit_costs_no_extra_round_trip(
         .expect("a conditional read")
         .into_text_unless_unchanged()
         .expect("text or unchanged");
-    assert!(body.is_some(), "a cold conditional read must return the text");
+    assert!(
+        body.is_some(),
+        "a cold conditional read must return the text"
+    );
     let cold_cost = supervisor.request_count() - before;
 
     // The same read with no `knownHash` at all: the cost this must not exceed.
@@ -3036,7 +3127,10 @@ async fn a_write_records_its_own_hash_so_the_read_back_never_hydrates() {
     // is the write itself.
     let before = supervisor.request_count();
     let (body, version) = backend
-        .execute(BackendRequest::read_text_known_hash("WrittenBack.md", &hash))
+        .execute(BackendRequest::read_text_known_hash(
+            "WrittenBack.md",
+            &hash,
+        ))
         .await
         .expect("a conditional read")
         .into_text_unless_unchanged()
@@ -3048,7 +3142,10 @@ async fn a_write_records_its_own_hash_so_the_read_back_never_hydrates() {
         "reading back a just-written note with the hash the write returned must be \
          answered `unchanged`, not hydrated"
     );
-    assert!(version.is_some(), "and must name the revision it was written at");
+    assert!(
+        version.is_some(),
+        "and must name the revision it was written at"
+    );
     assert!(
         cost <= 1,
         "it must cost at most the one metadata round trip, not an entry fetch plus every \

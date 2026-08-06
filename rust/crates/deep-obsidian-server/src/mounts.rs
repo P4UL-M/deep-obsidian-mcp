@@ -226,6 +226,27 @@ fn mount_index_dir(config: &ResolvedServiceConfig, mount: &MountConfig) -> std::
     declared.unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id))
 }
 
+/// What follows "mount 'x' cannot be served: <reason>;" in the startup warning.
+///
+/// One sentence, and it has to differ for the ROOT mount now that a remote backend may
+/// be one. The old wording — "the vault root keeps serving and readiness reports the
+/// server as degraded" — was true of every mount that could reach this code, because
+/// every mount that could was a non-root one. Saying it about a failed ROOT would be
+/// flatly false, and false in the reassuring direction: an operator reading it would
+/// believe their vault was up.
+///
+/// Both wordings say the server starts DEGRADED, because it does either way (see
+/// [`crate::runtime::root_failure_is_fatal`]). What differs is what still works.
+fn unserveable_mount_consequence(mount: &MountConfig) -> &'static str {
+    if mount.mount_at.is_empty() {
+        "this mount is the VAULT ROOT, so the server starts degraded and every path \
+         refuses with that reason until the mount recovers; readiness answers 503 and \
+         names it"
+    } else {
+        "the vault root keeps serving and readiness reports the server as degraded"
+    }
+}
+
 fn build_entry(
     config: &ResolvedServiceConfig,
     mount: MountConfig,
@@ -264,14 +285,14 @@ fn build_entry(
             let api_key = match resolve_algolia_api_key(&mount.id, api_key_ref, resolver) {
                 Ok(api_key) => api_key,
                 Err(error) => {
-                    // Degraded, not fatal: an algolia mount is non-root-only, so the
-                    // vault root keeps serving. Same shape as the couchdb missing-secret
-                    // path, deliberately reusing that failure mode rather than inventing
-                    // one.
+                    // Degraded, not fatal. Same shape as the couchdb missing-secret path,
+                    // deliberately reusing that failure mode rather than inventing one.
+                    // See `unserveable_mount_consequence` for what the message says when
+                    // the mount that failed is the vault ROOT, which it now may be.
                     warn!(
-                        "mount '{}' cannot be served: {error}; the vault root keeps serving and \
-readiness reports the server as degraded",
-                        mount.id
+                        "mount '{}' cannot be served: {error}; {}",
+                        mount.id,
+                        unserveable_mount_consequence(&mount)
                     );
                     return MountBackendEntry {
                         backend: Arc::new(UnavailableBackend::of_kind(
@@ -325,9 +346,9 @@ and its writes are immediately visible to every other participant mounting the s
                 },
                 Err(error) => {
                     warn!(
-                        "mount '{}' cannot be served: {error}; the vault root keeps serving and \
-readiness reports the server as degraded",
-                        mount.id
+                        "mount '{}' cannot be served: {error}; {}",
+                        mount.id,
+                        unserveable_mount_consequence(&mount)
                     );
                     MountBackendEntry {
                         backend: Arc::new(UnavailableBackend::of_kind(
@@ -366,14 +387,17 @@ could not be started: {error}",
             ) {
                 Ok(credentials) => credentials,
                 Err(error) => {
-                    // A missing secret is a configuration failure, but NOT a fatal
-                    // one: a couchdb mount is non-root-only, so degrading it keeps
-                    // the vault root serving. The stub backend refuses every request
-                    // with this exact message.
+                    // A missing secret is a configuration failure, but NOT a fatal one:
+                    // degrading the mount keeps every OTHER mount serving, and when the
+                    // failed mount is the vault root the server still starts so that
+                    // readiness can name it and say why. The stub backend refuses every
+                    // request with this exact message. See
+                    // `unserveable_mount_consequence` and
+                    // `crate::runtime::root_failure_is_fatal`.
                     warn!(
-                        "mount '{}' cannot be served: {error}; the vault root keeps serving and \
-readiness reports the server as degraded",
-                        mount.id
+                        "mount '{}' cannot be served: {error}; {}",
+                        mount.id,
+                        unserveable_mount_consequence(&mount)
                     );
                     return MountBackendEntry {
                         backend: Arc::new(crate::mounts::UnavailableBackend::new(format!(
@@ -435,9 +459,9 @@ edit this vault, and its writes replicate to every device syncing it",
                 },
                 Err(error) => {
                     warn!(
-                        "mount '{}' cannot be served: {error}; the vault root keeps serving and \
-readiness reports the server as degraded",
-                        mount.id
+                        "mount '{}' cannot be served: {error}; {}",
+                        mount.id,
+                        unserveable_mount_consequence(&mount)
                     );
                     MountBackendEntry {
                         backend: Arc::new(UnavailableBackend::new(format!(
@@ -665,7 +689,7 @@ mod tests {
     fn config_with(mounts: Vec<MountConfig>, index_dir: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
             federated_rerank: true,
-            vault_path: PathBuf::from("/tmp/root-vault"),
+            vault_path: Some(PathBuf::from("/tmp/root-vault")),
             mounts,
             experimental: ExperimentalConfig {
                 multi_vault: true,

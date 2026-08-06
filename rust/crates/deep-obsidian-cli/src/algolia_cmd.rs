@@ -326,10 +326,38 @@ pub struct SeedReport {
 /// — the router would resolve `_Wiki` to the algolia mount and hand back the REMOTE's
 /// files, which is the opposite of the question being asked.
 ///
-/// A root-mounted algolia mount is impossible (config rejects it), so `mount_at` is always
-/// a non-empty prefix here and the join always names a real subdirectory.
-fn default_seed_source(config: &ResolvedServiceConfig, mount: &MountConfig) -> PathBuf {
-    config.vault_path.join(&mount.mount_at)
+/// # When there is no default source
+///
+/// The default is a path INSIDE the root vault, so it exists only when the root vault is a
+/// local directory. Two shapes now have no default and must be given `--from` explicitly:
+///
+/// * a REMOTE root, which has no local directory for the mount's prefix to sit in;
+/// * this algolia mount being the ROOT mount itself, whose `mount_at` is `""` — the join
+///   would then name the vault root, i.e. propose importing the entire vault into the
+///   shared corpus, which is never what "seed this mount" means.
+///
+/// Both are errors rather than silent fallbacks: guessing the source tree of an import
+/// that WRITES to a corpus several people share is exactly the wrong place to guess.
+fn default_seed_source(config: &ResolvedServiceConfig, mount: &MountConfig) -> Result<PathBuf> {
+    let Some(vault_path) = config.vault_path.as_deref() else {
+        bail!(
+            "seeding mount {:?} needs --from: the default source is the folder the mount \
+             shadows inside the root vault, and this config's vault root is a {} backend with \
+             no local directory. Pass --from <dir> naming the local folder to import.",
+            mount.id,
+            config.root_mount().backend.kind_name()
+        );
+    };
+    if mount.mount_at.is_empty() {
+        bail!(
+            "seeding mount {:?} needs --from: it IS the vault root, so the folder it shadows \
+             would be the whole vault at {} — an import of everything, which is not what \
+             seeding one mount means. Pass --from <dir> naming the local folder to import.",
+            mount.id,
+            vault_path.display()
+        );
+    }
+    Ok(vault_path.join(&mount.mount_at))
 }
 
 /// Compute what a seed would import.
@@ -461,9 +489,10 @@ pub async fn seed_with_resolver(
     resolver: &SecretResolver,
 ) -> Result<SeedReport> {
     let mount = algolia_mount(config, mount_id)?;
-    let from_dir = from
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_seed_source(config, &mount));
+    let from_dir = match from {
+        Some(from) => from.to_path_buf(),
+        None => default_seed_source(config, &mount)?,
+    };
     let arc = connect(config, mount_id, resolver)?;
     let backend = require_algolia(&arc, mount_id)?;
     // Checked BEFORE the source tree is read, so a user pointing a seed at a read-only
@@ -2133,7 +2162,7 @@ mod tests {
         };
         let config = ResolvedServiceConfig {
             federated_rerank: true,
-            vault_path: PathBuf::from("/vault"),
+            vault_path: Some(PathBuf::from("/vault")),
             mounts: vec![mount.clone()],
             experimental: Default::default(),
             index_dir: PathBuf::from("/idx"),
@@ -2147,7 +2176,7 @@ mod tests {
             config_file_path: None,
         };
         assert_eq!(
-            default_seed_source(&config, &mount),
+            default_seed_source(&config, &mount).expect("a local root has a default source"),
             PathBuf::from("/vault/_Wiki")
         );
     }

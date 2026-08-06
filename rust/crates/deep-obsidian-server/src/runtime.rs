@@ -352,10 +352,20 @@ impl std::fmt::Debug for RuntimeState {
 impl RuntimeState {
     /// A runtime indexing the config's own vault directory.
     ///
-    /// Signature and behaviour unchanged: the target it derives is exactly what the
-    /// path-based index entry points constructed internally before this slice.
+    /// Behaviour unchanged for a config with a local root: the target it derives is
+    /// exactly what the path-based index entry points constructed internally before this
+    /// slice. Panics on a config whose root is REMOTE, and that is the right shape rather
+    /// than an oversight — this constructor's whole contract is "index the directory this
+    /// config names", and a remote-rooted config names none. The serve path never reaches
+    /// it: [`MountRuntimes::new`] builds every runtime from its mount's own
+    /// [`IndexTarget`] via [`RuntimeState::with_target`], which is how a couchdb mount
+    /// gets a `CouchDbSource` instead of a directory scan.
     pub fn new(config: ResolvedServiceConfig) -> Arc<Self> {
-        let target = IndexTarget::filesystem(&config.vault_path, &config.index_dir);
+        let vault_path = config
+            .vault_path
+            .clone()
+            .expect("RuntimeState::new to be given a config with a local vault root");
+        let target = IndexTarget::filesystem(&vault_path, &config.index_dir);
         Self::with_target(config, target)
     }
 
@@ -386,15 +396,30 @@ impl RuntimeState {
         tokio::pin!(refresh);
         match tokio::time::timeout(STARTUP_SCAN_WARN_AFTER, &mut refresh).await {
             Ok(result) => result,
+            // The macOS-TCC wording is emitted ONLY for a mount that actually reads a
+            // local directory. A remote-backed mount cannot be blocked on a permission
+            // prompt for a folder it never opens, so pointing an operator at System
+            // Settings would send them to the wrong place — the stall is a slow or
+            // unresponsive remote. Both branches say what is still running and for how
+            // long; only the diagnosis differs.
             Err(_) => {
-                warn!(
-                    "initial vault scan of {} still running after {}s — if it never completes, \
+                match self.config.vault_path.as_deref() {
+                    Some(vault_path) => warn!(
+                        "initial vault scan of {} still running after {}s — if it never completes, \
 the process is likely blocked on a macOS permission prompt for the vault folder; approve the \
 dialog, or grant the deep-obsidian-mcp binary Full Disk Access in System Settings → Privacy & \
 Security and restart the service",
-                    self.config.vault_path.display(),
-                    STARTUP_SCAN_WARN_AFTER.as_secs(),
-                );
+                        vault_path.display(),
+                        STARTUP_SCAN_WARN_AFTER.as_secs(),
+                    ),
+                    None => warn!(
+                        "initial index build of remote vault {} still running after {}s — if it \
+never completes, the remote is likely slow or unresponsive rather than the local machine being \
+busy; check the mount's url and the service log for the backend's own diagnostics",
+                        self.target.describes,
+                        STARTUP_SCAN_WARN_AFTER.as_secs(),
+                    ),
+                }
                 refresh.await
             }
         }
@@ -746,47 +771,88 @@ fn unix_time_ms() -> u128 {
 /// [`crate::mounts::MountBackendEntry::index_target`]. What survives here is the
 /// config a runtime reports about itself (`vault_path` for diagnostics and the
 /// startup watchdog message, `index_dir` for the health payload), which for a
-/// backend with no local directory is the mount's index directory and an empty
-/// vault path.
-fn filesystem_mount_paths(
+/// backend with no local directory is the mount's index directory and NO vault path.
+///
+/// The absent vault path is an [`Option`] rather than an empty `PathBuf` because the
+/// difference is observable: an empty path is normalized against the process working
+/// directory by `ensure_vault_path`, so anything that treated it as a directory would
+/// silently address the server's CWD. `None` cannot be mistaken for a directory by
+/// construction.
+fn mount_runtime_paths(
     config: &ResolvedServiceConfig,
     mount: &MountConfig,
-) -> (PathBuf, PathBuf) {
-    match &mount.backend {
-        MountBackendConfig::Filesystem {
-            vault_path,
-            index_dir,
-        } => (
-            vault_path.clone(),
-            index_dir
-                .clone()
-                .unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id)),
-        ),
-        // No local directory to report. The empty path is never opened: a couchdb
-        // mount's `IndexTarget` carries a `CouchDbSource`, not a `FilesystemSource`.
-        MountBackendConfig::Couchdb { index_dir, .. } => (
-            PathBuf::new(),
-            index_dir
-                .clone()
-                .unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id)),
-        ),
-        // Unreachable in practice: an algolia mount gets no `RuntimeState` at all (see
-        // [`mount_has_local_index`]), so nothing asks it for a runtime config. Kept
-        // exhaustive and answered honestly rather than with a panic, because a future
-        // caller that DOES build a runtime for one would otherwise crash the server
-        // instead of reporting an empty vault path.
-        MountBackendConfig::Algolia { index_dir, .. } => (
-            PathBuf::new(),
-            index_dir
-                .clone()
-                .unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id)),
-        ),
-    }
+) -> (Option<PathBuf>, PathBuf) {
+    let declared_index_dir = match &mount.backend {
+        MountBackendConfig::Filesystem { index_dir, .. }
+        | MountBackendConfig::Couchdb { index_dir, .. }
+        | MountBackendConfig::Algolia { index_dir, .. } => index_dir.clone(),
+    };
+    (
+        // `None` for couchdb (whose `IndexTarget` carries a `CouchDbSource`, not a
+        // `FilesystemSource`) and for algolia (which gets no `RuntimeState` at all — see
+        // [`mount_has_local_index`] — so this arm is belt and braces for a future caller
+        // that builds one anyway, answered honestly rather than with a panic).
+        mount.backend.local_vault_path().map(Path::to_path_buf),
+        declared_index_dir.unwrap_or_else(|| default_mount_index_dir(&config.index_dir, &mount.id)),
+    )
 }
 
-/// True when a mount reads a local directory, i.e. when `notify` can watch it.
-fn mount_is_filesystem(mount: &MountConfig) -> bool {
-    matches!(mount.backend, MountBackendConfig::Filesystem { .. })
+/// Whether a mount failing at startup must take the whole service down.
+///
+/// True for a mount that is BOTH the vault root AND backed by a local directory;
+/// false for everything else. The one predicate both startup gates consult — this
+/// module's index bootstrap and the HTTP transport's backend reachability gate — so the
+/// two cannot drift.
+///
+/// # Why the asymmetry is the right shape and not an inconsistency
+///
+/// The two failures are different KINDS of failure, and fail-fast is right for exactly
+/// one of them:
+///
+/// * A filesystem root that cannot be read is a **permanent configuration error**. The
+///   directory is missing, or misspelled, or unreadable; nothing about waiting improves
+///   it, and a server that came up serving errors for the entire vault would hide the
+///   mistake behind a green process. Failing at startup is what puts the message in
+///   front of the operator who just changed the config. This is unchanged behaviour, and
+///   it is unchanged for stdio too, where a client shows a startup failure but has
+///   nowhere to show a readiness probe.
+/// * A remote root that cannot be reached is a **transient outage**. The url is right,
+///   the credentials are right, and the remote is down or slow or mid-rebuild. Making
+///   that fatal would mean a network blip at the wrong moment bricks a service that a
+///   supervisor then restart-loops, and — worse — it would take down the mounts that ARE
+///   healthy along with it. So the server starts DEGRADED: readiness answers 503 naming
+///   the mount, health says so honestly, vault paths on the failed mount refuse with the
+///   backend's own reason, and every other mount serves normally. A couchdb mount then
+///   re-handshakes in the background until the remote returns, with no process restart —
+///   see [`deep_obsidian_backend::sidecar::SidecarSupervisor`]'s readiness-recovery loop,
+///   which is what makes the degraded start recoverable rather than merely survivable.
+///   An algolia mount needs no such loop: it probes the remote on every call, so its
+///   readiness is never cached.
+///
+/// The rule is therefore about the FAILURE MODE, not about being the root: "a permanent
+/// local misconfiguration fails fast; an unreachable remote degrades".
+///
+/// # The honest caveat: not every remote-root failure is transient
+///
+/// A remote root also degrades when its failure is NOT an outage — a `passwordRef` that
+/// resolves to nothing, a sidecar bundle that is not where it should be. Those are
+/// permanent configuration errors, so by the argument above they would seem to deserve
+/// fail-fast. They still degrade, for three reasons and deliberately:
+///
+/// * **The failure cannot be classified from here.** This predicate sees a mount config;
+///   the gates see a `BackendError` from `health_overview`. "Secret missing" and "remote
+///   down" arrive as the same shape, and guessing wrong in the fatal direction is the
+///   expensive way to be wrong.
+/// * **Degrading says strictly more.** The server comes up, `/readyz` answers 503 naming
+///   the mount, and every path on it refuses with the backend's own message — which
+///   states which mount, which backend and which secret. A refusal to start prints one
+///   line to a log the operator may not be watching and leaves nothing to interrogate.
+/// * **It is what a non-root remote mount has always done.** A missing secret on a
+///   couchdb mount at `LiveSync` has degraded that mount since the mount existed. Making
+///   the same misconfiguration fatal purely because the mount sits at `""` would be a
+///   rule about position, which is exactly what this function is not.
+pub fn root_failure_is_fatal(mount: &MountConfig) -> bool {
+    mount.mount_at.is_empty() && mount.backend.local_vault_path().is_some()
 }
 
 /// True when a mount is served by a LOCAL search index of its own.
@@ -824,10 +890,11 @@ pub fn mount_has_local_index(mount: &MountConfig) -> bool {
 ///
 /// # Why the root mount gets the config UNCHANGED
 ///
-/// `ResolvedServiceConfig::vault_path` *is* the root mount's vault path and
-/// `index_dir` already resolves the root mount's `indexDir` (see
-/// `normalize_service_config`). Returning the config verbatim for the root
-/// therefore is not an optimization — it is what makes "a single-mount config
+/// `ResolvedServiceConfig::vault_path` *is* the root mount's vault path (or `None`
+/// when the root is a remote backend, which is exactly what the root's runtime should
+/// then report about itself) and `index_dir` already resolves the root mount's
+/// `indexDir` (see `normalize_service_config`). Returning the config verbatim for the
+/// root therefore is not an optimization — it is what makes "a single-mount config
 /// behaves exactly as before" a structural property: the one runtime a
 /// single-mount server builds is constructed from the identical config value it
 /// was constructed from before this slice existed.
@@ -838,7 +905,7 @@ fn mount_runtime_config(
     if mount.mount_at.is_empty() {
         return config.clone();
     }
-    let (vault_path, index_dir) = filesystem_mount_paths(config, mount);
+    let (vault_path, index_dir) = mount_runtime_paths(config, mount);
     ResolvedServiceConfig {
         federated_rerank: true,
         vault_path,
@@ -884,6 +951,9 @@ pub struct MountRuntime {
     pub runtime: Arc<RuntimeState>,
     /// What drives this mount's staleness signal.
     pub change_source: ChangeSource,
+    /// Whether this mount failing its startup index build must abort the service.
+    /// Computed once, by [`root_failure_is_fatal`], which is where the reasoning lives.
+    fatal_on_startup_failure: bool,
 }
 
 impl MountRuntime {
@@ -902,12 +972,14 @@ impl MountRuntime {
 ///
 /// # Failure isolation
 ///
-/// The ROOT mount is load-bearing (it holds the vault root, and every legacy
-/// config is exactly one root mount), so a root index failure at startup stays
-/// fatal — unchanged from before. A NON-ROOT mount that fails to index is logged
-/// and left `Degraded`: the root mount keeps serving, and
-/// [`MountRuntimes::aggregate_diagnostics`] reports the server as degraded so
-/// `/readyz` cannot claim everything is fine.
+/// A LOCAL root mount is load-bearing and its failure is a permanent configuration
+/// error, so a filesystem root's index failure at startup stays fatal — unchanged from
+/// before, and unchanged for every legacy config, which is exactly one filesystem root
+/// mount. Everything else is logged and left `Degraded`: a non-root mount of any kind,
+/// and now also a REMOTE root, whose failure is an outage rather than a mistake. The
+/// server then starts and [`MountRuntimes::aggregate_diagnostics`] reports it degraded so
+/// `/readyz` cannot claim everything is fine. See [`root_failure_is_fatal`] for the full
+/// argument.
 ///
 /// # Where the next two slices attach
 ///
@@ -932,9 +1004,16 @@ impl MountRuntime {
 #[derive(Debug)]
 pub struct MountRuntimes {
     entries: Vec<MountRuntime>,
-    /// Index of the root mount in `entries`. Always valid: a resolved config
-    /// always declares exactly one root mount.
-    root: usize,
+    /// Index of the root mount in `entries`, when the root mount has a runtime here.
+    ///
+    /// `None` for exactly one shape: an ALGOLIA root mount, which by design has no
+    /// local index and therefore no entry (see [`mount_has_local_index`]). A
+    /// single-mount algolia-rooted config makes `entries` empty outright. Every other
+    /// root — filesystem or couchdb — is present.
+    root: Option<usize>,
+    /// The resolved config, kept so table-wide questions (is auto-reindex on?) can be
+    /// answered without a root entry to read them off.
+    config: Arc<ResolvedServiceConfig>,
 }
 
 impl MountRuntimes {
@@ -956,30 +1035,32 @@ impl MountRuntimes {
             .filter(|entry| mount_has_local_index(&entry.mount))
             .map(|entry| {
                 let mount = entry.mount.clone();
-                let change_source = if mount_is_filesystem(&mount) {
-                    ChangeSource::LocalDirectory(filesystem_mount_paths(config, &mount).0)
-                } else {
-                    ChangeSource::Backend(entry.backend.clone())
+                let change_source = match mount_runtime_paths(config, &mount).0 {
+                    Some(vault_path) => ChangeSource::LocalDirectory(vault_path),
+                    None => ChangeSource::Backend(entry.backend.clone()),
                 };
                 MountRuntime {
                     runtime: RuntimeState::with_target(
                         mount_runtime_config(config, &mount),
                         entry.index_target(&handle),
                     ),
+                    fatal_on_startup_failure: root_failure_is_fatal(&mount),
                     id: mount.id,
                     mount_at: mount.mount_at,
                     change_source,
                 }
             })
             .collect();
-        let root = entries
-            .iter()
-            .position(MountRuntime::is_root)
-            // `mount_table` synthesizes the implicit root mount and
-            // `normalize_service_config` rejects a table without one, so a config
-            // reaching here without a root mount is a programming error.
-            .expect("resolved config to declare a root mount");
-        Arc::new(Self { entries, root })
+        // `None` only when the root mount is an algolia one, which has no local index by
+        // design. Not an error, and deliberately not an `expect`: the config is valid and
+        // the vault serves — what does not exist is a local index for the root, and every
+        // caller that needs one refuses with that exact reason.
+        let root = entries.iter().position(MountRuntime::is_root);
+        Arc::new(Self {
+            entries,
+            root,
+            config: Arc::new(config.clone()),
+        })
     }
 
     /// Construct every mount's runtime and run each one's startup index refresh.
@@ -994,14 +1075,23 @@ impl MountRuntimes {
         let runtimes = Self::new(config, backends);
         for entry in &runtimes.entries {
             if let Err(error) = entry.runtime.startup_refresh_with_watchdog().await {
-                if entry.is_root() {
-                    // Fatal, exactly as a single-mount startup failure has always been.
+                if entry.fatal_on_startup_failure {
+                    // A LOCAL root that cannot be indexed is fatal, exactly as a
+                    // single-mount startup failure has always been. See
+                    // [`root_failure_is_fatal`] for why the asymmetry with a remote root
+                    // is the right shape rather than an inconsistency.
                     return Err(error);
                 }
                 warn!(
-                    "mount '{}' failed its initial index refresh: {error}; the vault root keeps \
-serving and readiness reports the server as degraded",
+                    "mount '{}' failed its initial index refresh: {error}; the server starts \
+DEGRADED and readiness reports it as such{}",
                     entry.id,
+                    if entry.is_root() {
+                        " — vault paths on the root will refuse until the remote comes back, \
+which the mount retries by itself"
+                    } else {
+                        "; the vault root keeps serving"
+                    },
                 );
             }
         }
@@ -1012,7 +1102,7 @@ serving and readiness reports the server as degraded",
     /// Start the background watcher/periodic-sync task for every mount, when
     /// auto-reindex is enabled. One watcher per mount, each on its own vault.
     pub fn start_auto_reindex(&self) -> Vec<AutoReindexHandle> {
-        if !self.root().config().auto_reindex.enabled {
+        if !self.config().auto_reindex.enabled {
             return Vec::new();
         }
         self.entries
@@ -1055,8 +1145,20 @@ serving and readiness reports the server as degraded",
     }
 
     /// The ROOT mount's runtime: the one every non-federated caller means.
-    pub fn root(&self) -> &Arc<RuntimeState> {
-        &self.entries[self.root].runtime
+    ///
+    /// `None` when the root mount has no local index of its own — an algolia root. See
+    /// the [`MountRuntimes::root`] field and [`crate::mcp::AppState::runtime`].
+    pub fn root(&self) -> Option<&Arc<RuntimeState>> {
+        self.root.map(|index| &self.entries[index].runtime)
+    }
+
+    /// The resolved config this table was built from.
+    ///
+    /// Read instead of the root runtime's own config for table-wide questions, because
+    /// there may be no root runtime — and because a table-wide question was never the
+    /// root's to answer in the first place.
+    pub fn config(&self) -> &ResolvedServiceConfig {
+        self.config.as_ref()
     }
 
     /// The runtime serving `mount_id`, or `None` when that mount has no index of
@@ -1091,8 +1193,52 @@ serving and readiness reports the server as degraded",
     /// mount has one. `last_success`/`last_error` stay the root mount's — another
     /// mount's message must not be laundered into a field whose wording says
     /// nothing about mounts; the additive per-mount detail names it instead.
+    ///
+    /// # When there is no root runtime
+    ///
+    /// An ALGOLIA root mount has no local index, so there is no root runtime whose
+    /// diagnostics could be the base. The status is then the worst over the mounts that
+    /// DO have an index — `Ready` when there are none — and never `Degraded` merely
+    /// because the root has no index: a mount that by design never has one is working
+    /// exactly as designed, and reporting `/readyz` permanently red for it is the precise
+    /// failure [`mount_has_local_index`] documents.
+    ///
+    /// The `snapshot` is `None` in that case, so the payload's `ready` is `false` and it
+    /// carries no index statistics. That is deliberate and it is the only honest answer:
+    /// those numbers describe the ROOT's index, and there is no root index to describe.
+    /// Substituting another mount's counts would report one mount's corpus as the vault's.
+    /// What a caller reads instead is the additive `mounts[]` detail, which states each
+    /// mount's own index state including "has none".
+    ///
+    /// Note that `ready: false` and `status: "ready"` therefore coexist on an
+    /// algolia-rooted vault, and the HTTP code is **200**:
+    /// [`crate::health::readiness_status_code`] keys on `status`, never on `ready`. The
+    /// two fields have always answered different questions — `status` is "can this server
+    /// serve?", `ready` is "does the root index have a usable snapshot?" — and on every
+    /// index-backed configuration they happen to agree, which is why the difference has
+    /// not mattered before. `ready` is not redefined to mean `status == Ready`, tempting
+    /// though it is: on a multi-mount vault whose root is fine and whose second mount is
+    /// degraded, that would flip `ready` from `true` to `false` for configurations that
+    /// exist today.
     pub fn aggregate_diagnostics(&self) -> RuntimeDiagnostics {
-        let root = self.root().diagnostics();
+        let Some(root) = self.root() else {
+            return RuntimeDiagnostics {
+                status: self
+                    .entries
+                    .iter()
+                    .fold(RuntimeReadiness::Ready, |worst, entry| {
+                        worst.worst(entry.runtime.diagnostics().status)
+                    }),
+                refresh_in_flight: self
+                    .entries
+                    .iter()
+                    .any(|entry| entry.runtime.diagnostics().refresh_in_flight),
+                snapshot: None,
+                last_success: None,
+                last_error: None,
+            };
+        };
+        let root = root.diagnostics();
         if !self.is_multi_mount() {
             return root;
         }
@@ -1324,7 +1470,7 @@ mod tests {
     fn test_config(vault_path: PathBuf, index_dir: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
             federated_rerank: true,
-            vault_path,
+            vault_path: Some(vault_path),
             index_dir,
             mounts: Vec::new(),
             experimental: Default::default(),
@@ -1407,7 +1553,7 @@ mod tests {
         let team = &config.mount_table()[1];
         let derived = mount_runtime_config(&config, team);
 
-        assert_eq!(derived.vault_path, team_vault);
+        assert_eq!(derived.vault_path, Some(team_vault));
         assert_eq!(
             derived.index_dir,
             config.index_dir.join("mounts").join("team")
@@ -1447,11 +1593,14 @@ mod tests {
         assert!(runtimes.is_multi_mount());
         assert_eq!(runtimes.entries().len(), 2);
         assert!(Arc::ptr_eq(
-            runtimes.root(),
+            runtimes.root().expect("a filesystem root has a runtime"),
             runtimes.for_mount("vault").unwrap()
         ));
         let team = runtimes.for_mount("team").expect("team runtime");
-        assert!(!Arc::ptr_eq(runtimes.root(), team));
+        assert!(!Arc::ptr_eq(
+            runtimes.root().expect("a filesystem root has a runtime"),
+            team
+        ));
         assert!(runtimes.for_mount("absent").is_none());
     }
 
@@ -1487,7 +1636,10 @@ mod tests {
         assert!(!runtimes.is_multi_mount());
 
         let aggregate = runtimes.aggregate_diagnostics();
-        let root = runtimes.root().diagnostics();
+        let root = runtimes
+            .root()
+            .expect("a filesystem root has a runtime")
+            .diagnostics();
         assert_eq!(aggregate.status, root.status);
         assert_eq!(aggregate.status, RuntimeReadiness::Loading);
         assert!(aggregate.snapshot.is_none());
@@ -1510,7 +1662,11 @@ mod tests {
             .expect("a non-root mount failure must not fail the bootstrap");
 
         assert_eq!(
-            runtimes.root().diagnostics().status,
+            runtimes
+                .root()
+                .expect("a filesystem root has a runtime")
+                .diagnostics()
+                .status,
             RuntimeReadiness::Ready
         );
         assert_eq!(
@@ -1527,8 +1683,69 @@ mod tests {
         let _ = fs::remove_dir_all(&config.index_dir);
     }
 
-    /// A failing ROOT mount stays fatal, exactly as a single-mount startup failure
-    /// has always been.
+    /// The fatality rule, on every combination of position and backend kind.
+    ///
+    /// Asserted as a table because the rule is easy to state and easy to get subtly
+    /// wrong in either direction: making a remote root fatal would let a network blip
+    /// brick a fully-remote vault, and making a LOCAL root non-fatal would let a typo'd
+    /// `vaultPath` come up green and serve errors for the whole vault. It is also the
+    /// single predicate BOTH startup gates consult — this module's index bootstrap and
+    /// the HTTP transport's backend reachability gate — so a drift here would silently
+    /// desynchronize them.
+    #[test]
+    fn only_a_local_root_mount_is_fatal_on_startup_failure() {
+        let mount = |mount_at: &str, backend: MountBackendConfig| MountConfig {
+            unknown: Default::default(),
+            recall_weight: None,
+            id: "m".to_string(),
+            mount_at: mount_at.to_string(),
+            backend,
+        };
+        let filesystem = || MountBackendConfig::Filesystem {
+            vault_path: PathBuf::from("/tmp/vault"),
+            index_dir: None,
+        };
+        let couchdb = || MountBackendConfig::Couchdb {
+            url: "https://couch.example".to_string(),
+            database: "vault".to_string(),
+            username: None,
+            password_ref: deep_obsidian_types::SecretRef::EncryptedFile {
+                id: "pw".to_string(),
+            },
+            e2ee: None,
+            sidecar_path: None,
+            index_dir: None,
+            options: None,
+            writable: false,
+        };
+        let algolia = || MountBackendConfig::Algolia {
+            app_id: "APP".to_string(),
+            index_name: "wiki".to_string(),
+            api_key_ref: deep_obsidian_types::SecretRef::EncryptedFile {
+                id: "key".to_string(),
+            },
+            base_url: None,
+            writable: false,
+            participant_id: None,
+            cache: None,
+            retention: None,
+            index_dir: None,
+        };
+
+        // The ONE fatal shape: a local directory at the vault root.
+        assert!(root_failure_is_fatal(&mount("", filesystem())));
+        // A remote root degrades — its failure is an outage, not a mistake.
+        assert!(!root_failure_is_fatal(&mount("", couchdb())));
+        assert!(!root_failure_is_fatal(&mount("", algolia())));
+        // No non-root mount is ever fatal, whatever it is backed by.
+        assert!(!root_failure_is_fatal(&mount("Team", filesystem())));
+        assert!(!root_failure_is_fatal(&mount("LiveSync", couchdb())));
+        assert!(!root_failure_is_fatal(&mount("_Shared", algolia())));
+    }
+
+    /// A failing LOCAL ROOT mount stays fatal, exactly as a single-mount startup failure
+    /// has always been — asserted through `bootstrap` rather than through the predicate,
+    /// so the wiring is covered and not just the rule.
     #[tokio::test]
     async fn a_failing_root_mount_still_fails_the_bootstrap() {
         let root = temp_path("root_failure");

@@ -848,7 +848,7 @@ impl Harness {
 
         let config = ResolvedServiceConfig {
             federated_rerank: rerank,
-            vault_path: base.join("root-vault"),
+            vault_path: Some(base.join("root-vault")),
             mounts,
             experimental: ExperimentalConfig {
                 multi_vault: layout != Layout::Unified,
@@ -1512,7 +1512,7 @@ async fn a_mount_that_cannot_hold_artifacts_is_skipped_rather_than_reported_miss
 
     let config = ResolvedServiceConfig {
         federated_rerank: true,
-        vault_path: root_vault.clone(),
+        vault_path: Some(root_vault.clone()),
         mounts: vec![
             MountConfig {
                 unknown: Default::default(),

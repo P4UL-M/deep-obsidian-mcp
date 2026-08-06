@@ -100,7 +100,7 @@ impl Fixture {
     fn config(&self, writable: bool) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
             federated_rerank: true,
-            vault_path: self.vault(),
+            vault_path: Some(self.vault()),
             mounts: vec![
                 MountConfig {
                     unknown: Default::default(),

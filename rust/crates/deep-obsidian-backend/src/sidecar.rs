@@ -27,7 +27,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -36,7 +36,7 @@ use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::watch::ChangeEvent;
 
@@ -184,6 +184,61 @@ impl CompatibilityStatus {
             CompatibilityStatus::E2eeRequired => "e2ee-required",
             CompatibilityStatus::E2eeInvalid => "e2ee-invalid",
             CompatibilityStatus::Unknown => "unknown",
+        }
+    }
+
+    /// Whether re-running `initialize` against the same mount config could ever
+    /// produce a different verdict — i.e. whether
+    /// [`SidecarSupervisor`]'s readiness-recovery loop should keep trying.
+    ///
+    /// # The discriminator: can the remedy REACH a running supervisor?
+    ///
+    /// Not "is the failure transient" — that is a judgement about the world. The
+    /// mechanical question, and the one with a decidable answer, is where the fix has
+    /// to be applied:
+    ///
+    /// * **In the mount's configuration** — the url, the username, the password behind
+    ///   `passwordRef`, the `e2ee` passphrase, the `options` chunk settings. Every one
+    ///   of those is read ONCE, into [`SidecarConfig`], when the supervisor is
+    ///   constructed. A running supervisor re-hand-shakes with the *same* values
+    ///   forever, so a corrected config provably cannot reach it and retrying is
+    ///   nothing but log noise against a remote that will keep giving the same answer.
+    ///   The service has to be restarted to pick the new config up, and that restart is
+    ///   what fixes it. `AuthFailed`, `E2eeRequired`, `E2eeInvalid` and `Mismatched`
+    ///   are these.
+    /// * **On the remote** — the CouchDB server, the LiveSync milestone, the plugin
+    ///   versions of the devices that sync it, the `obsydian_livesync_version` document.
+    ///   None of that is in this process's config, all of it can change while this
+    ///   process runs, and none of it announces itself. So the only way to notice is to
+    ///   ask again. `Unreachable`, `Locked`, `Cleaned`, `Incompatible`, `UnknownSchema`
+    ///   and `Unknown` are these.
+    ///
+    /// Two of those deserve their own note, because they are why the loop exists at all:
+    /// [`Self::Locked`]'s and [`Self::Incompatible`]'s remediations literally end with
+    /// "then restart the service". Retrying is what makes that restart unnecessary —
+    /// the operator waits for the rebuild, or upgrades their devices, and the mount
+    /// heals on its own.
+    ///
+    /// [`Self::Unknown`] is retried deliberately even though it is the vaguest of them.
+    /// It is not just the sidecar's own `unknown`, it is also this build's fallback for
+    /// a status a NEWER sidecar reports and this build has never heard of (see the
+    /// `#[serde(other)]` above). Treating an unrecognized status as permanent would
+    /// hard-code today's classification into tomorrow's failure mode; treating it as
+    /// retryable costs one `initialize` per backoff interval.
+    pub fn is_recoverable_without_reconfiguration(self) -> bool {
+        match self {
+            // Already serving; nothing to recover.
+            CompatibilityStatus::Ok => false,
+            CompatibilityStatus::Unreachable
+            | CompatibilityStatus::Locked
+            | CompatibilityStatus::Cleaned
+            | CompatibilityStatus::Incompatible
+            | CompatibilityStatus::UnknownSchema
+            | CompatibilityStatus::Unknown => true,
+            CompatibilityStatus::AuthFailed
+            | CompatibilityStatus::E2eeRequired
+            | CompatibilityStatus::E2eeInvalid
+            | CompatibilityStatus::Mismatched => false,
         }
     }
 
@@ -1321,6 +1376,16 @@ pub struct ChangeEntry {
 /// replays `changesSince` from the last cursor before re-arming `watch`. The
 /// catch-up is what keeps a restart from silently dropping edits made while the
 /// child was down.
+///
+/// # Readiness recovery
+///
+/// A non-`ok` verdict whose remedy is on the REMOTE rather than in the mount config
+/// (see [`CompatibilityStatus::is_recoverable_without_reconfiguration`]) additionally
+/// starts a background loop that re-hand-shakes on a bounded backoff until the verdict
+/// turns `ok`. Nothing has to call the mount for it to heal, which is the point: a
+/// service that came up while CouchDB was down comes back by itself, and `/readyz`
+/// stops reporting it degraded, with no process restart. See
+/// [`SidecarSupervisor::spawn_readiness_recovery`].
 pub struct SidecarSupervisor {
     config: SidecarConfig,
     /// Serializes start/restart so a burst of concurrent calls spawns one child.
@@ -1376,6 +1441,22 @@ pub struct SidecarSupervisor {
     /// Same `Arc` reasoning as `cursor`: shared with the pump, not copied to it.
     subscribers: Arc<StdMutex<Vec<mpsc::UnboundedSender<ChangeEvent>>>>,
     notification_pump: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The readiness-recovery loop, when one is running. At most one per supervisor;
+    /// see [`SidecarSupervisor::spawn_readiness_recovery`].
+    readiness_recovery: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// A handle to this supervisor, for the tasks it owns.
+    ///
+    /// **Weak, and that is load-bearing.** The recovery loop retries indefinitely
+    /// against a remote that may never come back, so a strong `Arc` in it would keep
+    /// the supervisor — and therefore the child process — alive for as long as the
+    /// program runs, even after every backend holding it was dropped. With a `Weak` the
+    /// loop's next tick simply fails to upgrade and the task ends, which is why
+    /// dropping a `CouchDbVaultBackend` still reaps everything it owned.
+    ///
+    /// The notification pump needs no such handle: it borrows only `cursor`,
+    /// `change_epoch` and `subscribers`, each already behind its own `Arc`. Recovery
+    /// cannot do that, because re-hand-shaking is a whole-supervisor operation.
+    self_handle: Weak<Self>,
 }
 
 impl std::fmt::Debug for SidecarSupervisor {
@@ -1388,8 +1469,14 @@ impl std::fmt::Debug for SidecarSupervisor {
 }
 
 impl SidecarSupervisor {
+    /// Construct a supervisor. Does no IO — see the type docs.
+    ///
+    /// `new_cyclic` rather than `new` for one reason: the readiness-recovery loop needs
+    /// a [`Weak`] back to the supervisor it retries, and the only way to have one at
+    /// construction is to be handed it. Nothing in the closure touches the `Weak`, so
+    /// there is no upgrade-before-initialized hazard.
     pub fn new(config: SidecarConfig) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|self_handle| Self {
             config,
             connect_lock: Mutex::new(()),
             connection: StdMutex::new(None),
@@ -1400,6 +1487,8 @@ impl SidecarSupervisor {
             watch_requested: AtomicBool::new(false),
             subscribers: Arc::new(StdMutex::new(Vec::new())),
             notification_pump: StdMutex::new(None),
+            readiness_recovery: StdMutex::new(None),
+            self_handle: self_handle.clone(),
         })
     }
 
@@ -1504,10 +1593,7 @@ impl SidecarSupervisor {
             .connection
             .lock()
             .ok()
-            .and_then(|slot| {
-                slot.as_ref()
-                    .map(|connection| !connection.is_dead())
-            })
+            .and_then(|slot| slot.as_ref().map(|connection| !connection.is_dead()))
             .unwrap_or(false);
         // Two locks are taken here, never nested: the connection lock is released by
         // the end of the expression above, before `health()` takes its own. Nothing
@@ -1570,6 +1656,19 @@ impl SidecarSupervisor {
             tokio::time::sleep(delay).await;
         }
 
+        self.handshake_recording_health().await
+    }
+
+    /// Spawn a child, hand-shake, and record the outcome in [`SupervisorHealth`].
+    ///
+    /// Extracted so the two callers cannot drift: [`Self::started_connection`] (a first
+    /// start or a restart after a death) and [`Self::rehandshake`] (the readiness
+    /// recovery loop). `starts` counting, the consecutive-failure reset and the
+    /// `last_error` bookkeeping have to mean the same thing whichever one ran, because
+    /// `health` is a published diagnostic and a caller cannot tell them apart.
+    ///
+    /// The caller must hold [`Self::connect_lock`].
+    async fn handshake_recording_health(&self) -> Result<Arc<Connection>, SidecarError> {
         match self.start_and_handshake().await {
             Ok(connection) => {
                 self.update_health(|health| {
@@ -1589,6 +1688,152 @@ impl SidecarSupervisor {
                 Err(error)
             }
         }
+    }
+
+    /// Replace the current child with a freshly hand-shaken one, to get a FRESH
+    /// compatibility verdict.
+    ///
+    /// # Why the child has to be recycled rather than re-`initialize`d
+    ///
+    /// The obvious implementation — send a second `initialize` down the existing pipe —
+    /// is refused by the sidecar itself: its `initialize` handler answers
+    /// `already-initialized` to a second call on the same connection, on purpose, so a
+    /// vault's credentials and mode cannot be swapped underneath a live session. The
+    /// sidecar is a published protocol peer and is out of scope for this change, so the
+    /// verdict is refreshed the only way the protocol allows: end this child, start
+    /// another, and let its one `initialize` render a new judgement.
+    ///
+    /// That means [`SupervisorHealth::starts`] advances on every recovery attempt. It is
+    /// the honest number — a child process really did start — and it is what makes a
+    /// recovery observable at all. What does NOT happen is a restart of the *service*:
+    /// the vault keeps serving throughout, other mounts are untouched, and no supervisor
+    /// outside this one notices.
+    ///
+    /// Exactly one `initialize` per call, and no data method: the point is to learn the
+    /// verdict, and probing with a read would both cost more and misreport a
+    /// content-level failure as a readiness one.
+    async fn rehandshake(&self) {
+        let _guard = self.connect_lock.lock().await;
+        // Graceful, not `mark_connection_dead`: the child is healthy and answering, it
+        // is only its VERDICT that is stale, so it gets the same orderly `shutdown` an
+        // explicit stop would give it rather than being left to `kill_on_drop`.
+        let previous = self.connection.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(previous) = previous {
+            previous.shutdown().await;
+        }
+        self.update_health(|health| health.watching = false);
+        let _ = self.handshake_recording_health().await;
+    }
+
+    /// Start the background loop that re-hand-shakes until the mount becomes serveable.
+    ///
+    /// Called from [`Self::start_and_handshake`] whenever a handshake records a non-`ok`
+    /// verdict whose remedy is on the remote rather than in the mount config — see
+    /// [`CompatibilityStatus::is_recoverable_without_reconfiguration`] for that split,
+    /// which is what keeps this from hammering a remote that is rejecting credentials
+    /// this process can never change.
+    ///
+    /// # What it fixes
+    ///
+    /// Before this loop, the compatibility verdict was decided once per child and cached
+    /// on both sides — the sidecar answers `health` from its recorded status rather than
+    /// re-probing, and the supervisor answers [`Self::ready_connection`] from the health
+    /// it recorded. Nothing re-ran `initialize` while the child was alive, and the
+    /// restart backoff only runs when the connection has DIED, which an unreachable
+    /// remote does not cause. So an operator whose CouchDB was down at startup had to
+    /// restart the service. Now they do not.
+    ///
+    /// # Timing
+    ///
+    /// [`restart_backoff`] with the config's own `restart_backoff_base` — the same curve
+    /// and the same [`RESTART_BACKOFF_MAX`] ceiling as a restart, so there is one backoff
+    /// policy in this file rather than two, and the same injectable base that lets tests
+    /// run in milliseconds.
+    ///
+    /// Its attempt counter is SEPARATE from `consecutive_failures`, deliberately. A
+    /// handshake that succeeds while reporting a non-`ok` verdict is not a failure and
+    /// does not touch `consecutive_failures`; conversely, a long readiness outage must
+    /// not leave the *restart* path pre-loaded with a maxed-out backoff, which sharing
+    /// the counter would do. The counter starts the first wait at `base` rather than at
+    /// zero, because unlike a first start every tick here IS a retry.
+    ///
+    /// The consequence in the other direction is intended too: because each attempt's
+    /// handshake *succeeds* (a bad verdict is a successful `initialize`),
+    /// `consecutive_failures` stays at 0 throughout, so if the child later dies the
+    /// restart path waits [`restart_backoff`]`(base, 0)` — zero — and reconnects at once.
+    /// That is the right answer: an hours-long readiness outage is not evidence that the
+    /// next child will fail to *start*, and it must not be made to look like it.
+    ///
+    /// # Termination
+    ///
+    /// The loop ends when the mount becomes serveable, when the verdict turns into one
+    /// that reconfiguration alone could fix, when [`Self::shutdown`] aborts it, or when
+    /// the supervisor is dropped and the `Weak` no longer upgrades. It never gives up on
+    /// a still-recoverable verdict: an outage has no maximum length, and a loop that
+    /// expired after N attempts would leave exactly the state this exists to prevent —
+    /// a permanently degraded mount whose remote came back.
+    fn spawn_readiness_recovery(&self) {
+        let Ok(mut slot) = self.readiness_recovery.lock() else {
+            return;
+        };
+        // At most one loop. A running one already covers this verdict, and the
+        // re-handshake it is about to perform re-enters `start_and_handshake` and would
+        // otherwise spawn a second.
+        if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let handle = self.self_handle.clone();
+        let base = self.config.restart_backoff_base;
+        *slot = Some(tokio::spawn(async move {
+            let mut attempt: u32 = 1;
+            loop {
+                tokio::time::sleep(restart_backoff(base, attempt)).await;
+                // Gone: every backend holding this supervisor was dropped, so there is
+                // nothing left to recover and nothing left to keep alive.
+                let Some(supervisor) = handle.upgrade() else {
+                    return;
+                };
+                let health = supervisor.health();
+                // Something else already fixed it — most likely a transport failure that
+                // recycled the child through the restart path.
+                if health.is_ready() {
+                    return;
+                }
+                // A verdict this loop cannot help with. Stop rather than keep asking: the
+                // answer will not change until the config does, and the config cannot
+                // change under a running supervisor.
+                //
+                // NO verdict — `None` — deliberately does NOT stop, and `is_some_and` is
+                // what says so in the code rather than in a comment. The distinction
+                // matters because the wrong choice here is silent: a loop that returned on
+                // `None` would leave the mount degraded forever with nothing logged.
+                //
+                // `None` should in fact be unreachable — `start_and_handshake` writes
+                // `health.compatibility = Some(..)` before it ever calls
+                // `spawn_readiness_recovery`, and nothing anywhere sets the field back
+                // (`probe_health` only overwrites it with a value that parsed). But
+                // "unreachable because of a write ordering two hundred lines away" is a
+                // poor thing for a silent stop to rest on, so the absence is answered on
+                // its own merits: no verdict means the handshake did not complete, which is
+                // exactly what a re-handshake exists to fix.
+                if health.compatibility.is_some_and(|compatibility| {
+                    !compatibility
+                        .status
+                        .is_recoverable_without_reconfiguration()
+                }) {
+                    return;
+                }
+                attempt = attempt.saturating_add(1);
+                supervisor.rehandshake().await;
+                if supervisor.health().is_ready() {
+                    // Logged at INFO because it is the good news an operator watching a
+                    // degraded mount is waiting for, and it is the only place that says
+                    // the mount healed without anybody restarting anything.
+                    info!("livesync mount became serveable again after a re-handshake");
+                    return;
+                }
+            }
+        }));
     }
 
     fn live_connection(&self) -> Option<Arc<Connection>> {
@@ -1652,10 +1897,24 @@ impl SidecarSupervisor {
             health.watching = false;
         });
         if !ready {
-            warn!(
-                "livesync mount is not serveable: {}",
-                compatibility.describe()
-            );
+            if compatibility
+                .status
+                .is_recoverable_without_reconfiguration()
+            {
+                warn!(
+                    "livesync mount is not serveable: {}; retrying the handshake in the \
+                     background until it is",
+                    compatibility.describe()
+                );
+                self.spawn_readiness_recovery();
+            } else {
+                // No loop: the remedy is in the mount config, which a running supervisor
+                // cannot re-read. The message already names it.
+                warn!(
+                    "livesync mount is not serveable: {}",
+                    compatibility.describe()
+                );
+            }
         }
 
         // Publish the connection BEFORE the catch-up, so the catch-up's own calls go
@@ -2182,7 +2441,23 @@ impl SidecarSupervisor {
     }
 
     /// Stop the child: `shutdown`, close stdin, SIGKILL after the grace period.
+    ///
+    /// The readiness-recovery loop is stopped FIRST, and joined rather than merely
+    /// aborted. Ordering and joining are both load-bearing: that loop's whole job is to
+    /// start replacement children, so one still running past this point could publish a
+    /// fresh child into `connection` *after* this function had already emptied it —
+    /// leaving a live `node` process nothing owns. Awaiting the aborted handle means the
+    /// task is provably finished before the connection is taken.
     pub async fn shutdown(&self) {
+        let recovery = self
+            .readiness_recovery
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(recovery) = recovery {
+            recovery.abort();
+            let _ = recovery.await;
+        }
         if let Ok(mut pump) = self.notification_pump.lock() {
             if let Some(pump) = pump.take() {
                 pump.abort();
@@ -2209,11 +2484,22 @@ impl SidecarSupervisor {
 
 impl Drop for SidecarSupervisor {
     /// `Connection`'s `kill_on_drop(true)` does the actual killing; this only stops
-    /// the pump task, which holds no child.
+    /// the tasks, neither of which holds a child.
+    ///
+    /// The recovery loop cannot be joined here (`drop` is not async), and does not need
+    /// to be: it holds only a `Weak` to this supervisor, which by definition can no
+    /// longer be upgraded, so its next tick would return on its own even if the abort
+    /// raced. Any child it managed to spawn is dropped with the connection and killed by
+    /// `kill_on_drop`.
     fn drop(&mut self) {
         if let Ok(mut pump) = self.notification_pump.lock() {
             if let Some(pump) = pump.take() {
                 pump.abort();
+            }
+        }
+        if let Ok(mut recovery) = self.readiness_recovery.lock() {
+            if let Some(recovery) = recovery.take() {
+                recovery.abort();
             }
         }
     }

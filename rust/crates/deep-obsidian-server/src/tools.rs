@@ -3218,7 +3218,7 @@ fn resolve_recall_target(
 ) -> Result<RecallTarget, String> {
     if !state.router.is_multi_mount() {
         return Ok(RecallTarget::Local(ScopedIndex {
-            runtime: state.runtime().clone(),
+            runtime: root_index(state, tool)?,
             mount_at: String::new(),
         }));
     }
@@ -3268,7 +3268,7 @@ fn resolve_recall_path(
     if !state.router.is_multi_mount() {
         return Ok((
             ScopedIndex {
-                runtime: state.runtime().clone(),
+                runtime: root_index(state, tool)?,
                 mount_at: String::new(),
             },
             logical_path.to_string(),
@@ -3348,6 +3348,39 @@ fn mount_index(
         runtime,
         mount_at: mount.mount_at.clone(),
     })
+}
+
+/// The ROOT mount's index runtime, or the honest refusal when the root has none.
+///
+/// # Why this exists rather than an `expect`
+///
+/// Everything about the vault ROOT itself — the vault overview, `build_index`'s root
+/// pass, `recommend_folder`, and the single-mount fast paths in
+/// [`resolve_recall_target`] / [`resolve_recall_path`] — used to be able to assume a root
+/// index existed, because the root mount was always a filesystem one. It is not anymore:
+/// an ALGOLIA root has no local index by design (the remote index IS the corpus; see
+/// [`crate::runtime::mount_has_local_index`]), and a single-mount algolia-rooted config
+/// therefore has no local index anywhere.
+///
+/// A couchdb root is unaffected — it has a local index — so a fully-remote LiveSync vault
+/// keeps every index-backed tool.
+///
+/// The refusal is deliberately [`mount_index`]'s, verbatim, rather than a second wording
+/// for the same fact: it already explains WHY there is no index, names what does work on
+/// such a mount (plain reads and writes, `grep_search` with a glob), and names the
+/// natively-served recall a `NativeRecall` mount can still answer. Inventing a
+/// root-specific message would have said less and drifted.
+pub(crate) fn root_index(state: &AppState, tool: &str) -> Result<Arc<RuntimeState>, String> {
+    if let Some(runtime) = state.runtime() {
+        return Ok(runtime.clone());
+    }
+    let root = state
+        .router
+        .root()
+        // `normalize_service_config` rejects a rootless mount table
+        // (`ConfigError::MissingRootMount`), so this cannot happen for a resolved config.
+        .expect("a resolved config to declare a root mount");
+    mount_index(state, tool, root).map(|scoped| scoped.runtime)
 }
 
 /// One entry of `build_index`'s additive per-mount report.
@@ -3443,9 +3476,11 @@ const MAX_REPORTED_CONFLICTED_PATHS: usize = 20;
 /// It goes in `vault_info.mounts[]` and not in a read payload for two reasons. The read
 /// payloads (`read_file`, `list_children`, `resources/read`) are frozen by the
 /// single-mount goldens, and widening one would change bytes a client already depends
-/// on. And `mounts[]` is additive and multi-mount-only by construction, which is the
-/// same pattern the capability and index detail already follow — a couchdb mount cannot
-/// exist in a single-mount vault, so nothing a golden describes can gain a field.
+/// on. And `mounts[]` is purely additive, appearing only where no golden describes the
+/// payload — see [`crate::health::insert_mount_index_detail`], which places the array
+/// this joins onto and owns that condition. Note that "no golden describes it" is no
+/// longer the same as "multi-mount": a couchdb mount CAN now be the only mount in a
+/// table, because it can be the root, and such a vault does get this report.
 ///
 /// It is best-effort: a mount whose remote is unreachable contributes NO field rather
 /// than an error or a zero. Reporting `conflictedCount: 0` for a vault nobody could
@@ -3918,7 +3953,9 @@ pub async fn call_tool(
     let config = state.config.as_ref();
     match name {
         "vault_info" => {
-            let snapshot = state.runtime().fresh_snapshot("vault_info").await?;
+            let snapshot = root_index(state, "vault_info")?
+                .fresh_snapshot("vault_info")
+                .await?;
             let mut payload = build_vault_overview_payload(config, &snapshot);
             // Non-fatal live health probe for the note embedding backend. vault_info must
             // never error when the backend is down — it reports the status as a field.
@@ -4034,8 +4071,11 @@ pub async fn call_tool(
             // behaviours.
             let read = match &known_hash {
                 Some(known_hash) => {
-                    backend_call(state, BackendRequest::read_text_known_hash(&path, known_hash))
-                        .await?
+                    backend_call(
+                        state,
+                        BackendRequest::read_text_known_hash(&path, known_hash),
+                    )
+                    .await?
                 }
                 None => backend_call(state, BackendRequest::read_text(&path)).await?,
             };
@@ -4300,7 +4340,9 @@ pub async fn call_tool(
             // Every mount, sequentially. `build_index` is the one recall-adjacent tool
             // that needs no scope: rebuilding is exhaustive by nature, so doing all
             // mounts is the complete answer rather than a merge of partial ones.
-            let root_snapshot = state.runtime().rebuild("manual build_index").await?;
+            let root_snapshot = root_index(state, "build_index")?
+                .rebuild("manual build_index")
+                .await?;
             let mut mount_results = Vec::new();
             let mut failures = Vec::new();
             for entry in state.runtimes.entries() {
@@ -4882,7 +4924,9 @@ pub async fn call_tool(
                     "scores": []
                 })));
             }
-            let snapshot = state.runtime().fresh_snapshot("recommend_folder").await?;
+            let snapshot = root_index(state, "recommend_folder")?
+                .fresh_snapshot("recommend_folder")
+                .await?;
             let index = snapshot.index;
             let query = [Some(topic.clone()), project.clone()]
                 .into_iter()
@@ -5226,7 +5270,7 @@ mod tests {
         ResolvedServiceConfig {
             federated_rerank: true,
             index_dir: vault_path.join(".deep-obsidian-mcp-test"),
-            vault_path,
+            vault_path: Some(vault_path),
             mounts: Vec::new(),
             experimental: Default::default(),
             transport: TransportMode::Http,
@@ -5282,7 +5326,11 @@ mod tests {
             .expect("build_index should succeed");
         let payload = &result.structured_content;
 
-        let snapshot = state.runtime().snapshot().expect("snapshot after rebuild");
+        let snapshot = state
+            .runtime()
+            .expect("a filesystem root has a runtime")
+            .snapshot()
+            .expect("snapshot after rebuild");
         assert_eq!(payload["rebuilt"], json!(true));
         assert_eq!(payload["noteCount"], json!(snapshot.index.note_count));
         assert_eq!(payload["chunkCount"], json!(snapshot.index.chunk_count));
@@ -6126,7 +6174,7 @@ mod tests {
         // whose `rg` path does not exist reports no grep capability.
         let backend: std::sync::Arc<dyn deep_obsidian_backend::VaultBackend> =
             std::sync::Arc::new(deep_obsidian_backend::FilesystemVaultBackend::with_ripgrep(
-                config.vault_path.clone(),
+                config.vault_path.clone().expect("a local vault root"),
                 vault_path.join("definitely-missing-rg"),
             ));
         let state = AppState {

@@ -105,7 +105,7 @@ impl Fixture {
             federated_rerank: true,
             // Still the ROOT mount's path: it is what `vaultPath` has always meant,
             // and the root mount's own runtime is built from this config verbatim.
-            vault_path: self.root_vault.clone(),
+            vault_path: Some(self.root_vault.clone()),
             mounts: vec![
                 MountConfig {
                     unknown: Default::default(),
@@ -1127,9 +1127,11 @@ async fn template_protection_still_applies_on_a_non_root_mount() {
 // A couchdb mount, end to end through the MCP surface
 // ---------------------------------------------------------------------------
 //
-// A couchdb mount is multi-mount BY DEFINITION (it cannot be the root mount), so it
-// belongs in this suite rather than in `mcp_contract.rs`, whose goldens describe a
-// single-mount vault and must not move.
+// The couchdb topologies below are all multi-mount (a filesystem root plus the couchdb
+// prefix), so they belong in this suite rather than in `mcp_contract.rs`, whose goldens
+// describe a single-mount vault and must not move. A couchdb mount CAN now be the root —
+// see `a_couchdb_root_serves_the_whole_vault` further down, which is deliberately kept in
+// this suite for the same reason.
 //
 // A stub sidecar stands in for the real one. That is the right level here: the real
 // sidecar against the real fixture CouchDB is already covered end to end in
@@ -1153,6 +1155,22 @@ async fn template_protection_still_applies_on_a_non_root_mount() {
 /// against the real thing.
 const STUB_SIDECAR: &str = r##"
 import { createInterface } from "node:readline";
+import { existsSync } from "node:fs";
+/**
+ * Where this child's compatibility verdict comes from.
+ *
+ * `null` -- the value every test but the readiness-recovery one uses -- means "always
+ * ok". A PATH makes the verdict depend on whether that file existed when THIS CHILD
+ * STARTED, which is exactly the mechanism a readiness-recovery test needs: the sidecar
+ * protocol refuses a second `initialize` on one connection, so the supervisor can only
+ * obtain a fresh verdict by starting a fresh child, and a fresh child re-reads the flag.
+ * Rewritten by `gated_stub_sidecar`.
+ */
+const READY_FLAG = null;
+const COMPATIBILITY =
+    READY_FLAG === null || existsSync(READY_FLAG)
+        ? { status: "ok" }
+        : { status: "unreachable", detail: "the fixture remote is refusing connections" };
 const NOTES = {
     "Charter.md": "# LiveSync Charter\n\nServed from the CouchDB mount.\n",
     "Deep/Nested.md": "# Nested\n\nA nested LiveSync note.\n",
@@ -1196,7 +1214,7 @@ rl.on("line", (line) => {
                     maxSchemaVersion: 12,
                     pluginVersionTested: "1.0.3",
                 },
-                compatibility: { status: "ok" },
+                compatibility: COMPATIBILITY,
                 remote: { schemaVersion: 12, encrypted: false, pathObfuscation: false },
             });
         case "manifest":
@@ -1351,7 +1369,7 @@ rl.on("line", (line) => {
         case "unwatch":
             return reply({ watching: false });
         case "health":
-            return reply({ status: "ok", mode, compatibility: { status: "ok" }, watching: false, uptimeMs: 1 });
+            return reply({ status: "ok", mode, compatibility: COMPATIBILITY, watching: false, uptimeMs: 1 });
         case "shutdown":
             reply({ ok: true });
             return process.exit(0);
@@ -2310,9 +2328,9 @@ impl AlgoliaFixture {
     }
 }
 
-/// The gate: an algolia mount needs its own experimental flag, and cannot be the root.
+/// The gate: an algolia mount needs its own experimental flag. It MAY be the root.
 #[test]
-fn an_algolia_mount_requires_the_algolia_vaults_flag_and_a_non_root_prefix() {
+fn an_algolia_mount_requires_the_algolia_vaults_flag_and_may_be_the_root() {
     let mounts = vec![
         MountConfig {
             unknown: Default::default(),
@@ -2372,25 +2390,24 @@ fn an_algolia_mount_requires_the_algolia_vaults_flag_and_a_non_root_prefix() {
     )
     .is_ok());
 
-    // At the vault root: refused, because `vaultPath` would have nothing to point at.
+    // At the vault root: ACCEPTED. `vaultPath` resolves to nothing, which is the point —
+    // a fully-remote vault has no local directory and no longer has to pretend to.
+    // `multiVault` is not needed for a one-mount table.
     let mut rooted = mounts;
     rooted.remove(0);
     rooted[0].mount_at = String::new();
-    let error =
+    let resolved =
         deep_obsidian_server::normalize_service_config(deep_obsidian_types::ServiceConfigInput {
             mounts: Some(rooted),
             experimental: Some(ExperimentalConfig {
-                multi_vault: true,
                 algolia_vaults: true,
                 ..ExperimentalConfig::default()
             }),
             ..Default::default()
         })
-        .expect_err("an algolia root mount must be refused");
-    assert!(
-        error.to_string().contains("no local directory"),
-        "the refusal must say why: {error}"
-    );
+        .expect("an algolia root mount resolves");
+    assert_eq!(resolved.vault_path, None);
+    assert_eq!(resolved.root_location(), "TESTAPP/team-wiki");
 }
 
 /// Reads, writes, listings and outlines all work on an algolia mount, through the
@@ -3850,11 +3867,16 @@ async fn a_read_only_algolia_mount_refuses_a_delete_it_never_advertised() {
 //
 // # No sleeps
 //
-// Recovery is never a background loop here. Every mount's freshness is checked inside the
-// operation that needs it (`fresh_snapshot` on a query, a live HTTP call on an algolia
-// read), so the polls below RE-ISSUE THE OPERATION rather than watching a status field —
-// a field-watching poll would sit there until its deadline and then fail. The deadline is
-// the only timing these tests contain.
+// Every mount's freshness is checked inside the operation that needs it (`fresh_snapshot`
+// on a query, a live HTTP call on an algolia read), so the polls below RE-ISSUE THE
+// OPERATION rather than watching a status field — a field-watching poll would sit there
+// until its deadline and then fail. The deadline is the only timing these tests contain.
+//
+// One recovery in this repository IS driven by a background loop: a couchdb mount whose
+// remote was unreachable at handshake time re-hand-shakes on its own (see
+// `a_remote_root_down_at_startup_starts_degraded_and_recovers_without_a_restart`). Its
+// poll re-issues a read all the same, and the docstring there explains why that is a
+// proof rather than a shortcut — a read has no power to re-handshake.
 
 /// The bound every recovery poll below is allowed.
 const RECOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -4164,5 +4186,520 @@ async fn a_federated_answer_stops_being_degraded_once_the_algolia_mount_returns(
     assert!(
         paths.iter().any(|path| path.starts_with("_Shared/")),
         "the recovered mount must contribute results again: {paths:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A REMOTE backend at the vault root
+// ---------------------------------------------------------------------------
+//
+// Every topology above puts a filesystem mount at `mountAt: ""`, because until this slice
+// the config refused anything else. These are the configurations that restriction used to
+// forbid: a couchdb root, an algolia root, and a table with no filesystem mount in it at
+// all.
+//
+// They live in THIS suite rather than in `mcp_contract.rs` for the same reason the
+// non-root remote mounts do: `mcp_contract.rs`'s goldens describe a single-mount
+// FILESYSTEM vault and must not move. Nothing here is single-mount in that sense, even
+// when the table has one entry — the entry is not a directory.
+
+/// A single-mount config whose only mount is the couchdb stub, AT THE VAULT ROOT.
+///
+/// `vault_path` is `None`, which is the whole point, and `index_dir` is the fixture's own
+/// directory rather than the XDG-anchored default. That override is deliberate and
+/// load-bearing for the test suite: `default_remote_root_index_dir` resolves under the
+/// user's real Application Support / `XDG_DATA_HOME`, so a test that took the default
+/// would write a SQLite index into the developer's data directory and would collide with
+/// itself between runs. The default derivation is asserted where it belongs — as a pure
+/// function, in the config crate's own tests.
+fn couchdb_root_config(fixture: &CouchdbFixture, mount_id: &str) -> ResolvedServiceConfig {
+    let mut config = fixture.config();
+    config.vault_path = None;
+    config.experimental = ExperimentalConfig {
+        // NOT set: a one-mount table is the legacy shape spelled out longhand, so the
+        // multi-mount gate does not apply to it. Only the couchdb flag is needed.
+        multi_vault: false,
+        couchdb_vaults: true,
+        algolia_vaults: false,
+    };
+    let mut mount = config.mounts.remove(1);
+    mount.id = mount_id.to_string();
+    mount.mount_at = String::new();
+    config.mounts = vec![mount];
+    config
+}
+
+/// Build state from an arbitrary config, resolving the fixture's couchdb password.
+///
+/// `CouchdbFixture::state` hard-codes its own two-mount table; these tests need the same
+/// secret plumbing over a table they built themselves.
+async fn couchdb_state_from(fixture: &CouchdbFixture, config: ResolvedServiceConfig) -> AppState {
+    let resolver = SecretResolver::with_encrypted_file_path(fixture.secrets.clone());
+    resolver
+        .put(
+            &SecretRef::EncryptedFile {
+                id: "livesync-password".to_string(),
+            },
+            secrecy::SecretString::new("s3cr3t-password-value".to_string()),
+        )
+        .expect("store the fixture password");
+    let backends = MountBackends::build_with_resolver(&config, &resolver);
+    let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
+        .await
+        .expect("a couchdb root must not fail the bootstrap");
+    AppState::with_backends(config, runtimes, &backends)
+}
+
+/// A COUCHDB ROOT serves the whole vault: reads, listings, and the index-backed tools.
+///
+/// The centrepiece of the slice. A CouchDB-backed mount at `mountAt: ""` means a vault
+/// with no local directory anywhere, and every logical path in it — no prefix, because
+/// there is no prefix — routes to the remote.
+///
+/// # Why the index-backed tools matter here specifically
+///
+/// A couchdb mount HAS a local search index (over content it reads back from the remote),
+/// which is what separates it from an algolia root. So `vault_info` and `hybrid_search`
+/// must keep working on a fully-remote LiveSync vault, and `tools::root_index` must find a
+/// root runtime rather than refuse. Asserting that is asserting the difference between the
+/// two remote backends is real and not incidental.
+#[tokio::test]
+async fn a_couchdb_root_serves_the_whole_vault() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("couchdb-root");
+    let config = couchdb_root_config(&fixture, "live");
+    assert_eq!(config.vault_path, None);
+    assert_eq!(config.root_location(), "http://couch.invalid/vault");
+    let state = couchdb_state_from(&fixture, config).await;
+
+    // A read at a path with NO mount prefix, because the remote is the root.
+    let read = tool_call(&state, "read_file", json!({"path": "Charter.md"})).await;
+    let text = structured(&read)["text"]
+        .as_str()
+        .expect("text")
+        .to_string();
+    assert!(
+        text.contains("Served from the CouchDB mount"),
+        "the root read must come from the remote: {text}"
+    );
+
+    // The ROOT listing is the remote's, with no filesystem entries mixed into it.
+    let listed = tool_call(&state, "list_children", json!({"path": ""})).await;
+    let names: Vec<&str> = structured(&listed)["children"]
+        .as_array()
+        .expect("children")
+        .iter()
+        .filter_map(|child| child["name"].as_str())
+        .collect();
+    assert!(names.contains(&"Charter.md"), "{names:?}");
+    assert!(
+        !names.contains(&"Root.md"),
+        "the filesystem fixture vault must not appear: {names:?}"
+    );
+
+    // `vault_info` works, which is the couchdb-specific half: the root HAS a local index.
+    let info = structured(&tool_call(&state, "vault_info", json!({})).await).clone();
+    assert_eq!(
+        info["vaultPath"],
+        json!("http://couch.invalid/vault"),
+        "the overview names the remote rather than an empty path: {info}"
+    );
+    // A lone REMOTE mount still gets the additive per-mount report, unlike a lone
+    // filesystem one — see `health::mount_detail_applies`. Without it a fully-remote
+    // LiveSync vault would have no surface for its capabilities or its conflicts.
+    let mounts = info["mounts"].as_array().expect("mounts");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0]["id"], json!("live"));
+    assert_eq!(mounts[0]["backendKind"], json!("couchdb"));
+    assert_eq!(mounts[0]["mountAt"], json!(""));
+    assert!(
+        mounts[0]["capabilities"].is_array(),
+        "the one place a caller can read what this vault supports: {info}"
+    );
+
+    // And the index really covers the remote's notes, so recall is not merely available
+    // but populated.
+    let recall =
+        structured(&tool_call(&state, "hybrid_search", json!({"query": "charter"})).await).clone();
+    let paths: Vec<&str> = recall["matches"]
+        .as_array()
+        .expect("matches")
+        .iter()
+        .filter_map(|item| item["path"].as_str())
+        .collect();
+    assert!(
+        paths.contains(&"Charter.md"),
+        "a couchdb root's index must cover the remote: {paths:?}"
+    );
+
+    // Readiness is GREEN: nothing about this configuration is degraded.
+    let diagnostics = state.runtimes.aggregate_diagnostics();
+    assert_eq!(diagnostics.status.as_str(), "ready");
+    assert_eq!(
+        readiness_status_code(&diagnostics),
+        axum::http::StatusCode::OK
+    );
+    let payload = build_readiness_payload(&state.config, &diagnostics);
+    assert_eq!(payload["vaultPath"], json!("http://couch.invalid/vault"));
+    assert_eq!(payload["ready"], json!(true));
+}
+
+/// An ALGOLIA ROOT serves reads and writes, and refuses the index-backed tools with the
+/// reason a scoped call on an index-less mount already gives.
+///
+/// The other half of the pair. An Algolia mount has no local index BY DESIGN — the remote
+/// index is the corpus — so when it is the root there is no root index anywhere, and the
+/// tools derived from one have to say so. What must NOT happen is a panic (the old
+/// `MountRuntimes::root()` was an `expect`) or a permanently red `/readyz` (a mount that
+/// by design has no index is working exactly as designed).
+#[tokio::test]
+async fn an_algolia_root_serves_reads_and_refuses_the_index_backed_tools() {
+    let fixture = AlgoliaFixture::new("algolia-root").await;
+
+    // WRITABLE, because the corpus is seeded through the tool surface: the mock has no
+    // back door, and writing through `upsert_note` is also the only way to prove a
+    // remote-rooted vault accepts writes at an unprefixed path.
+    let mut config = fixture.config_writable(true);
+    config.vault_path = None;
+    config.experimental = ExperimentalConfig {
+        multi_vault: false,
+        couchdb_vaults: false,
+        algolia_vaults: true,
+    };
+    let mut mount = config.mounts.remove(1);
+    mount.mount_at = String::new();
+    config.mounts = vec![mount];
+    assert_eq!(
+        config.root_location(),
+        format!("TESTAPP/team-wiki via {}", fixture.base_url)
+    );
+
+    let resolver = SecretResolver::with_encrypted_file_path(fixture.secrets.clone());
+    resolver
+        .put(
+            &SecretRef::EncryptedFile {
+                id: "algolia-api-key".to_string(),
+            },
+            secrecy::SecretString::new("test-key".to_string()),
+        )
+        .expect("store the fixture api key");
+    let backends = MountBackends::build_with_resolver(&config, &resolver);
+    let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
+        .await
+        .expect("an algolia root must not fail the bootstrap");
+    let state = AppState::with_backends(config, runtimes, &backends);
+
+    // A write at an UNPREFIXED path, because the remote corpus is the vault root.
+    let created = tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "Handbook.md",
+            "content": "# Handbook\n\nThe shared handbook body.\n",
+        }),
+    )
+    .await;
+    assert_eq!(structured(&created)["created"], json!(true));
+    assert_eq!(structured(&created)["path"], json!("Handbook.md"));
+
+    // And it reads back from the remote at the same unprefixed path.
+    let read = tool_call(&state, "read_file", json!({"path": "Handbook.md"})).await;
+    let text = structured(&read)["text"]
+        .as_str()
+        .expect("text")
+        .to_string();
+    assert!(text.contains("shared handbook body"), "{text}");
+
+    // `vault_info` refuses, and the refusal is `mount_index`'s: it names the mount, says
+    // WHY there is no index, and says what does work on such a mount. A second wording
+    // invented for the root would have said less.
+    let refused = tool_call(&state, "vault_info", json!({})).await;
+    let message = error_message(&refused);
+    assert!(message.contains("shared"), "must name the mount: {message}");
+    assert!(
+        message.contains("grep_search"),
+        "must name what still works: {message}"
+    );
+
+    // Readiness is NOT degraded: there is nothing wrong. `ready` is false because there
+    // is no ROOT INDEX SNAPSHOT to report statistics from, which is a different question
+    // — and the HTTP code keys on `status`, so a monitor gets 200.
+    let diagnostics = state.runtimes.aggregate_diagnostics();
+    assert_eq!(
+        diagnostics.status.as_str(),
+        "ready",
+        "a root with no index by design is not a degraded root"
+    );
+    assert_eq!(
+        readiness_status_code(&diagnostics),
+        axum::http::StatusCode::OK
+    );
+    let mut payload = build_readiness_payload(&state.config, &diagnostics);
+    insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
+    assert_eq!(payload["ready"], json!(false));
+    assert!(
+        payload["vaultPath"]
+            .as_str()
+            .expect("a vault path")
+            .starts_with("TESTAPP/team-wiki"),
+        "{payload}"
+    );
+    // No index statistics rather than another mount's, which would report one mount's
+    // corpus as the vault's.
+    assert!(payload.get("markdownFileCount").is_none(), "{payload}");
+    // The mount reports "no index", not "degraded index", and so does NOT appear in
+    // `degradedMounts` — a mount that by design never has one is working as designed.
+    let mounts = payload["mounts"].as_array().expect("mounts");
+    assert_eq!(mounts[0]["indexStatus"], json!("none"));
+    assert_eq!(mounts[0]["localIndex"], json!(false));
+    assert!(payload.get("degradedMounts").is_none(), "{payload}");
+}
+
+/// A FULLY REMOTE two-mount vault: a couchdb root with an algolia mount grafted under it,
+/// and not one filesystem directory in the table.
+///
+/// The shape the multi-backend documentation now describes. Worth its own test because it
+/// is the only configuration in which every question about the vault root is answered by a
+/// remote AND the router still has a prefix to resolve — so a regression that quietly
+/// reintroduced a filesystem assumption at either level would show up here and nowhere
+/// else.
+#[tokio::test]
+async fn a_fully_remote_two_mount_vault_serves_and_reports_both_mounts() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let couchdb = CouchdbFixture::new("fully-remote-couch");
+    let algolia = AlgoliaFixture::new("fully-remote-algolia").await;
+
+    let mut config = couchdb_root_config(&couchdb, "live");
+    config.experimental = ExperimentalConfig {
+        multi_vault: true,
+        couchdb_vaults: true,
+        algolia_vaults: true,
+    };
+    config.mounts.push(MountConfig {
+        unknown: Default::default(),
+        recall_weight: None,
+        id: "shared".to_string(),
+        mount_at: "_Shared".to_string(),
+        backend: MountBackendConfig::Algolia {
+            app_id: "TESTAPP".to_string(),
+            index_name: "team-wiki".to_string(),
+            api_key_ref: SecretRef::EncryptedFile {
+                id: "algolia-api-key".to_string(),
+            },
+            base_url: Some(algolia.base_url.clone()),
+            // Writable so the corpus can be seeded through the tool surface; the mock has
+            // no back door.
+            writable: true,
+            participant_id: Some("paul@test".to_string()),
+            cache: None,
+            retention: None,
+            index_dir: None,
+        },
+    });
+
+    // Both secrets, into the SAME store: the resolver is per-state, not per-mount.
+    let resolver = SecretResolver::with_encrypted_file_path(couchdb.secrets.clone());
+    for (id, value) in [
+        ("livesync-password", "s3cr3t-password-value"),
+        ("algolia-api-key", "test-key"),
+    ] {
+        resolver
+            .put(
+                &SecretRef::EncryptedFile { id: id.to_string() },
+                secrecy::SecretString::new(value.to_string()),
+            )
+            .expect("store a fixture secret");
+    }
+    let backends = MountBackends::build_with_resolver(&config, &resolver);
+    let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
+        .await
+        .expect("a fully-remote table must not fail the bootstrap");
+    let state = AppState::with_backends(config, runtimes, &backends);
+
+    // Seed the shared corpus through the mount that owns it.
+    let created = tool_call(
+        &state,
+        "upsert_note",
+        json!({
+            "path": "_Shared/Handbook.md",
+            "content": "# Handbook\n\nThe shared handbook body.\n",
+        }),
+    )
+    .await;
+    assert_eq!(structured(&created)["created"], json!(true));
+
+    // Each mount serves its own paths, and the root's paths carry no prefix.
+    let root_read = tool_call(&state, "read_file", json!({"path": "Charter.md"})).await;
+    assert!(structured(&root_read)["text"]
+        .as_str()
+        .expect("text")
+        .contains("Served from the CouchDB mount"));
+    let shared_read = tool_call(&state, "read_file", json!({"path": "_Shared/Handbook.md"})).await;
+    assert!(structured(&shared_read)["text"]
+        .as_str()
+        .expect("text")
+        .contains("shared handbook body"));
+
+    // `vault_info` names the root's location and both mounts with their backends.
+    let info = structured(&tool_call(&state, "vault_info", json!({})).await).clone();
+    assert_eq!(info["vaultPath"], json!("http://couch.invalid/vault"));
+    let mounts = info["mounts"].as_array().expect("mounts");
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0]["backendKind"], json!("couchdb"));
+    assert_eq!(mounts[0]["mountAt"], json!(""));
+    assert_eq!(mounts[1]["backendKind"], json!("algolia"));
+    assert_eq!(mounts[1]["mountAt"], json!("_Shared"));
+    assert!(
+        !mounts
+            .iter()
+            .any(|mount| mount["backendKind"] == json!("filesystem")),
+        "there is no filesystem anywhere in this vault: {info}"
+    );
+
+    // Readiness is green, and the `mounts[]` detail states each mount's own index state
+    // including the algolia mount's "has none".
+    let diagnostics = state.runtimes.aggregate_diagnostics();
+    assert_eq!(diagnostics.status.as_str(), "ready");
+    assert_eq!(
+        readiness_status_code(&diagnostics),
+        axum::http::StatusCode::OK
+    );
+    let mut payload = build_readiness_payload(&state.config, &diagnostics);
+    insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
+    assert_eq!(payload["vaultPath"], json!("http://couch.invalid/vault"));
+    let reported = payload["mounts"].as_array().expect("mounts");
+    assert_eq!(reported[0]["id"], json!("live"));
+    assert_eq!(reported[0]["indexStatus"], json!("ready"));
+    assert_eq!(reported[1]["id"], json!("shared"));
+    assert_eq!(
+        reported[1]["indexStatus"],
+        json!("none"),
+        "an algolia mount reports no index rather than a degraded one: {payload}"
+    );
+}
+
+/// The stub sidecar, rewritten so its compatibility verdict depends on a FLAG FILE.
+///
+/// See `READY_FLAG` in `STUB_SIDECAR` for why the gate is read at child startup: it is
+/// the only observation point the sidecar protocol leaves, since a second `initialize` on
+/// one connection is refused.
+fn gated_stub_sidecar(ready_flag: &std::path::Path) -> String {
+    let literal = serde_json::to_string(&ready_flag.to_string_lossy().to_string())
+        .expect("a path renders as a JSON string");
+    let gated = STUB_SIDECAR.replace(
+        "const READY_FLAG = null;",
+        &format!("const READY_FLAG = {literal};"),
+    );
+    assert_ne!(
+        gated, STUB_SIDECAR,
+        "the READY_FLAG declaration must be rewritten"
+    );
+    gated
+}
+
+/// A REMOTE ROOT that is unreachable at startup starts the server DEGRADED — not fatally
+/// — and then heals with no process restart.
+///
+/// # The three claims, and why they belong together
+///
+/// 1. **Not fatal.** `MountRuntimes::bootstrap` returns `Ok` even though the root mount
+///    could not be indexed. A filesystem root in the same position still aborts; see
+///    `runtime::root_failure_is_fatal` for why the asymmetry is about the failure MODE
+///    (permanent local misconfiguration vs transient outage) rather than about position.
+/// 2. **Honestly degraded.** `/readyz` answers 503, the mount is named, and reads refuse
+///    with the backend's own reason instead of answering an empty vault — which a caller
+///    could not distinguish from a vault that really is empty.
+/// 3. **Recovered by itself.** The poll re-issues a read, and that is a proof rather than
+///    a loophole: a read CANNOT recover a not-ready mount. `ready_connection` returns the
+///    live connection and then refuses on the verdict it already recorded; nothing on the
+///    data path re-runs `initialize`, and the child never died so the restart path never
+///    runs either. So the only thing that can turn those refusals into content is the
+///    supervisor's own background readiness-recovery loop.
+///
+/// Together they are the reason a remote root is allowed at all: without (3), a network
+/// blip at the wrong moment would leave a fully-remote vault permanently unserveable
+/// behind a process that looks alive, which is strictly worse than failing to start.
+///
+/// # Readiness comes back one step later, and on purpose
+///
+/// The mount healing is not the same event as `/readyz` turning green: the root's
+/// `RuntimeState` is `Degraded` because its startup INDEX BUILD failed, and a runtime
+/// re-indexes when something asks it for a fresh snapshot (or on the auto-reindex tick,
+/// which this fixture disables). So the last step below asks for one and then asserts
+/// readiness. Reporting `ready` the instant the mount was reachable would have been the
+/// lie — the index really is still empty at that point.
+#[tokio::test]
+async fn a_remote_root_down_at_startup_starts_degraded_and_recovers_without_a_restart() {
+    if !node_available() {
+        eprintln!("skipping: `node` is not available on PATH");
+        return;
+    }
+    let fixture = CouchdbFixture::new("remote-root-degraded");
+    // The flag does NOT exist yet, so the first child classifies the remote unreachable.
+    let ready_flag = fixture.secrets.with_file_name("remote-is-up");
+    fs::write(&fixture.stub, gated_stub_sidecar(&ready_flag)).expect("rewrite the stub");
+    assert!(!ready_flag.exists());
+
+    let config = couchdb_root_config(&fixture, "live");
+    let state = couchdb_state_from(&fixture, config).await;
+
+    // (1) and (2): the server is up, and it says it is not serving.
+    let diagnostics = state.runtimes.aggregate_diagnostics();
+    assert_eq!(diagnostics.status.as_str(), "degraded");
+    assert_eq!(
+        readiness_status_code(&diagnostics),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let mut payload = build_readiness_payload(&state.config, &diagnostics);
+    insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
+    assert_eq!(payload["degradedMounts"], json!(["live"]));
+    assert_eq!(
+        payload["vaultPath"],
+        json!("http://couch.invalid/vault"),
+        "a degraded remote root is still nameable: {payload}"
+    );
+
+    // Reads refuse, and the refusal carries the sidecar's verdict rather than a generic
+    // failure or an empty result.
+    let refused = tool_call(&state, "read_file", json!({"path": "Charter.md"})).await;
+    let message = error_message(&refused);
+    assert!(
+        message.contains("unreachable"),
+        "the refusal must carry the verdict: {message}"
+    );
+
+    // The remote comes back. Nothing else is touched: no restart, no rebuild, no probe.
+    fs::write(&ready_flag, b"up").expect("raise the ready flag");
+
+    // (3): the same read that refused above starts working. See the docstring for why a
+    // read cannot be what recovered it.
+    let text = poll_until_some("the degraded remote root to heal by itself", || async {
+        let response = tool_call(&state, "read_file", json!({"path": "Charter.md"})).await;
+        match response.get("result") {
+            Some(_) => Ok(structured(&response)["text"]
+                .as_str()
+                .expect("text")
+                .to_string()),
+            None => Err(error_message(&response).to_string()),
+        }
+    })
+    .await;
+    assert!(text.contains("Served from the CouchDB mount"), "{text}");
+
+    // And readiness follows, once the index has been given the chance to build — which is
+    // one step later than the mount healing, deliberately. See the docstring.
+    let rebuilt = tool_call(&state, "build_index", json!({})).await;
+    assert_eq!(structured(&rebuilt)["rebuilt"], json!(true));
+    let diagnostics = state.runtimes.aggregate_diagnostics();
+    assert_eq!(diagnostics.status.as_str(), "ready");
+    assert_eq!(
+        readiness_status_code(&diagnostics),
+        axum::http::StatusCode::OK
     );
 }
