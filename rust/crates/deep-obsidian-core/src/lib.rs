@@ -4,9 +4,9 @@ pub mod vault;
 
 pub use hash::{content_hash, ContentHasher};
 pub use text::{
-    count_terms, extract_block_sections, extract_heading_sections, extract_wiki_links,
-    frontmatter_title, heading_title, normalize_heading_slug, note_title, tokenize, BlockSection,
-    HeadingSection,
+    count_terms, extract_block_sections, extract_heading_sections,
+    extract_shallow_heading_sections, extract_wiki_links, frontmatter_title, heading_title,
+    normalize_heading_slug, note_title, tokenize, BlockSection, HeadingSection,
 };
 pub use vault::{
     chunk_lines, describe_io_error, ensure_inside_vault, ensure_vault_path, list_children,
