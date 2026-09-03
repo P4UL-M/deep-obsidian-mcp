@@ -1,7 +1,9 @@
+pub mod diff;
 pub mod hash;
 pub mod text;
 pub mod vault;
 
+pub use diff::{line_delta, unified_line_diff, LineDelta};
 pub use hash::{content_hash, ContentHasher};
 pub use text::{
     count_terms, extract_block_sections, extract_heading_sections,
