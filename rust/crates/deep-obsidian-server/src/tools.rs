@@ -3,12 +3,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::edits::{apply_edits, EditSpec};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use deep_obsidian_backend::{
     BackendKind, BackendRequest, BaseVersion, Capability, GrepContextLine, GrepMatch,
     RecallRequest, VaultChildEntry, VaultEntryKind, RIPGREP_UNAVAILABLE_MESSAGE,
 };
+use deep_obsidian_core::diff::{line_delta, unified_line_diff};
 use deep_obsidian_core::text::{
     extract_block_sections, extract_heading_sections, extract_wiki_links, normalize_heading_slug,
     note_title, tokenize,
@@ -355,6 +357,143 @@ fn validate_expected_hash(
         }
     }
     Ok(())
+}
+
+/// Turn the `edits` argument into specs, rejecting shapes the schema alone cannot.
+///
+/// JSON Schema can express the `oneOf` between the two forms, but a client that ignores
+/// the schema still reaches here, and two constraints are easier to state as an error than
+/// as a schema: `replaceAll` together with `occurrence` (they contradict), and an entry
+/// that carries neither `old` nor `heading` (ambiguous which form was meant).
+fn parse_edit_specs(arguments: &Value) -> Result<Vec<EditSpec>, String> {
+    let entries = arguments
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "edit_note requires `edits`, an array of at least one edit.".to_string())?;
+    if entries.is_empty() {
+        return Err("edit_note requires at least one edit in `edits`.".to_string());
+    }
+    if entries.len() > 50 {
+        return Err(format!(
+            "edit_note accepts at most 50 edits per call; got {}. Split the batch.",
+            entries.len()
+        ));
+    }
+
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let has_old = entry.get("old").is_some();
+            let has_heading = entry.get("heading").is_some();
+            match (has_old, has_heading) {
+                (true, true) => Err(format!(
+                    "edits[{index}]: an edit addresses a region either with `old` or with \
+                     `heading`, not both."
+                )),
+                (false, false) => Err(format!(
+                    "edits[{index}]: an edit needs either `old` (replace exact text) or \
+                     `heading` (declare a section's body)."
+                )),
+                (true, false) => {
+                    let replace_all = bool_arg(entry, "replaceAll", false);
+                    let occurrence = entry
+                        .get("occurrence")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as usize);
+                    if replace_all && occurrence.is_some() {
+                        return Err(format!(
+                            "edits[{index}]: `replaceAll` and `occurrence` contradict each \
+                             other — one changes every match, the other exactly one."
+                        ));
+                    }
+                    Ok(EditSpec::Literal {
+                        old: string_arg(entry, "old")?,
+                        new: string_arg(entry, "new")?,
+                        replace_all,
+                        occurrence,
+                    })
+                }
+                (false, true) => Ok(EditSpec::Section {
+                    heading: string_arg(entry, "heading")?,
+                    level: clamped_usize_arg(entry, "level", 2, 1, 6),
+                    content: string_arg(entry, "content")?,
+                    include_subsections: bool_arg(entry, "includeSubsections", false),
+                    create_if_missing: bool_arg(entry, "createIfMissing", false),
+                    after: optional_string_arg(entry, "after"),
+                    before: optional_string_arg(entry, "before"),
+                }),
+            }
+        })
+        .collect()
+}
+
+/// Unchanged lines kept either side of a hunk when a caller asks for the diff.
+const DIFF_CONTEXT_LINES: usize = 3;
+
+/// How much a write should say about what it changed.
+///
+/// `counts` is the default because the counts are the part the caller does not already
+/// have. On a whole-document write the caller composed the new content itself, so echoing
+/// a full diff back makes the response pay for information the caller sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteVerbosity {
+    Counts,
+    Full,
+}
+
+/// Read `verbosity`, defaulting to counts when the key is absent **or explicitly null**.
+///
+/// A client that serializes an unset optional as `null` rather than omitting the key is
+/// asking for the default, not for an error, so both spellings mean the same thing here.
+/// An unrecognised *value* is still an error, matching how every other enum argument on
+/// this surface behaves.
+fn write_verbosity(arguments: &Value) -> Result<WriteVerbosity, String> {
+    if matches!(arguments.get("verbosity"), None | Some(Value::Null)) {
+        return Ok(WriteVerbosity::Counts);
+    }
+    match optional_enum_string_arg(arguments, "verbosity", &["counts", "full"])?.as_deref() {
+        Some("full") => Ok(WriteVerbosity::Full),
+        _ => Ok(WriteVerbosity::Counts),
+    }
+}
+
+/// Attach what the write changed to its response.
+///
+/// Every write tool routes through here rather than computing its own counts, so the six
+/// of them cannot drift on what `added`/`removed` mean.
+///
+/// Why a write reports this at all: `previousHash` and `newHash` are both opaque and both
+/// change on any edit, so they cannot tell a caller it removed more than it meant to. The
+/// counts can, because the caller already knows the magnitude it intended — a one-line
+/// change reporting twenty removals is wrong on its face. They are reported on applied
+/// writes and not only on `dryRun`, because the accident happens on the write that was not
+/// previewed.
+///
+/// Counts do not catch a volume-neutral mistake (five lines replaced by five wrong ones
+/// reads as `+5 -5`); `verbosity: "full"` is the escape hatch for that.
+fn insert_write_delta(
+    payload: &mut Value,
+    verbosity: WriteVerbosity,
+    previous: Option<&str>,
+    next: &str,
+) {
+    let delta = line_delta(previous, next);
+    payload["added"] = json!(delta.added);
+    payload["removed"] = json!(delta.removed);
+    if verbosity == WriteVerbosity::Full {
+        payload["diff"] = json!(unified_line_diff(previous, next, DIFF_CONTEXT_LINES));
+    }
+}
+
+/// The `verbosity` input property, declared on every tool that reports a write delta.
+fn verbosity_property() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["counts", "full"],
+        "default": "counts",
+        "description": "How much the response says about what changed. 'counts' (the default, also used when this is null) reports added/removed line counts. 'full' adds a unified diff — ask for it when the counts do not match what you intended, since a volume-neutral mistake reads as equal counts."
+    })
 }
 
 fn normalize_score_order(left: f64, right: f64, left_path: &str, right_path: &str) -> Ordering {
@@ -1069,6 +1208,7 @@ fn tool_definitions(
                     ("preserveManualNotes", json!({"type":"boolean","default":true})),
                     ("dryRun", json!({"type":"boolean","default":false,"description":"Preview the write without changing the vault."})),
                     ("expectedHash", json!({"type":"string","description":"Optional hash of the current file content. If it does not match, no write occurs."})),
+                    ("verbosity", verbosity_property()),
                 ],
                 vec!["content"],
             ),
@@ -1113,8 +1253,65 @@ fn tool_definitions(
             ),
         },
         ToolDefinition {
+            name: "edit_note".to_string(),
+            description: "Change part of an existing note, addressing the region either literally or by heading. Prefer this over rewriting a note with upsert_note: the request costs what the change costs rather than the size of the note, which is also the only way to edit a note too large to read back in one call. `old`/`new` replaces exact text and is the only form that reaches frontmatter, preamble prose, a heading line itself, or a span crossing section boundaries; `new: \"\"` deletes. `heading` declares a section's body without having read it, and creates it with createIfMissing. All edits in one call apply atomically and in order, so a frontmatter property and the body block it replaces move together. Ambiguous targets are refused with their line numbers rather than resolved to the first match.".to_string(),
+            annotations: Some(tool_annotations(false, Some(false), Some(false))),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema_with_extra(
+                vec![
+                    ("path", json!({"type":"string","description":"Vault-relative markdown path. The note must already exist; use upsert_note to create one."})),
+                    ("edits", json!({
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 50,
+                        "description": "Applied in order against the evolving note, so a later edit may target text an earlier one introduced. If any edit fails, none are written.",
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "title": "LiteralEdit",
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["old", "new"],
+                                    "properties": {
+                                        "old": {"type":"string","minLength":1,"description":"Verbatim text to find, including indentation and line breaks. Must match exactly once unless replaceAll or occurrence is set; on multiple matches the call is refused and the matching line numbers are returned."},
+                                        "new": {"type":"string","description":"Replacement text. An empty string deletes."},
+                                        "replaceAll": {"type":"boolean","default":false,"description":"Replace every occurrence. Mutually exclusive with occurrence."},
+                                        "occurrence": {"type":"integer","exclusiveMinimum":0,"description":"Replace only the Nth occurrence, 1-based. Mutually exclusive with replaceAll."}
+                                    }
+                                },
+                                {
+                                    "title": "SectionEdit",
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["heading", "content"],
+                                    "properties": {
+                                        "heading": {"type":"string","description":"Exact heading title, without the leading #. Refused if the note has more than one heading with this title."},
+                                        "content": {"type":"string","description":"Replacement body. The heading line itself is preserved; use an old/new edit to rename or remove it."},
+                                        "level": {"type":"integer","minimum":1,"maximum":6,"default":2,"description":"Heading level used when creating the section."},
+                                        "includeSubsections": {"type":"boolean","default":false,"description":"false (the default) stops the replaced range at the next heading of any level, so nested subsections survive. true makes them part of the replaced region, and content must restate any you want to keep."},
+                                        "createIfMissing": {"type":"boolean","default":false,"description":"Add the section when the note has no heading with this title."},
+                                        "after": {"type":"string","description":"When creating: place the new section after this heading instead of at the end of the note."},
+                                        "before": {"type":"string","description":"When creating: place the new section before this heading."}
+                                    }
+                                }
+                            ]
+                        }
+                    })),
+                    ("dryRun", json!({"type":"boolean","default":false,"description":"Preview the write without changing the vault."})),
+                    ("expectedHash", json!({"type":"string","description":"Optional hash of the current note content. If it does not match, no write occurs."})),
+                    ("verbosity", verbosity_property()),
+                ],
+                vec!["path","edits"],
+                // No `resolveDivergence`. PR #40 pinned the same narrowing on
+                // `update_note_section`: a partial edit cannot assert that the whole note
+                // reconciles a recorded divergence, because it never saw the whole note.
+                // Reconcile with `upsert_note` instead.
+                vec![],
+            ),
+        },
+        ToolDefinition {
             name: "update_note_section".to_string(),
-            description: "Replace the note preamble or a named heading section without rewriting the whole note.".to_string(),
+            description: "Replace the note preamble or a named heading section without rewriting the whole note. Superseded by edit_note, which addresses a region literally as well as by heading, batches edits atomically, refuses an ambiguous heading instead of taking the first match, and preserves nested subsections by default. This tool keeps its original behaviour — a heading section is replaced together with everything nested under it — and is retained because shipped skills and the documented contract still name it.".to_string(),
             annotations: Some(tool_annotations(false, Some(false), Some(true))),
             execution: Some(json!({"taskSupport":"forbidden"})),
             input_schema: object_schema_with_extra(
@@ -1127,6 +1324,7 @@ fn tool_definitions(
                     ("createIfMissing", json!({"type":"boolean","default":true})),
                     ("dryRun", json!({"type":"boolean","default":false,"description":"Preview the write without changing the vault."})),
                     ("expectedHash", json!({"type":"string","description":"Optional hash of the current note content. If it does not match, no write occurs."})),
+                    ("verbosity", verbosity_property()),
                 ],
                 vec!["path","content"],
                 // `heading` is required unless writing the preamble. The `if`
@@ -5141,9 +5339,62 @@ pub async fn call_tool(
                 "previousHash": previous_hash,
                 "newHash": new_hash
             });
+            insert_write_delta(
+                &mut payload,
+                write_verbosity(arguments)?,
+                existing.as_deref(),
+                &final_content,
+            );
             if let Some(warning) = compose_warning {
                 payload["warning"] = json!(warning);
             }
+            Ok(json_text_result(payload))
+        }
+        "edit_note" => {
+            let path = string_arg(arguments, "path")?;
+            if !path.to_lowercase().ends_with(".md") {
+                return Err("edit_note requires a vault-relative .md path.".to_string());
+            }
+            let dry_run = bool_arg(arguments, "dryRun", false);
+            let expected_hash = expected_hash_arg(arguments);
+            let verbosity = write_verbosity(arguments)?;
+            let specs = parse_edit_specs(arguments)?;
+            // Like `update_note_section` and unlike the upserts, this REQUIRES an existing
+            // note: there is nothing to address in a note that is not there.
+            let (existing, base_version) = backend_call(state, BackendRequest::read_text(&path))
+                .await?
+                .into_versioned_text()
+                .map(|(text, version)| (text, BaseVersion::from_read(version)))
+                .map_err(|error| error.to_string())?;
+            let previous_hash = content_hash(existing.as_bytes());
+            validate_expected_hash(expected_hash.as_deref(), Some(&previous_hash), &path)?;
+            let (final_content, applied) = apply_edits(&existing, &specs)?;
+            let new_hash = content_hash(final_content.as_bytes());
+            if !dry_run {
+                backend_call(
+                    state,
+                    BackendRequest::write_text_guarded(&path, &final_content, base_version),
+                )
+                .await?;
+            }
+            let mut payload = json!({
+                "action": "updated",
+                "path": path,
+                "resourceUri": note_uri(&path),
+                "created": false,
+                "dryRun": dry_run,
+                "previousHash": previous_hash,
+                "newHash": new_hash,
+                "applied": applied
+                    .iter()
+                    .map(|record| json!({
+                        "editIndex": record.index,
+                        "line": record.line,
+                        "action": record.action
+                    }))
+                    .collect::<Vec<_>>()
+            });
+            insert_write_delta(&mut payload, verbosity, Some(&existing), &final_content);
             Ok(json_text_result(payload))
         }
         "update_note_section" => {
@@ -5201,7 +5452,7 @@ pub async fn call_tool(
                 )
                 .await?;
             }
-            Ok(json_text_result(json!({
+            let mut payload = json!({
                 "action": action,
                 "path": path,
                 "resourceUri": note_uri(&path),
@@ -5212,7 +5463,14 @@ pub async fn call_tool(
                 "dryRun": dry_run,
                 "previousHash": previous_hash,
                 "newHash": new_hash
-            })))
+            });
+            insert_write_delta(
+                &mut payload,
+                write_verbosity(arguments)?,
+                Some(&existing),
+                &final_content,
+            );
+            Ok(json_text_result(payload))
         }
         "request_vault_upload" => {
             let path = string_arg(arguments, "path")?;
@@ -5305,7 +5563,7 @@ pub async fn call_tool(
                 )
                 .await?;
             }
-            Ok(json_text_result(json!({
+            let mut payload = json!({
                 "action": if existing.is_some() { "updated" } else { "created" },
                 "path": target_path,
                 "resourceUri": note_uri(&target_path),
@@ -5314,7 +5572,14 @@ pub async fn call_tool(
                 "dryRun": dry_run,
                 "previousHash": previous_hash,
                 "newHash": new_hash
-            })))
+            });
+            insert_write_delta(
+                &mut payload,
+                write_verbosity(arguments)?,
+                existing.as_deref(),
+                &final_content,
+            );
+            Ok(json_text_result(payload))
         }
         _ => Err(format!("unknown tool: {}", name)),
     }

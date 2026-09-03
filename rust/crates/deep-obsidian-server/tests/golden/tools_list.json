@@ -75,7 +75,8 @@
       "folder",
       "path",
       "preserveManualNotes",
-      "topic"
+      "topic",
+      "verbosity"
     ],
     "required": [
       "content"
@@ -113,6 +114,29 @@
     "hasExecution": true,
     "inputSchemaKeys": [
       "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "edit_note",
+    "properties": [
+      "dryRun",
+      "edits",
+      "expectedHash",
+      "path",
+      "verbosity"
+    ],
+    "required": [
+      "path",
+      "edits"
+    ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
       "allOf",
       "properties",
       "required",
@@ -127,7 +151,8 @@
       "heading",
       "level",
       "path",
-      "target"
+      "target",
+      "verbosity"
     ],
     "required": [
       "path",

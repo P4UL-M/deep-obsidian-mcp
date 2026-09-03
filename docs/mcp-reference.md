@@ -18,7 +18,8 @@ and usage, see the top-level [USAGE.md](../USAGE.md).
 - `related_notes` — notes related by subject similarity
 - `graph_traverse` — traverse wiki-link graph (`direction:"incoming"`, `depth:1` for backlinks)
 - `upsert_note` — create/update a markdown note
-- `update_note_section` — replace the preamble or a named heading section
+- `edit_note` — change part of a note, addressed literally (`old`/`new`) or by heading
+- `update_note_section` — replace the preamble or a named heading section (superseded by `edit_note`)
 - `request_vault_upload` — mint an out-of-band upload URL for binary/large files
 - `upsert_session_note` — create/update a session note
 
@@ -142,8 +143,34 @@ must either declare the argument that fetches them or offer no cursor at all.
   accepted only when their text is identical (the call succeeds with a
   `warning` in the result); diverging text is rejected. No implicit title
   injection.
+- **`edit_note`** — change part of an existing note. Two ways to address the
+  region, mixable in one atomic batch: `old`/`new` replaces exact text, and is
+  the only form that reaches frontmatter, preamble prose, a heading line itself,
+  or a span crossing section boundaries (`new:""` deletes); `heading` declares a
+  section's body without having read it, and creates it with `createIfMissing`
+  plus optional `after`/`before` placement. The request costs what the change
+  costs rather than the size of the note, which is also the only way to edit a
+  note too large to read back in one call. An ambiguous target — a repeated
+  `old`, or a duplicated heading — is refused with the candidate line numbers
+  rather than resolved to the first match. Nested subsections survive a section
+  edit by default; `includeSubsections:true` opts into replacing the subtree.
+  Does not accept `resolveDivergence`: a partial edit never saw the whole note,
+  so it cannot assert that the note reconciles a divergence.
 - **`update_note_section`** — patch the preamble or one heading section without
-  rewriting the whole note.
+  rewriting the whole note. Superseded by `edit_note` and retained unchanged: a
+  heading section is still replaced together with everything nested under it.
+- **Every markdown write reports what it changed.** `upsert_note`, `edit_note`,
+  `update_note_section` and `upsert_session_note` return `added` and `removed`
+  line counts, on applied writes and not only on `dryRun` — the accident worth
+  catching happens on the write that was not previewed. `previousHash` and
+  `newHash` cannot serve this purpose: both are opaque and both change on any
+  edit, so neither says how much moved. The counts can, because the caller
+  already knows the magnitude it intended. They do not catch a volume-neutral
+  mistake (five lines replaced by five wrong ones reads as `+5 -5`);
+  `verbosity:"full"` adds a unified diff for that, and `verbosity` defaults to
+  `"counts"` when absent or null. The binary upload commit path is excluded: it
+  is a raw `PUT` with no MCP arguments, and line counts are meaningless for
+  bytes.
 - **`request_vault_upload`** — for binary or large non-markdown files, returns a
   short-lived capability URL to `PUT` the bytes to.
 - **`list_children`** — inspect real vault structure instead of inferring it from
