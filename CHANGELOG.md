@@ -7,7 +7,57 @@ All notable changes to deep-obsidian-mcp are documented here.
 Date set when the tag is pushed — replace `PENDING` with the tag date as the first
 step of the release (see [docs/release-checklist.md](./docs/release-checklist.md)).
 
+### ⚠️ Breaking changes (MCP tool surface: `update_note_section` → `edit_note`)
+
+- **`update_note_section` is retired.** `edit_note` replaces it and supersedes it
+  on every axis. Two behaviour differences matter when porting a call:
+  - `includeSubsections` defaults to **false**, so a nested `###` now SURVIVES a
+    replacement of the `##` above it. The old tool spliced over a range that
+    ended at the next heading of level `<=` its own, so it deleted the subsection
+    unless the replacement restated it.
+  - `createIfMissing` defaults to **false**, where the old tool defaulted to true.
+  - `target: "preamble"` is gone. Address preamble prose with `old`/`new`, which
+    is more precise: it edits the prose without restating the whole preamble.
+- Packaged skills and `docs/` no longer name the retired tool. An installation
+  whose skills predate this release will still ask agents to call it.
+
 ### Added
+
+- **`edit_note` — change part of a note without rewriting it.** The write surface
+  had a whole-document level (`upsert_note`) and a whole-section level, and
+  nothing below: no primitive cost what the change costs. That was not only about
+  efficiency — a note past the `read_file` character cap cannot be read back in
+  one call, so it could not be rewritten, so it could not be edited at all.
+
+  Two ways to address a region, mixable in one atomic batch, because "replace
+  this text" and "declare this section's body" are two ways to name a region
+  rather than two operations:
+  - `old`/`new` replaces exact text and is the only form that reaches
+    frontmatter, preamble prose, a heading line itself, or a span crossing
+    section boundaries. `new: ""` deletes.
+  - `heading` declares a section's body without having read it, creates one with
+    `createIfMissing`, and places it with `after`/`before`.
+
+  An ambiguous target — a repeated `old`, or a duplicated heading — is refused
+  with the candidate line numbers rather than resolved to the first match: a
+  duplicated heading is usually the defect being repaired, so guessing edits the
+  wrong copy. Edits apply in order against the evolving note and all-or-nothing.
+
+  No `resolveDivergence`: a partial edit never saw the whole note, so it cannot
+  assert the note reconciles a divergence. Reconcile with `upsert_note`.
+
+- **Every markdown write reports what it changed.** `upsert_note`, `edit_note`
+  and `upsert_session_note` return `added` and `removed` line counts — on applied
+  writes, not only on `dryRun`, because the accident worth catching happens on
+  the write nobody previewed. `previousHash`/`newHash` cannot serve that purpose:
+  both are opaque and both change on any edit, so neither says how much moved.
+  The counts can, because the caller already knows the magnitude it intended.
+
+  `verbosity` defaults to `counts` when absent or explicitly null; `full` adds a
+  unified diff, for the volume-neutral mistake counts cannot see (five lines
+  replaced by five wrong ones reads as `+5 -5`). The binary upload commit path is
+  excluded: it is a raw `PUT` with no MCP arguments, and line counts mean nothing
+  for bytes.
 
 - **Multi-backend vaults (experimental, off by default).** A vault can now be
   composed of several **mounts**, each grafting other storage onto a folder of

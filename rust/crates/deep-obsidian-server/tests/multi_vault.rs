@@ -304,11 +304,17 @@ async fn a_section_update_routes_to_the_owning_mount() {
 
     let updated = tool_call(
         &state,
-        "update_note_section",
+        "edit_note",
         json!({
             "path": "Team/Charter.md",
-            "heading": "Scope",
-            "content": "Scoped to the team mount.",
+            // `Charter.md` has no `Scope` heading, so this exercises creation as well as
+            // routing. `edit_note` defaults `createIfMissing` to false, unlike the tool
+            // this replaced.
+            "edits": [{
+                "heading": "Scope",
+                "content": "Scoped to the team mount.",
+                "createIfMissing": true
+            }],
         }),
     )
     .await;
@@ -1759,15 +1765,13 @@ async fn the_write_tools_work_end_to_end_on_a_writable_couchdb_mount() {
     assert_eq!(payload["created"], json!(false), "{payload}");
     assert_eq!(payload["action"], json!("updated"), "{payload}");
 
-    // A section update, which reads-composes-writes in one tool call.
+    // A section edit, which reads-composes-writes in one tool call.
     let sectioned = tool_call(
         &state,
-        "update_note_section",
+        "edit_note",
         json!({
             "path": "LiveSync/Charter.md",
-            "heading": "Status",
-            "content": "Green.",
-            "createIfMissing": true
+            "edits": [{"heading": "Status", "content": "Green.", "createIfMissing": true}],
         }),
     )
     .await;
@@ -3717,18 +3721,21 @@ async fn the_capability_tools_appear_only_for_a_mount_that_can_serve_them() {
         description.contains("never merges"),
         "the argument must say the server does not merge: {description}"
     );
-    // `update_note_section` does NOT gain it: a reconciliation is a whole-note decision.
-    let section = response["result"]["tools"]
+    // `edit_note` does NOT gain it: a reconciliation is a whole-note decision. This is the
+    // narrowing PR #40 pinned on `update_note_section`, carried over when that tool was
+    // retired — a partial edit never saw the whole note, so it cannot assert the note
+    // reconciles a divergence, whichever tool performs it.
+    let partial = response["result"]["tools"]
         .as_array()
         .expect("tools")
         .iter()
-        .find(|tool| tool["name"] == json!("update_note_section"))
-        .expect("update_note_section");
+        .find(|tool| tool["name"] == json!("edit_note"))
+        .expect("edit_note");
     assert!(
-        section["inputSchema"]["properties"]
+        partial["inputSchema"]["properties"]
             .get("resolveDivergence")
             .is_none(),
-        "a section replacement cannot assert a whole-note reconciliation: {section}"
+        "a partial edit cannot assert a whole-note reconciliation: {partial}"
     );
 
     // A READ-ONLY algolia mount: the history tools, but NOT `delete_note`. Reading history

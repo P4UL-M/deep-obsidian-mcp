@@ -216,7 +216,50 @@ pub fn extract_wiki_links(content: &str) -> Vec<String> {
     links
 }
 
+/// Section ranges that extend over nested subsections: a section ends at the next
+/// heading of level **<= its own**, so an `##` section contains every `###` beneath it.
+///
+/// This is the boundary `note_outline` and the `obsidian://heading` resource need — both
+/// present a heading together with its subtree, and both freeze it in golden snapshots.
+/// For a range that stops at the next heading of *any* level, see
+/// [`extract_shallow_heading_sections`].
 pub fn extract_heading_sections(content: &str) -> Vec<HeadingSection> {
+    collect_heading_sections(content, |candidate_level, own_level| {
+        candidate_level <= own_level
+    })
+}
+
+/// Section ranges that stop at the next heading of **any** level, so an `##` section
+/// excludes the `###` subsections nested under it.
+///
+/// This is the boundary a *destructive* section write wants. Replacing a range produced by
+/// [`extract_heading_sections`] deletes the nested subsections along with the body, which
+/// is silent data loss whenever the caller's replacement text does not restate them.
+///
+/// Both functions share [`collect_heading_sections`] so they cannot drift on slug
+/// generation, fence-blindness, or the trailing-line accounting described there.
+pub fn extract_shallow_heading_sections(content: &str) -> Vec<HeadingSection> {
+    collect_heading_sections(content, |_candidate_level, _own_level| true)
+}
+
+/// The shared scan behind both public section functions.
+///
+/// `stops_section(candidate_level, own_level)` decides whether a later heading terminates
+/// the section being measured. The two callers differ only in that predicate.
+///
+/// Two conventions are load-bearing and must not be "cleaned up":
+///
+/// * **Fence-blind.** A `# foo` line inside a fenced code block reads as a heading. The
+///   index crate has a fence-aware chunker for its own purposes; this family does not.
+/// * **Trailing-line accounting.** [`split_lines`] yields a trailing empty element for
+///   newline-terminated content, so the fallback `end_line = lines.len()` can exceed the
+///   last visible line. Callers slice `lines[start_line - 1..end_line]`, and a destructive
+///   caller feeds `end_line` straight into a tail splice, so changing this shifts
+///   round-trip formatting.
+fn collect_heading_sections(
+    content: &str,
+    stops_section: impl Fn(usize, usize) -> bool,
+) -> Vec<HeadingSection> {
     let lines = split_lines(content);
     let mut headings = Vec::new();
 
@@ -244,7 +287,7 @@ pub fn extract_heading_sections(content: &str) -> Vec<HeadingSection> {
         .map(|(index, (level, title, slug, start_line))| {
             let mut end_line = lines.len();
             for next in headings.iter().skip(index + 1) {
-                if next.0 <= *level {
+                if stops_section(next.0, *level) {
                     end_line = next.3 - 1;
                     break;
                 }
@@ -356,6 +399,73 @@ mod tests {
         assert_eq!(sections[0].text, "# One\ntext\n## Two\nmore\n");
         assert_eq!(sections[1].slug, "two");
         assert_eq!(sections[1].end_line, 5);
+    }
+
+    /// The two boundaries must disagree on a heading that actually has subsections.
+    ///
+    /// The pre-existing `extract_heading_sections_preserves_ranges` case uses same-level
+    /// neighbours (`# One` then `## Two` with nothing after), where both rules yield the
+    /// same end line. That made a boundary change invisible to the suite, so this case
+    /// pins the difference explicitly.
+    #[test]
+    fn shallow_and_deep_boundaries_disagree_on_nested_subsections() {
+        let content = "# Root\nintro\n## Child\nbody\n### Grandchild\ndeep\n## Sibling\ntail\n";
+
+        let deep = extract_heading_sections(content);
+        let shallow = extract_shallow_heading_sections(content);
+        assert_eq!(deep.len(), 4);
+        assert_eq!(shallow.len(), 4);
+
+        // `# Root` spans everything under it: no later heading is at level <= 1, so the
+        // deep scan falls back to `lines.len()` — 9, not 8, because `split_lines` yields a
+        // trailing empty element for the newline-terminated content. The shallow scan
+        // instead stops at `## Child` on line 3.
+        assert_eq!(deep[0].title, "Root");
+        assert_eq!(deep[0].end_line, 9);
+        assert_eq!(shallow[0].end_line, 2);
+
+        // `## Child` is the discriminating case: deep swallows `### Grandchild`, shallow
+        // stops before it.
+        assert_eq!(deep[1].title, "Child");
+        assert_eq!(deep[1].end_line, 6);
+        assert!(deep[1].text.contains("### Grandchild"));
+        assert_eq!(shallow[1].title, "Child");
+        assert_eq!(shallow[1].end_line, 4);
+        assert!(!shallow[1].text.contains("### Grandchild"));
+
+        // A leaf heading is identical under both rules.
+        assert_eq!(deep[2].title, "Grandchild");
+        assert_eq!(deep[2].end_line, shallow[2].end_line);
+        assert_eq!(deep[3].title, "Sibling");
+        assert_eq!(deep[3].end_line, shallow[3].end_line);
+    }
+
+    /// Slugs, levels and titles come from the shared scan, so they cannot drift between
+    /// the two boundaries. Only `end_line`/`text` may differ.
+    #[test]
+    fn shallow_boundary_shares_slug_and_level_derivation() {
+        let content = "# Root Note\n## Étape 1 — Cadrage\nbody\n### Detail\nmore\n";
+        let deep = extract_heading_sections(content);
+        let shallow = extract_shallow_heading_sections(content);
+
+        assert_eq!(deep.len(), shallow.len());
+        for (deep_section, shallow_section) in deep.iter().zip(shallow.iter()) {
+            assert_eq!(deep_section.level, shallow_section.level);
+            assert_eq!(deep_section.title, shallow_section.title);
+            assert_eq!(deep_section.slug, shallow_section.slug);
+            assert_eq!(deep_section.start_line, shallow_section.start_line);
+        }
+    }
+
+    /// The deep boundary is frozen by `note_outline`'s golden snapshot and by the
+    /// `obsidian://heading` resource body. Guard it here too, next to its sibling, so a
+    /// future edit to the shared scan cannot silently change it.
+    #[test]
+    fn deep_boundary_is_unchanged_by_the_shared_scan() {
+        let content = "# One\ntext\n## Two\nmore\n";
+        let sections = extract_heading_sections(content);
+        assert_eq!(sections[0].end_line, 5);
+        assert_eq!(sections[0].text, "# One\ntext\n## Two\nmore\n");
     }
 
     #[test]

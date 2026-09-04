@@ -390,5 +390,5 @@ Project wiki initialized for <Project>. I can also create a recurring Deep Obsid
 - `read_file`: check existing scaffold notes and verify writes
 - `list_children`: inspect a specific folder being initialized (use `foldersOnly:true` to disambiguate project folders when direct path checks are not enough)
 - `upsert_note`: create missing scaffold notes
-- `update_note_section`: add missing sections without rewriting whole notes
+- `edit_note`: add a missing section (`heading` + `createIfMissing`), or change part of an existing note without rewriting it (`old`/`new`)
 - `request_vault_upload`: create non-markdown placeholder/binary files when folder creation requires a file
