@@ -837,9 +837,14 @@ async fn a_repeated_listing_is_served_from_cache_until_a_write_moves_the_generat
     let mock = MockAlgolia::default();
     let (base_url, _server) = spawn_mock_with(mock.clone()).await;
     let backend = writable(&base_url, "generation-wiki");
-    write(&backend, "Alpha.md", "# Alpha\n\nbody\n", BaseVersion::Absent)
-        .await
-        .expect("create");
+    write(
+        &backend,
+        "Alpha.md",
+        "# Alpha\n\nbody\n",
+        BaseVersion::Absent,
+    )
+    .await
+    .expect("create");
 
     let first = markdown_files(&backend).await;
     assert_eq!(first, vec!["Alpha.md".to_string()]);
@@ -923,9 +928,14 @@ async fn a_mount_that_cannot_read_the_sentinel_lists_correctly_and_never_caches(
     ]);
     let (base_url, _server) = spawn_mock_with(mock.clone()).await;
     let backend = writable(&base_url, "scoped-wiki");
-    write(&backend, "Alpha.md", "# Alpha\n\nbody\n", BaseVersion::Absent)
-        .await
-        .expect("create");
+    write(
+        &backend,
+        "Alpha.md",
+        "# Alpha\n\nbody\n",
+        BaseVersion::Absent,
+    )
+    .await
+    .expect("create");
 
     let first = markdown_files(&backend).await;
     assert_eq!(first, vec!["Alpha.md".to_string()]);

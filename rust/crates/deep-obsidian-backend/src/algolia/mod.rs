@@ -576,6 +576,10 @@ impl VaultBackend for AlgoliaVaultBackend {
         ];
         if self.writable {
             capabilities.push(Capability::SoftDelete);
+            // Two steps, not one — an objectID is `note:{path}`, so the move is a re-index
+            // plus a delete. Advertised anyway and reported `atomic: false`; see
+            // `rename_by_write_then_remove`.
+            capabilities.push(Capability::Rename);
         }
         BackendDescriptor::new(BackendKind::Algolia, capabilities)
     }
@@ -597,6 +601,14 @@ impl VaultBackend for AlgoliaVaultBackend {
                 .write_text(&path, &content, base_version, resolve_divergence)
                 .await
                 .map(BackendResponse::Mutation),
+            // An Algolia record is addressed by its own object id, so a path change is a
+            // re-index plus a delete — two operations, not a move. Same reasoning as the
+            // couchdb mount: no atomicity, so no `Capability::Rename`.
+            BackendRequest::Mutation(MutationRequest::Rename { from, to, .. }) => {
+                crate::rename_by_write_then_remove(self, &from, &to)
+                    .await
+                    .map(BackendResponse::Mutation)
+            }
             BackendRequest::Mutation(MutationRequest::SoftDelete { path }) => {
                 self.soft_delete(&path).await.map(BackendResponse::Mutation)
             }
@@ -1152,27 +1164,35 @@ mod tests {
         }
     }
 
-    /// `writable` gates EXACTLY one capability, and it has to be that one: the server
-    /// registers `delete_note` from `SoftDelete`, so advertising it on a read-only mount
+    /// `writable` gates exactly the MUTATING capabilities, and the set is closed: the
+    /// server registers a tool per capability, so advertising one on a read-only mount
     /// would put a tool on the surface whose every call is refused. Reading the history
     /// stays available, because recovering content is a read.
     #[test]
-    fn only_soft_delete_is_gated_on_writable() {
+    fn writable_gates_exactly_the_mutating_capabilities() {
         let read_only = backend(false).descriptor();
         let writable = backend(true).descriptor();
-        assert!(!read_only.supports(Capability::SoftDelete));
-        assert!(writable.supports(Capability::SoftDelete));
+        for mutating in [Capability::SoftDelete, Capability::Rename] {
+            assert!(!read_only.supports(mutating), "{read_only:?}");
+            assert!(writable.supports(mutating), "{writable:?}");
+        }
         assert!(
             read_only.supports(Capability::VersionHistory)
                 && read_only.supports(Capability::NativeRecall),
             "reads do not depend on `writable`: {read_only:?}"
         );
-        let difference: Vec<Capability> = writable
+        let mut difference: Vec<Capability> = writable
             .capabilities
             .difference(&read_only.capabilities)
             .copied()
             .collect();
-        assert_eq!(difference, vec![Capability::SoftDelete]);
+        difference.sort_by_key(|capability| format!("{capability:?}"));
+        assert_eq!(
+            difference,
+            vec![Capability::Rename, Capability::SoftDelete],
+            "the gated set is closed: a new mutating capability must be added here \
+             deliberately, not discovered later"
+        );
     }
 
     /// A read-only mount refuses a DELETE by naming the setting, exactly as it refuses a

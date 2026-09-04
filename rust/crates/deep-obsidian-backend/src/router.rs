@@ -601,6 +601,31 @@ impl VaultRouter {
                     ))
                     .await?)
             }
+            MutationRequest::Rename {
+                from,
+                to,
+                base_version,
+            } => {
+                // The one mutation that names two paths, and therefore the only caller of
+                // `resolve_pair` — which exists for exactly this and refuses the
+                // cross-mount case before any backend sees it. A cross-mount move is not a
+                // rename: it is a read from one provider and a write to another, with no
+                // atomicity available at this boundary.
+                let (source, destination) = self.resolve_pair("rename", &from, &to)?;
+                let backend_from = source.backend_relative_path.clone();
+                let backend_to = destination.backend_relative_path.clone();
+                Ok(source
+                    .mount
+                    .backend
+                    .execute(BackendRequest::Mutation(MutationRequest::Rename {
+                        from: backend_from,
+                        to: backend_to,
+                        // Forwarded rather than rebuilt, for the reason spelled out on
+                        // `WriteText` above: it is the caller's observation of the source.
+                        base_version,
+                    }))
+                    .await?)
+            }
             MutationRequest::SoftDelete { path } => {
                 let resolved = self.resolve(&path)?;
                 Ok(resolved
@@ -1895,7 +1920,11 @@ mod tests {
     #[tokio::test]
     async fn a_federated_grep_merges_in_mount_order_not_completion_order() {
         let router = VaultRouter::new(vec![
-            Mount::new("slow", "Slow", SlowGrepBackend::mounted(60, &["A.md", "B.md"])),
+            Mount::new(
+                "slow",
+                "Slow",
+                SlowGrepBackend::mounted(60, &["A.md", "B.md"]),
+            ),
             Mount::new("fast", "Fast", SlowGrepBackend::mounted(0, &["C.md"])),
         ])
         .expect("router");

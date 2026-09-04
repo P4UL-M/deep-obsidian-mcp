@@ -1332,6 +1332,10 @@ impl VaultBackend for CouchDbVaultBackend {
             capabilities.push(Capability::BinaryWrite);
             capabilities.push(Capability::Upload);
             capabilities.push(Capability::SoftDelete);
+            // Two steps, not one — the sidecar reaches a document through `path2id`, so a
+            // move is a write at the new path and a removal at the old. Advertised anyway
+            // and reported `atomic: false`; see `rename_by_write_then_remove`.
+            capabilities.push(Capability::Rename);
         }
         BackendDescriptor::new(BackendKind::Couchdb, capabilities)
     }
@@ -1366,6 +1370,16 @@ impl VaultBackend for CouchDbVaultBackend {
                 .write_text(&path, &content, base_version)
                 .await
                 .map(BackendResponse::Mutation),
+            // Refused rather than emulated. LiveSync has no move: doing it as
+            // write-then-soft-delete is two replications, and a crash between them leaves
+            // the note visible at both paths to every other participant with no way to
+            // tell that from success. `Capability::Rename` is therefore not advertised —
+            // see its doc, which requires atomicity to claim it.
+            BackendRequest::Mutation(MutationRequest::Rename { from, to, .. }) => {
+                crate::rename_by_write_then_remove(self, &from, &to)
+                    .await
+                    .map(BackendResponse::Mutation)
+            }
             BackendRequest::Mutation(MutationRequest::SoftDelete { path }) => {
                 self.soft_delete(&path).await.map(BackendResponse::Mutation)
             }

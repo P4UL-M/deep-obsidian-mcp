@@ -10,10 +10,14 @@
 //! ## Why the request vocabulary looks like this
 //!
 //! The variants were derived from the server's actual call sites, not from what a
-//! generic vault API might want. There is no `WriteBytes`, `Rename`, `RemoveFile`,
-//! or `CreateDirAll` because no server call site needs one: the only binary write
+//! generic vault API might want. There is no `WriteBytes`, `RemoveFile`, or
+//! `CreateDirAll` because no server call site needs one: the only binary write
 //! path is the out-of-band upload, whose temp-file-plus-atomic-rename mechanics are
 //! deliberately private to the backend (see [`MutationRequest::CommitUploadStream`]).
+//!
+//! [`MutationRequest::Rename`] was added when a call site appeared — the `rename_note`
+//! tool — and not before, which is the same rule the paragraph above states rather than
+//! an exception to it.
 //!
 //! ## Error fidelity is the hard constraint
 //!
@@ -135,6 +139,24 @@ pub enum Capability {
     /// Absent on last-writer-wins storage, where there is exactly one version of a
     /// note by construction and "list its history" has no answer — not an empty one.
     VersionHistory,
+    /// The backend can move a note from one path to another
+    /// ([`MutationRequest::Rename`]) as one operation.
+    ///
+    /// Separate from [`Capability::SoftDelete`] on purpose, and present on backends that
+    /// lack it. The distinction is recoverability THROUGH THIS SURFACE: after a rename the
+    /// content is fully readable at the new path and renaming back restores the original
+    /// state exactly, so nothing became unreachable. After a delete, nothing is at the path
+    /// at all — which is why local filesystem deletion is deliberately absent from this
+    /// surface (see `FILESYSTEM_SOFT_DELETE_UNSUPPORTED_MESSAGE`) while local rename is not.
+    ///
+    /// Advertised by any backend that can move a note. Whether the move is ATOMIC is a
+    /// separate, per-backend fact reported on [`MutationResponse::Renamed`] — the
+    /// filesystem has `fs::rename`, while a corpus whose document id derives from the path
+    /// has to write the destination and remove the source as two steps. Reporting it beats
+    /// refusing it: the two-step failure leaves the note readable at both paths, which is
+    /// visible and idempotent to retry, and that is the same contract `SoftDelete` already
+    /// accepts for itself.
+    Rename,
     /// The backend can remove a note in a way that is OBSERVABLE and RECOVERABLE
     /// ([`MutationRequest::SoftDelete`]): the removal leaves a tombstone other readers
     /// see, and the content stays reachable through the version history.
@@ -476,6 +498,17 @@ pub enum MutationRequest {
     /// through the version history. A backend that cannot promise all three must
     /// refuse rather than approximate it with an unlink — see [`Capability::SoftDelete`].
     SoftDelete { path: String },
+    /// Move a note, atomically, within one mount.
+    ///
+    /// Cross-mount moves are refused before reaching a backend — see
+    /// [`VaultRouter::resolve_pair`], whose whole purpose is that guard. `base_version`
+    /// is the precondition on the SOURCE, so a rename cannot silently move content the
+    /// caller has not seen.
+    Rename {
+        from: String,
+        to: String,
+        base_version: BaseVersion,
+    },
     /// Land a byte stream at `path` atomically.
     ///
     /// The backend owns the entire mechanic — staging location, incremental hashing,
@@ -731,6 +764,21 @@ pub enum MutationResponse {
         /// [`CouchDbVaultBackend::soft_delete`].
         recoverable_from: Option<String>,
     },
+    Renamed {
+        /// True when the destination already held a note that this rename replaced.
+        ///
+        /// Reported rather than refused at the backend: whether clobbering is acceptable is
+        /// a policy the tool layer owns, and it needs to know what happened either way.
+        replaced_destination: bool,
+        /// False when the move was a write to the destination followed by a removal of the
+        /// source rather than one operation.
+        ///
+        /// Surfaced all the way to the caller, because the failure it admits is one a
+        /// caller has to handle: an interrupted two-step move leaves the note at BOTH
+        /// paths. That state is readable and re-running the same rename repairs it, but a
+        /// caller that believed the move was atomic would not think to check.
+        atomic: bool,
+    },
     UploadCommitted {
         created: bool,
         bytes_written: usize,
@@ -904,6 +952,59 @@ pub struct GrepContextLine {
 // ---------------------------------------------------------------------------
 
 /// A vault, behind three entry points.
+/// Move a note on a backend whose document id derives from its path, by writing the
+/// destination and then removing the source.
+///
+/// # Why this is not refused
+///
+/// A corpus that addresses a note by a path-derived id has no single-operation move: the
+/// LiveSync sidecar reaches a document through `path2id`, and an Algolia record's objectID
+/// is `note:{path}`. Refusing on those grounds would be the wrong call twice over. First,
+/// the two-step failure is benign in the way that matters — an interrupted move leaves the
+/// note READABLE at both paths, so nothing is lost, the state is visible, and re-running
+/// the same rename repairs it. Second, `SoftDelete` already accepts exactly this contract
+/// for itself, so refusing a move for lacking atomicity while shipping a delete that also
+/// lacks it would be inconsistent.
+///
+/// What the caller must not be allowed to believe is that the move WAS atomic, which is why
+/// [`MutationResponse::Renamed`] carries `atomic: false` from here and the tool layer
+/// forwards it.
+///
+/// # Order
+///
+/// Write first, remove second, deliberately. The reverse order risks losing the note
+/// entirely if the write fails after the removal succeeded; this order can only ever
+/// duplicate it.
+pub async fn rename_by_write_then_remove(
+    backend: &(impl VaultBackend + ?Sized),
+    from: &str,
+    to: &str,
+) -> Result<MutationResponse, BackendError> {
+    let replaced_destination = backend.execute(BackendRequest::read_text(to)).await.is_ok();
+
+    let text = backend
+        .execute(BackendRequest::read_text(from))
+        .await?
+        .into_text()?;
+
+    backend
+        .execute(BackendRequest::write_text_full(
+            to.to_string(),
+            text,
+            BaseVersion::Unobserved,
+            false,
+        ))
+        .await?;
+    backend
+        .execute(BackendRequest::soft_delete(from.to_string()))
+        .await?;
+
+    Ok(MutationResponse::Renamed {
+        replaced_destination,
+        atomic: false,
+    })
+}
+
 #[async_trait::async_trait]
 pub trait VaultBackend: Send + Sync {
     /// What this backend is and what it can do.
