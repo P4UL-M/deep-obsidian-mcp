@@ -204,6 +204,38 @@ impl FilesystemVaultBackend {
         })
     }
 
+    /// Move a note with `fs::rename`, which is atomic within one filesystem.
+    ///
+    /// Both paths go through `ensure_inside_vault` — the destination too, or a rename would
+    /// be a way to write outside the vault that no other mutation offers. Missing parent
+    /// directories are created for the destination, matching `write_text_file`, so moving a
+    /// note into a new folder does not need a separate step.
+    ///
+    /// Reports whether the destination was occupied. `fs::rename` overwrites silently on
+    /// Unix, so this is checked BEFORE the move: afterwards the evidence is gone. Whether
+    /// clobbering is acceptable is the tool layer's policy, and it cannot decide without
+    /// being told.
+    fn rename(&self, from: &str, to: &str) -> Result<MutationResponse, BackendError> {
+        let source = vault::ensure_inside_vault(&self.vault_path, from)?;
+        let destination = vault::ensure_inside_vault(&self.vault_path, to)?;
+        if !source.exists() {
+            return Err(BackendError::Message(format!(
+                "cannot rename {from}: no such note in the vault"
+            )));
+        }
+        let replaced_destination = destination.exists();
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| BackendError::Message(vault::describe_io_error(parent, &error)))?;
+        }
+        std::fs::rename(&source, &destination)
+            .map_err(|error| BackendError::Message(vault::describe_io_error(&source, &error)))?;
+        Ok(MutationResponse::Renamed {
+            replaced_destination,
+            atomic: true,
+        })
+    }
+
     async fn recall(&self, request: RecallRequest) -> Result<RecallResponse, BackendError> {
         match request {
             RecallRequest::Grep {
@@ -287,6 +319,13 @@ impl VaultBackend for FilesystemVaultBackend {
             Capability::BinaryWrite,
             Capability::Upload,
             Capability::Watch,
+            // Advertised even though `SoftDelete` is not, and the difference is
+            // recoverability through this surface rather than squeamishness about writes:
+            // the content stays fully readable at the new path and renaming back restores
+            // the original state exactly. Deletion leaves nothing to read and nothing to
+            // undo — see `FILESYSTEM_SOFT_DELETE_UNSUPPORTED_MESSAGE`. This is also the one
+            // backend whose move is a single operation, so it reports `atomic: true`.
+            Capability::Rename,
         ];
         if self.ripgrep_available {
             capabilities.push(Capability::GrepSearch);
@@ -341,6 +380,9 @@ impl VaultBackend for FilesystemVaultBackend {
             BackendRequest::Mutation(MutationRequest::SoftDelete { .. }) => Err(
                 BackendError::Unsupported(FILESYSTEM_SOFT_DELETE_UNSUPPORTED_MESSAGE.to_string()),
             ),
+            BackendRequest::Mutation(MutationRequest::Rename { from, to, .. }) => {
+                self.rename(&from, &to).map(BackendResponse::Mutation)
+            }
             BackendRequest::Mutation(MutationRequest::SweepOrphanStagingFiles) => {
                 sweep_orphan_temp_files_at(&self.vault_path, std::time::SystemTime::now());
                 Ok(BackendResponse::Mutation(MutationResponse::Swept))

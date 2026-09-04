@@ -249,11 +249,12 @@ async fn current_token(backend: &AlgoliaVaultBackend) -> Option<String> {
         .get_objects(backend.index(), &[GENERATION_OBJECT_ID.to_string()])
         .await;
     let token = match fetched {
-        Ok(objects) => objects
-            .into_iter()
-            .next()
-            .flatten()
-            .and_then(|record| record.get("token").and_then(Value::as_str).map(str::to_string)),
+        Ok(objects) => objects.into_iter().next().flatten().and_then(|record| {
+            record
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }),
         Err(error) => {
             // Not an error the caller can act on, and not one it should fail for. A
             // secured key that forbids addressing this object is a legitimate
@@ -330,8 +331,7 @@ mod tests {
 
     #[test]
     fn minted_tokens_never_repeat_even_within_one_millisecond() {
-        let tokens: std::collections::BTreeSet<String> =
-            (0..1000).map(|_| mint_token()).collect();
+        let tokens: std::collections::BTreeSet<String> = (0..1000).map(|_| mint_token()).collect();
         assert_eq!(tokens.len(), 1000, "a repeated token would freeze a cache");
     }
 
