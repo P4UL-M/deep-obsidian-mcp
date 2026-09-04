@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod couchdb_source;
 pub mod federation;
 pub mod health;
+pub mod links;
 pub mod mcp;
 pub mod mounts;
 pub mod prompts;
