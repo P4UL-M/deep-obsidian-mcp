@@ -364,7 +364,6 @@ fn validate_expected_hash(
     Ok(())
 }
 
-<<<<<<< HEAD
 /// Ceiling for either the diff or failure diagnostic in an `edit_note` conflict.
 ///
 /// An always-on conflict diff is itself a context hazard: on a 4 000-line note with
