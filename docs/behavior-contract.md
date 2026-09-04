@@ -136,7 +136,6 @@ The black-box surface must preserve:
 - `graph_traverse` (with `direction:"incoming"` for backlinks)
 - `upsert_note`
 - `edit_note`
-- `update_note_section`
 - `request_vault_upload`
 - `upsert_session_note`
 

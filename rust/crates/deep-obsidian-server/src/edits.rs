@@ -656,6 +656,20 @@ mod tests {
         assert_eq!(out, "# Note\n\ntext\n");
     }
 
+    /// What `update_note_section`'s `target: "preamble"` used to do, now reachable by
+    /// literal addressing — and reachable more precisely, since it edits the prose without
+    /// having to restate the whole preamble.
+    #[test]
+    fn preamble_prose_is_editable_between_the_frontmatter_and_the_first_heading() {
+        let content = "---\ntitle: Note\n---\n\nold intro prose\n\n## Section\n\nbody\n";
+        let (out, applied) = apply_edits(content, &[literal("old intro prose", "new intro prose")])
+            .expect("applies");
+        assert!(out.starts_with("---\ntitle: Note\n---\n"), "{out}");
+        assert!(out.contains("new intro prose"), "{out}");
+        assert!(out.contains("## Section"), "{out}");
+        assert_eq!(applied[0].line, 5);
+    }
+
     #[test]
     fn an_empty_old_is_refused_with_an_explanation() {
         let error = apply_edits("x\n", &[literal("", "y")]).expect_err("refused");

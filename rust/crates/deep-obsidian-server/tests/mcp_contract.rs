@@ -827,55 +827,6 @@ async fn upsert_note_is_frozen() {
 }
 
 #[tokio::test]
-async fn update_note_section_is_frozen() {
-    let fixture = Fixture::new("update-section");
-    let state = fixture.state().await;
-    let scrub = fixture.scrub_prefixes();
-
-    let heading = tool_call(
-        &state,
-        "update_note_section",
-        json!({
-            "path": "Root.md",
-            "heading": "Overview",
-            "content": "Replaced overview body.",
-        }),
-    )
-    .await;
-    assert_golden(
-        "tool_update_note_section_heading",
-        &normalize(&heading, &scrub),
-    );
-
-    let preamble = tool_call(
-        &state,
-        "update_note_section",
-        json!({
-            "path": "Folder/Child.md",
-            "target": "preamble",
-            "content": "Replaced preamble body.",
-            "dryRun": true,
-        }),
-    )
-    .await;
-    assert_golden(
-        "tool_update_note_section_preamble_dry_run",
-        &normalize(&preamble, &scrub),
-    );
-
-    let missing_heading = tool_call(
-        &state,
-        "update_note_section",
-        json!({"path": "Root.md", "content": "No heading given."}),
-    )
-    .await;
-    assert_golden(
-        "error_update_note_section_missing_heading",
-        &normalize(&missing_heading, &scrub),
-    );
-}
-
-#[tokio::test]
 async fn edit_note_is_frozen() {
     let fixture = Fixture::new("edit-note");
     let state = fixture.state().await;
@@ -922,44 +873,19 @@ async fn edit_note_is_frozen() {
     );
 }
 
-/// The behaviour contrast `edit_note` exists for, pinned on both sides.
+/// The boundary `edit_note` exists to get right: `Folder/Child.md` has `### Child Section`
+/// nested under `# Child`, and addressing `Child` must not take the subsection with it.
 ///
-/// `Folder/Child.md` has `### Child Section` nested under `# Child`. Addressing `Child`
-/// with `update_note_section` replaces the deep range and takes the subsection with it —
-/// that is its long-standing behaviour and this test keeps it from changing by accident.
-/// Addressing the same heading with `edit_note` stops at the next heading of any level, so
-/// the subsection survives.
+/// This used to be a two-sided comparison against `update_note_section`, which replaced the
+/// deep range. That tool is gone, so only the surviving behaviour is pinned — but the
+/// nesting in the fixture is the whole point of the case, and the previous unit test and
+/// golden both used same-level neighbours where the two rules agreed.
 #[tokio::test]
-async fn a_nested_subsection_survives_edit_note_but_not_update_note_section() {
-    let section_fixture = Fixture::new("nested-section-old");
-    let section_state = section_fixture.state().await;
+async fn a_nested_subsection_survives_a_section_edit() {
+    let fixture = Fixture::new("nested-section");
+    let state = fixture.state().await;
     tool_call(
-        &section_state,
-        "update_note_section",
-        json!({
-            "path": "Folder/Child.md",
-            "heading": "Child",
-            "level": 1,
-            "content": "Rewritten child body.",
-        }),
-    )
-    .await;
-    let after_section = std::fs::read_to_string(section_fixture.vault_path.join("Folder/Child.md"))
-        .expect("read child note");
-    assert!(
-        after_section.contains("Rewritten child body."),
-        "{after_section}"
-    );
-    assert!(
-        !after_section.contains("### Child Section"),
-        "update_note_section replaces the whole subtree, and that is the behaviour being \
-         preserved for the shipped skills that call it: {after_section}"
-    );
-
-    let edit_fixture = Fixture::new("nested-section-new");
-    let edit_state = edit_fixture.state().await;
-    tool_call(
-        &edit_state,
+        &state,
         "edit_note",
         json!({
             "path": "Folder/Child.md",
@@ -967,15 +893,14 @@ async fn a_nested_subsection_survives_edit_note_but_not_update_note_section() {
         }),
     )
     .await;
-    let after_edit = std::fs::read_to_string(edit_fixture.vault_path.join("Folder/Child.md"))
+    let after = std::fs::read_to_string(fixture.vault_path.join("Folder/Child.md"))
         .expect("read child note");
-    assert!(after_edit.contains("Rewritten child body."), "{after_edit}");
+    assert!(after.contains("Rewritten child body."), "{after}");
     assert!(
-        after_edit.contains("### Child Section"),
-        "edit_note stops at the next heading of any level, so the nested subsection \
-         survives: {after_edit}"
+        after.contains("### Child Section"),
+        "the replaced range must stop at the next heading of any level: {after}"
     );
-    assert!(after_edit.contains("Nested child content."), "{after_edit}");
+    assert!(after.contains("Nested child content."), "{after}");
 }
 
 #[tokio::test]

@@ -19,7 +19,6 @@ and usage, see the top-level [USAGE.md](../USAGE.md).
 - `graph_traverse` — traverse wiki-link graph (`direction:"incoming"`, `depth:1` for backlinks)
 - `upsert_note` — create/update a markdown note
 - `edit_note` — change part of a note, addressed literally (`old`/`new`) or by heading
-- `update_note_section` — replace the preamble or a named heading section (superseded by `edit_note`)
 - `request_vault_upload` — mint an out-of-band upload URL for binary/large files
 - `upsert_session_note` — create/update a session note
 
@@ -156,11 +155,8 @@ must either declare the argument that fetches them or offer no cursor at all.
   edit by default; `includeSubsections:true` opts into replacing the subtree.
   Does not accept `resolveDivergence`: a partial edit never saw the whole note,
   so it cannot assert that the note reconciles a divergence.
-- **`update_note_section`** — patch the preamble or one heading section without
-  rewriting the whole note. Superseded by `edit_note` and retained unchanged: a
-  heading section is still replaced together with everything nested under it.
 - **Every markdown write reports what it changed.** `upsert_note`, `edit_note`,
-  `update_note_section` and `upsert_session_note` return `added` and `removed`
+  `edit_note` and `upsert_session_note` return `added` and `removed`
   line counts, on applied writes and not only on `dryRun` — the accident worth
   catching happens on the write that was not previewed. `previousHash` and
   `newHash` cannot serve this purpose: both are opaque and both change on any

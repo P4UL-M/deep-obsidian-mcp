@@ -137,34 +137,6 @@
     "hasExecution": true,
     "inputSchemaKeys": [
       "$schema",
-      "allOf",
-      "properties",
-      "required",
-      "type"
-    ],
-    "name": "update_note_section",
-    "properties": [
-      "content",
-      "createIfMissing",
-      "dryRun",
-      "expectedHash",
-      "heading",
-      "level",
-      "path",
-      "target",
-      "verbosity"
-    ],
-    "required": [
-      "path",
-      "content"
-    ]
-  },
-  {
-    "hasAnnotations": true,
-    "hasDescription": true,
-    "hasExecution": true,
-    "inputSchemaKeys": [
-      "$schema",
       "properties",
       "required",
       "type"
