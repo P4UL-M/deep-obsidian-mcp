@@ -206,6 +206,16 @@ step of the release (see [docs/release-checklist.md](./docs/release-checklist.md
 
 ### Improved
 
+- **A hash conflict on `edit_note` says what to do next.** It named two opaque
+  hashes and nothing else, so the only recovery was a full re-read — and that is
+  the dominant failure of the section-write path, with `conflict → read_file →
+  retry` the one fail-then-retry loop that recurs in practice. The error now
+  names the hash to retry with and carries a unified diff of what the same call
+  would change against the note as it now stands, which is the diff a caller can
+  act on: it answers whether retrying is still the right edit. Three outcomes are
+  distinguished — the edits still apply, they no longer do, or a concurrent write
+  already produced the intended result and a retry would be a no-op.
+
 - **Multi-backend performance: five measured fixes.** All five came out of a
   release-build audit of the multi-backend stack and each is verified against that
   audit's own harness. No payload changes and no new staleness: every cache here is
