@@ -206,6 +206,21 @@ step of the release (see [docs/release-checklist.md](./docs/release-checklist.md
 
 ### Improved
 
+- **`maxTextChars` is a default, not a ceiling.** An explicit value above 20 000
+  was silently clamped to it. The silence was the defect: the response then
+  carried `textTruncated: true`, which reads as "the note is longer than what I
+  asked for" when the truth was "your cap was overridden" — two different facts,
+  one signal, and only one of them true. A caller acting on the wrong reading
+  concludes the note is bigger than it is, or that it saw everything up to a
+  limit that was never applied. The server also cannot know the caller's context
+  budget, so it was the wrong place for the decision. The default is unchanged;
+  a caller that asks for more now gets it and owns the larger response.
+
+  Multi-result tools stay bounded by a separate guard:
+  `RESPONSE_TEXT_BUDGET_CHARS` caps total snippet text across a response and
+  sets `responseTruncated`, so raising the per-field value cannot make a search
+  response unbounded.
+
 - **Multi-backend performance: five measured fixes.** All five came out of a
   release-build audit of the multi-backend stack and each is verified against that
   audit's own harness. No payload changes and no new staleness: every cache here is
