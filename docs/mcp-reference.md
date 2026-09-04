@@ -155,7 +155,9 @@ must either declare the argument that fetches them or offer no cursor at all.
   rather than resolved to the first match. Nested subsections survive a section
   edit by default; `includeSubsections:true` opts into replacing the subtree.
   Does not accept `resolveDivergence`: a partial edit never saw the whole note,
-  so it cannot assert that the note reconciles a divergence.
+  so it cannot assert that the note reconciles a divergence. An `expectedHash`
+  conflict returns the current hash to retry with, plus a diff of what this same
+  call would change when applied to the note as it now stands.
 - **`update_note_section`** — patch the preamble or one heading section without
   rewriting the whole note. Superseded by `edit_note` and retained unchanged: a
   heading section is still replaced together with everything nested under it.

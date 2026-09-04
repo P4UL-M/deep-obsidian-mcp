@@ -359,6 +359,43 @@ fn validate_expected_hash(
     Ok(())
 }
 
+/// A hash conflict that carries the current hash and what the write would still change.
+///
+/// The old message gave two opaque hashes and nothing to act on. The retry hash is the
+/// found one — spelled out here so a caller does not have to infer it — and the diff is
+/// between the note as it stands now and what this same call would produce against it.
+/// That is the diff a caller can use: it says whether retrying is still the right edit.
+///
+/// `would_produce` is `None` when the edits no longer apply to the current content at all,
+/// in which case there is nothing to diff and the caller has to re-read.
+fn hash_conflict_with_diff(
+    path: &str,
+    expected_hash: &str,
+    current_hash: &str,
+    current_content: &str,
+    would_produce: Option<String>,
+) -> String {
+    let tail = match would_produce {
+        Some(next) => {
+            let diff = unified_line_diff(Some(current_content), &next, DIFF_CONTEXT_LINES);
+            if diff.is_empty() {
+                "Applied to the note as it stands now, this call would change nothing — the \
+                 concurrent write already produced your intended result."
+                    .to_string()
+            } else {
+                format!("Applied to the note as it stands now, this call would change:\n{diff}")
+            }
+        }
+        None => "This call no longer applies to the note as it stands now, so re-read it and \
+                 re-derive the edits."
+            .to_string(),
+    };
+    format!(
+        "hash conflict for {path}: expected {expected_hash}, found {current_hash}. \
+         Retry with expectedHash {current_hash}. {tail}"
+    )
+}
+
 /// Turn the `edits` argument into specs, rejecting shapes the schema alone cannot.
 ///
 /// JSON Schema can express the `oneOf` between the two forms, but a client that ignores
@@ -5367,7 +5404,19 @@ pub async fn call_tool(
                 .map(|(text, version)| (text, BaseVersion::from_read(version)))
                 .map_err(|error| error.to_string())?;
             let previous_hash = content_hash(existing.as_bytes());
-            validate_expected_hash(expected_hash.as_deref(), Some(&previous_hash), &path)?;
+            if let Some(expected) = expected_hash.as_deref() {
+                if expected != previous_hash {
+                    return Err(hash_conflict_with_diff(
+                        &path,
+                        expected,
+                        &previous_hash,
+                        &existing,
+                        apply_edits(&existing, &specs)
+                            .ok()
+                            .map(|(content, _)| content),
+                    ));
+                }
+            }
             let (final_content, applied) = apply_edits(&existing, &specs)?;
             let new_hash = content_hash(final_content.as_bytes());
             if !dry_run {
@@ -6590,6 +6639,53 @@ mod tests {
         assert_eq!(matches[1]["text"], "also small");
         assert!(matches[0].get("textOmitted").is_none());
         assert!(matches[1].get("textOmitted").is_none());
+    }
+
+    #[test]
+    fn a_hash_conflict_carries_the_retry_hash_and_the_pending_diff() {
+        let current = "# Note\n\nunrelated change\n\nthe anchor line\n";
+        let would = "# Note\n\nunrelated change\n\nthe replaced line\n";
+        let message = super::hash_conflict_with_diff(
+            "Notes/A.md",
+            "fnv1a64:stale",
+            "fnv1a64:current",
+            current,
+            Some(would.to_string()),
+        );
+        assert!(
+            message.contains("Retry with expectedHash fnv1a64:current"),
+            "{message}"
+        );
+        assert!(message.contains("-the anchor line"), "{message}");
+        assert!(message.contains("+the replaced line"), "{message}");
+    }
+
+    #[test]
+    fn a_hash_conflict_whose_edits_no_longer_apply_says_to_re_read() {
+        let message = super::hash_conflict_with_diff(
+            "Notes/A.md",
+            "fnv1a64:stale",
+            "fnv1a64:current",
+            "# Note\n\nrewritten\n",
+            None,
+        );
+        assert!(message.contains("no longer applies"), "{message}");
+        assert!(message.contains("re-read"), "{message}");
+    }
+
+    /// A concurrent write that already produced the intended result is a distinct answer
+    /// from "here is what would change": retrying would be a no-op, not an edit.
+    #[test]
+    fn a_hash_conflict_whose_work_is_already_done_says_so() {
+        let current = "# Note\n\nthe replaced line\n";
+        let message = super::hash_conflict_with_diff(
+            "Notes/A.md",
+            "fnv1a64:stale",
+            "fnv1a64:current",
+            current,
+            Some(current.to_string()),
+        );
+        assert!(message.contains("would change nothing"), "{message}");
     }
 
     #[test]
