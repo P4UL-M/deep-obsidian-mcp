@@ -210,21 +210,26 @@ impl TextPayloadOptions {
     fn from_arguments(arguments: &Value, default_include_text: bool) -> Self {
         Self {
             include_text: bool_arg(arguments, "includeText", default_include_text),
-            max_text_chars: clamped_usize_arg(
-                arguments,
-                "maxTextChars",
-                DEFAULT_MAX_TEXT_CHARS,
-                0,
-                DEFAULT_MAX_TEXT_CHARS,
-            ),
+            // Deliberately NOT clamped to `DEFAULT_MAX_TEXT_CHARS`. That constant is the
+            // default, not a ceiling: a caller that asks for more owns the consequence of
+            // the larger response, and the server has no way to know the caller's context
+            // budget. Silently lowering the request was worse than either alternative —
+            // the response carried `textTruncated: true`, which a caller reads as "the
+            // note is longer than what I asked for" when the truth was "your cap was
+            // overridden". Those are different facts and only one of them was true.
+            //
+            // Multi-result tools are still bounded: `RESPONSE_TEXT_BUDGET_CHARS` is a
+            // separate aggregate guard applied by `apply_response_text_budget`, so raising
+            // the per-field value cannot make a search response unbounded.
+            max_text_chars: usize_arg(arguments, "maxTextChars", DEFAULT_MAX_TEXT_CHARS),
         }
     }
 
     /// Like [`from_arguments`], but defaults the per-result snippet cap to
     /// [`DEFAULT_SEARCH_SNIPPET_CHARS`] when the caller did not pass
     /// `maxTextChars`. Used by multi-result search tools so the aggregate
-    /// response stays small by default. An explicit `maxTextChars` is still
-    /// honored (clamped to [`DEFAULT_MAX_TEXT_CHARS`]).
+    /// response stays small by default. An explicit `maxTextChars` is honored as given,
+    /// including above [`DEFAULT_MAX_TEXT_CHARS`] — see [`Self::from_arguments`].
     fn search_snippet_from_arguments(arguments: &Value, default_include_text: bool) -> Self {
         let mut options = Self::from_arguments(arguments, default_include_text);
         if arguments.get("maxTextChars").is_none() {
@@ -1029,7 +1034,7 @@ fn tool_definitions(
                     ("includeGraph", json!({"type":"boolean","default":true})),
                     ("graphDepth", json!({"type":"integer","exclusiveMinimum":0,"maximum":3,"default":1})),
                     ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["subject"],
@@ -1188,7 +1193,7 @@ fn tool_definitions(
                     ("endLine", json!({"type":"integer","exclusiveMinimum":0,"maximum":MAX_SAFE_INTEGER})),
                     ("knownHash", json!({"type":"string","description":"If set and it matches the file's current content hash, the body is omitted and `unchanged: true` is returned."})),
                     ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"default":DEFAULT_MAX_TEXT_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["path"],
@@ -1237,7 +1242,7 @@ fn tool_definitions(
                     ("contextLines", json!({"type":"integer","minimum":0,"maximum":20,"default":0})),
                     ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":500,"default":50})),
                     ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_MAX_TEXT_CHARS})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"default":DEFAULT_MAX_TEXT_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["query"],
@@ -1252,7 +1257,7 @@ fn tool_definitions(
                 vec![
                     ("path", json!({"type":"string","description":"Vault-relative markdown path."})),
                     ("includeText", json!({"type":"boolean","default":false,"description":"Include heading and block text excerpts."})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":4000})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"default":4000})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["path"],
@@ -1277,7 +1282,7 @@ fn tool_definitions(
                     ("semanticWeight", json!({"type":"number","minimum":0,"maximum":1,"default":1.0,"description":"RRF weight for the semantic list (multiplies its 1/(k+rank) contribution). Default 1.0 (unweighted)."})),
                     ("bm25Weight", json!({"type":"number","minimum":0,"maximum":1,"default":1.0,"description":"RRF weight for the BM25 list (multiplies its 1/(k+rank) contribution). Default 1.0 (unweighted)."})),
                     ("includeText", json!({"type":"boolean","default":true})),
-                    ("maxTextChars", json!({"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TEXT_CHARS,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
+                    ("maxTextChars", json!({"type":"integer","minimum":0,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
                 ],
                 vec!["query"],
@@ -6340,12 +6345,41 @@ mod tests {
             TextPayloadOptions::search_snippet_from_arguments(&json!({"maxTextChars": 5000}), true);
         assert_eq!(explicit.max_text_chars, 5000);
 
-        // Explicit value above the ceiling is clamped to the per-field max.
-        let clamped = TextPayloadOptions::search_snippet_from_arguments(
+        // An explicit value ABOVE the default is honored as given. `DEFAULT_MAX_TEXT_CHARS`
+        // is a default, not a ceiling: the server cannot know the caller's context budget,
+        // and silently lowering the request made the response say `textTruncated: true`,
+        // which reads as "the note is longer than I asked for" when the truth was "your cap
+        // was overridden". A caller that asks for more owns the larger response.
+        let raised = TextPayloadOptions::search_snippet_from_arguments(
             &json!({"maxTextChars": 999999}),
             true,
         );
-        assert_eq!(clamped.max_text_chars, super::DEFAULT_MAX_TEXT_CHARS);
+        assert_eq!(raised.max_text_chars, 999_999);
+    }
+
+    /// Raising the per-field value does NOT make a multi-result response unbounded:
+    /// `RESPONSE_TEXT_BUDGET_CHARS` is a separate aggregate guard, so the guarantee that
+    /// uncapping the per-field value is safe rests on this constant staying in force.
+    #[test]
+    fn the_aggregate_text_budget_is_independent_of_the_per_field_cap() {
+        let raised = TextPayloadOptions::search_snippet_from_arguments(
+            &json!({"maxTextChars": 999999}),
+            true,
+        );
+        assert!(raised.max_text_chars > super::RESPONSE_TEXT_BUDGET_CHARS);
+
+        // Two matches whose text each exceed the whole aggregate budget: the first is
+        // measured, the second loses its text and is marked omitted.
+        let long = "x".repeat(super::RESPONSE_TEXT_BUDGET_CHARS + 1);
+        let mut matches = vec![json!({"text": long.clone()}), json!({"text": long})];
+        let omitted = super::apply_response_text_budget(
+            &mut matches,
+            "text",
+            super::RESPONSE_TEXT_BUDGET_CHARS,
+        );
+        assert!(omitted, "the aggregate guard must still fire: {matches:?}");
+        assert!(matches[1].get("text").is_none(), "{matches:?}");
+        assert_eq!(matches[1]["textOmitted"], json!(true));
     }
 
     #[tokio::test]
