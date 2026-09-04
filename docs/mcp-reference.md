@@ -22,6 +22,8 @@ and usage, see the top-level [USAGE.md](../USAGE.md).
 - `request_vault_upload` — mint an out-of-band upload URL for binary/large files
 - `upsert_session_note` — create/update a session note
 
+- `rename_note` — move a note and repoint the wikilinks that referenced it
+
 ### Conditionally advertised tools
 
 `tools/list` is computed once per process, and exactly three things may change what it
