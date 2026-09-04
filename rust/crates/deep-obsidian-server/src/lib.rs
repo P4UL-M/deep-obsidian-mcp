@@ -5,6 +5,7 @@ pub mod control;
 pub mod edits;
 pub mod federation;
 pub mod health;
+pub mod links;
 pub mod mcp;
 pub mod mounts;
 pub mod multiuser;
