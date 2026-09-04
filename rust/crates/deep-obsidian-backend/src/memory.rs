@@ -192,6 +192,20 @@ impl VaultBackend for InMemoryVaultBackend {
             }
             // Removing a key from a map would be a delete, but not an OBSERVABLE and
             // RECOVERABLE one, which is what the request means.
+            BackendRequest::Mutation(MutationRequest::Rename { from, to, .. }) => {
+                let mut files = self.files.lock().expect("files lock");
+                let Some(content) = files.remove(&from) else {
+                    return Err(BackendError::Message(format!(
+                        "cannot rename {from}: no such note"
+                    )));
+                };
+                let replaced_destination = files.insert(to, content).is_some();
+                Ok(BackendResponse::Mutation(MutationResponse::Renamed {
+                    replaced_destination,
+                    // One lock held across both map operations.
+                    atomic: true,
+                }))
+            }
             BackendRequest::Mutation(MutationRequest::SoftDelete { .. }) => Err(
                 BackendError::Unsupported(IN_MEMORY_UNSUPPORTED_MESSAGE.to_string()),
             ),

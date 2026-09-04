@@ -875,6 +875,123 @@ async fn update_note_section_is_frozen() {
     );
 }
 
+/// The move itself, plus the repair pass that is the point of the tool.
+///
+/// `Root.md` links to `[[Folder/Child]]` in full form; the fixture also gives `Child.md` a
+/// link back, so both directions are exercised.
+#[tokio::test]
+async fn rename_note_moves_the_note_and_repoints_inbound_links() {
+    let fixture = Fixture::new("rename-note");
+    let state = fixture.state().await;
+
+    let response = tool_call(
+        &state,
+        "rename_note",
+        json!({"from": "Folder/Child.md", "to": "Folder/Renamed Child.md"}),
+    )
+    .await;
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["to"], json!("Folder/Renamed Child.md"));
+    assert_eq!(
+        result["atomic"],
+        json!(true),
+        "a filesystem move is one operation: {result}"
+    );
+
+    assert!(
+        !fixture.vault_path.join("Folder/Child.md").exists(),
+        "the source must be gone"
+    );
+    let moved = std::fs::read_to_string(fixture.vault_path.join("Folder/Renamed Child.md"))
+        .expect("the note is at its new path");
+    assert!(moved.contains("Child body"), "{moved}");
+
+    let root = std::fs::read_to_string(fixture.vault_path.join("Root.md")).expect("read root");
+    assert!(
+        root.contains("[[Folder/Renamed Child]]"),
+        "the inbound link must be repointed: {root}"
+    );
+    assert!(!root.contains("[[Folder/Child]]"), "{root}");
+}
+
+/// Re-running the same rename is the documented recovery, so it must not fail or
+/// double-rewrite. The second call fails on the move (the source is gone) — which is the
+/// honest outcome and why the response, not a silent success, is what a caller reads.
+#[tokio::test]
+async fn rename_note_reports_what_links_here_without_touching_anything_on_a_dry_run() {
+    let fixture = Fixture::new("rename-dry");
+    let state = fixture.state().await;
+
+    let response = tool_call(
+        &state,
+        "rename_note",
+        json!({"from": "Folder/Child.md", "to": "Folder/Moved.md", "dryRun": true}),
+    )
+    .await;
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["dryRun"], json!(true));
+    assert!(
+        result["linkingNotes"]
+            .as_array()
+            .expect("linkingNotes")
+            .iter()
+            .any(|note| note == "Root.md"),
+        "Root.md links to the note being moved: {result}"
+    );
+    assert!(
+        fixture.vault_path.join("Folder/Child.md").exists(),
+        "a dry run must not move anything"
+    );
+}
+
+/// The first refusal: renaming onto an existing note would destroy it.
+#[tokio::test]
+async fn rename_note_refuses_an_occupied_destination() {
+    let fixture = Fixture::new("rename-occupied");
+    let state = fixture.state().await;
+    let response = tool_call(
+        &state,
+        "rename_note",
+        json!({"from": "Folder/Child.md", "to": "Root.md"}),
+    )
+    .await;
+    let message = response["error"]["message"].as_str().expect("an error");
+    assert!(message.contains("already exists there"), "{message}");
+    assert!(message.contains("would destroy it"), "{message}");
+}
+
+/// The second refusal, and the subtler one: a colliding basename would silently change
+/// where SHORT links in unrelated notes resolve.
+#[tokio::test]
+async fn rename_note_refuses_a_destination_whose_basename_collides() {
+    let fixture = Fixture::new("rename-collision");
+    let state = fixture.state().await;
+    // The destination path does NOT exist, so this is not the occupied-destination
+    // refusal — but its basename `Root.md` is already used by the vault-root `Root.md`,
+    // so a short `[[Root]]` anywhere would become ambiguous.
+    assert!(
+        !fixture.vault_path.join("Folder/Nested/Root.md").exists(),
+        "the destination must be free, or this tests the wrong refusal"
+    );
+    let response = tool_call(
+        &state,
+        "rename_note",
+        json!({"from": "Folder/Child.md", "to": "Folder/Nested/Root.md"}),
+    )
+    .await;
+    let message = response["error"]["message"].as_str().expect("an error");
+    assert!(message.contains("basename"), "{message}");
+    assert!(message.contains("Root.md"), "{message}");
+    assert!(
+        message.contains("silently change where such links"),
+        "{message}"
+    );
+    assert!(
+        fixture.vault_path.join("Folder/Child.md").exists(),
+        "a refused rename must not move anything"
+    );
+}
+
 #[tokio::test]
 async fn request_vault_upload_is_frozen() {
     let fixture = Fixture::new("upload");

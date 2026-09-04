@@ -3321,15 +3321,16 @@ async fn vault_info_describes_the_algolia_mount_and_never_calls_it_degraded() {
     assert_eq!(shared["backendKind"], json!("algolia"));
     assert_eq!(shared["mountAt"], json!("_Shared"));
     // Capabilities are the backend's own, and they are honest: a bounded grep, its own
-    // ranked recall, a version history, a soft delete (this mount is writable) — and
-    // nothing binary. The ORDER is the `Capability` enum's declaration order, which is
-    // what reaches a client, so this pins it too.
+    // ranked recall, a version history, and — because this mount is writable — a soft
+    // delete and a rename. Nothing binary. The ORDER is the `Capability` enum's
+    // declaration order, which is what reaches a client, so this pins it too.
     assert_eq!(
         shared["capabilities"],
         json!([
             "grep-search",
             "native-recall",
             "version-history",
+            "rename",
             "soft-delete"
         ])
     );

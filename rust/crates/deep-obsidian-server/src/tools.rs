@@ -6,8 +6,9 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use deep_obsidian_backend::{
-    BackendKind, BackendRequest, BaseVersion, Capability, GrepContextLine, GrepMatch,
-    RecallRequest, VaultChildEntry, VaultEntryKind, RIPGREP_UNAVAILABLE_MESSAGE,
+    BackendKind, BackendRequest, BackendResponse, BaseVersion, Capability, GrepContextLine,
+    GrepMatch, MutationRequest, MutationResponse, RecallRequest, VaultChildEntry, VaultEntryKind,
+    RIPGREP_UNAVAILABLE_MESSAGE,
 };
 use deep_obsidian_core::text::{
     extract_block_sections, extract_heading_sections, extract_wiki_links, normalize_heading_slug,
@@ -355,6 +356,42 @@ fn validate_expected_hash(
         }
     }
     Ok(())
+}
+
+/// Final path segment of a vault-relative note path, extension included.
+fn note_basename(note_path: &str) -> &str {
+    note_path.rsplit('/').next().unwrap_or(note_path)
+}
+
+/// Rewrite one note's links to a moved note, returning how many changed.
+///
+/// Guarded on the revision just read, so a concurrent edit to a linking note makes this one
+/// fail rather than clobbering it. The caller retries the rename and only the notes that
+/// failed are touched again.
+async fn rewrite_links_in_note(
+    state: &AppState,
+    note_path: &str,
+    from: &str,
+    to: &str,
+    old_basename_was_unique: bool,
+) -> Result<usize, String> {
+    let (content, base_version) = backend_call(state, BackendRequest::read_text(note_path))
+        .await
+        .map_err(|error| error.to_string())?
+        .into_versioned_text()
+        .map(|(text, version)| (text, BaseVersion::from_read(version)))
+        .map_err(|error| error.to_string())?;
+    let outcome = crate::links::rewrite_wiki_links(&content, from, to, old_basename_was_unique);
+    if outcome.rewritten == 0 {
+        return Ok(0);
+    }
+    backend_call(
+        state,
+        BackendRequest::write_text_full(note_path, &outcome.content, base_version, false),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(outcome.rewritten)
 }
 
 fn normalize_score_order(left: f64, right: f64, left_path: &str, right_path: &str) -> Ordering {
@@ -941,6 +978,24 @@ fn insert_capability_tools(definitions: &mut Vec<ToolDefinition>, capabilities: 
             ),
         });
     }
+    if capabilities.rename {
+        definitions.push(ToolDefinition {
+            name: "rename_note".to_string(),
+            description: "Move a note to a new vault-relative path and repoint the wikilinks that referenced it. Refuses rather than guessing in the two cases where a move changes meaning it was not asked to change: a destination that already holds a note (that would destroy it, which is not what renaming means), and a destination whose basename already exists elsewhere in the vault (short `[[Name]]` links in unrelated notes would silently resolve somewhere new). Link rewriting is a repair pass over the notes that link here, not part of the move: it is idempotent, so if it is interrupted the response says which notes were left and re-running the same rename finishes them. Only mounts advertising 'rename' in vault_info.mounts[].capabilities; the response's 'atomic' says whether the move itself was one operation.".to_string(),
+            annotations: Some(tool_annotations(false, Some(true), Some(true))),
+            execution: Some(json!({"taskSupport":"forbidden"})),
+            input_schema: object_schema(
+                vec![
+                    ("from", json!({"type":"string","description":"Current vault-relative markdown path."})),
+                    ("to", json!({"type":"string","description":"New vault-relative markdown path. Missing parent folders are created."})),
+                    ("rewriteLinks", json!({"type":"boolean","default":true,"description":"Repoint inbound wikilinks after the move. Set false to move the note only and get the list of notes that link to it, to fix yourself."})),
+                    ("expectedHash", json!({"type":"string","description":"Optional hash of the note being moved. If it does not match, nothing moves."})),
+                    ("dryRun", json!({"type":"boolean","default":false,"description":"Report what would move and which notes link here, without changing the vault."})),
+                ],
+                vec!["from", "to"],
+            ),
+        });
+    }
     if !capabilities.version_history {
         return;
     }
@@ -994,6 +1049,7 @@ fn insert_capability_tools(definitions: &mut Vec<ToolDefinition>, capabilities: 
 pub struct CapabilitySet {
     pub version_history: bool,
     pub soft_delete: bool,
+    pub rename: bool,
 }
 
 impl CapabilitySet {
@@ -1004,6 +1060,7 @@ impl CapabilitySet {
             let descriptor = mount.backend.descriptor();
             set.version_history |= descriptor.supports(Capability::VersionHistory);
             set.soft_delete |= descriptor.supports(Capability::SoftDelete);
+            set.rename |= descriptor.supports(Capability::Rename);
         }
         set
     }
@@ -4748,6 +4805,146 @@ pub async fn call_tool(
                     "rawLink": edge.raw_link
                 })).collect::<Vec<_>>()
             })))
+        }
+        "rename_note" => {
+            let from = string_arg(arguments, "from")?;
+            let to = string_arg(arguments, "to")?;
+            for (label, path) in [("from", &from), ("to", &to)] {
+                if !path.to_lowercase().ends_with(".md") {
+                    return Err(format!(
+                        "rename_note requires a vault-relative .md path; `{label}` is not one."
+                    ));
+                }
+            }
+            if from == to {
+                return Err("rename_note was given the same path twice.".to_string());
+            }
+            refuse_incapable_mount(state, "rename_note", &from, Capability::Rename)?;
+            let dry_run = bool_arg(arguments, "dryRun", false);
+            let rewrite_links = bool_arg(arguments, "rewriteLinks", true);
+            let expected_hash = expected_hash_arg(arguments);
+
+            let (existing, base_version) = backend_call(state, BackendRequest::read_text(&from))
+                .await?
+                .into_versioned_text()
+                .map(|(text, version)| (text, BaseVersion::from_read(version)))
+                .map_err(|error| error.to_string())?;
+            validate_expected_hash(
+                expected_hash.as_deref(),
+                Some(&content_hash(existing.as_bytes())),
+                &from,
+            )?;
+
+            // Two refusals, both cases where finishing the move would change something the
+            // caller never asked to change.
+            let notes = backend_call(state, BackendRequest::walk_markdown())
+                .await?
+                .into_markdown_files()
+                .map_err(|error| error.to_string())?;
+            if notes.iter().any(|note| note == &to) {
+                return Err(format!(
+                    "refusing to rename {from} to {to}: a note already exists there, and \
+                     renaming onto it would destroy it. Pick another path, or remove that note \
+                     first if replacing it is what you meant."
+                ));
+            }
+            let destination_basename = note_basename(&to);
+            if let Some(collision) = notes
+                .iter()
+                .find(|note| *note != &from && note_basename(note) == destination_basename)
+            {
+                return Err(format!(
+                    "refusing to rename {from} to {to}: the basename {destination_basename:?} is \
+                     already used by {collision}. Obsidian resolves a short [[{}]] link by \
+                     basename, so finishing this move would silently change where such links in \
+                     unrelated notes point. Rename to a distinct basename.",
+                    strip_md_extension(destination_basename)
+                ));
+            }
+            // Whether the OLD basename was unique decides whether short links may be
+            // rewritten: if it was not, `[[Name]]` never unambiguously meant this note.
+            let from_basename = note_basename(&from);
+            let old_basename_was_unique = !notes
+                .iter()
+                .any(|note| note != &from && note_basename(note) == from_basename);
+
+            let (scoped, mount_path) = resolve_recall_path(state, "rename_note", &from)?;
+            let snapshot = scoped.runtime.fresh_snapshot("rename_note").await?;
+            let graph = index_graph::graph_traverse(
+                &snapshot.index,
+                &mount_path,
+                index_graph::GraphDirection::Incoming,
+                1,
+                500,
+            )
+            .map_err(|error| error.to_string())?;
+            let linking: Vec<String> = graph
+                .nodes
+                .into_iter()
+                .filter(|node| node.depth > 0)
+                .map(|node| scoped.to_logical(&node.path))
+                .collect();
+
+            if dry_run {
+                return Ok(json_text_result(json!({
+                    "from": from,
+                    "to": to,
+                    "dryRun": true,
+                    "linkingNotes": linking,
+                    "oldBasenameWasUnique": old_basename_was_unique,
+                })));
+            }
+
+            let renamed = backend_call(
+                state,
+                BackendRequest::Mutation(MutationRequest::Rename {
+                    from: from.clone(),
+                    to: to.clone(),
+                    base_version,
+                }),
+            )
+            .await?;
+            let atomic = matches!(
+                renamed,
+                BackendResponse::Mutation(MutationResponse::Renamed { atomic: true, .. })
+            );
+
+            // The repair pass. Each note is its own write, so a failure leaves the rest done
+            // and the response names the ones that were not — re-running the same rename
+            // finishes them, because a rewritten note has no old-path link left to match.
+            let mut rewritten = Vec::new();
+            let mut failed = Vec::new();
+            if rewrite_links {
+                for note in &linking {
+                    match rewrite_links_in_note(state, note, &from, &to, old_basename_was_unique)
+                        .await
+                    {
+                        Ok(0) => {}
+                        Ok(count) => rewritten.push(json!({"path": note, "links": count})),
+                        Err(reason) => failed.push(json!({"path": note, "error": reason})),
+                    }
+                }
+            }
+
+            let mut payload = json!({
+                "from": from,
+                "to": to,
+                "atomic": atomic,
+                "dryRun": false,
+                "resourceUri": note_uri(&to),
+                "wikiLink": note_wiki_link(&to),
+                "linkingNotes": linking,
+                "rewroteLinksIn": rewritten,
+            });
+            if !failed.is_empty() {
+                payload["linkRewritesFailed"] = json!(failed);
+                payload["howToRecover"] = json!(
+                    "the note moved and some inbound links still point at the old path. \
+                     Re-run the same rename_note call: the pass is idempotent, so notes already \
+                     rewritten are untouched and only these are retried."
+                );
+            }
+            Ok(json_text_result(payload))
         }
         "delete_note" => {
             let path = string_arg(arguments, "path")?;

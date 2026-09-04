@@ -9,6 +9,42 @@ step of the release (see [docs/release-checklist.md](./docs/release-checklist.md
 
 ### Added
 
+- **`rename_note` — move a note and repoint the links that referenced it.**
+  Advertised on any mount that can move a note, which is all of them; whether the
+  move is one operation differs, so the response carries `atomic`. The filesystem
+  has `fs::rename`; a corpus whose document id derives from the path does not —
+  the LiveSync sidecar reaches a document through `path2id` and an Algolia
+  objectID is `note:{path}` — so there the move writes the destination and
+  removes the source, in that order, since the reverse could lose the note while
+  this order can only duplicate it. That two-step failure is reported rather than
+  refused, because it leaves the note READABLE at both paths: nothing is lost, the
+  state is visible, and re-running the same rename repairs it.
+
+  It works on local filesystem notes, where `delete_note` deliberately does not.
+  The line between them is recoverability through this surface: after a rename the
+  content is fully readable at the new path and renaming back restores the
+  original state; after a delete there is nothing at the path at all.
+
+  Two refusals, both cases where finishing the move would change something the
+  caller never asked to change:
+  - the destination already holds a note — renaming onto it would destroy it
+  - the destination basename is already used elsewhere — Obsidian resolves a
+    short `[[Name]]` link by basename, so completing the move would silently
+    change where such links in UNRELATED notes point
+
+  Link rewriting is a repair pass, not part of the move: N inbound links are N
+  writes and nothing makes them one transaction. It is idempotent — a note already
+  rewritten has no old-path link left to match — so an interrupted pass is
+  finished by re-running the same call, and the response names the notes it could
+  not rewrite. Each rewrite is guarded on the revision just read, so a concurrent
+  edit to a linking note fails that note rather than clobbering it. Five link
+  forms are handled: `[[path]]`, `[[path|alias]]`, `[[path#heading]]`, the
+  shortest-path `[[basename]]`, and any of them behind a `!` embed —
+  `[[path\|alias]]` included, since the escaped pipe is the only way to write an
+  alias inside a table cell. The shortest-path form is only rewritten when the
+  OLD basename was unique; otherwise a bare `[[Name]]` never unambiguously meant
+  this note, and `dryRun` reports which case applies.
+
 - **Multi-backend vaults (experimental, off by default).** A vault can now be
   composed of several **mounts**, each grafting other storage onto a folder of
   your vault while your agent keeps seeing one namespace. Nothing changes for a

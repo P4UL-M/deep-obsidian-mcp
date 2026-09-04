@@ -354,5 +354,28 @@
     "required": [
       "path"
     ]
+  },
+  {
+    "hasAnnotations": true,
+    "hasDescription": true,
+    "hasExecution": true,
+    "inputSchemaKeys": [
+      "$schema",
+      "properties",
+      "required",
+      "type"
+    ],
+    "name": "rename_note",
+    "properties": [
+      "dryRun",
+      "expectedHash",
+      "from",
+      "rewriteLinks",
+      "to"
+    ],
+    "required": [
+      "from",
+      "to"
+    ]
   }
 ]
