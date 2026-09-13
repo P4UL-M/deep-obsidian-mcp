@@ -2,10 +2,7 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
-## v0.2.0-alpha.1 — PENDING
-
-Date set when the tag is pushed — replace `PENDING` with the tag date as the first
-step of the release (see [docs/release-checklist.md](./docs/release-checklist.md)).
+## v0.2.0-alpha.1 — 2026-09-13
 
 ### ⚠️ Breaking changes (MCP tool surface: `update_note_section` → `edit_note`)
 
