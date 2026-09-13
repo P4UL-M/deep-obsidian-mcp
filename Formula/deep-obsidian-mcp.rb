@@ -4,7 +4,6 @@ class DeepObsidianMcp < Formula
   desc "Filesystem-first MCP server for deep Obsidian vault access"
   homepage "https://github.com/P4UL-M/deep-obsidian-mcp"
   url "https://github.com/P4UL-M/deep-obsidian-mcp/archive/refs/tags/v0.2.0-alpha.1.tar.gz"
-  version "0.2.0-alpha.1"
   sha256 "cdd873120099cd5cc383aa5813077e5d5943a4b3d44118aa9921fd173aadeb96"
   license "MIT"
 

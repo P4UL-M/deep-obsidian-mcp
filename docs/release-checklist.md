@@ -13,7 +13,7 @@ Bumped **before** the tag, on `main`, and they must all agree with the tag:
 | Place | What it is | Who reads it |
 |---|---|---|
 | `Cargo.toml` → `[workspace.package] version` | the source of truth | `CARGO_PKG_VERSION` → `deep-obsidian-mcp version`; cargo-deb's default package version; `Cargo.lock` (regenerate with any `cargo` command, do not hand-edit) |
-| `Formula/deep-obsidian-mcp.rb` → `url`, `sha256`, `version`, and the `livesync-sidecar` resource's `url` + `sha256` | this repo's canonical copy | nothing installs from it (see step 4 below) |
+| `Formula/deep-obsidian-mcp.rb` → `url`, `sha256`, and the `livesync-sidecar` resource's `url` + `sha256` | this repo's canonical copy | nothing installs from it (see step 4 below) |
 | `P4UL-M/homebrew-tap` → `Formula/deep-obsidian-mcp.rb` | the copy `brew install` actually uses | every Homebrew user |
 | `Dockerfile` → `ARG VERSION` | default for the OCI `org.opencontainers.image.version` label | image consumers; CI passes the tag version explicitly when publishing |
 | `CHANGELOG.md` → the top section heading | release notes | humans |
@@ -47,7 +47,7 @@ Do **all** of these — the two Homebrew formula copies and the apt tap are easy
    - Requires repo secret `APT_GPG_PRIVATE_KEY`, and the `github-pages` environment must allow `v*` tag deploys.
    - The Pages deploy is historically flaky; if it fails, delete the stale
      `github-pages` artifact and re-run the job rather than re-tagging.
-3. [ ] **This repo's `Formula/deep-obsidian-mcp.rb`** — set `version`, the tarball `url` +
+3. [ ] **This repo's `Formula/deep-obsidian-mcp.rb`** — set the tarball `url` +
    `sha256`, and the `livesync-sidecar` resource's `url` + `sha256`. Canonical copy, but
    **not** what `brew install` uses, so it is the only copy allowed to sit with
    placeholder hashes between a stack merge and a tag.
@@ -55,7 +55,7 @@ Do **all** of these — the two Homebrew formula copies and the apt tap are easy
    - Bundle hash: the **first field** of the release's `livesync-sidecar-X.Y.Z.mjs.sha256`
      asset (the workflow's "Name and checksum the asset" step prints the same line).
 4. [ ] **Separate tap repo `P4UL-M/homebrew-tap` → `Formula/deep-obsidian-mcp.rb`** — mirror
-   the same `url`/`sha256`/`version` **and the whole `resource "livesync-sidecar"` block,
+   the same `url`/`sha256` **and the whole `resource "livesync-sidecar"` block,
    its `install` staging lines, and the `assert_path_exists` in `test do`** (that assertion
    is what makes `brew test` catch a tap copy whose resource stopped landing).
    **`brew tap P4UL-M/tap` installs from here, not from
