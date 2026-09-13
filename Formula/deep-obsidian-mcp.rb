@@ -113,7 +113,7 @@ class DeepObsidianMcp < Formula
 
   test do
     assert_match "Usage:", shell_output("#{bin}/deep-obsidian-mcp help")
-    assert_match "deep-obsidian-mcp", shell_output("#{bin}/deep-obsidian-mcp version")
+    assert_equal version.to_s, shell_output("#{bin}/deep-obsidian-mcp version").strip
     # The sidecar bundle, at the exact path the binary's exe-relative probe derives. A
     # `couchdb` mount is the only thing that reads it, so a resource that silently
     # stopped landing here would otherwise surface as a broken mount, months later.
