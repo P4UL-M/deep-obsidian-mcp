@@ -75,7 +75,8 @@
       "folder",
       "path",
       "preserveManualNotes",
-      "topic"
+      "topic",
+      "verbosity"
     ],
     "required": [
       "content"
@@ -113,25 +114,21 @@
     "hasExecution": true,
     "inputSchemaKeys": [
       "$schema",
-      "allOf",
       "properties",
       "required",
       "type"
     ],
-    "name": "update_note_section",
+    "name": "edit_note",
     "properties": [
-      "content",
-      "createIfMissing",
       "dryRun",
+      "edits",
       "expectedHash",
-      "heading",
-      "level",
       "path",
-      "target"
+      "verbosity"
     ],
     "required": [
       "path",
-      "content"
+      "edits"
     ]
   },
   {

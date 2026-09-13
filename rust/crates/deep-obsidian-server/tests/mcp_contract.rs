@@ -827,52 +827,80 @@ async fn upsert_note_is_frozen() {
 }
 
 #[tokio::test]
-async fn update_note_section_is_frozen() {
-    let fixture = Fixture::new("update-section");
+async fn edit_note_is_frozen() {
+    let fixture = Fixture::new("edit-note");
     let state = fixture.state().await;
     let scrub = fixture.scrub_prefixes();
 
-    let heading = tool_call(
+    let literal = tool_call(
         &state,
-        "update_note_section",
+        "edit_note",
         json!({
             "path": "Root.md",
-            "heading": "Overview",
-            "content": "Replaced overview body.",
+            "edits": [{"old": "ripgrep and embeddings", "new": "ripgrep"}],
         }),
     )
     .await;
-    assert_golden(
-        "tool_update_note_section_heading",
-        &normalize(&heading, &scrub),
-    );
+    assert_golden("tool_edit_note_literal", &normalize(&literal, &scrub));
 
-    let preamble = tool_call(
+    // `body` occurs in both `## Overview` and `## Details`, so this is the refusal, not a
+    // first-match edit. The message carries the candidate lines.
+    let ambiguous = tool_call(
         &state,
-        "update_note_section",
+        "edit_note",
         json!({
-            "path": "Folder/Child.md",
-            "target": "preamble",
-            "content": "Replaced preamble body.",
+            "path": "Root.md",
+            "edits": [{"old": "body", "new": "BODY"}],
+        }),
+    )
+    .await;
+    assert_golden("error_edit_note_ambiguous", &normalize(&ambiguous, &scrub));
+
+    let full = tool_call(
+        &state,
+        "edit_note",
+        json!({
+            "path": "Root.md",
+            "edits": [{"old": "Overview body", "new": "New overview body"}],
+            "verbosity": "full",
             "dryRun": true,
         }),
     )
     .await;
     assert_golden(
-        "tool_update_note_section_preamble_dry_run",
-        &normalize(&preamble, &scrub),
+        "tool_edit_note_full_verbosity_dry_run",
+        &normalize(&full, &scrub),
     );
+}
 
-    let missing_heading = tool_call(
+/// The boundary `edit_note` exists to get right: `Folder/Child.md` has `### Child Section`
+/// nested under `# Child`, and addressing `Child` must not take the subsection with it.
+///
+/// This used to be a two-sided comparison against `update_note_section`, which replaced the
+/// deep range. That tool is gone, so only the surviving behaviour is pinned — but the
+/// nesting in the fixture is the whole point of the case, and the previous unit test and
+/// golden both used same-level neighbours where the two rules agreed.
+#[tokio::test]
+async fn a_nested_subsection_survives_a_section_edit() {
+    let fixture = Fixture::new("nested-section");
+    let state = fixture.state().await;
+    tool_call(
         &state,
-        "update_note_section",
-        json!({"path": "Root.md", "content": "No heading given."}),
+        "edit_note",
+        json!({
+            "path": "Folder/Child.md",
+            "edits": [{"heading": "Child", "content": "Rewritten child body."}],
+        }),
     )
     .await;
-    assert_golden(
-        "error_update_note_section_missing_heading",
-        &normalize(&missing_heading, &scrub),
+    let after = std::fs::read_to_string(fixture.vault_path.join("Folder/Child.md"))
+        .expect("read child note");
+    assert!(after.contains("Rewritten child body."), "{after}");
+    assert!(
+        after.contains("### Child Section"),
+        "the replaced range must stop at the next heading of any level: {after}"
     );
+    assert!(after.contains("Nested child content."), "{after}");
 }
 
 #[tokio::test]

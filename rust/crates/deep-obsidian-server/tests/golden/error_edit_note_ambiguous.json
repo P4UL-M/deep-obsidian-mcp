@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": -32000,
+    "message": "edits[0]: `old` occurs 2 times, on lines 13, 17. Refusing rather than guessing which one you meant: widen `old` with surrounding context to make it unique, or set `occurrence` to pick one, or `replaceAll` to change every one."
+  },
+  "id": 1,
+  "jsonrpc": "2.0"
+}

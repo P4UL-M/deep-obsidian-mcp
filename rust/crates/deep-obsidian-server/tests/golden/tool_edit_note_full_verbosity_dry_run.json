@@ -1,0 +1,31 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "text": "{\n  \"action\": \"updated\",\n  \"added\": 1,\n  \"applied\": [\n    {\n      \"action\": \"replaced\",\n      \"editIndex\": 0,\n      \"line\": 13\n    }\n  ],\n  \"created\": false,\n  \"diff\": \"@@ -10,6 +10,6 @@\\n \\n ## Overview\\n \\n-Overview body about the vault backend contract.\\n+New overview body about the vault backend contract.\\n \\n ## Details\\n\",\n  \"dryRun\": true,\n  \"newHash\": \"fnv1a64:86a42dd235b10b4b\",\n  \"path\": \"Root.md\",\n  \"previousHash\": \"fnv1a64:3d9798501d889f2d\",\n  \"removed\": 1,\n  \"resourceUri\": \"obsidian://note?path=Root.md\"\n}",
+        "type": "text"
+      }
+    ],
+    "structuredContent": {
+      "action": "updated",
+      "added": 1,
+      "applied": [
+        {
+          "action": "replaced",
+          "editIndex": 0,
+          "line": 13
+        }
+      ],
+      "created": false,
+      "diff": "@@ -10,6 +10,6 @@\n \n ## Overview\n \n-Overview body about the vault backend contract.\n+New overview body about the vault backend contract.\n \n ## Details\n",
+      "dryRun": true,
+      "newHash": "fnv1a64:86a42dd235b10b4b",
+      "path": "Root.md",
+      "previousHash": "fnv1a64:3d9798501d889f2d",
+      "removed": 1,
+      "resourceUri": "obsidian://note?path=Root.md"
+    }
+  }
+}
