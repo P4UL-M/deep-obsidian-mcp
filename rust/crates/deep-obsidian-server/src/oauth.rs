@@ -11,7 +11,7 @@ use std::{
 
 use axum::{
     extract::{Form, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
@@ -497,6 +497,25 @@ struct Consent {
     decision: String,
 }
 
+/// Firefox can submit a same-origin top-level form with `Origin: null` when the
+/// page's referrer policy suppresses the referrer. Keep the CSRF boundary tight:
+/// accept that opaque origin only when Fetch Metadata still proves same-origin.
+fn consent_origin_is_valid(headers: &HeaderMap, issuer: &str) -> bool {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    if origin == Some(issuer) {
+        return true;
+    }
+    if origin != Some("null") {
+        return false;
+    }
+    headers
+        .get(HeaderName::from_static("sec-fetch-site"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("same-origin"))
+}
+
 async fn consent(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -505,11 +524,7 @@ async fn consent(
     let Some(oauth) = &state.auth.oauth else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        != Some(oauth.issuer.as_str())
-    {
+    if !consent_origin_is_valid(&headers, &oauth.issuer) {
         return error(StatusCode::FORBIDDEN, "invalid_request");
     }
     // Zeroize the submitted owner credential on every return path.
@@ -1253,6 +1268,37 @@ mod tests {
         ] {
             assert!(!valid_redirect(uri), "{uri}");
         }
+    }
+
+    #[test]
+    fn firefox_opaque_origin_is_allowed_only_for_same_origin_fetches() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, HeaderValue::from_static("null"));
+        headers.insert(
+            HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static("same-origin"),
+        );
+        assert!(consent_origin_is_valid(&headers, "https://server.example"));
+
+        headers.insert(
+            HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static("cross-site"),
+        );
+        assert!(!consent_origin_is_valid(&headers, "https://server.example"));
+
+        headers.remove(HeaderName::from_static("sec-fetch-site"));
+        assert!(!consent_origin_is_valid(&headers, "https://server.example"));
+    }
+
+    #[test]
+    fn explicit_issuer_origin_remains_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://server.example"),
+        );
+        assert!(consent_origin_is_valid(&headers, "https://server.example"));
+        assert!(!consent_origin_is_valid(&headers, "https://other.example"));
     }
 
     #[tokio::test]
