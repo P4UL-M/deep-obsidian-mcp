@@ -2,6 +2,19 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.2.0-alpha.3 — 2026-10-07
+
+### Fixed
+
+- Firefox OAuth consent forms sending `Origin: null` with
+  `Sec-Fetch-Site: same-origin` no longer fail with `403 invalid_request`.
+  Opaque origins are accepted only for same-origin requests; cross-site requests
+  and opaque origins without Fetch Metadata remain rejected. Consent still
+  requires a valid browser cookie, form nonce and owner password.
+- Added regression tests for Firefox's opaque-origin submission and exact issuer
+  validation. Legacy bearer authentication and rotating refresh tokens keep their
+  existing behavior.
+
 ## v0.2.0-alpha.2 — 2026-10-07
 
 ### Added
