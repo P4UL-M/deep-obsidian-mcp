@@ -2,6 +2,37 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.2.0-alpha.2 — 2026-10-07
+
+### Added
+
+- Optional remote OAuth Authorization Code + PKCE S256 alongside the existing
+  legacy bearer authentication. Includes protected-resource and authorization-server
+  metadata, discovery challenges, consent, public-client registration (DCR), and
+  expiring access tokens. The owner enters the existing server secret directly on
+  the server's consent page; OAuth clients never receive it.
+- Rotating refresh tokens with a 30-day absolute authorization lifetime by default.
+  Reusing a spent refresh token revokes its authorization family. Client, resource,
+  scope, expiry and concurrent exchanges are validated. Access tokens default to
+  one hour; `refreshTokenTtlSeconds: 0` disables renewal.
+- Initialization wizard choice between legacy-only and legacy + OAuth, validated
+  configuration, Docker options and an OAuth deployment guide in `docs/oauth.md`.
+
+### Fixed
+
+- Re-enabling HTTP authentication or changing modes preserves existing stored
+  credentials and secret references instead of silently rotating them.
+
+### Compatibility and deployment
+
+- Existing configs remain legacy-only unless `auth.oauth` is added. The legacy
+  `DEEP_OBSIDIAN_AUTH_TOKEN` override, `/mcp`, `/upload` and frozen MCP tool payloads
+  keep their existing behavior. No configuration change is required for legacy users.
+- OAuth requires a public HTTPS origin and proxy access to `/.well-known/*`,
+  `/register`, `/authorize` and `/token`. Grant and token state is in memory and
+  invalidated on restart; registered clients persist. Use one server instance.
+- Experimental CouchDB, Algolia and multi-vault gates remain opt-in.
+
 ## v0.2.0-alpha.1 — 2026-09-13
 
 ### ⚠️ Breaking changes (MCP tool surface: `update_note_section` → `edit_note`)

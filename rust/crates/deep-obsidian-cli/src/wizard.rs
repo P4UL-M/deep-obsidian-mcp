@@ -592,6 +592,7 @@ struct TransportAnswers {
     /// `None` for stdio: there is no HTTP surface to authenticate, and passing `Some(false)`
     /// would DEPROVISION a token a previous HTTP setup had stored.
     auth: Option<bool>,
+    oauth: Option<deep_obsidian_types::OAuthConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,6 +1143,7 @@ fn ask_transport(
             // Not `Some(false)`: see the field's own comment. Leaving auth alone is not the
             // same as turning it off, and only one of the two deletes a stored token.
             auth: None,
+            oauth: None,
         });
     }
 
@@ -1161,10 +1163,40 @@ fn ask_transport(
          expose the port beyond this machine)",
         auth_on,
     )?;
+    let previous_oauth = existing
+        .and_then(|config| config.auth.as_ref())
+        .and_then(|auth| auth.oauth.as_ref());
+    let oauth = if auth
+        && io.answers.choice(
+            "HTTP authentication mode",
+            &[
+                "Legacy bearer only",
+                "Legacy bearer + OAuth (MCP / ChatGPT)",
+            ],
+            usize::from(previous_oauth.is_some()),
+        )? == 1
+    {
+        let issuer_url = io.answers.line(
+            "Public OAuth origin (HTTPS, e.g. https://obsidian-mcp.example.com)",
+            previous_oauth.map(|oauth| oauth.issuer_url.as_str()),
+        )?;
+        Some(deep_obsidian_types::OAuthConfig {
+            issuer_url,
+            access_token_ttl_seconds: previous_oauth
+                .map_or(3600, |oauth| oauth.access_token_ttl_seconds),
+            refresh_token_ttl_seconds: previous_oauth
+                .map_or_else(deep_obsidian_types::default_oauth_refresh_ttl, |oauth| {
+                    oauth.refresh_token_ttl_seconds
+                }),
+        })
+    } else {
+        None
+    };
     Ok(TransportAnswers {
         transport: TransportMode::Http,
         port: Some(port),
         auth: Some(auth),
+        oauth,
     })
 }
 
@@ -1337,6 +1369,14 @@ async fn finish_through_setup_service(
 
     let mut resolved = crate::config::resolve_runtime_config(&options)?;
     resolved.service.embedding.api_key_ref = embeddings.api_key_ref.clone();
+    if transport.auth.is_some() {
+        resolved.service.auth.oauth = transport.oauth.clone();
+        // Validate the same config shown in the recap before provisioning a secret.
+        let validated = deep_obsidian_config::normalize_persisted_config(
+            deep_obsidian_config::to_persisted_config(&resolved.service),
+        )?;
+        resolved.service.auth.oauth = validated.auth.and_then(|auth| auth.oauth);
+    }
 
     // The recap is built from the SAME resolved config `setup_service` is about to be handed,
     // with the two rewrites that command applies on a write mirrored onto the preview: the
@@ -1456,11 +1496,13 @@ async fn finish_with_mount_table(
     }
     if let Some(enabled) = transport.auth {
         let mut auth = candidate.auth.clone().unwrap_or(AuthConfigInput {
+            oauth: None,
             enabled: None,
             token_ref: None,
             allowed_origins: None,
         });
         auth.enabled = Some(enabled);
+        auth.oauth = transport.oauth.clone();
         candidate.auth = Some(auth);
     }
 

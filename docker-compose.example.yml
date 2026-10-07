@@ -171,6 +171,12 @@ services:
       couchdb-init:
         condition: service_completed_successfully
     environment:
+      # Optional OAuth for MCP/ChatGPT; the existing auth_token remains valid.
+      # DO_AUTH_MODE: legacy+oauth
+      # DO_OAUTH_ISSUER_URL: https://obsidian-mcp.example.com
+      # DO_OAUTH_ACCESS_TOKEN_TTL_SECONDS: 3600
+      # DO_OAUTH_REFRESH_TOKEN_TTL_SECONDS: 2592000  # 30 days; 0 disables refresh
+      # On an existing volume, edit config.json or set DO_REBUILD_CONFIG=1 once.
       # --- the root vault: this CouchDB database ---
       DO_ROOT_KIND: couchdb
       DO_ROOT_ID: vault

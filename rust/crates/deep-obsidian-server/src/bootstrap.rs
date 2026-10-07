@@ -53,6 +53,24 @@ fn env_is_truthy(key: &str) -> bool {
 /// override and persisted config. Errors when auth is enabled but no token can
 /// be resolved (fail closed rather than silently allow).
 fn resolve_auth_state(config: &ResolvedServiceConfig) -> Result<AuthState, io::Error> {
+    let mut auth = resolve_legacy_auth_state(config)?;
+    if let Some(oauth) = &config.auth.oauth {
+        if !auth.enabled || auth.token.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "OAuth requires the existing auth token (tokenRef or DEEP_OBSIDIAN_AUTH_TOKEN)",
+            ));
+        }
+        auth.oauth = Some(Arc::new(crate::oauth::OAuthState::new(
+            oauth,
+            &config.http.mcp_path,
+            Some(config.index_dir.join("oauth-clients.json")),
+        )?));
+    }
+    Ok(auth)
+}
+
+fn resolve_legacy_auth_state(config: &ResolvedServiceConfig) -> Result<AuthState, io::Error> {
     let allowed_origins = Arc::new(config.auth.allowed_origins.clone());
 
     if let Ok(token) = std::env::var(AUTH_TOKEN_ENV) {
@@ -62,6 +80,7 @@ fn resolve_auth_state(config: &ResolvedServiceConfig) -> Result<AuthState, io::E
             return Ok(AuthState {
                 enabled: true,
                 token: Some(SecretString::new(token)),
+                oauth: None,
                 allowed_origins,
             });
         }
@@ -71,6 +90,7 @@ fn resolve_auth_state(config: &ResolvedServiceConfig) -> Result<AuthState, io::E
         return Ok(AuthState {
             enabled: false,
             token: None,
+            oauth: None,
             allowed_origins,
         });
     }
@@ -97,6 +117,7 @@ fn resolve_auth_state(config: &ResolvedServiceConfig) -> Result<AuthState, io::E
     Ok(AuthState {
         enabled: true,
         token: Some(token),
+        oauth: None,
         allowed_origins,
     })
 }
@@ -427,6 +448,9 @@ readiness reports it as such",
     if config.http.health_path != "/readyz" {
         router = router.route("/readyz", get(ready_handler));
     }
+    if state.auth.oauth.is_some() {
+        router = router.merge(crate::oauth::routes(&config.http.mcp_path));
+    }
     let router = router.with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", config.http.host, config.http.port)
@@ -601,5 +625,20 @@ mod tests {
         let state = state.expect("auth state resolves from store");
         assert!(state.enabled);
         assert_eq!(state.token.expect("token present").expose_secret(), &token);
+    }
+    #[test]
+    fn oauth_fails_closed_without_a_resolved_owner_secret() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(AUTH_TOKEN_ENV);
+        let mut config = config_with("127.0.0.1", false);
+        config.auth.oauth = Some(deep_obsidian_types::OAuthConfig {
+            issuer_url: "https://server.example".into(),
+            access_token_ttl_seconds: 3600,
+            refresh_token_ttl_seconds: deep_obsidian_types::default_oauth_refresh_ttl(),
+        });
+        let error = resolve_auth_state(&config)
+            .err()
+            .expect("OAuth must never be anonymous");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

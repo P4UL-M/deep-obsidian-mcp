@@ -28,3 +28,5 @@ the top-level guides instead:** [README](../README.md) ·
 - [migration-and-rollback.md](./migration-and-rollback.md) — moving a folder onto a remote backend, and getting back off it.
 - [homebrew-gap-todo.md](./homebrew-gap-todo.md) — outstanding release-artifact gaps.
 - [FIX_EMBEDDING_CONTEXT_CRASH.md](./FIX_EMBEDDING_CONTEXT_CRASH.md) — incident note.
+
+- [OAuth authentication](oauth.md): optional Authorization Code + PKCE for remote MCP clients, alongside legacy bearer authentication.

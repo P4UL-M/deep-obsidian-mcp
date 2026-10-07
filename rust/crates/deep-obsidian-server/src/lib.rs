@@ -6,6 +6,7 @@ pub mod federation;
 pub mod health;
 pub mod mcp;
 pub mod mounts;
+pub mod oauth;
 pub mod prompts;
 pub mod protocol;
 pub mod resources;

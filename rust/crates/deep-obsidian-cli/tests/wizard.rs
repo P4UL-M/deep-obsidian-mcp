@@ -424,6 +424,7 @@ async fn accepting_http_auth_on_a_local_root_stores_a_token_by_reference() {
             "2",                            // transport -> HTTP
             "4321",                         // port
             "y",                            // enable bearer auth
+            "1",                            // legacy only
             "n",                            // register with local agents? -> no
             "",                             // skills -> no
             "",                             // snippets -> no
@@ -470,6 +471,7 @@ async fn accepting_http_auth_stores_a_token_by_reference() {
         "2",    // transport -> HTTP
         "4321", // port
         "y",    // enable bearer auth
+        "1",    // legacy only
         "n",    // register with local agents? -> no
         "",     // skills -> no
         // No snippets question: the root is remote.
@@ -1332,4 +1334,146 @@ fn cli_argv_reports_missing_mount_flags_instead_of_hanging() {
     assert!(!config_path.with_extension("json.bak").exists());
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn local_http_wizard_enables_additive_oauth_without_storing_plaintext() {
+    let fixture = Fixture::new("transport-http-oauth");
+    let vault = fixture.base.join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let options = fixture.options();
+    let mut io = fixture.io(
+        vec![
+            "1",
+            vault.to_str().unwrap(),
+            "",
+            "",
+            "2",
+            "4321",
+            "y",
+            "2",
+            "https://obsidian-mcp.example.com",
+            "n",
+            "",
+            "",
+            "",
+        ],
+        Vec::new(),
+    );
+    let report = run_with_io(&request(&options, false), &mut io)
+        .await
+        .unwrap();
+    assert!(report.written);
+    let json = fixture.config_json();
+    assert_eq!(json["auth"]["enabled"], true);
+    assert_eq!(
+        json["auth"]["oauth"]["issuerUrl"],
+        "https://obsidian-mcp.example.com"
+    );
+    assert_eq!(json["auth"]["oauth"]["accessTokenTtlSeconds"], 3600);
+    assert_eq!(json["auth"]["tokenRef"]["id"], "http-auth-token");
+    assert!(fixture.secret_exists("http-auth-token"));
+    assert!(json["auth"].get("token").is_none());
+    let _ = std::fs::remove_dir_all(&fixture.base);
+}
+
+#[tokio::test]
+async fn remote_http_wizard_enables_additive_oauth() {
+    let fixture = Fixture::new("remote-http-oauth");
+    let (base_url, _mock) = spawn_mock().await;
+    let options = fixture.options();
+    let mut answers = algolia_root_answers(&base_url);
+    answers.extend([
+        "",
+        "",
+        "2",
+        "4321",
+        "y",
+        "2",
+        "https://obsidian-mcp.example.com",
+        "n",
+        "",
+        "",
+    ]);
+    let mut io = fixture.io(answers, vec![API_KEY]);
+    let report = run_with_io(&request(&options, false), &mut io)
+        .await
+        .unwrap();
+    assert!(report.written);
+    let json = fixture.config_json();
+    assert_eq!(json["auth"]["enabled"], true);
+    assert_eq!(
+        json["auth"]["oauth"]["issuerUrl"],
+        "https://obsidian-mcp.example.com"
+    );
+    assert!(fixture.secret_exists("http-auth-token"));
+    let _ = std::fs::remove_dir_all(&fixture.base);
+}
+
+#[tokio::test]
+async fn editing_an_existing_oauth_setup_preserves_secret_defaults_and_stdio_config() {
+    use secrecy::ExposeSecret;
+    let fixture = Fixture::new("existing-oauth");
+    let vault = fixture.base.join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let reference = SecretRef::EncryptedFile {
+        id: "custom-owner-secret".into(),
+    };
+    fixture
+        .resolver
+        .put(
+            &reference,
+            secrecy::SecretString::new("fake-unchanged-owner-secret".into()),
+        )
+        .unwrap();
+    let config = serde_json::json!({"vaultPath":vault, "indexDir":fixture.index_dir, "transport":"http", "http":{"port":4321}, "auth":{"enabled":true, "tokenRef":reference, "oauth":{"issuerUrl":"https://obsidian.example.com", "accessTokenTtlSeconds":7200, "refreshTokenTtlSeconds":1728000}}});
+    std::fs::write(&fixture.config_path, config.to_string()).unwrap();
+    let options = fixture.options();
+    // Keep HTTP, existing authentication mode, issuer and lifetime through defaults.
+    let mut io = fixture.io(
+        vec!["1", "", "", "", "2", "", "", "", "", "n", "", "", ""],
+        Vec::new(),
+    );
+    run_with_io(&request(&options, false), &mut io)
+        .await
+        .unwrap();
+    let saved = fixture.config_json();
+    assert_eq!(saved["auth"]["oauth"], config["auth"]["oauth"]);
+    assert_eq!(saved["auth"]["tokenRef"], config["auth"]["tokenRef"]);
+    assert_eq!(
+        fixture
+            .resolver
+            .get(&reference)
+            .unwrap()
+            .unwrap()
+            .expose_secret(),
+        "fake-unchanged-owner-secret"
+    );
+    // Switching to stdio preserves the entire HTTP authentication setup.
+    let mut io = fixture.io(vec!["1", "", "", "", "1", "n", "", "", ""], Vec::new());
+    run_with_io(&request(&options, false), &mut io)
+        .await
+        .unwrap();
+    assert_eq!(fixture.config_json()["auth"], saved["auth"]);
+    // Switching back to HTTP with legacy-only removes OAuth, keeps the original credential.
+    let mut io = fixture.io(
+        vec!["1", "", "", "", "2", "", "y", "1", "n", "", "", ""],
+        Vec::new(),
+    );
+    run_with_io(&request(&options, false), &mut io)
+        .await
+        .unwrap();
+    let legacy = fixture.config_json();
+    assert!(legacy["auth"].get("oauth").is_none());
+    assert_eq!(legacy["auth"]["tokenRef"], saved["auth"]["tokenRef"]);
+    assert_eq!(
+        fixture
+            .resolver
+            .get(&reference)
+            .unwrap()
+            .unwrap()
+            .expose_secret(),
+        "fake-unchanged-owner-secret"
+    );
+    let _ = std::fs::remove_dir_all(&fixture.base);
 }

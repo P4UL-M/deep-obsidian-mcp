@@ -22,6 +22,8 @@ use crate::mcp::AppState;
 /// Resolved authentication state held by [`AppState`]. Cheap to clone.
 #[derive(Clone, Default)]
 pub struct AuthState {
+    /// Optional additive OAuth authority; the legacy token remains accepted.
+    pub oauth: Option<Arc<crate::oauth::OAuthState>>,
     /// When true, a valid bearer token is required on protected routes.
     pub enabled: bool,
     /// The expected bearer token, resolved at startup. `None` when auth is off.
@@ -50,7 +52,8 @@ pub fn generate_token() -> String {
 
 /// Axum middleware enforcing `Origin` validation (always) and bearer auth (when
 /// enabled). Returns `403` for a disallowed origin and `401` (with a
-/// `WWW-Authenticate: Bearer` challenge) for a missing or invalid token.
+/// bearer challenge) for a missing or invalid token. OAuth mode adds resource
+/// metadata discovery; legacy-only challenges remain unchanged.
 pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if let Some(rejection) = authorize(request.headers(), state.auth.as_ref()) {
         return rejection;
@@ -76,12 +79,22 @@ fn authorize(headers: &HeaderMap, auth: &AuthState) -> Option<Response> {
         }
     }
 
-    if auth.enabled && !bearer_matches(headers, auth.token.as_ref()) {
+    let oauth_matches = auth.oauth.as_ref().is_some_and(|oauth| {
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(extract_bearer)
+            .is_some_and(|token| oauth.accepts(token))
+    });
+    if auth.enabled && !bearer_matches(headers, auth.token.as_ref()) && !oauth_matches {
         let mut response =
             (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
         response
             .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            .insert(header::WWW_AUTHENTICATE, auth.oauth.as_ref().map_or_else(
+                || HeaderValue::from_static("Bearer"),
+                |oauth| HeaderValue::from_str(&format!("Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\", scope=\"obsidian\"", oauth.issuer())).expect("validated issuer"),
+            ));
         return Some(response);
     }
 
@@ -149,6 +162,7 @@ mod tests {
     fn enabled_auth(token: &str) -> AuthState {
         AuthState {
             enabled: true,
+            oauth: None,
             token: Some(SecretString::new(token.to_string())),
             allowed_origins: Arc::new(Vec::new()),
         }
@@ -216,6 +230,7 @@ mod tests {
     fn allowed_origin_passes_with_valid_token() {
         let auth = AuthState {
             enabled: true,
+            oauth: None,
             token: Some(SecretString::new("secret".to_string())),
             allowed_origins: Arc::new(vec!["https://app.example".to_string()]),
         };

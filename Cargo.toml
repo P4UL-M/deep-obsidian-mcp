@@ -21,7 +21,7 @@ members = [
 # NOTE: the MCP `serverInfo.version` reported over the wire is deliberately NOT this
 # value (it is a frozen literal in deep-obsidian-server/src/mcp.rs, asserted by
 # tests/golden/initialize.json). Bumping here does not move that contract.
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 edition = "2021"
 license = "MIT"
 
@@ -68,4 +68,5 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 urlencoding = "2"
+url = "2"
 zeroize = "1"

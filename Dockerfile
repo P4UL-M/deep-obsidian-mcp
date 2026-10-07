@@ -116,7 +116,7 @@ FROM ${NODE_IMAGE} AS runtime
 
 # Keep in step with `[workspace.package] version` in Cargo.toml; CI passes the tag
 # version explicitly when an image is published (docs/release-checklist.md).
-ARG VERSION=0.2.0-alpha.1
+ARG VERSION=0.2.0-alpha.2
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="deep-obsidian-mcp" \

@@ -1587,6 +1587,16 @@ pub(crate) fn provision_auth_token(
     resolver: &SecretResolver,
     prefer_os_keyring: bool,
 ) -> Result<()> {
+    // Changing transport/auth mode must not rotate an existing legacy credential.
+    // Rotation remains explicit through `secrets set --target auth-token`.
+    if auth.token_ref.is_some() {
+        if !dry_run && resolver.resolve_auth_token(auth)?.is_none() {
+            return Err(anyhow!("the configured HTTP auth token is missing; restore it with secrets set --target auth-token"));
+        }
+        auth.enabled = true;
+        println!("HTTP authentication enabled; preserving the existing stored token.");
+        return Ok(());
+    }
     let token = deep_obsidian_server::auth::generate_token();
     let reference = if prefer_os_keyring {
         SecretRef::OsKeyring {
@@ -1655,6 +1665,7 @@ pub(crate) fn deprovision_auth_token(
 ) {
     let previous_ref = auth.token_ref.take();
     auth.enabled = false;
+    auth.oauth = None;
 
     if dry_run {
         if previous_ref.is_some() {
@@ -4336,8 +4347,44 @@ mod tests {
     }
 
     #[test]
+    fn enabling_auth_preserves_existing_legacy_secret_and_reference() {
+        use secrecy::ExposeSecret;
+        let path = std::env::temp_dir().join(format!(
+            "deep-obsidian-auth-preserve-{}.json",
+            deep_obsidian_server::auth::generate_token()
+        ));
+        let resolver = SecretResolver::with_encrypted_file_path(path.clone());
+        let reference = deep_obsidian_types::SecretRef::EncryptedFile {
+            id: "custom-existing-token".into(),
+        };
+        resolver
+            .put(
+                &reference,
+                secrecy::SecretString::new("fake-existing-secret".into()),
+            )
+            .unwrap();
+        let mut auth = deep_obsidian_types::AuthConfig {
+            enabled: true,
+            token_ref: Some(reference.clone()),
+            ..Default::default()
+        };
+        super::provision_auth_token(&mut auth, false, false, &resolver, false).unwrap();
+        assert_eq!(auth.token_ref, Some(reference));
+        assert_eq!(
+            resolver
+                .resolve_auth_token(&auth)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            "fake-existing-secret"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn deprovision_auth_token_clears_enabled_and_ref() {
         let mut auth = deep_obsidian_types::AuthConfig {
+            oauth: None,
             enabled: true,
             token_ref: Some(deep_obsidian_types::SecretRef::EncryptedFile {
                 id: "http-auth-token".to_string(),

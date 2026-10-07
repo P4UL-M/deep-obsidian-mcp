@@ -93,6 +93,10 @@ BIN=/opt/deep-obsidian-mcp/bin/deep-obsidian-mcp
 : "${DO_HTTP_PORT:=4100}"
 : "${DO_INSECURE_NO_AUTH:=0}"
 : "${DO_REBUILD_CONFIG:=0}"
+: "${DO_AUTH_MODE:=legacy}"
+: "${DO_OAUTH_ISSUER_URL:=}"
+: "${DO_OAUTH_ACCESS_TOKEN_TTL_SECONDS:=3600}"
+: "${DO_OAUTH_REFRESH_TOKEN_TTL_SECONDS:=2592000}"
 : "${XDG_CONFIG_HOME:=$HOME/.config}"
 
 # EXPORTED, not merely set. The `:=` above assigns a shell variable, and a variable
@@ -103,7 +107,8 @@ BIN=/opt/deep-obsidian-mcp/bin/deep-obsidian-mcp
 # doing it for all of them is what makes that irrelevant.
 export DO_STATE_DIR DO_CONFIG_PATH DO_MOUNTED_CONFIG DO_SECRETS_DIR DO_INDEX_DIR \
     DO_ROOT_KIND DO_ROOT_ID DO_VAULT_PATH DO_HTTP_HOST DO_HTTP_PORT \
-    DO_INSECURE_NO_AUTH DO_REBUILD_CONFIG XDG_CONFIG_HOME
+    DO_INSECURE_NO_AUTH DO_REBUILD_CONFIG DO_AUTH_MODE DO_OAUTH_ISSUER_URL \
+    DO_OAUTH_ACCESS_TOKEN_TTL_SECONDS DO_OAUTH_REFRESH_TOKEN_TTL_SECONDS XDG_CONFIG_HOME
 
 SECRETS_STORE="$XDG_CONFIG_HOME/deep-obsidian-mcp/secrets.json"
 
@@ -187,6 +192,25 @@ write_env_config() {
         *)
             die "DO_ROOT_KIND=$DO_ROOT_KIND is not one of filesystem, couchdb, algolia"
             ;;
+    esac
+    case "$DO_AUTH_MODE" in
+        legacy) ;;
+        legacy+oauth)
+            [ -n "$DO_OAUTH_ISSUER_URL" ] || die "legacy+oauth requires DO_OAUTH_ISSUER_URL (the public HTTPS origin)"
+            DO_ENTRYPOINT_CONFIG="$CONFIG" node -e '
+const fs = require("fs");
+const path = process.env.DO_ENTRYPOINT_CONFIG;
+const config = JSON.parse(fs.readFileSync(path, "utf8"));
+config.auth = { ...config.auth, enabled: true, oauth: {
+    issuerUrl: process.env.DO_OAUTH_ISSUER_URL,
+    accessTokenTtlSeconds: Number(process.env.DO_OAUTH_ACCESS_TOKEN_TTL_SECONDS),
+    refreshTokenTtlSeconds: Number(process.env.DO_OAUTH_REFRESH_TOKEN_TTL_SECONDS),
+} };
+fs.writeFileSync(path + ".tmp", JSON.stringify(config, null, 2) + "\n");
+fs.renameSync(path + ".tmp", path);
+'
+            ;;
+        *) die "DO_AUTH_MODE must be legacy or legacy+oauth" ;;
     esac
 }
 

@@ -333,3 +333,22 @@ the bundle in any of the three channels.
 - **CouchDB's own credentials come from the environment**, not from a file: the
   official image supports no `*_FILE` variant. The example compose generates `.env`
   from the secret file so there is still one source of truth.
+
+## Optional OAuth for MCP / ChatGPT
+
+On first boot, set `DO_AUTH_MODE=legacy+oauth` and
+`DO_OAUTH_ISSUER_URL=https://obsidian-mcp.example.com` to add OAuth alongside the
+existing legacy bearer. `DO_OAUTH_ACCESS_TOKEN_TTL_SECONDS` defaults to `3600`
+and accepts 1–86400 seconds. `DO_OAUTH_REFRESH_TOKEN_TTL_SECONDS` defaults to
+`2592000` (30 days); use `0` to disable refresh tokens. The authorization lifetime
+is absolute and is not extended by refresh rotation. All root backend kinds support these options.
+
+Existing volume configs remain unchanged. Edit their `auth.oauth` block, or set
+`DO_REBUILD_CONFIG=1` once to regenerate from the environment. A mounted config
+always wins and must declare `auth.oauth` itself. Keep mounting `/run/secrets/auth_token`;
+it is also the password entered by the owner on `/authorize`. Never place it in
+a plugin, client metadata or client-side configuration. OAuth requires HTTPS
+externally and a single server instance; publish `/authorize`, `/token`, `/register`
+and `/.well-known/*` through the same proxy. Persist the index directory to retain
+registered clients. Codes, access tokens and refresh tokens are invalidated on restart. See
+[OAuth setup](oauth.md) for the full configuration and limitations.

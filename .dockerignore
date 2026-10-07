@@ -14,6 +14,12 @@ sidecar/livesync-sidecar/dist/
 .git/
 .github/
 .claude/
+# Local deployment credentials and backups never belong in a build context.
+.env
+.env.*
+secrets/
+deploy/
+docker-compose.yml
 outputs/
 **/.DS_Store
 **/.deep-obsidian-mcp/

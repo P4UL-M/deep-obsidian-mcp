@@ -24,6 +24,8 @@ pub const DEFAULT_AUTO_REINDEX_INTERVAL_MS: u64 = 30000;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("invalid OAuth configuration: {0}")]
+    InvalidOAuth(&'static str),
     #[error("missing vault path")]
     MissingVaultPath,
     #[error("invalid transport mode for HTTP service: {0:?}")]
@@ -735,7 +737,26 @@ pub fn normalize_service_config(
     let auto_reindex = normalize_auto_reindex_input(input.auto_reindex);
     let embedding = normalize_embedding_input(input.embedding);
     let artifact_embedding = normalize_embedding_input(input.artifact_embedding);
-    let auth = normalize_auth_input(input.auth);
+    let auth = normalize_auth_input(input.auth)?;
+    if auth.oauth.is_some() {
+        let reserved = [
+            "/authorize",
+            "/token",
+            "/register",
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server",
+        ];
+        let metadata_alias = format!("/.well-known/oauth-protected-resource{}", http.mcp_path);
+        if reserved.contains(&http.mcp_path.as_str())
+            || reserved.contains(&http.health_path.as_str())
+            || http.health_path == metadata_alias
+            || http.mcp_path.contains(['{', '}'])
+        {
+            return Err(ConfigError::InvalidOAuth(
+                "HTTP paths conflict with OAuth routes",
+            ));
+        }
+    }
 
     Ok(ResolvedServiceConfig {
         // Absent means enabled: the rerank is what makes a federated answer RANKED rather
@@ -864,8 +885,10 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
         auth: if config.auth.enabled
             || config.auth.token_ref.is_some()
             || !config.auth.allowed_origins.is_empty()
+            || config.auth.oauth.is_some()
         {
             Some(AuthConfigInput {
+                oauth: config.auth.oauth.clone(),
                 enabled: Some(config.auth.enabled),
                 token_ref: config.auth.token_ref.clone(),
                 allowed_origins: if config.auth.allowed_origins.is_empty() {
@@ -924,9 +947,41 @@ pub fn carry_unknown_fields(
     }
 }
 
-fn normalize_auth_input(input: Option<AuthConfigInput>) -> AuthConfig {
-    let input = input.unwrap_or_default();
-    AuthConfig {
+fn normalize_auth_input(input: Option<AuthConfigInput>) -> Result<AuthConfig, ConfigError> {
+    let mut input = input.unwrap_or_default();
+    if let Some(oauth) = &mut input.oauth {
+        let url = url::Url::parse(&oauth.issuer_url)
+            .map_err(|_| ConfigError::InvalidOAuth("issuerUrl must be a public origin"))?;
+        let loopback = match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(url::Host::Domain(host)) => host == "localhost",
+            None => false,
+        };
+        if !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ConfigError::InvalidOAuth("issuerUrl must be an HTTPS origin (HTTP only on loopback), without credentials, path, query or fragment"));
+        }
+        if !(1..=86400).contains(&oauth.access_token_ttl_seconds) {
+            return Err(ConfigError::InvalidOAuth(
+                "accessTokenTtlSeconds must be between 1 and 86400",
+            ));
+        }
+        if oauth.refresh_token_ttl_seconds > 30 * 24 * 3600 {
+            return Err(ConfigError::InvalidOAuth(
+                "refreshTokenTtlSeconds must be between 0 (disabled) and 2592000 (30 days)",
+            ));
+        }
+        oauth.issuer_url = url.origin().ascii_serialization();
+    }
+    Ok(AuthConfig {
+        oauth: input.oauth,
         enabled: input.enabled.unwrap_or(false),
         token_ref: input.token_ref,
         allowed_origins: input
@@ -936,7 +991,7 @@ fn normalize_auth_input(input: Option<AuthConfigInput>) -> AuthConfig {
             .map(|origin| origin.trim().to_string())
             .filter(|origin| !origin.is_empty())
             .collect(),
-    }
+    })
 }
 
 pub fn build_service_endpoints(
@@ -1546,6 +1601,7 @@ mod tests {
         let input = ServiceConfigInput {
             vault_path: Some(std::path::PathBuf::from("/tmp/vault")),
             auth: Some(AuthConfigInput {
+                oauth: None,
                 enabled: Some(true),
                 token_ref: Some(SecretRef::OsKeyring {
                     service: "deep-obsidian-mcp".to_string(),
@@ -2519,5 +2575,95 @@ mod tests {
             "if this now round-trips, the gap closed and this test should assert that \
              instead: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod oauth_config_tests {
+    use super::*;
+    fn load(auth: serde_json::Value) -> Result<ResolvedServiceConfig, ConfigError> {
+        normalize_service_config(
+            serde_json::from_value(serde_json::json!({"vaultPath": "/tmp/vault", "auth": auth}))
+                .unwrap(),
+        )
+    }
+    #[test]
+    fn legacy_auth_and_oauth_config_roundtrip() {
+        let legacy = load(serde_json::json!({"enabled": true})).unwrap();
+        assert!(legacy.auth.oauth.is_none());
+        assert!(
+            serde_json::to_value(to_persisted_config(&legacy)).unwrap()["auth"]
+                .get("oauth")
+                .is_none()
+        );
+        let auth = serde_json::json!({"enabled": true, "tokenRef": {"kind":"encryptedFile", "id":"existing-reference"}, "oauth": {"issuerUrl":"https://server.example/"}});
+        let config = load(auth).unwrap();
+        let oauth = config.auth.oauth.as_ref().unwrap();
+        assert_eq!(oauth.issuer_url, "https://server.example");
+        assert_eq!(oauth.access_token_ttl_seconds, 3600);
+        assert_eq!(oauth.refresh_token_ttl_seconds, 2592000);
+        let persisted = to_persisted_config(&config);
+        let normalized = normalize_persisted_config(persisted.clone()).unwrap();
+        assert_eq!(normalized, persisted);
+        assert_eq!(normalized.auth.unwrap().token_ref, config.auth.token_ref);
+    }
+    #[test]
+    fn rejects_unsafe_issuers_and_bad_lifetimes() {
+        for issuer in [
+            "http://remote.example",
+            "http://127.evil.example",
+            "https://server.example/path",
+            "https://server.example?bad=query",
+            "https://user:password@server.example",
+            "https://server.example#fragment",
+            "bad",
+        ] {
+            assert!(
+                load(serde_json::json!({"oauth": {"issuerUrl": issuer}})).is_err(),
+                "{issuer}"
+            );
+        }
+        for issuer in [
+            "http://127.0.0.1:4100",
+            "http://[::1]:4100",
+            "http://localhost:4100",
+        ] {
+            assert!(
+                load(serde_json::json!({"oauth": {"issuerUrl": issuer}})).is_ok(),
+                "{issuer}"
+            );
+        }
+        for ttl in [0, 86401, u64::MAX] {
+            assert!(load(serde_json::json!({"oauth": {"issuerUrl":"https://server.example", "accessTokenTtlSeconds":ttl}})).is_err());
+        }
+        let config = serde_json::json!({"vaultPath":"/tmp/vault", "http":{"mcpPath":"/token"}, "auth":{"oauth":{"issuerUrl":"https://server.example"}}});
+        assert!(normalize_service_config(serde_json::from_value(config).unwrap()).is_err());
+    }
+    #[test]
+    fn refresh_lifetime_is_bounded_and_can_be_disabled() {
+        for ttl in [0, 1, 2592000] {
+            let config = load(serde_json::json!({"oauth":{"issuerUrl":"https://server.example", "refreshTokenTtlSeconds":ttl}})).unwrap();
+            assert_eq!(
+                config
+                    .auth
+                    .oauth
+                    .as_ref()
+                    .unwrap()
+                    .refresh_token_ttl_seconds,
+                ttl
+            );
+            assert_eq!(
+                to_persisted_config(&config)
+                    .auth
+                    .unwrap()
+                    .oauth
+                    .unwrap()
+                    .refresh_token_ttl_seconds,
+                ttl
+            );
+        }
+        for ttl in [2592001, u64::MAX] {
+            assert!(load(serde_json::json!({"oauth":{"issuerUrl":"https://server.example", "refreshTokenTtlSeconds":ttl}})).is_err());
+        }
     }
 }

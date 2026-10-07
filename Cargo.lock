@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-algolia"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 dependencies = [
  "axum",
  "base64",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-backend"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 dependencies = [
  "async-trait",
  "deep-obsidian-algolia",
@@ -630,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-cli"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-config"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -664,12 +664,13 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml",
+ "url",
  "zeroize",
 ]
 
 [[package]]
 name = "deep-obsidian-core"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 dependencies = [
  "anyhow",
  "thiserror",
@@ -677,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-index"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -694,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-server"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -714,17 +715,19 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
 ]
 
 [[package]]
 name = "deep-obsidian-types"
-version = "0.2.0-alpha.1"
+version = "0.2.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",

@@ -159,13 +159,34 @@ pub struct EmbeddingConfigInput {
     pub query_instruction: Option<String>,
 }
 
-/// HTTP transport authentication. Optional and disabled by default so existing
-/// loopback deployments keep working untouched. The bearer token itself is never
-/// stored here; only a [`SecretRef`] pointing at the OS keyring or the encrypted
-/// secrets file.
+/// Additive single-owner OAuth authority, enabled by the presence of `auth.oauth`.
+/// The shared owner secret remains in the existing secret store, never in this config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthConfig {
+    /// Canonical public origin, HTTPS except for loopback development.
+    pub issuer_url: String,
+    #[serde(default = "default_oauth_token_ttl")]
+    pub access_token_ttl_seconds: u64,
+    /// Absolute authorization lifetime; zero disables refresh tokens.
+    #[serde(default = "default_oauth_refresh_ttl")]
+    pub refresh_token_ttl_seconds: u64,
+}
+
+pub fn default_oauth_token_ttl() -> u64 {
+    3600
+}
+
+pub fn default_oauth_refresh_ttl() -> u64 {
+    30 * 24 * 3600
+}
+
+/// Shared bearer authentication with optional OAuth. Omitting OAuth preserves legacy behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthConfig>,
     /// When true, `/mcp` and `/upload` require a matching `Authorization: Bearer`
     /// token.
     pub enabled: bool,
@@ -183,6 +204,8 @@ pub struct AuthConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthConfigInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

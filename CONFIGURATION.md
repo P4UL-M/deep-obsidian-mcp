@@ -226,7 +226,7 @@ HTTP bearer authentication is **optional and disabled by default**, so loopback
 service beyond the local machine (binding `0.0.0.0` or fronting it with a
 tunnel).
 
-Enable it (generates a 256-bit token, stores it securely, prints it once):
+Enable it (on first setup, generates a 256-bit token, stores it securely and prints it once; existing token references are preserved):
 
 ```bash
 deep-obsidian-mcp setup-service --wizard     # answer yes to authentication
@@ -690,3 +690,9 @@ within a single index.
 - Tools whose whole purpose depends on a capability appear only when some mount has
   it. See
   [docs/mcp-reference.md](./docs/mcp-reference.md#conditionally-advertised-tools).
+
+## Remote OAuth authentication
+
+Omit `auth.oauth` to keep legacy bearer authentication. Add `auth.oauth` to enable
+Authorization Code + PKCE alongside the existing bearer token. See [OAuth setup](docs/oauth.md)
+for configuration, discovery, registration and restart behavior.
