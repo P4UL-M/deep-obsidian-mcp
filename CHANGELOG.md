@@ -2,6 +2,25 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.2.0-alpha.4 — 2026-10-08
+
+### Fixed
+
+- Text embeddings now honor the documented API-key environment overrides:
+  `DEEP_OBSIDIAN_EMBEDDING_API_KEY`, `EMBEDDING_API_KEY`, then `OPENAI_API_KEY`.
+  The first non-blank value takes precedence over `embedding.apiKeyRef`, including
+  an unavailable stored secret. Secret values are never logged or persisted in
+  configuration. Artifact embedding credentials remain independent.
+- Docker deployments can mount an `embedding_api_key` secret to populate an
+  existing `embedding.apiKeyRef`. The entrypoint reinjects it after clearing the
+  ephemeral store on every boot, so authenticated embedding providers continue
+  working after container restarts.
+
+### Compatibility
+
+- Existing secret references and unauthenticated local Ollama endpoints keep
+  working. No embedding model, index schema or MCP payload changes are required.
+
 ## v0.2.0-alpha.3 — 2026-10-07
 
 ### Fixed
