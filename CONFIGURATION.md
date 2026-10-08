@@ -215,14 +215,14 @@ Environment variables (useful for the service wrapper and containers):
 | Provider | `DEEP_OBSIDIAN_EMBEDDING_PROVIDER`, `EMBEDDING_PROVIDER` |
 | Model | `DEEP_OBSIDIAN_EMBEDDING_MODEL`, `EMBEDDING_MODEL`, `OPENAI_EMBEDDING_MODEL` |
 | Base URL | `DEEP_OBSIDIAN_EMBEDDING_BASE_URL`, `EMBEDDING_BASE_URL`, `OPENAI_BASE_URL` |
-| API key | `DEEP_OBSIDIAN_EMBEDDING_API_KEY`, `EMBEDDING_API_KEY`, `OPENAI_API_KEY` |
+| API key override | `DEEP_OBSIDIAN_EMBEDDING_API_KEY` |
 
-The first non-blank API key environment variable wins over `embedding.apiKeyRef`;
-whitespace-only variables are ignored. When an environment key shadows a configured
+The non-blank `DEEP_OBSIDIAN_EMBEDDING_API_KEY` override wins over `embedding.apiKeyRef`;
+a whitespace-only override is ignored. When an environment key shadows a configured
 reference, the server logs a warning naming the variable, never its value. Without
 an environment key, the configured reference is resolved and a missing secret is an
 error. With neither, no API key is sent, which supports local endpoints such as Ollama.
-These variables apply only to text embeddings: `artifactEmbedding.apiKeyRef` remains
+This override applies only to text embeddings: `artifactEmbedding.apiKeyRef` remains
 independent so text-provider credentials are not sent to an artifact endpoint.
 
 ## Authentication

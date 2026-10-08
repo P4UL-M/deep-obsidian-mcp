@@ -240,31 +240,47 @@ cat > "$TMP/embedding-config.json" <<'JSON'
   }
 }
 JSON
-EMBED_C=do-smoke-embedding-secret-$$
-CONTAINERS+=("$EMBED_C")
-EMBED_OUT=$(docker run --name "$EMBED_C" \
-  -v "$TMP/embedding-config.json:/etc/deep-obsidian/config.json:ro" \
-  -v "$TMP/embedding-secrets:/run/secrets:ro" \
-  "$IMAGE" secrets check 2>&1)
-EMBED_CODE=$?
-if [ "$EMBED_CODE" = 0 ] && printf '%s\n' "$EMBED_OUT" | grep -e '\[ok.*embedding.apiKeyRef' >/dev/null; then
-  pass "embedding secret resolves in the custom configured reference"
-else
-  fail "embedding secret injection failed (exit $EMBED_CODE)"
-  printf '%s\n' "$EMBED_OUT"
-fi
-RESTART_OUT=$(docker start -a "$EMBED_C" 2>&1)
-RESTART_CODE=$(docker inspect -f '{{.State.ExitCode}}' "$EMBED_C")
-if [ "$RESTART_CODE" = 0 ] && printf '%s\n' "$RESTART_OUT" | grep -e '\[ok.*embedding.apiKeyRef' >/dev/null; then
-  pass "embedding secret is restored after a second boot clears the store"
-else
-  fail "embedding secret did not survive the reinjection cycle"
-fi
-if printf '%s\n%s\n' "$EMBED_OUT" "$RESTART_OUT" | grep -F -e 'embedding-smoke-key' >/dev/null; then
-  fail "embedding secret leaked into startup output"
-else
-  pass "embedding secret value is absent from startup output"
-fi
+for CONFIG_MODE in mounted persistent; do
+  EMBED_C=do-smoke-embedding-secret-$CONFIG_MODE-$$
+  CONTAINERS+=("$EMBED_C")
+  if [ "$CONFIG_MODE" = mounted ]; then
+    EMBED_CONFIG_PATH=/etc/deep-obsidian/config.json
+    EMBED_MOUNTS=(-v "$TMP/embedding-config.json:$EMBED_CONFIG_PATH:ro")
+  else
+    EMBED_VOL=do-smoke-embedding-state-$$
+    VOLUMES+=("$EMBED_VOL")
+    EMBED_CONFIG_PATH=/var/lib/deep-obsidian-mcp/config.json
+    docker run --rm --user 0 --entrypoint sh \
+      -v "$EMBED_VOL:/var/lib/deep-obsidian-mcp" \
+      -v "$TMP/embedding-config.json:/tmp/existing-config.json:ro" "$IMAGE" \
+      -c 'cp /tmp/existing-config.json /var/lib/deep-obsidian-mcp/config.json; chown 10001:10001 /var/lib/deep-obsidian-mcp/config.json'
+    EMBED_MOUNTS=(-v "$EMBED_VOL:/var/lib/deep-obsidian-mcp")
+  fi
+  EMBED_OUT=$(docker run --name "$EMBED_C" "${EMBED_MOUNTS[@]}" \
+    -v "$TMP/embedding-secrets:/run/secrets:ro" "$IMAGE" secrets check 2>&1)
+  EMBED_CODE=$?
+  if [ "$EMBED_CODE" = 0 ] && printf '%s\n' "$EMBED_OUT" | grep -e '\[ok.*embedding.apiKeyRef' >/dev/null; then
+    pass "$CONFIG_MODE embedding secret resolves in the custom configured reference"
+  else
+    fail "$CONFIG_MODE embedding secret injection failed (exit $EMBED_CODE)"
+    printf '%s\n' "$EMBED_OUT"
+  fi
+  RESTART_OUT=$(docker start -a "$EMBED_C" 2>&1)
+  RESTART_CODE=$(docker inspect -f '{{.State.ExitCode}}' "$EMBED_C")
+  if [ "$RESTART_CODE" = 0 ] && printf '%s\n' "$RESTART_OUT" | grep -e '\[ok.*embedding.apiKeyRef' >/dev/null; then
+    pass "$CONFIG_MODE embedding secret is restored after a second boot clears the store"
+  else
+    fail "$CONFIG_MODE embedding secret did not survive the reinjection cycle"
+  fi
+  docker cp "$EMBED_C:$EMBED_CONFIG_PATH" "$TMP/embedding-config-after-$CONFIG_MODE.json"
+  check "$CONFIG_MODE embedding config is unchanged after two boots" \
+    cmp "$TMP/embedding-config.json" "$TMP/embedding-config-after-$CONFIG_MODE.json"
+  if printf '%s\n%s\n' "$EMBED_OUT" "$RESTART_OUT" | grep -F -e 'embedding-smoke-key' >/dev/null; then
+    fail "$CONFIG_MODE embedding secret leaked into startup output"
+  else
+    pass "$CONFIG_MODE embedding secret value is absent from startup output"
+  fi
+done
 
 # ---------------------------------------------------------------------------
 step "Entrypoint contract: filesystem root, bearer auth, index on the volume"
@@ -292,6 +308,8 @@ docker run -d --name "$C1" \
   -v "$VOL:/var/lib/deep-obsidian-mcp" \
   -v "$TMP/vault:/vault" \
   -v "$TMP/secrets:/run/secrets:ro" \
+  -e DO_AUTH_MODE=legacy+oauth \
+  -e DO_OAUTH_ISSUER_URL=https://mcp.example.test \
   "$IMAGE" >/dev/null
 
 if wait_for_health "$C1"; then
@@ -315,6 +333,13 @@ if [ "$CODE" = 200 ] && grep -q '"serverInfo"' "$TMP/init.json"; then
 else
   fail "MCP initialize with the token returned $CODE"
   head -c 400 "$TMP/init.json"; echo
+fi
+OAUTH_CODE=$(curl -sS -o "$TMP/oauth-metadata.json" -w '%{http_code}' \
+  "http://127.0.0.1:$PORT/.well-known/oauth-authorization-server")
+if [ "$OAUTH_CODE" = 200 ] && grep -F -e 'https://mcp.example.test' "$TMP/oauth-metadata.json" >/dev/null; then
+  pass "OAuth discovery and the existing MCP bearer token work together"
+else
+  fail "OAuth metadata is unavailable alongside legacy bearer auth"
 fi
 # /healthz must stay open: the image's HEALTHCHECK carries no credential.
 HEALTH_CODE=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/healthz")
@@ -353,6 +378,13 @@ if wait_for_health "$C1"; then
   docker logs "$C1" 2>&1 | grep -e 'already on the volume' >/dev/null \
     && pass "the entrypoint reported reusing the volume's config" \
     || fail "the entrypoint did not report reusing the volume's config"
+  CODE=$(mcp_initialize "$TOKEN")
+  [ "$CODE" = 200 ] && pass "the existing MCP token still authenticates after restart" \
+    || fail "the existing MCP token failed after restart ($CODE)"
+  OAUTH_CODE=$(curl -sS -o "$TMP/oauth-metadata.json" -w '%{http_code}' \
+    "http://127.0.0.1:$PORT/.well-known/oauth-authorization-server")
+  [ "$OAUTH_CODE" = 200 ] && pass "OAuth discovery remains available after restart" \
+    || fail "OAuth discovery failed after restart ($OAUTH_CODE)"
 else
   fail "server did not come back after a restart"
   docker logs "$C1" 2>&1 | tail -30

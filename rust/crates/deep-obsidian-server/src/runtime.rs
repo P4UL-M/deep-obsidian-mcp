@@ -138,23 +138,14 @@ fn index_embedding_config_with_env(
         }
         None => None,
     };
-    let env_key = [
-        "DEEP_OBSIDIAN_EMBEDDING_API_KEY",
-        "EMBEDDING_API_KEY",
-        "OPENAI_API_KEY",
-    ]
-    .into_iter()
-    .find_map(|name| {
-        env_value(name)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(|value| (name, value))
-    });
+    let env_key = env_value("DEEP_OBSIDIAN_EMBEDDING_API_KEY")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let api_key = match env_key {
-        Some((name, value)) => {
+        Some(value) => {
             if config.embedding.api_key_ref.is_some() {
                 warn!(
-                    "text embeddings are using the API key from ${name}, which SHADOWS the \
+                    "text embeddings are using the API key from $DEEP_OBSIDIAN_EMBEDDING_API_KEY, which SHADOWS the \
 key its 'embedding.apiKeyRef' points at; unset the variable to use the configured secret"
                 );
             }
@@ -1537,48 +1528,32 @@ mod tests {
     }
 
     #[test]
-    fn embedding_api_key_environment_aliases_work_without_a_reference() {
+    fn explicit_embedding_api_key_works_without_a_reference() {
         let config = embedding_key_config();
         let resolver = SecretResolver::with_encrypted_file_path(temp_path("unused_secrets"));
-        for alias in [
-            "DEEP_OBSIDIAN_EMBEDDING_API_KEY",
-            "EMBEDDING_API_KEY",
-            "OPENAI_API_KEY",
-        ] {
-            let runtime = index_embedding_config_with_env(&config, &resolver, |name| {
-                (name == alias).then(|| "  env-secret  ".to_string())
-            })
-            .expect("resolve environment key");
-            assert_eq!(runtime.api_key.as_deref(), Some("env-secret"), "{alias}");
-            // Effective values never become plaintext configuration fields.
-            assert!(!serde_json::to_string(&config)
-                .unwrap()
-                .contains("env-secret"));
-        }
+        let runtime = index_embedding_config_with_env(&config, &resolver, |name| {
+            assert_eq!(name, "DEEP_OBSIDIAN_EMBEDDING_API_KEY");
+            Some("  env-secret  ".to_string())
+        })
+        .expect("resolve environment key");
+        assert_eq!(runtime.api_key.as_deref(), Some("env-secret"));
+        // Effective values never become plaintext configuration fields.
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("env-secret"));
     }
 
     #[test]
-    fn embedding_api_key_environment_precedence_skips_blank_values() {
+    fn explicit_embedding_api_key_ignores_blank_values() {
         let config = embedding_key_config();
         let resolver = SecretResolver::with_encrypted_file_path(temp_path("unused_secrets"));
-        for (primary, generic, expected) in [
-            ("primary", "generic", "primary"),
-            (" \n", "generic", "generic"),
-            ("", " \t", "openai"),
-        ] {
+        for value in ["", " \n", " \t"] {
             let runtime = index_embedding_config_with_env(&config, &resolver, |name| {
-                Some(
-                    match name {
-                        "DEEP_OBSIDIAN_EMBEDDING_API_KEY" => primary,
-                        "EMBEDDING_API_KEY" => generic,
-                        "OPENAI_API_KEY" => "openai",
-                        _ => unreachable!(),
-                    }
-                    .to_string(),
-                )
+                assert_eq!(name, "DEEP_OBSIDIAN_EMBEDDING_API_KEY");
+                Some(value.to_string())
             })
             .expect("resolve environment key");
-            assert_eq!(runtime.api_key.as_deref(), Some(expected));
+            assert!(runtime.api_key.is_none());
         }
         let runtime =
             index_embedding_config_with_env(&config, &resolver, |_| Some(" \t".to_string()))
@@ -1616,12 +1591,23 @@ mod tests {
         let error = index_embedding_config_with_env(&config, &resolver, |_| None)
             .expect_err("configured missing reference must fail");
         assert_eq!(error, "secret not found");
+        let blank_error =
+            index_embedding_config_with_env(&config, &resolver, |_| Some(" \t".into()))
+                .expect_err("blank override must not hide a missing configured reference");
+        assert_eq!(blank_error, "secret not found");
         resolver
             .put(&reference, secrecy::SecretString::new("stored-key".into()))
             .unwrap();
         let runtime = index_embedding_config_with_env(&config, &resolver, |_| None)
             .expect("resolve stored key");
         assert_eq!(runtime.api_key.as_deref(), Some("stored-key"));
+        let overridden =
+            index_embedding_config_with_env(&config, &resolver, |_| Some("explicit-key".into()))
+                .expect("explicit override wins over a valid stored key");
+        assert_eq!(overridden.api_key.as_deref(), Some("explicit-key"));
+        let blank = index_embedding_config_with_env(&config, &resolver, |_| Some(" \t".into()))
+            .expect("blank override uses the stored reference");
+        assert_eq!(blank.api_key.as_deref(), Some("stored-key"));
         std::fs::remove_file(path).unwrap();
     }
 
