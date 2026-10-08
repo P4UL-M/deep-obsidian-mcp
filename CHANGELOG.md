@@ -2,12 +2,32 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.2.0-alpha.5 — 2026-10-08
+
+### Changed
+
+- Text embedding credentials use `embedding.apiKeyRef` for storage and only
+  `DEEP_OBSIDIAN_EMBEDDING_API_KEY` for an explicit environment override.
+  Generic provider API-key aliases are removed immediately, without a
+  deprecation period, from the runtime and service scripts. Configure the
+  explicit override or a secret reference when upgrading from alpha.4.
+- HTTP and launchd service scripts pass the explicit override under its own
+  name. Stored references and unauthenticated local endpoints remain supported.
+
+### Validation and compatibility
+
+- Regression coverage checks stored and explicit credentials over real HTTP,
+  preservation of existing configs, mounted and persistent Docker configs,
+  reinjection after restart, and separation from the existing MCP bearer token.
+- Legacy MCP bearer authentication and OAuth remain available together, including
+  after Docker restarts. No model, index schema or MCP contract changes.
+
 ## v0.2.0-alpha.4 — 2026-10-08
 
 ### Fixed
 
-- Text embeddings now honor the documented API-key environment overrides:
-  `DEEP_OBSIDIAN_EMBEDDING_API_KEY`, `EMBEDDING_API_KEY`, then `OPENAI_API_KEY`.
+- Text embeddings now honor API-key environment overrides, including
+  `DEEP_OBSIDIAN_EMBEDDING_API_KEY`.
   The first non-blank value takes precedence over `embedding.apiKeyRef`, including
   an unavailable stored secret. Secret values are never logged or persisted in
   configuration. Artifact embedding credentials remain independent.
