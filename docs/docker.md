@@ -128,7 +128,7 @@ compose). `mcpPath` is free to change: nothing in the image depends on it.
 
 ## Secrets are ephemeral
 
-Four files, all optional, all read from `$DO_SECRETS_DIR` (`/run/secrets`, which is
+Five files, all optional, all read from `$DO_SECRETS_DIR` (`/run/secrets`, which is
 where `secrets:` in compose mounts them):
 
 | File | Goes to |
@@ -137,10 +137,17 @@ where `secrets:` in compose mounts them):
 | `couchdb_password` | `secrets set --mount <id> --field password` on the config's couchdb mount. |
 | `e2ee_passphrase` | `secrets set --mount <id> --field e2ee-passphrase`. |
 | `algolia_api_key` | `secrets set --mount <id> --field api-key`. |
+| `embedding_api_key` | `secrets set --target embedding-api-key` into the text embedding config's existing `embedding.apiKeyRef`. |
 
 The mount is found by reading the config, so the same files work for a derived
 config and for a mounted one. Only the first line of each file is used, with the
 newline stripped; a blank file is an error, not "no secret".
+
+For an authenticated embedding provider, declare an `embedding.apiKeyRef` such as
+`{"kind":"encryptedFile","id":"embedding-api-key"}` in the persistent or mounted
+config and mount `embedding_api_key` as a Compose secret. The entrypoint reloads it
+after clearing the ephemeral secret store on every boot. The secret file alone
+does not create a reference or change the embedding model or endpoint.
 
 **File permissions matter.** A bind-mounted secret (which is what compose's
 `secrets: file:` is) keeps its host permissions, and the container runs as uid

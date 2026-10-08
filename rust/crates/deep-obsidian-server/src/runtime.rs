@@ -120,16 +120,51 @@ pub struct RuntimeFreshnessDiagnostics {
 }
 
 fn index_embedding_config(config: &ResolvedServiceConfig) -> Result<IndexEmbeddingConfig, String> {
+    index_embedding_config_with_env(config, &SecretResolver::new(), |name| {
+        std::env::var(name).ok()
+    })
+}
+
+/// Environment overrides belong to text embeddings only: artifact embeddings may
+/// use a different endpoint and must never inherit the text provider's credential.
+fn index_embedding_config_with_env(
+    config: &ResolvedServiceConfig,
+    resolver: &SecretResolver,
+    mut env_value: impl FnMut(&str) -> Option<String>,
+) -> Result<IndexEmbeddingConfig, String> {
     let provider = match config.embedding.provider {
         Some(deep_obsidian_types::EmbeddingProvider::OpenAiCompatible) => {
             Some(IndexEmbeddingProvider::OpenAiCompatible)
         }
         None => None,
     };
-    let api_key = SecretResolver::new()
-        .resolve_embedding_api_key(&config.embedding)
-        .map_err(|error| error.to_string())?
-        .map(|secret| secret.expose_secret().to_string());
+    let env_key = [
+        "DEEP_OBSIDIAN_EMBEDDING_API_KEY",
+        "EMBEDDING_API_KEY",
+        "OPENAI_API_KEY",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        env_value(name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| (name, value))
+    });
+    let api_key = match env_key {
+        Some((name, value)) => {
+            if config.embedding.api_key_ref.is_some() {
+                warn!(
+                    "text embeddings are using the API key from ${name}, which SHADOWS the \
+key its 'embedding.apiKeyRef' points at; unset the variable to use the configured secret"
+                );
+            }
+            Some(value)
+        }
+        None => resolver
+            .resolve_embedding_api_key(&config.embedding)
+            .map_err(|error| error.to_string())?
+            .map(|secret| secret.expose_secret().to_string()),
+    };
 
     Ok(IndexEmbeddingConfig {
         provider,
@@ -1492,6 +1527,114 @@ mod tests {
             auth: deep_obsidian_types::AuthConfig::default(),
             config_file_path: None,
         }
+    }
+
+    fn embedding_key_config() -> ResolvedServiceConfig {
+        let mut config = test_config(temp_path("key_vault"), temp_path("key_index"));
+        config.embedding.provider = Some(deep_obsidian_types::EmbeddingProvider::OpenAiCompatible);
+        config.embedding.model = Some("test-embedding".into());
+        config
+    }
+
+    #[test]
+    fn embedding_api_key_environment_aliases_work_without_a_reference() {
+        let config = embedding_key_config();
+        let resolver = SecretResolver::with_encrypted_file_path(temp_path("unused_secrets"));
+        for alias in [
+            "DEEP_OBSIDIAN_EMBEDDING_API_KEY",
+            "EMBEDDING_API_KEY",
+            "OPENAI_API_KEY",
+        ] {
+            let runtime = index_embedding_config_with_env(&config, &resolver, |name| {
+                (name == alias).then(|| "  env-secret  ".to_string())
+            })
+            .expect("resolve environment key");
+            assert_eq!(runtime.api_key.as_deref(), Some("env-secret"), "{alias}");
+            // Effective values never become plaintext configuration fields.
+            assert!(!serde_json::to_string(&config)
+                .unwrap()
+                .contains("env-secret"));
+        }
+    }
+
+    #[test]
+    fn embedding_api_key_environment_precedence_skips_blank_values() {
+        let config = embedding_key_config();
+        let resolver = SecretResolver::with_encrypted_file_path(temp_path("unused_secrets"));
+        for (primary, generic, expected) in [
+            ("primary", "generic", "primary"),
+            (" \n", "generic", "generic"),
+            ("", " \t", "openai"),
+        ] {
+            let runtime = index_embedding_config_with_env(&config, &resolver, |name| {
+                Some(
+                    match name {
+                        "DEEP_OBSIDIAN_EMBEDDING_API_KEY" => primary,
+                        "EMBEDDING_API_KEY" => generic,
+                        "OPENAI_API_KEY" => "openai",
+                        _ => unreachable!(),
+                    }
+                    .to_string(),
+                )
+            })
+            .expect("resolve environment key");
+            assert_eq!(runtime.api_key.as_deref(), Some(expected));
+        }
+        let runtime =
+            index_embedding_config_with_env(&config, &resolver, |_| Some(" \t".to_string()))
+                .expect("local endpoint without a key");
+        assert!(runtime.api_key.is_none());
+    }
+
+    #[test]
+    fn embedding_api_key_environment_shadows_even_an_unreadable_store() {
+        let mut config = embedding_key_config();
+        config.embedding.api_key_ref = Some(deep_obsidian_types::SecretRef::EncryptedFile {
+            id: "embedding-key".into(),
+        });
+        let path = temp_path("corrupt_embedding_secrets");
+        std::fs::write(&path, "not a secret store").unwrap();
+        let resolver = SecretResolver::with_encrypted_file_path(path.clone());
+        let runtime = index_embedding_config_with_env(&config, &resolver, |name| {
+            (name == "DEEP_OBSIDIAN_EMBEDDING_API_KEY").then(|| "override".to_string())
+        })
+        .expect("environment bypasses store resolution");
+        assert_eq!(runtime.api_key.as_deref(), Some("override"));
+        assert!(index_embedding_config_with_env(&config, &resolver, |_| None).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn embedding_api_key_reference_is_required_unless_environment_overrides() {
+        let mut config = embedding_key_config();
+        let reference = deep_obsidian_types::SecretRef::EncryptedFile {
+            id: "embedding-key".into(),
+        };
+        config.embedding.api_key_ref = Some(reference.clone());
+        let path = temp_path("embedding_reference_secrets");
+        let resolver = SecretResolver::with_encrypted_file_path(path.clone());
+        let error = index_embedding_config_with_env(&config, &resolver, |_| None)
+            .expect_err("configured missing reference must fail");
+        assert_eq!(error, "secret not found");
+        resolver
+            .put(&reference, secrecy::SecretString::new("stored-key".into()))
+            .unwrap();
+        let runtime = index_embedding_config_with_env(&config, &resolver, |_| None)
+            .expect("resolve stored key");
+        assert_eq!(runtime.api_key.as_deref(), Some("stored-key"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn embedding_api_key_environment_is_not_inherited_by_artifact_embeddings() {
+        let config = embedding_key_config();
+        let resolver = SecretResolver::with_encrypted_file_path(temp_path("unused_secrets"));
+        let text =
+            index_embedding_config_with_env(&config, &resolver, |_| Some("text-only-key".into()))
+                .unwrap();
+        assert_eq!(text.api_key.as_deref(), Some("text-only-key"));
+        let artifact = index_artifact_embedding_config(&config).unwrap();
+        assert!(artifact.api_key.is_none());
     }
 
     /// The two-mount table the derivation tests share.

@@ -225,6 +225,48 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+step "Embedding secret is reinjected after the ephemeral store is cleared"
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/embedding-secrets"
+printf '%s\n' 'embedding-smoke-key' > "$TMP/embedding-secrets/embedding_api_key"
+cat > "$TMP/embedding-config.json" <<'JSON'
+{
+  "vaultPath": "/vault",
+  "embedding": {
+    "provider": "openai-compatible",
+    "model": "smoke-embedding",
+    "baseUrl": "http://embedding.invalid/v1",
+    "apiKeyRef": { "kind": "encryptedFile", "id": "custom-embedding-key" }
+  }
+}
+JSON
+EMBED_C=do-smoke-embedding-secret-$$
+CONTAINERS+=("$EMBED_C")
+EMBED_OUT=$(docker run --name "$EMBED_C" \
+  -v "$TMP/embedding-config.json:/etc/deep-obsidian/config.json:ro" \
+  -v "$TMP/embedding-secrets:/run/secrets:ro" \
+  "$IMAGE" secrets check 2>&1)
+EMBED_CODE=$?
+if [ "$EMBED_CODE" = 0 ] && printf '%s\n' "$EMBED_OUT" | grep -e '\[ok.*embedding.apiKeyRef' >/dev/null; then
+  pass "embedding secret resolves in the custom configured reference"
+else
+  fail "embedding secret injection failed (exit $EMBED_CODE)"
+  printf '%s\n' "$EMBED_OUT"
+fi
+RESTART_OUT=$(docker start -a "$EMBED_C" 2>&1)
+RESTART_CODE=$(docker inspect -f '{{.State.ExitCode}}' "$EMBED_C")
+if [ "$RESTART_CODE" = 0 ] && printf '%s\n' "$RESTART_OUT" | grep -e '\[ok.*embedding.apiKeyRef' >/dev/null; then
+  pass "embedding secret is restored after a second boot clears the store"
+else
+  fail "embedding secret did not survive the reinjection cycle"
+fi
+if printf '%s\n%s\n' "$EMBED_OUT" "$RESTART_OUT" | grep -F -e 'embedding-smoke-key' >/dev/null; then
+  fail "embedding secret leaked into startup output"
+else
+  pass "embedding secret value is absent from startup output"
+fi
+
+# ---------------------------------------------------------------------------
 step "Entrypoint contract: filesystem root, bearer auth, index on the volume"
 # ---------------------------------------------------------------------------
 mkdir -p "$TMP/secrets" "$TMP/vault/Notes"

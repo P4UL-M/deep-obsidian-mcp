@@ -356,6 +356,21 @@ inject_mount_secret "$DO_SECRETS_DIR/couchdb_password" couchdb password
 inject_mount_secret "$DO_SECRETS_DIR/e2ee_passphrase" couchdb e2ee-passphrase e2ee
 inject_mount_secret "$DO_SECRETS_DIR/algolia_api_key" algolia api-key
 
+inject_target_secret() {
+    file="$1"
+    target="$2"
+    label="$3"
+
+    [ -f "$file" ] || return 0
+    [ -r "$file" ] || die "$file exists but is not readable by $(id -un) (uid $(id -u)). Secret files keep their host permissions when bind-mounted: use mode 644 inside a directory only you can enter (chmod 700 secrets && chmod 644 secrets/*), or run the container as the owning uid with compose's 'user:'."
+    [ -s "$file" ] || die "$file exists but is empty"
+    log "injecting $(basename "$file") into $label"
+    head -n 1 "$file" | cli secrets set --target "$target" --stdin >&2 \
+        || die "could not store $(basename "$file") for $label; ensure the config declares an encryptedFile apiKeyRef for that target"
+}
+
+inject_target_secret "$DO_SECRETS_DIR/embedding_api_key" embedding-api-key embedding.apiKeyRef
+
 # Informational, never a gate: `secrets check` reports the STORE, and a MISSING line
 # can be correct for a reference an environment variable shadows at runtime.
 cli secrets check >&2 || log "WARNING: 'secrets check' reported a missing or unreadable reference (see above); mounts needing it will start degraded"
