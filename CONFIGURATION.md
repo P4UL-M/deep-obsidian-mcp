@@ -225,6 +225,29 @@ error. With neither, no API key is sent, which supports local endpoints such as 
 This override applies only to text embeddings: `artifactEmbedding.apiKeyRef` remains
 independent so text-provider credentials are not sent to an artifact endpoint.
 
+### Embedding request limits
+
+Optionally add these fields to the existing `embedding` block in `config.json`:
+
+```json
+{
+  "embedding": {
+    "maxConcurrency": 1,
+    "timeoutSeconds": 180
+  }
+}
+```
+
+`maxConcurrency` caps parallel requests during batch indexing. `timeoutSeconds`
+is the timeout for each HTTP embedding request, including search-query embeddings.
+Both must be positive integers. When omitted, the existing defaults remain four
+parallel requests and 60 seconds. The same options are available independently
+under `artifactEmbedding`; they do not change the model or index schema.
+
+These settings are config-file only and survive config rewrites. In Docker, edit
+or mount the persistent config and recreate the MCP container; its config survives
+image upgrades. There are no new CLI flags or environment overrides.
+
 ## Authentication
 
 HTTP bearer authentication is **optional and disabled by default**, so loopback

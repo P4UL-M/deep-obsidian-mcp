@@ -597,6 +597,8 @@ fn eval_config(base_url: String) -> EmbeddingConfig {
         api_key: None,
         max_chars: embeddings::DEFAULT_EMBEDDING_MAX_CHARS,
         batch_size: embeddings::DEFAULT_EMBEDDING_BATCH_SIZE,
+        max_concurrency: 4,
+        timeout_seconds: 60,
         max_input_tokens: embeddings::DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
         context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
         chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,

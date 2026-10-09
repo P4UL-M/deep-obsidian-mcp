@@ -262,6 +262,18 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
             model: embedding_model,
             base_url: embedding_base_url,
             api_key_ref: embedding_api_key_ref,
+            max_concurrency: config_file.as_ref().and_then(|config| {
+                config
+                    .embedding
+                    .as_ref()
+                    .and_then(|embedding| embedding.max_concurrency)
+            }),
+            timeout_seconds: config_file.as_ref().and_then(|config| {
+                config
+                    .embedding
+                    .as_ref()
+                    .and_then(|embedding| embedding.timeout_seconds)
+            }),
             max_chars: None,
             max_input_tokens: None,
             context_tokens: None,
@@ -634,6 +646,31 @@ mod tests {
             embedding_model: None,
             embedding_base_url: None,
         }
+    }
+
+    #[test]
+    fn resolve_runtime_config_preserves_embedding_request_settings() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let root = unique_temp_dir("embedding-request-settings");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        let path = root.join("config.json");
+        fs::write(
+            &path,
+            serde_json::json!({
+                "embedding": { "maxConcurrency": 1, "timeoutSeconds": 180 }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let resolved = resolve_runtime_config(&service_options(path, vault)).unwrap();
+        assert_eq!(resolved.service.embedding.max_concurrency, Some(1));
+        assert_eq!(resolved.service.embedding.timeout_seconds, Some(180));
+        let persisted = deep_obsidian_config::to_persisted_config(&resolved.service);
+        let json = serde_json::to_value(persisted).unwrap();
+        assert_eq!(json["embedding"]["maxConcurrency"], 1);
+        assert_eq!(json["embedding"]["timeoutSeconds"], 180);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

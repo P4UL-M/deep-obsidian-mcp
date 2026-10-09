@@ -6,6 +6,11 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 ### Added
 
+- Optional `embedding.maxConcurrency` and `embedding.timeoutSeconds` settings
+  (also supported under `artifactEmbedding`) preserve deployment-specific request
+  limits without patching the binary. Defaults remain 4 requests and 60 seconds;
+  positive values survive configuration rewrites.
+
 - Published releases build and smoke-test native AMD64 and ARM64 Docker images,
   then publish the tested images to GHCR and Docker Hub under one multi-platform
   version tag. Stable releases update `latest`; prereleases update `alpha`,

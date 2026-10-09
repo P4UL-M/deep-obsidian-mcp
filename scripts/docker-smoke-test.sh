@@ -235,6 +235,8 @@ cat > "$TMP/embedding-config.json" <<'JSON'
   "embedding": {
     "provider": "openai-compatible",
     "model": "smoke-embedding",
+    "maxConcurrency": 1,
+    "timeoutSeconds": 180,
     "baseUrl": "http://embedding.invalid/v1",
     "apiKeyRef": { "kind": "encryptedFile", "id": "custom-embedding-key" }
   }
@@ -274,7 +276,15 @@ for CONFIG_MODE in mounted persistent; do
   fi
   docker cp "$EMBED_C:$EMBED_CONFIG_PATH" "$TMP/embedding-config-after-$CONFIG_MODE.json"
   check "$CONFIG_MODE embedding config is unchanged after two boots" \
-    cmp "$TMP/embedding-config.json" "$TMP/embedding-config-after-$CONFIG_MODE.json"
+    EMBED_SETTINGS=$(docker run --rm "${EMBED_MOUNTS[@]}" \
+    -v "$TMP/embedding-secrets:/run/secrets:ro" "$IMAGE" print-config 2>/dev/null)
+  if printf '%s\n' "$EMBED_SETTINGS" | grep -e '"maxConcurrency": 1' >/dev/null && \
+     printf '%s\n' "$EMBED_SETTINGS" | grep -e '"timeoutSeconds": 180' >/dev/null; then
+    pass "$CONFIG_MODE embedding request limits survive restart and runtime config resolution"
+  else
+    fail "$CONFIG_MODE embedding request limits were lost"
+  fi
+  cmp "$TMP/embedding-config.json" "$TMP/embedding-config-after-$CONFIG_MODE.json"
   if printf '%s\n%s\n' "$EMBED_OUT" "$RESTART_OUT" | grep -F -e 'embedding-smoke-key' >/dev/null; then
     fail "$CONFIG_MODE embedding secret leaked into startup output"
   else

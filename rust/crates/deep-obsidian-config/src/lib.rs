@@ -24,6 +24,8 @@ pub const DEFAULT_AUTO_REINDEX_INTERVAL_MS: u64 = 30000;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("invalid embedding configuration: {0}")]
+    InvalidEmbedding(&'static str),
     #[error("invalid OAuth configuration: {0}")]
     InvalidOAuth(&'static str),
     #[error("missing vault path")]
@@ -735,8 +737,8 @@ pub fn normalize_service_config(
     let stdio_mode = input.stdio_mode.unwrap_or(StdioMode::Auto);
     let http = normalize_http_input(input.http);
     let auto_reindex = normalize_auto_reindex_input(input.auto_reindex);
-    let embedding = normalize_embedding_input(input.embedding);
-    let artifact_embedding = normalize_embedding_input(input.artifact_embedding);
+    let embedding = normalize_embedding_input(input.embedding)?;
+    let artifact_embedding = normalize_embedding_input(input.artifact_embedding)?;
     let auth = normalize_auth_input(input.auth)?;
     if auth.oauth.is_some() {
         let reserved = [
@@ -863,11 +865,15 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
             max_input_tokens: config.embedding.max_input_tokens,
             context_tokens: config.embedding.context_tokens,
             query_instruction: config.embedding.query_instruction.clone(),
+            max_concurrency: config.embedding.max_concurrency,
+            timeout_seconds: config.embedding.timeout_seconds,
         }),
         artifact_embedding: if config.artifact_embedding.provider.is_some()
             || config.artifact_embedding.model.is_some()
             || config.artifact_embedding.base_url.is_some()
             || config.artifact_embedding.api_key_ref.is_some()
+            || config.artifact_embedding.max_concurrency.is_some()
+            || config.artifact_embedding.timeout_seconds.is_some()
         {
             Some(EmbeddingConfigInput {
                 provider: config.artifact_embedding.provider.clone(),
@@ -878,6 +884,8 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
                 max_input_tokens: config.artifact_embedding.max_input_tokens,
                 context_tokens: config.artifact_embedding.context_tokens,
                 query_instruction: config.artifact_embedding.query_instruction.clone(),
+                max_concurrency: config.artifact_embedding.max_concurrency,
+                timeout_seconds: config.artifact_embedding.timeout_seconds,
             })
         } else {
             None
@@ -1084,8 +1092,20 @@ fn normalize_auto_reindex_input(input: Option<AutoReindexConfigInput>) -> AutoRe
     }
 }
 
-fn normalize_embedding_input(input: Option<EmbeddingConfigInput>) -> EmbeddingConfig {
+fn normalize_embedding_input(
+    input: Option<EmbeddingConfigInput>,
+) -> Result<EmbeddingConfig, ConfigError> {
     let input = input.unwrap_or_default();
+    if input.max_concurrency == Some(0) {
+        return Err(ConfigError::InvalidEmbedding(
+            "maxConcurrency must be greater than zero",
+        ));
+    }
+    if input.timeout_seconds == Some(0) {
+        return Err(ConfigError::InvalidEmbedding(
+            "timeoutSeconds must be greater than zero",
+        ));
+    }
     let provider = match input.provider {
         Some(EmbeddingProvider::OpenAiCompatible) => Some(EmbeddingProvider::OpenAiCompatible),
         None if input.model.is_some()
@@ -1097,7 +1117,7 @@ fn normalize_embedding_input(input: Option<EmbeddingConfigInput>) -> EmbeddingCo
         None => None,
     };
 
-    EmbeddingConfig {
+    Ok(EmbeddingConfig {
         provider,
         model: trim_optional(input.model),
         base_url: trim_optional(input.base_url),
@@ -1106,7 +1126,9 @@ fn normalize_embedding_input(input: Option<EmbeddingConfigInput>) -> EmbeddingCo
         max_input_tokens: input.max_input_tokens,
         context_tokens: input.context_tokens,
         query_instruction: trim_optional(input.query_instruction),
-    }
+        max_concurrency: input.max_concurrency,
+        timeout_seconds: input.timeout_seconds,
+    })
 }
 
 fn trim_optional(value: Option<String>) -> Option<String> {
@@ -1220,6 +1242,75 @@ mod tests {
     // -----------------------------------------------------------------------
     // Legacy equivalence
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn embedding_request_settings_round_trip_and_are_optional() {
+        for extension in ["json", "toml"] {
+            let root = temp_dir("embedding-request-settings");
+            let path = root.join(format!("config.{extension}"));
+            let input: PersistedServiceConfig = serde_json::from_value(serde_json::json!({
+                "vaultPath": root,
+                "embedding": { "maxConcurrency": 1, "timeoutSeconds": 180 },
+                "artifactEmbedding": { "maxConcurrency": 2, "timeoutSeconds": 90 }
+            }))
+            .unwrap();
+            let resolved = normalize_persisted_config(input).unwrap();
+            write_config_file(&path, &resolved).unwrap();
+            let loaded = read_config_file(&path).unwrap().unwrap();
+            let resolved = normalize_persisted_config(loaded).unwrap();
+            assert_eq!(
+                resolved.embedding.as_ref().unwrap().max_concurrency,
+                Some(1)
+            );
+            assert_eq!(
+                resolved.embedding.as_ref().unwrap().timeout_seconds,
+                Some(180)
+            );
+            assert_eq!(
+                resolved
+                    .artifact_embedding
+                    .as_ref()
+                    .unwrap()
+                    .max_concurrency,
+                Some(2)
+            );
+            assert_eq!(
+                resolved
+                    .artifact_embedding
+                    .as_ref()
+                    .unwrap()
+                    .timeout_seconds,
+                Some(90)
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        let defaults = super::normalize_embedding_input(None).unwrap();
+        let json = serde_json::to_value(defaults).unwrap();
+        assert!(json.get("maxConcurrency").is_none());
+        assert!(json.get("timeoutSeconds").is_none());
+    }
+
+    #[test]
+    fn embedding_request_settings_reject_zero_and_negative_values() {
+        for section in ["embedding", "artifactEmbedding"] {
+            for field in ["maxConcurrency", "timeoutSeconds"] {
+                let input: PersistedServiceConfig = serde_json::from_value(serde_json::json!({
+                    "vaultPath": "/tmp/vault", section: { field: 0 }
+                }))
+                .unwrap();
+                assert!(matches!(
+                    normalize_persisted_config(input),
+                    Err(ConfigError::InvalidEmbedding(_))
+                ));
+                assert!(
+                    serde_json::from_value::<PersistedServiceConfig>(serde_json::json!({
+                        "vaultPath": "/tmp/vault", section: { field: -1 }
+                    }))
+                    .is_err()
+                );
+            }
+        }
+    }
 
     #[test]
     fn legacy_vault_path_resolves_to_an_implicit_root_mount() {

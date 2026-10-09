@@ -736,6 +736,8 @@ fn write_note(root: &Path, relative: &str, content: &str) {
 
 fn eval_embedding(base_url: &str) -> EmbeddingConfig {
     EmbeddingConfig {
+        max_concurrency: None,
+        timeout_seconds: None,
         provider: Some(EmbeddingProvider::OpenAiCompatible),
         model: Some("pseudo-eval-model".to_string()),
         base_url: Some(base_url.to_string()),

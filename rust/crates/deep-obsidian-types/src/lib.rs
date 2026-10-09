@@ -136,6 +136,12 @@ pub struct EmbeddingConfig {
     /// applied at runtime for recognized instruct models. Query-side only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_instruction: Option<String>,
+    /// Maximum parallel text embedding requests (4 when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
+    /// Per-request text embedding timeout in seconds (60 when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -157,6 +163,12 @@ pub struct EmbeddingConfigInput {
     pub context_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_instruction: Option<String>,
+    /// Maximum parallel text embedding requests (4 when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
+    /// Per-request text embedding timeout in seconds (60 when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Additive single-owner OAuth authority, enabled by the presence of `auth.oauth`.

@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::index::SemanticBackend;
 
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
-pub(crate) const DEFAULT_EMBEDDING_MAX_CONCURRENCY: usize = 4;
+pub const DEFAULT_EMBEDDING_MAX_CONCURRENCY: usize = 4;
 /// Hard character ceiling on a single embedding input. Acts as a backstop on top
 /// of the token budget below; the effective per-input cap is the smaller of the two.
 pub const DEFAULT_EMBEDDING_MAX_CHARS: usize = 8_000;
@@ -24,7 +24,10 @@ pub const DEFAULT_EMBEDDING_MAX_INPUT_TOKENS: usize = 2_800;
 /// tokens per char (observed on technical vaults), so we keep this low to
 /// over-estimate token counts and stay safe.
 pub const DEFAULT_CHARS_PER_TOKEN: f64 = 2.5;
-pub(crate) const DEFAULT_EMBEDDING_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_EMBEDDING_TIMEOUT_SECONDS: u64 = 60;
+#[cfg(test)]
+pub(crate) const DEFAULT_EMBEDDING_TIMEOUT: Duration =
+    Duration::from_secs(DEFAULT_EMBEDDING_TIMEOUT_SECONDS);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -48,6 +51,10 @@ pub struct EmbeddingConfig {
     pub api_key: Option<String>,
     pub max_chars: usize,
     pub batch_size: usize,
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
     /// Per-input token budget. Each embedding input is clamped to at most
     /// `max_input_tokens * chars_per_token` characters (and `max_chars`).
     pub max_input_tokens: usize,
@@ -71,6 +78,13 @@ pub fn format_query_with_instruction(instruction: &str, query: &str) -> String {
     format!("Instruct: {instruction}\nQuery: {query}")
 }
 
+fn default_max_concurrency() -> usize {
+    DEFAULT_EMBEDDING_MAX_CONCURRENCY
+}
+fn default_timeout_seconds() -> u64 {
+    DEFAULT_EMBEDDING_TIMEOUT_SECONDS
+}
+
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self::sparse()
@@ -86,6 +100,8 @@ impl EmbeddingConfig {
             api_key: None,
             max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+            max_concurrency: DEFAULT_EMBEDDING_MAX_CONCURRENCY,
+            timeout_seconds: DEFAULT_EMBEDDING_TIMEOUT_SECONDS,
             max_input_tokens: DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
@@ -95,6 +111,8 @@ impl EmbeddingConfig {
 
     pub fn normalize(mut self) -> Self {
         self.batch_size = self.batch_size.max(1);
+        self.max_concurrency = self.max_concurrency.max(1);
+        self.timeout_seconds = self.timeout_seconds.max(1);
         self.max_chars = self.max_chars.max(1);
         self.max_input_tokens = self.max_input_tokens.max(1);
         self.context_tokens = self.context_tokens.max(self.max_input_tokens);
@@ -200,8 +218,8 @@ impl EmbeddingBatchOptions {
     pub(crate) fn from_config(config: &EmbeddingConfig) -> Self {
         Self {
             batch_size: config.batch_size.max(1),
-            max_concurrency: DEFAULT_EMBEDDING_MAX_CONCURRENCY,
-            timeout: DEFAULT_EMBEDDING_TIMEOUT,
+            max_concurrency: config.max_concurrency.max(1),
+            timeout: Duration::from_secs(config.timeout_seconds.max(1)),
             // Cap the per-request token sum at the per-input budget so a batch never
             // decodes far more than a single chunk's worth of tokens against the
             // worker's `num_ctx`. llama.cpp can crash (heap corruption) when a
@@ -301,7 +319,7 @@ pub fn embed_texts(
 ) -> Result<EmbeddingResult, EmbeddingError> {
     // Bound every request so a hung backend can't stall the caller indefinitely.
     // Source the timeout from the same plumbing the batch path uses, defaulting to
-    // `DEFAULT_EMBEDDING_TIMEOUT` (60s) when config exposes no explicit value.
+    // the configured timeout, falling back to 60s for existing configurations.
     let client = reqwest::blocking::Client::builder()
         .timeout(EmbeddingBatchOptions::from_config(config).timeout)
         .build()
@@ -765,6 +783,8 @@ mod tests {
             api_key: None,
             max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
             batch_size: 2,
+            max_concurrency: DEFAULT_EMBEDDING_MAX_CONCURRENCY,
+            timeout_seconds: DEFAULT_EMBEDDING_TIMEOUT_SECONDS,
             max_input_tokens: DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
             context_tokens: DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
@@ -870,6 +890,67 @@ mod tests {
         let body_start = header_end + 4;
         (request.len() >= body_start + content_length)
             .then(|| &request[body_start..body_start + content_length])
+    }
+
+    #[test]
+    fn configured_request_timeout_is_used_by_single_and_batch_calls() {
+        for batch in [false, true] {
+            let (base_url, _listener) = spawn_silent_server();
+            let mut config = test_config(base_url);
+            config.timeout_seconds = 1;
+            let start = std::time::Instant::now();
+            let texts = vec!["hello".to_string()];
+            let result = if batch {
+                embed_text_batches(&texts, &config, None).map(|_| ())
+            } else {
+                embed_texts(&texts, &config).map(|_| ())
+            };
+            assert!(result.is_err());
+            assert!(start.elapsed() >= Duration::from_millis(800));
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "configured timeout ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_concurrency_bounds_batch_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for concurrency in [1, 2] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut config = test_config(format!("http://{}", listener.local_addr().unwrap()));
+            config.batch_size = 1;
+            config.max_concurrency = concurrency;
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&peak);
+            let handle = thread::spawn(move || {
+                let mut workers = Vec::new();
+                for stream in listener.incoming().take(4) {
+                    let active = Arc::clone(&active);
+                    let peak = Arc::clone(&peak);
+                    workers.push(thread::spawn(move || {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(80));
+                        handle_embedding_request(
+                            stream.unwrap(),
+                            2,
+                            &Arc::new(Mutex::new(Vec::new())),
+                        );
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    }));
+                }
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+            });
+            let texts = vec!["a".to_string(); 4];
+            embed_text_batches(&texts, &config, None).unwrap();
+            handle.join().unwrap();
+            assert_eq!(observed.load(Ordering::SeqCst), concurrency);
+        }
     }
 
     #[test]

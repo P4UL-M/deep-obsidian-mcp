@@ -9,7 +9,8 @@ use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_index::embeddings::{
     EmbeddingConfig as IndexEmbeddingConfig, EmbeddingProvider as IndexEmbeddingProvider,
     DEFAULT_CHARS_PER_TOKEN, DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_CONTEXT_TOKENS,
-    DEFAULT_EMBEDDING_MAX_CHARS, DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+    DEFAULT_EMBEDDING_MAX_CHARS, DEFAULT_EMBEDDING_MAX_CONCURRENCY,
+    DEFAULT_EMBEDDING_MAX_INPUT_TOKENS, DEFAULT_EMBEDDING_TIMEOUT_SECONDS,
 };
 use deep_obsidian_index::index::{
     build_index_from_source, get_search_index_from_source, same_artifact_embedding_config,
@@ -167,6 +168,14 @@ key its 'embedding.apiKeyRef' points at; unset the variable to use the configure
             .max_chars
             .unwrap_or(DEFAULT_EMBEDDING_MAX_CHARS),
         batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+        max_concurrency: config
+            .embedding
+            .max_concurrency
+            .unwrap_or(DEFAULT_EMBEDDING_MAX_CONCURRENCY),
+        timeout_seconds: config
+            .embedding
+            .timeout_seconds
+            .unwrap_or(DEFAULT_EMBEDDING_TIMEOUT_SECONDS),
         max_input_tokens: config
             .embedding
             .max_input_tokens
@@ -205,6 +214,14 @@ fn index_artifact_embedding_config(
             .max_chars
             .unwrap_or(DEFAULT_EMBEDDING_MAX_CHARS),
         batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
+        max_concurrency: config
+            .artifact_embedding
+            .max_concurrency
+            .unwrap_or(DEFAULT_EMBEDDING_MAX_CONCURRENCY),
+        timeout_seconds: config
+            .artifact_embedding
+            .timeout_seconds
+            .unwrap_or(DEFAULT_EMBEDDING_TIMEOUT_SECONDS),
         max_input_tokens: config
             .artifact_embedding
             .max_input_tokens
@@ -1525,6 +1542,26 @@ mod tests {
         config.embedding.provider = Some(deep_obsidian_types::EmbeddingProvider::OpenAiCompatible);
         config.embedding.model = Some("test-embedding".into());
         config
+    }
+
+    #[test]
+    fn embedding_request_settings_reach_runtime_without_changing_defaults() {
+        let mut config = embedding_key_config();
+        let resolver =
+            SecretResolver::with_encrypted_file_path(temp_path("unused_settings_secrets"));
+        let defaults = index_embedding_config_with_env(&config, &resolver, |_| None).unwrap();
+        assert_eq!(defaults.max_concurrency, 4);
+        assert_eq!(defaults.timeout_seconds, 60);
+        config.embedding.max_concurrency = Some(1);
+        config.embedding.timeout_seconds = Some(180);
+        let runtime = index_embedding_config_with_env(&config, &resolver, |_| None).unwrap();
+        assert_eq!(runtime.max_concurrency, 1);
+        assert_eq!(runtime.timeout_seconds, 180);
+        config.artifact_embedding.max_concurrency = Some(2);
+        config.artifact_embedding.timeout_seconds = Some(90);
+        let artifacts = index_artifact_embedding_config(&config).unwrap();
+        assert_eq!(artifacts.max_concurrency, 2);
+        assert_eq!(artifacts.timeout_seconds, 90);
     }
 
     #[test]
