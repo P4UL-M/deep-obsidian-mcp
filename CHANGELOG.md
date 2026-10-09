@@ -2,7 +2,7 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
-## Unreleased
+## v0.2.0-alpha.6 — 2026-10-10
 
 ### Added
 
