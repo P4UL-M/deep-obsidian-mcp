@@ -23,7 +23,7 @@ async function begin(page, request, oauth, redirect) {
     state, scope: 'obsidian', resource: `${oauth.issuer}/mcp` }).toString();
   const response = await page.goto(url.toString());
   expect(response.status()).toBe(200);
-  await expect(page.getByRole('heading', { name: 'Allow access to Deep Obsidian?' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Connect to your vault.' })).toBeVisible();
   return client;
 }
 
@@ -96,4 +96,26 @@ test('wrong owner secret never reaches the callback', async ({ page, request, oa
   expect((await post).status()).toBe(401);
   await expect(page.locator('body')).toContainText('access_denied');
   expect(oauth.callbacks).toHaveLength(callbackCount);
+});
+
+test('consent follows browser theme and fits mobile without scripts', async ({ page, request, oauth, browserName }) => {
+  const client = await begin(page, request, oauth, oauth.redirects.https);
+  await expect(page.locator('.brand-logo svg')).toBeVisible();
+  await expect(page.locator('dd').first()).toHaveText(client);
+  for (const [colorScheme, background] of [['light', 'rgb(246, 247, 249)'], ['dark', 'rgb(22, 21, 27)']]) {
+    await page.emulateMedia({ colorScheme });
+    // Computed colors also prove the hash-authorized inline stylesheet loaded.
+    await expect(page.locator('body')).toHaveCSS('background-color', background);
+    await page.setViewportSize({ width: 736, height: 850 });
+    if (browserName === 'chromium') {
+      await page.screenshot({ path: `../../output/playwright/oauth-${colorScheme}.png`, fullPage: true });
+    }
+    await page.setViewportSize({ width: 320, height: 740 });
+    await expect(page.getByLabel('Server secret')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Allow access', exact: true })).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(320);
+    await page.locator('summary').click();
+    await expect(page.locator('details')).not.toHaveAttribute('open', '');
+    await page.locator('summary').click();
+  }
 });

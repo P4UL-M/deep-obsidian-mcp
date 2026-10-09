@@ -16,7 +16,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use deep_obsidian_types::OAuthConfig;
 use reqwest::Url;
 use secrecy::ExposeSecret;
@@ -31,6 +34,16 @@ const CAPACITY: usize = 1024;
 const REFRESH_CAPACITY: usize = 8192;
 const CODE_TTL: Duration = Duration::from_secs(300);
 const COOKIE: &str = "deep_obsidian_consent";
+const CONSENT_CSS: &str = include_str!("oauth-consent.css");
+const CONSENT_LOGO: &str = include_str!("../../../../assets/deep-obsidian-menubar.svg");
+const CONSENT_PERMISSION_ICON: &str = include_str!("../../../../assets/icons/file-pen-line.svg");
+
+fn consent_style_source() -> String {
+    format!(
+        "'sha256-{}'",
+        STANDARD.encode(Sha256::digest(CONSENT_CSS.as_bytes()))
+    )
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Client {
@@ -471,7 +484,15 @@ async fn authorize(
     }
     let nonce = generate_token();
     let cookie = generate_token();
-    let page = format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Deep Obsidian authorization</title><h1>Allow access to Deep Obsidian?</h1><p>This client will be able to read and modify your vault.</p><p>Client: <code>{}</code></p><p>Return URL: <code>{}</code></p><form method=\"post\" action=\"/authorize\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><label>Server secret <input type=\"password\" name=\"password\" required autocomplete=\"current-password\"></label><button name=\"decision\" value=\"allow\">Allow access</button><button name=\"decision\" value=\"deny\" formnovalidate>Cancel</button></form></html>", escape(&request.client_id), escape(&request.redirect_uri), nonce);
+    let page = format!(
+        include_str!("oauth-consent.html"),
+        stylesheet = CONSENT_CSS,
+        logo = CONSENT_LOGO,
+        permission_icon = CONSENT_PERMISSION_ICON,
+        client = escape(&request.client_id),
+        redirect = escape(&request.redirect_uri),
+        nonce = nonce
+    );
     // Browsers can apply form-action to the redirect after consent as well.
     // Only trust the origin of the exact, registered callback validated above.
     // IP callbacks commit an HTML document after POST, so form-action needs no
@@ -493,7 +514,7 @@ async fn authorize(
     response.headers_mut().insert(
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_str(&format!(
-            "default-src 'none'; form-action 'self'{redirect_source}; frame-ancestors 'none'; base-uri 'none'"
+            "default-src 'none'; style-src {}; form-action 'self'{redirect_source}; frame-ancestors 'none'; base-uri 'none'", consent_style_source()
         ))
         .expect("validated redirect origin"),
     );
@@ -939,7 +960,7 @@ mod tests {
             .contains("frame-ancestors 'none'"));
         assert_eq!(
             response.headers()["content-security-policy"],
-            "default-src 'none'; form-action 'self' https://client.example; frame-ancestors 'none'; base-uri 'none'"
+            format!("default-src 'none'; style-src {}; form-action 'self' https://client.example; frame-ancestors 'none'; base-uri 'none'", consent_style_source())
         );
         let cookie = response.headers()[header::SET_COOKIE]
             .to_str()
@@ -999,7 +1020,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()["content-security-policy"].to_str().unwrap(),
-                format!("default-src 'none'; form-action 'self'{origin}; frame-ancestors 'none'; base-uri 'none'"));
+                format!("default-src 'none'; style-src {}; form-action 'self'{origin}; frame-ancestors 'none'; base-uri 'none'", consent_style_source()));
         }
     }
 

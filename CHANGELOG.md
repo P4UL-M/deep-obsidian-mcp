@@ -4,6 +4,12 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 ## Unreleased
 
+### Changed
+
+- OAuth consent uses a responsive, accessible layout with the Deep Obsidian logo
+  and light/dark colors matching the browser preference. The form needs no
+  JavaScript or external resources; its stylesheet is authorized by a CSP hash.
+
 ### Fixed
 
 - OAuth consent permits only the registered domain callback origin in its
@@ -18,8 +24,9 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 - Added Chromium, Firefox and WebKit coverage for approval, denial, invalid
   passwords, HTTPS and local IPv4/IPv6 callbacks, PKCE token exchange, MCP access
-  and authorization-code replay rejection. All 27 cases also pass with JavaScript
-  disabled. The browser suite now runs in CI.
+  and authorization-code replay rejection, plus automatic theme changes and
+  320px mobile layouts. All 30 cases also pass with JavaScript disabled. The
+  browser suite now runs in CI.
 
 ## v0.2.0-alpha.5 — 2026-10-08
 

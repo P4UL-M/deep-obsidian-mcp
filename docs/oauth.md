@@ -82,6 +82,11 @@ rejected. There is no password or client-credentials grant.
 
 ## Returning from consent
 
+The consent page follows the browser's light or dark preference and fits mobile
+screens. The Deep Obsidian logo and stylesheet are embedded in the binary, with
+no external assets or JavaScript. A CSP hash allows only the embedded stylesheet;
+scripts, external resources and framing remain blocked.
+
 Callbacks with a domain name retain the HTTP 303 redirect after Allow or Cancel.
 For an IP-literal callback, the POST instead returns a same-origin HTML page
 (HTTP 200) that immediately navigates to the exact registered callback using a

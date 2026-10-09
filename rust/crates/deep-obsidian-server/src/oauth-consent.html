@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Deep Obsidian authorization</title>
+<style>{stylesheet}</style>
+</head>
+<body>
+<header class="brand"><span class="brand-logo" aria-hidden="true">{logo}</span>Deep Obsidian</header>
+<main>
+<div class="eyebrow">Application connection</div>
+<h1>Connect to your vault.</h1>
+<p class="intro">An application is requesting access to Deep Obsidian.</p>
+<section class="permission" aria-label="Requested access">
+<span class="permission-icon" aria-hidden="true">{permission_icon}</span>
+<div>
+<h2>Read and modify your notes</h2>
+<p>This application can access and make changes to your vault.</p>
+</div>
+</section>
+<details open>
+<summary>Application details</summary>
+<dl><dt>Client ID</dt><dd><code>{client}</code></dd><dt>Return URL</dt><dd><code>{redirect}</code></dd></dl>
+</details>
+<form method="post" action="/authorize">
+<input type="hidden" name="request_id" value="{nonce}">
+<label for="password">Server secret</label>
+<input id="password" type="password" name="password" required autocomplete="current-password" aria-describedby="secret-hint">
+<p class="hint" id="secret-hint">Enter your server secret to approve. It is never shared with the application.</p>
+<div class="actions"><button class="primary" name="decision" value="allow">Allow access</button><button class="cancel" name="decision" value="deny" formnovalidate>Cancel</button></div>
+</form>
+</main>
+<footer>Only approve applications you trust.</footer>
+</body>
+</html>
