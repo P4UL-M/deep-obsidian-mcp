@@ -57,6 +57,32 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
+  oauth-browser:
+    name: OAuth browser consent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tests/browser/package-lock.json
+      - run: cargo build --locked -p deep-obsidian-cli
+      - run: npm ci
+        working-directory: tests/browser
+      - run: npx playwright install --with-deps --only-shell chromium firefox webkit
+        working-directory: tests/browser
+      - run: npm test
+        working-directory: tests/browser
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: oauth-browser-failures
+          path: output/playwright/
+          retention-days: 7
+
   # Blocking, and deliberately NOT path-filtered to `sidecar/**`.
   #
   # The sidecar's stdio protocol is a contract the Rust supervisor codes

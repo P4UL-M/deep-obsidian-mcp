@@ -2,6 +2,25 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## Unreleased
+
+### Fixed
+
+- OAuth consent permits only the registered domain callback origin in its
+  `form-action` policy, avoiding WebKit blocking the redirect after submission.
+- IPv4 and IPv6 callbacks return through an automatic, JavaScript-free HTML
+  navigation page to avoid WebKit's form redirect restrictions. Domain callbacks
+  retain HTTP 303 redirects. Consent validation, PKCE and token exchange remain
+  unchanged; scripts posting the consent form directly must handle HTML 200 for
+  IP callbacks.
+
+### Validation
+
+- Added Chromium, Firefox and WebKit coverage for approval, denial, invalid
+  passwords, HTTPS and local IPv4/IPv6 callbacks, PKCE token exchange, MCP access
+  and authorization-code replay rejection. All 27 cases also pass with JavaScript
+  disabled. The browser suite now runs in CI.
+
 ## v0.2.0-alpha.5 — 2026-10-08
 
 ### Changed

@@ -6,3 +6,4 @@ outputs/
 # packaged by the release pipeline, never committed.
 sidecar/livesync-sidecar/dist/
 node_modules/
+output/playwright/

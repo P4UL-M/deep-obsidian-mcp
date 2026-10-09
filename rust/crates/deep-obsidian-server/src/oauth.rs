@@ -472,6 +472,15 @@ async fn authorize(
     let nonce = generate_token();
     let cookie = generate_token();
     let page = format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Deep Obsidian authorization</title><h1>Allow access to Deep Obsidian?</h1><p>This client will be able to read and modify your vault.</p><p>Client: <code>{}</code></p><p>Return URL: <code>{}</code></p><form method=\"post\" action=\"/authorize\"><input type=\"hidden\" name=\"request_id\" value=\"{}\"><label>Server secret <input type=\"password\" name=\"password\" required autocomplete=\"current-password\"></label><button name=\"decision\" value=\"allow\">Allow access</button><button name=\"decision\" value=\"deny\" formnovalidate>Cancel</button></form></html>", escape(&request.client_id), escape(&request.redirect_uri), nonce);
+    // Browsers can apply form-action to the redirect after consent as well.
+    // Only trust the origin of the exact, registered callback validated above.
+    // IP callbacks commit an HTML document after POST, so form-action needs no
+    // external source (IPv6 literals are not valid CSP host sources).
+    let redirect = Url::parse(&request.redirect_uri).expect("registered redirect");
+    let redirect_source = match redirect.host() {
+        Some(url::Host::Domain(_)) => format!(" {}", redirect.origin().ascii_serialization()),
+        _ => String::new(),
+    };
     store.pending.insert(
         hash(&nonce),
         Pending {
@@ -481,6 +490,13 @@ async fn authorize(
         },
     );
     let mut response = secure(Html(page).into_response());
+    response.headers_mut().insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_str(&format!(
+            "default-src 'none'; form-action 'self'{redirect_source}; frame-ancestors 'none'; base-uri 'none'"
+        ))
+        .expect("validated redirect origin"),
+    );
     let secure_cookie = if oauth.issuer.starts_with("https:") {
         "; Secure"
     } else {
@@ -596,7 +612,21 @@ async fn consent(
         }
         query.append_pair("iss", &oauth.issuer);
     }
-    let mut response = secure(Redirect::to(redirect.as_str()).into_response());
+    // WebKit can block an IP-literal callback in a form's redirect chain even
+    // when form-action names that origin. Commit a same-origin document first;
+    // its refresh performs a fresh GET navigation, without scripts or the POST.
+    // Domain callbacks retain their existing HTTP redirect behavior.
+    let mut response = secure(
+        if matches!(
+            redirect.host(),
+            Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_))
+        ) {
+            let target = escape(redirect.as_str());
+            Html(format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"0;url={target}\"><title>Returning to your application</title></head><body><p>Returning to your application…</p><a href=\"{target}\">Continue</a></body></html>")).into_response()
+        } else {
+            Redirect::to(redirect.as_str()).into_response()
+        },
+    );
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_static(
@@ -907,6 +937,10 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("frame-ancestors 'none'"));
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "default-src 'none'; form-action 'self' https://client.example; frame-ancestors 'none'; base-uri 'none'"
+        );
         let cookie = response.headers()[header::SET_COOKIE]
             .to_str()
             .unwrap()
@@ -925,6 +959,183 @@ mod tests {
             .unwrap()
             .to_string();
         (nonce, cookie)
+    }
+
+    #[tokio::test]
+    async fn consent_csp_allows_only_registered_domain_callback_origins() {
+        let f = fixture().await;
+        for (redirect, origin) in [
+            (
+                "https://client.example:8443/callback?next=https://other.example",
+                " https://client.example:8443",
+            ),
+            ("http://127.0.0.1:12345/callback", ""),
+            ("http://[::1]:12345/callback", ""),
+        ] {
+            let registration = f
+                .client
+                .post(format!("{}/register", f.base))
+                .json(&json!({"redirect_uris": [redirect], "token_endpoint_auth_method": "none"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(registration.status(), StatusCode::CREATED);
+            let client = registration.json::<serde_json::Value>().await.unwrap()["client_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let mut query = params(&client, CHALLENGE);
+            query
+                .iter_mut()
+                .find(|(key, _)| *key == "redirect_uri")
+                .unwrap()
+                .1 = redirect;
+            let response = f
+                .client
+                .get(format!("{}/authorize", f.base))
+                .query(&query)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-security-policy"].to_str().unwrap(),
+                format!("default-src 'none'; form-action 'self'{origin}; frame-ancestors 'none'; base-uri 'none'"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ip_callback_page_preserves_consent_security_and_oauth_parameters() {
+        let f = fixture().await;
+        for redirect in [
+            "http://127.0.0.1:1234/callback?existing=one%26two",
+            "http://[::1]:1234/callback?existing=one%26two",
+            "https://127.0.0.1:1234/callback?existing=one%26two",
+        ] {
+            for decision in ["allow", "deny"] {
+                let registration = f
+                    .client
+                    .post(format!("{}/register", f.base))
+                    .json(&json!({"redirect_uris": [redirect]}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(registration.status(), StatusCode::CREATED);
+                let client = registration.json::<serde_json::Value>().await.unwrap()["client_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let mut query = params(&client, CHALLENGE);
+                query
+                    .iter_mut()
+                    .find(|(key, _)| *key == "redirect_uri")
+                    .unwrap()
+                    .1 = redirect;
+                let response = f
+                    .client
+                    .get(format!("{}/authorize", f.base))
+                    .query(&query)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let cookie = response.headers()[header::SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let page = response.text().await.unwrap();
+                let nonce = page
+                    .split("name=\"request_id\" value=\"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap();
+                let form = [
+                    ("request_id", nonce),
+                    ("password", SECRET),
+                    ("decision", decision),
+                ];
+                for (origin, cookie) in [
+                    ("https://evil.example", cookie.as_str()),
+                    (f.base.as_str(), "wrong=cookie"),
+                ] {
+                    let rejected = f
+                        .client
+                        .post(format!("{}/authorize", f.base))
+                        .header(header::ORIGIN, origin)
+                        .header(header::COOKIE, cookie)
+                        .form(&form)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+                }
+                let response = f
+                    .client
+                    .post(format!("{}/authorize", f.base))
+                    .header(header::ORIGIN, &f.base)
+                    .header(header::COOKIE, &cookie)
+                    .form(&form)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(!response.headers().contains_key(header::LOCATION));
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+                assert_eq!(response.headers()["content-security-policy"],
+                    "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+                assert!(response.headers()[header::SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .contains("Max-Age=0"));
+                let page = response.text().await.unwrap();
+                assert!(page.contains("http-equiv=\"refresh\""));
+                assert!(!page.contains("<script"));
+                assert!(!page.contains(SECRET));
+                let target = page
+                    .split("href=\"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap()
+                    .replace("&amp;", "&");
+                let target = Url::parse(&target).unwrap();
+                assert_eq!(target.origin(), Url::parse(redirect).unwrap().origin());
+                assert_eq!(target.path(), "/callback");
+                let pairs: HashMap<_, _> = target.query_pairs().into_owned().collect();
+                assert_eq!(pairs["existing"], "one&two");
+                assert_eq!(pairs["state"], "some state&with=specials");
+                assert_eq!(pairs["iss"], f.base);
+                if decision == "deny" {
+                    assert_eq!(pairs["error"], "access_denied");
+                    assert!(!pairs.contains_key("code"));
+                } else {
+                    assert!(!pairs.contains_key("error"));
+                    assert!(f
+                        .oauth
+                        .store
+                        .lock()
+                        .unwrap()
+                        .codes
+                        .contains_key(&hash(&pairs["code"])));
+                }
+                let replay = f
+                    .client
+                    .post(format!("{}/authorize", f.base))
+                    .header(header::ORIGIN, &f.base)
+                    .header(header::COOKIE, &cookie)
+                    .form(&form)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+            }
+        }
     }
 
     async fn consent_response(f: &Fixture, client: &str, password: &str) -> reqwest::Response {

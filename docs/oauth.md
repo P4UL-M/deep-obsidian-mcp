@@ -80,6 +80,55 @@ For older clients, omitted `scope` defaults to `obsidian` and omitted `resource`
 defaults to the sole configured MCP resource. Explicitly different values are
 rejected. There is no password or client-credentials grant.
 
+## Returning from consent
+
+Callbacks with a domain name retain the HTTP 303 redirect after Allow or Cancel.
+For an IP-literal callback, the POST instead returns a same-origin HTML page
+(HTTP 200) that immediately navigates to the exact registered callback using a
+meta refresh. A Continue link is available if automatic navigation is disabled.
+This separates the callback GET from the form submission, which WebKit can
+otherwise block for IP literals. The page requires no JavaScript, keeps
+`form-action 'self'`, disables scripts and framing, and uses `no-store` and
+`no-referrer`. It never contains or forwards the owner's secret.
+
+This remains the authorization-code flow: callback URL, `code`/`error`, `state`,
+`iss`, PKCE, and the token exchange are unchanged. A program that directly posts
+the consent form must handle the HTML response for IP callbacks; that form is
+a browser interaction, not a token API.
+[OAuth permits returning through means provided by the user-agent](https://www.rfc-editor.org/rfc/rfc6749#section-4.1.1),
+and [loopback IP callbacks are the native-app pattern](https://www.rfc-editor.org/rfc/rfc8252#section-7.3).
+
+## Browser regression tests
+
+The consent suite drives the real Rust CLI through a local HTTPS proxy with
+Chromium, Firefox and WebKit. It covers Allow and Cancel with an HTTPS callback
+on another origin, HTTP localhost, and IPv4/IPv6 loopback callbacks, wrong owner credentials,
+PKCE exchange, MCP access, and rejection of code reuse. Callback requests must
+be GETs with an empty body: the owner secret must never leave the authorization
+server. Browser headers and CSP are not rewritten or mocked.
+
+```sh
+cargo build --locked -p deep-obsidian-cli
+cd tests/browser
+npm ci
+npx playwright install --only-shell chromium firefox webkit
+npm test
+```
+
+Node.js 20+ and OpenSSL are required. Linux hosts may need
+`npx playwright install --with-deps --only-shell chromium firefox webkit`.
+`DEEP_OBSIDIAN_TEST_BINARY` can select a previously built CLI binary.
+Each worker creates a temporary vault, a fake owner secret, and a self-signed
+certificate. No production vault, keychain or system certificate trust is used.
+Failure traces go to `output/playwright/`; CI uploads them for seven days.
+The WebKit project exercises Playwright's WebKit build, not the installed Safari
+application or the real ChatGPT callback. IPv4 and IPv6 use real listeners
+on `127.0.0.1` and `::1`. Set `DEEP_OBSIDIAN_BROWSER_NO_JS=1` to rerun with
+JavaScript disabled. The IP callback page is also tested for cookie/nonce/CSRF
+enforcement, exact callback parameters, security headers, and one-use consent.
+On macOS, Firefox's app-data directory is isolated with `CFFIXED_USER_HOME` to
+avoid accessing the user's Firefox data ([upstream issue](https://github.com/microsoft/playwright/issues/42768)).
+
 ## Refresh tokens
 
 After access-token expiry, the client sends `POST /token` with form fields
