@@ -4,6 +4,14 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 ## Unreleased
 
+### Added
+
+- Published releases build and smoke-test native AMD64 and ARM64 Docker images,
+  then publish the tested images to GHCR and Docker Hub under one multi-platform
+  version tag. Stable releases update `latest`; prereleases update `alpha`,
+  `beta`, `rc` or `preview` without replacing `latest`. Docker Hub requires the
+  repository variable `DOCKERHUB_USERNAME` and secret `DOCKERHUB_TOKEN`.
+
 ### Changed
 
 - OAuth consent uses a responsive, accessible layout with the Deep Obsidian logo
@@ -12,6 +20,8 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 ### Fixed
 
+- Docker's Rust build stage now includes the assets embedded in the OAuth page;
+  changes to assets also trigger the Docker CI checks.
 - OAuth consent permits only the registered domain callback origin in its
   `form-action` policy, avoiding WebKit blocking the redirect after submission.
 - IPv4 and IPv6 callbacks return through an automatic, JavaScript-free HTML

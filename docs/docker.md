@@ -52,7 +52,7 @@ docker run -d --name deep-obsidian \
   -v "$HOME/Obsidian/MyVault:/vault" \
   -v deep-obsidian-state:/var/lib/deep-obsidian-mcp \
   -v "$PWD/secrets:/run/secrets:ro" \
-  ghcr.io/p4ul-m/deep-obsidian-mcp:latest   # (see Known limitations: not published yet — build it)
+  ghcr.io/p4ul-m/deep-obsidian-mcp:alpha   # available after the first image release
 ```
 
 Point your MCP client at `http://localhost:4100/mcp` with the bearer token from
@@ -294,6 +294,45 @@ The CI job (`docker` in `.github/workflows/ci.yml`) builds natively on
 `platforms:` list, because QEMU would make the Rust release build take tens of
 minutes and because an image nobody can *run* is an image nobody has checked.
 
+## Release images
+
+Published GitHub releases invoke `.github/workflows/release-docker.yml`. The
+existing automated `.deb` release explicitly calls the same workflow after it
+publishes the release: events created by `GITHUB_TOKEN` do not trigger another
+workflow. No image is published on a branch push or a pull request.
+
+Both native images are smoke-tested before either registry publishes anything.
+The tested images are exported as short-lived workflow artifacts, then pushed
+to GHCR and Docker Hub and merged into a multi-platform manifest. Each registry
+publishes independently, so an outage on one does not suppress the other.
+Version and source revision labels come from the released tag and commit; the
+workflow refuses a tag that disagrees with the workspace version.
+
+Repository configuration (Settings → Secrets and variables → Actions):
+
+- Variable `DOCKERHUB_USERNAME`: your lowercase Docker Hub username.
+- Secret `DOCKERHUB_TOKEN`: a Docker Hub access token with write permission.
+  Signing in with GitHub does not replace this token for CI.
+- GHCR uses `GITHUB_TOKEN` with `packages: write`; no extra token is required.
+  After the first publication, set the GHCR package visibility to Public if
+  anonymous pulls are intended, and ensure the Docker Hub repository is public.
+
+Images use `ghcr.io/p4ul-m/deep-obsidian-mcp:<tag>` and
+`docker.io/<DOCKERHUB_USERNAME>/deep-obsidian-mcp:<tag>`:
+
+- The exact release tag, such as `v0.2.0-alpha.6`, is published on both registries.
+- Stable releases also update `latest`.
+- Alpha, beta and release-candidate versions update `alpha`, `beta` and `rc`
+  respectively. Other prereleases use `preview`; none replace `latest`.
+- `build-<run>-<attempt>-<arch>` tags hold the component images for the manifest.
+
+If a registry push fails, rerun the failed publication job in GitHub Actions; the
+tested image artifacts are retained for two days. After that, rerun all jobs to
+rebuild the images. This does not require creating another release.
+
+The first image publication still requires a new release containing this workflow
+and the Docker Hub configuration above. Until then, build locally.
+
 ## What the image contains
 
 Three stages, one runtime:
@@ -319,10 +358,6 @@ the bundle in any of the three channels.
 
 ## Known limitations
 
-- **No published image yet.** The GHCR push step exists in `ci.yml` but is commented
-  out, together with its tag policy (`vX.Y.Z` + `latest`, on tags only), pending the
-  release decision. Build locally in the meantime — the example compose does, via
-  `build: .`.
 - **A remote ROOT mount's config is written by the entrypoint, not by the CLI.**
   `mounts add` cannot create the first mount of an empty config
   (`allow_empty_base: false`), and adding a remote at `mountAt ""` beside a

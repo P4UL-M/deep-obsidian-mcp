@@ -1,0 +1,173 @@
+name: release-docker
+
+# Human-published releases fire this event. Releases created by GITHUB_TOKEN do
+# not; release-deb explicitly calls this workflow after publishing its release.
+on:
+  release:
+    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      prerelease:
+        default: false
+        type: boolean
+    secrets:
+      DOCKERHUB_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-docker-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      channel: ${{ steps.meta.outputs.channel }}
+      ghcr: ${{ steps.meta.outputs.ghcr }}
+      dockerhub: ${{ steps.meta.outputs.dockerhub }}
+      revision: ${{ steps.revision.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag || github.event.release.tag_name }}
+      - name: Check registry configuration
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo '::error::Configure the repository secret DOCKERHUB_TOKEN (Docker Hub write token).'
+            exit 1
+          fi
+      - name: Validate version and derive image names
+        id: meta
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease || github.event.release.prerelease || false }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+        run: python3 scripts/docker-release-metadata.py
+      - name: Resolve the released commit
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.revision }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build natively and load the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: deep-obsidian-mcp:release-${{ matrix.arch }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            VCS_REF=${{ needs.prepare.outputs.revision }}
+          cache-from: type=gha,scope=docker-${{ matrix.runner }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.runner }}
+      - name: Smoke-test the actual release image
+        env:
+          IMAGE: deep-obsidian-mcp:release-${{ matrix.arch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          REVISION: ${{ needs.prepare.outputs.revision }}
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --entrypoint deep-obsidian-mcp "$IMAGE" version)" = "$VERSION"
+          test "$(docker image inspect "$IMAGE" --format '{{.Architecture}}')" = "$ARCH"
+          test "$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$REVISION"
+          scripts/docker-smoke-test.sh "$IMAGE"
+      - name: Export the tested image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: docker save "deep-obsidian-mcp:release-$ARCH" | gzip > "image-$ARCH.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-release-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}.tar.gz
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        registry: [ghcr, dockerhub]
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: docker-release-*
+          merge-multiple: true
+          path: images
+      - name: Log in to GHCR
+        if: matrix.registry == 'ghcr'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub
+        if: matrix.registry == 'dockerhub'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push tested images and create the multi-architecture tags
+        env:
+          IMAGE: ${{ matrix.registry == 'ghcr' && needs.prepare.outputs.ghcr || needs.prepare.outputs.dockerhub }}
+          VERSION_TAG: ${{ needs.prepare.outputs.tag }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+        run: |
+          set -euo pipefail
+          sources=()
+          for arch in amd64 arm64; do
+            docker load --input "images/image-$arch.tar.gz"
+            staging="$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$arch"
+            docker tag "deep-obsidian-mcp:release-$arch" "$staging"
+            docker push "$staging"
+            # Merge by digest so tags cannot substitute a different image.
+            digest=$(docker image inspect "$staging" --format '{{index .RepoDigests 0}}')
+            sources+=("$digest")
+          done
+          docker buildx imagetools create --tag "$IMAGE:$VERSION_TAG" --tag "$IMAGE:$CHANNEL" "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION_TAG" --raw > manifest.json
+          python3 - <<'PY'
+          import json
+          with open('manifest.json') as file:
+              manifest = json.load(file)
+          platforms = {(item['platform']['os'], item['platform']['architecture'])
+                       for item in manifest['manifests']}
+          assert platforms == {('linux', 'amd64'), ('linux', 'arm64')}, platforms
+          PY
+          echo "Published $IMAGE:$VERSION_TAG and $IMAGE:$CHANNEL" >> "$GITHUB_STEP_SUMMARY"

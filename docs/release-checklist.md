@@ -159,44 +159,38 @@ the `brew services` plist. The env var stays a user-facing override.
   - `brew install` then `deep-obsidian-mcp doctor` reports the bundle located at the
     `pkgshare` path (with a couchdb mount declared).
 
-## The Container Image (not published yet)
+## The Container Image
 
-The `docker` job in `.github/workflows/ci.yml` builds the image natively on
-`ubuntu-24.04` + `ubuntu-24.04-arm` and runs `scripts/docker-smoke-test.sh` against
-it on every PR that touches `Dockerfile`, `docker/**`, `rust/**` or `sidecar/**`. It
-publishes **nothing**: the GHCR steps are present but commented out, pending the
-decision to start releasing images. Full deployment docs: [docker.md](./docker.md).
+The CI `docker` job builds and smoke-tests both native architectures without
+publishing. `release-docker.yml` publishes GHCR and Docker Hub images for each
+published GitHub release; `release-deb.yml` calls it explicitly after its automated
+release, because `GITHUB_TOKEN` events do not start another Actions run.
+Full configuration and recovery instructions: [docker.md](./docker.md#release-images).
 
-- [ ] **Decide whether this release publishes an image.** For **v0.2.0-alpha.1 the answer
-      is no** — the image stays unpublished and the GHCR steps stay commented out. If a
-      later release publishes one, uncommenting the two steps is **not sufficient**; all
-      four of these are required:
-  1. add `packages: write` to the workflow's `permissions`;
-  2. add a tag trigger to `ci.yml` — it currently fires on `push: branches: [main]`,
-     `pull_request` and `workflow_dispatch` **only**, so the commented steps' own
-     `if: startsWith(github.ref, 'refs/tags/v')` guard can never be true as things stand;
-  3. pass `build-args: VERSION=${GITHUB_REF_NAME#v}` and `VCS_REF=${{ github.sha }}` to
-     the push step — the commented block passes neither, so the published image would
-     carry the `Dockerfile`'s default `ARG VERSION` and `VCS_REF=unknown` in its OCI
-     labels;
-  4. join the two per-runner digests into one manifest list (next item).
-- [ ] **Tag policy, same shape as the `.deb` channel:** `ghcr.io/p4ul-m/deep-obsidian-mcp:vX.Y.Z`
-      plus `:latest`, on `v*` tags only — never from a branch or a PR.
-- [ ] **Multi-arch is a manifest list, not a `platforms:` build.** The CI job uses
-      `load: true` and is single-arch per runner on purpose (QEMU would make the Rust
-      release build take tens of minutes, and a cross-built image cannot be
-      smoke-tested on the builder). Publishing therefore means pushing one digest per
-      runner and joining them with `docker/metadata-action` + a `merge` job — not
-      switching the existing job to `platforms: linux/amd64,linux/arm64`.
-- [ ] **The bundle, in this channel: automatic.** A dedicated `node:20-slim` stage
-      runs `npm ci && npm run build` and the runtime stage copies `dist/sidecar.mjs`
-      to `/opt/deep-obsidian-mcp/share/deep-obsidian-mcp/...`, i.e. to the same
-      exe-relative path the `.deb` uses. `scripts/docker-smoke-test.sh` asserts
-      `doctor` (run from `/`) finds it there, which is the parity check that keeps the
-      second build path honest.
-- [ ] **If the image is published, say in the release notes** that it requires a
-      bearer-token secret (it refuses to start otherwise), terminates no TLS, and
-      starts *degraded* against a CouchDB database no Obsidian client has synced yet.
+- [ ] Configure repository variable `DOCKERHUB_USERNAME` and secret
+      `DOCKERHUB_TOKEN` (Docker Hub write token). GitHub-connected login alone
+      does not authenticate the CI. Create or allow creation of the
+      `deep-obsidian-mcp` repository in that account.
+- [ ] The new tag includes `release-docker.yml`, and its version without `v`
+      matches `[workspace.package] version`. Both image labels receive that
+      version and the released commit SHA.
+- [ ] Both AMD64 and ARM64 native builds and full Docker smoke tests pass before
+      publication. Tested images are transferred as artifacts (retained two
+      days), not rebuilt in publication jobs.
+- [ ] Both registries publish the exact `vX.Y.Z` tag and a common multi-platform
+      manifest. Stable releases update `latest`; alpha/beta/rc versions update
+      their respective channel, other prereleases use `preview`.
+- [ ] Verify both registries contain `linux/amd64` and `linux/arm64` in the
+      versioned manifest. Publication jobs verify this automatically.
+- [ ] Make the GHCR package public after its first publication if anonymous pulls
+      are intended; ensure the Docker Hub repository has the intended visibility.
+- [ ] Check both registry publication jobs. They run independently; rerun a failed
+      job while the tested-image artifacts exist, or rerun all jobs after expiry.
+- [ ] The LiveSync sidecar remains bundled automatically and is exercised by
+      `scripts/docker-smoke-test.sh`.
+- [ ] Release notes state that the image needs a bearer-token secret, terminates
+      no TLS, and starts degraded against a CouchDB database not yet synced by
+      an Obsidian client.
 
 ## Homebrew Smoke Test
 

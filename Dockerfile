@@ -83,6 +83,8 @@ RUN set -eux; \
 # ship a binary compiled from the empty `fn main() {}` above. The `version` check is
 # the assertion that this did not happen — an empty main prints nothing.
 COPY rust ./rust
+# OAuth embeds the monochrome brand and permission icons at compile time.
+COPY assets ./assets
 RUN set -eux; \
     find rust -name '*.rs' -exec touch {} +; \
     cargo build --release --locked -p deep-obsidian-cli; \
