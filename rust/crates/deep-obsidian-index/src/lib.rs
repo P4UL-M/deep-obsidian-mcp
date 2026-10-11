@@ -1,3 +1,5 @@
+pub mod embedding_activity;
+pub mod embedding_context;
 pub mod embeddings;
 pub mod graph;
 pub mod index;

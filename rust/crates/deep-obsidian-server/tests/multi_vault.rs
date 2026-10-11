@@ -748,7 +748,7 @@ async fn path_taking_recall_routes_to_the_mount_owning_the_path() {
 async fn every_mount_indexes_into_its_own_directory() {
     let fixture = Fixture::new("index-dirs");
     let state = fixture.state().await;
-    tool_call(&state, "build_index", json!({})).await;
+    tool_call(&state, "build_index", json!({"wait": true})).await;
 
     let root_index = fixture.index_dir.join("index.sqlite");
     let team_index = fixture.team_index_dir().join("index.sqlite");
@@ -767,7 +767,7 @@ async fn build_index_rebuilds_every_mount_and_reports_each_one() {
     let fixture = Fixture::new("build-index");
     let state = fixture.state().await;
 
-    let response = tool_call(&state, "build_index", json!({})).await;
+    let response = tool_call(&state, "build_index", json!({"wait": true})).await;
     let payload = structured(&response);
     assert_eq!(payload["rebuilt"], json!(true));
 
@@ -1948,7 +1948,7 @@ async fn delete_note_tombstones_a_couchdb_note_and_says_how_to_undo_it() {
     // next built — which the manifest walk, now excluding it, is what feeds. Asserted after
     // an explicit rebuild rather than assumed, because the alternative (the index keeps
     // serving a deleted note forever) would be the real defect.
-    tool_call(&state, "build_index", json!({})).await;
+    tool_call(&state, "build_index", json!({"wait": true})).await;
     let recall = tool_call(
         &state,
         "hybrid_search",
@@ -2429,10 +2429,9 @@ async fn vault_info_reports_write_capabilities_per_mount() {
         // Conflict surfacing rides on the same per-mount detail. The couchdb mount CAN
         // hold sibling revisions, so it reports a count even when that count is zero —
         // "checked, none" is information.
-        assert_eq!(
-            live["conflictedCount"],
-            json!(0),
-            "a couchdb mount must report its conflicted count: {live}"
+        assert!(
+            live.get("conflictedCount").is_none(),
+            "vault_info never probes remote conflicts: {live}"
         );
         // ...and reports no PATHS when there are none, rather than an empty array a
         // reader has to interpret.
@@ -3353,12 +3352,8 @@ async fn vault_info_describes_the_algolia_mount_and_never_calls_it_degraded() {
         info.get("degradedMounts").is_none(),
         "a working algolia mount must not be reported as degraded: {info}"
     );
-    // The mount reports `Some(vec![])` from `conflicted_paths`, so `conflictedCount`
-    // IS present and is zero. That is a real answer, not an inapplicable one: this
-    // storage can record a divergence and currently records none — see
-    // `AlgoliaVaultBackend::conflicted_paths` for why "divergence" here is not
-    // CouchDB's unreconciled sibling revision.
-    assert_eq!(shared["conflictedCount"], json!(0));
+    // vault_info reports declared capabilities without probing live conflicts.
+    assert!(shared.get("conflictedCount").is_none());
 
     // The root mount is still described as an indexed filesystem mount.
     let root = mounts
@@ -3367,8 +3362,7 @@ async fn vault_info_describes_the_algolia_mount_and_never_calls_it_degraded() {
         .expect("the root mount");
     assert_eq!(root["backendKind"], json!("filesystem"));
     assert_eq!(root["localIndex"], json!(true));
-    // ...and it answers `None` from `conflicted_paths`, so it gains no conflict field at
-    // all — which is the distinction `Some(vec![])` vs `None` exists to preserve.
+    // No mount gains live conflict fields in this informational response.
     assert!(
         root.get("conflictedCount").is_none(),
         "a filesystem mount has no sibling-version notion to report: {root}"
@@ -3387,7 +3381,7 @@ async fn vault_info_describes_the_algolia_mount_and_never_calls_it_degraded() {
 
     // `build_index` reports the algolia mount as SKIPPED rather than omitting it, so
     // its `mounts` array is a complete list of the vault's mounts.
-    let rebuilt = tool_call(&state, "build_index", json!({})).await;
+    let rebuilt = tool_call(&state, "build_index", json!({"wait": true})).await;
     let rebuilt = structured(&rebuilt);
     let shared = rebuilt["mounts"]
         .as_array()
@@ -4123,7 +4117,7 @@ async fn a_recorded_divergence_is_resolvable_and_only_an_asserted_merge_clears_i
         json!(v1),
         "...and the version its content came from: {history}"
     );
-    // `vault_info` reports it too, in the logical namespace.
+    // vault_info keeps describing the mount, without fetching its live conflicts.
     let info = structured(&tool_call(&state, "vault_info", json!({})).await).clone();
     let shared = info["mounts"]
         .as_array()
@@ -4132,8 +4126,8 @@ async fn a_recorded_divergence_is_resolvable_and_only_an_asserted_merge_clears_i
         .find(|mount| mount["id"] == json!("shared"))
         .expect("the shared mount")
         .clone();
-    assert_eq!(shared["conflictedCount"], json!(1), "{shared}");
-    assert_eq!(shared["conflictedPaths"], json!([logical]), "{shared}");
+    assert!(shared.get("conflictedCount").is_none(), "{shared}");
+    assert!(shared.get("conflictedPaths").is_none(), "{shared}");
 
     // All three corners of the merge, and no merge.
     let divergence =
@@ -4216,7 +4210,7 @@ async fn a_recorded_divergence_is_resolvable_and_only_an_asserted_merge_clears_i
         .find(|mount| mount["id"] == json!("shared"))
         .expect("the shared mount")
         .clone();
-    assert_eq!(shared["conflictedCount"], json!(0), "{shared}");
+    assert!(shared.get("conflictedCount").is_none(), "{shared}");
     assert!(shared.get("conflictedPaths").is_none(), "{shared}");
 }
 
@@ -4264,10 +4258,8 @@ async fn a_read_only_algolia_mount_refuses_a_delete_it_never_advertised() {
 //
 // # No sleeps
 //
-// Every mount's freshness is checked inside the operation that needs it (`fresh_snapshot`
-// on a query, a live HTTP call on an algolia read), so the polls below RE-ISSUE THE
-// OPERATION rather than watching a status field — a field-watching poll would sit there
-// until its deadline and then fail. The deadline is the only timing these tests contain.
+// Remote reads retry the backend itself; local index recovery requires an explicit
+// rebuild when automatic reindexing is disabled. Queries only read published snapshots.
 //
 // One recovery in this repository IS driven by a background loop: a couchdb mount whose
 // remote was unreachable at handshake time re-hand-shakes on its own (see
@@ -4303,12 +4295,11 @@ where
 /// A mount that was unreadable at startup serves — and clears its degraded readiness —
 /// once its vault appears, with no process restart.
 ///
-/// The companion to `a_broken_mount_degrades_readiness_by_name_while_the_root_keeps_serving`,
-/// which proves the failure. This proves the return, and it is the one recovery in this
-/// repository that happens with no help at all: a filesystem mount re-scans its vault on
-/// every query that needs a fresh snapshot, so the directory appearing is the whole fix.
+/// Reads resume when the vault appears. Index readiness remains degraded until the
+/// user explicitly rebuilds because this fixture disables automatic reindexing.
 #[tokio::test]
-async fn a_mount_that_was_unreadable_at_startup_recovers_when_its_vault_appears() {
+async fn a_mount_that_was_unreadable_at_startup_requires_explicit_rebuild_after_its_vault_appears()
+{
     let fixture = Fixture::new("mount-recovery");
     let missing = fixture.index_dir.parent().expect("base").join("late-vault");
     let config = fixture.config_with_team_vault(missing.clone());
@@ -4344,12 +4335,21 @@ async fn a_mount_that_was_unreadable_at_startup_recovers_when_its_vault_appears(
     .await;
     assert!(text.contains("arrived after startup"), "{text}");
 
-    // Readiness clears: no mount is degraded any more and the payload stops naming one.
-    // A server that served the mount while still reporting it broken would make
-    // readiness useless as a gate.
+    // Informational reads cannot clear an indexing error or trigger a rebuild.
+    let before = tool_call(&state, "vault_info", json!({})).await;
+    assert_eq!(structured(&before)["degradedMounts"], json!(["team"]));
+    assert!(
+        !state
+            .runtimes
+            .for_mount("team")
+            .unwrap()
+            .diagnostics()
+            .refresh_in_flight
+    );
+    let built = tool_call(&state, "build_index", json!({"wait": true})).await;
+    assert_eq!(structured(&built)["rebuilt"], json!(true));
     let ready = poll_until_some("readiness to clear", || async {
-        // A scoped query is what re-refreshes the mount's index; readiness only reports
-        // what the last refresh recorded.
+        // A scoped query reads the explicitly rebuilt snapshot.
         let _ = tool_call(
             &state,
             "hybrid_search",
@@ -5153,7 +5153,7 @@ async fn a_remote_root_down_at_startup_starts_degraded_and_recovers_without_a_re
 
     // And readiness follows, once the index has been given the chance to build — which is
     // one step later than the mount healing, deliberately. See the docstring.
-    let rebuilt = tool_call(&state, "build_index", json!({})).await;
+    let rebuilt = tool_call(&state, "build_index", json!({"wait": true})).await;
     assert_eq!(structured(&rebuilt)["rebuilt"], json!(true));
     let diagnostics = state.runtimes.aggregate_diagnostics();
     assert_eq!(diagnostics.status.as_str(), "ready");

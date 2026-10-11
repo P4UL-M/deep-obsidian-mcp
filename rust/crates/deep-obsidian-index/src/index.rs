@@ -51,6 +51,8 @@ pub enum IndexError {
     },
     #[error("semantic backend {0} is not supported by the sparse-only index implementation")]
     UnsupportedSemanticBackend(String),
+    #[error("index is incompatible: {0}; run build_index (or the index CLI command) to rebuild explicitly")]
+    IncompatibleIndex(String),
     #[error("note not found in index: {0}")]
     NoteNotFound(String),
     #[error("embedding vector dimensions mismatch: expected {expected}, got {actual}")]
@@ -162,6 +164,8 @@ pub struct SearchIndex {
     pub embedding_base_url: Option<String>,
     #[serde(skip_serializing, skip_deserializing, default)]
     pub runtime_embedding_api_key: Option<String>,
+    #[serde(skip, default)]
+    pub runtime_embedding_config: Option<EmbeddingConfig>,
     /// Explicit user-configured query instruction injected at load (query-side only,
     /// not persisted). When `None`, an auto-default is derived from the model name in
     /// `embedding_runtime_config`. Mirrors `runtime_embedding_api_key`.
@@ -173,6 +177,8 @@ pub struct SearchIndex {
     pub artifact_embedding_base_url: Option<String>,
     #[serde(skip_serializing, skip_deserializing, default)]
     pub runtime_artifact_embedding_api_key: Option<String>,
+    #[serde(skip, default)]
+    pub runtime_artifact_embedding_config: Option<EmbeddingConfig>,
     pub artifact_embedding_error: Option<String>,
     pub file_snapshots: Vec<FileSnapshot>,
     pub artifact_snapshots: Vec<ArtifactSnapshot>,
@@ -209,6 +215,54 @@ pub struct IndexContext {
     /// [`NoteSource::local_vault_path`]). `None` for non-filesystem sources. Carried for
     /// diagnostics; nothing on the query path reads it.
     pub vault_path: Option<PathBuf>,
+    /// Holds a committed query database until the last in-flight query releases it.
+    pub snapshot_file: Option<std::sync::Arc<IndexSnapshotFile>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct IndexSnapshotFile(PathBuf);
+impl Drop for IndexSnapshotFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+        for suffix in ["-wal", "-shm"] {
+            let mut path = self.0.as_os_str().to_os_string();
+            path.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(path));
+        }
+    }
+}
+
+/// Freeze the SQL tables as well as the in-memory metadata. Keeping an Arc of the
+/// metadata alone is insufficient: new query connections would see the next rebuild
+/// at the same filename (possibly different vectors or no vector table at all).
+pub fn freeze_search_index(mut index: SearchIndex) -> Result<SearchIndex> {
+    static SNAPSHOT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let context = index
+        .context
+        .as_mut()
+        .ok_or(IndexError::MissingIndexContext)?;
+    let parent = context
+        .index_file
+        .parent()
+        .ok_or(IndexError::MissingIndexContext)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = SNAPSHOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = parent.join(format!(
+        "runtime-snapshot-{}-{nonce}-{counter}.sqlite",
+        std::process::id()
+    ));
+    let keepalive = std::sync::Arc::new(IndexSnapshotFile(path.clone()));
+    let source = open_index_connection(&context.index_file, true)
+        .map_err(|e| IndexError::Embedding(e.to_string()))?;
+    source
+        .backup(rusqlite::DatabaseName::Main, &path, None)
+        .map_err(|e| IndexError::Embedding(e.to_string()))?;
+    context.index_file = path;
+    context.snapshot_file = Some(keepalive);
+    Ok(index)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1509,6 +1563,17 @@ pub fn same_semantic_config(
             index.semantic_backend == SemanticBackend::Embedding
                 && index.embedding_provider.as_deref() == Some(provider)
                 && index.embedding_model.as_deref() == config.model.as_deref()
+                && index
+                    .runtime_embedding_config
+                    .as_ref()
+                    .map_or(true, |runtime| {
+                        let config = config.clone().normalize();
+                        runtime.context_tokens == config.context_tokens
+                            && runtime.max_input_tokens == config.max_input_tokens
+                            && runtime.max_chars == config.max_chars
+                            && runtime.timeout_seconds == config.timeout_seconds
+                            && runtime.max_concurrency == config.max_concurrency
+                    })
         }
     }
 }
@@ -1544,6 +1609,17 @@ pub fn same_artifact_embedding_config(
             };
             index.artifact_embedding_provider.as_deref() == Some(provider)
                 && index.artifact_embedding_model.as_deref() == config.model.as_deref()
+                && index
+                    .runtime_artifact_embedding_config
+                    .as_ref()
+                    .map_or(true, |runtime| {
+                        let config = config.clone().normalize();
+                        runtime.context_tokens == config.context_tokens
+                            && runtime.max_input_tokens == config.max_input_tokens
+                            && runtime.max_chars == config.max_chars
+                            && runtime.timeout_seconds == config.timeout_seconds
+                            && runtime.max_concurrency == config.max_concurrency
+                    })
         }
     }
 }
@@ -1587,6 +1663,7 @@ fn apply_runtime_embedding_config(
         return;
     }
 
+    index.runtime_embedding_config = Some(config.clone());
     index.embedding_base_url = config
         .base_url
         .clone()
@@ -1610,6 +1687,7 @@ fn apply_runtime_artifact_embedding_config(
         return;
     }
 
+    index.runtime_artifact_embedding_config = Some(config.clone());
     index.artifact_embedding_base_url = config
         .base_url
         .clone()
@@ -1647,6 +1725,16 @@ pub fn embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> 
         .clone()
         .or_else(|| default_query_instruction_for_model(index.embedding_model.as_deref()));
 
+    if let Some(config) = &index.runtime_embedding_config {
+        let mut config = config.clone();
+        // Retain budgets without shadowing the index's current live transport.
+        config.base_url = index.embedding_base_url.clone();
+        config.model = index.embedding_model.clone();
+        config.api_key = index.runtime_embedding_api_key.clone();
+        config.query_instruction = query_instruction;
+        return Some(config.normalize());
+    }
+
     Some(
         EmbeddingConfig {
             provider: index
@@ -1673,6 +1761,13 @@ pub fn embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> 
 }
 
 pub fn artifact_embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> {
+    if let Some(config) = &index.runtime_artifact_embedding_config {
+        let mut config = config.clone();
+        config.base_url = index.artifact_embedding_base_url.clone();
+        config.model = index.artifact_embedding_model.clone();
+        config.api_key = index.runtime_artifact_embedding_api_key.clone();
+        return Some(config.normalize());
+    }
     let provider =
         index
             .artifact_embedding_provider
@@ -2334,7 +2429,11 @@ fn clear_note_embeddings(prepared: &mut PreparedNote) {
 }
 
 fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) -> Result<()> {
-    conn.execute_batch(
+    // Readers retain the previous committed schema until every table is ready.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    tx.execute_batch(
         r#"
         DROP TABLE IF EXISTS metadata;
         DROP TABLE IF EXISTS file_snapshots;
@@ -2344,6 +2443,7 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
         DROP TABLE IF EXISTS artifact_embeddings_vec;
         DROP TABLE IF EXISTS notes;
         DROP TABLE IF EXISTS chunks;
+        DROP TABLE IF EXISTS chunk_terms;
         DROP TABLE IF EXISTS artifacts;
         DROP TABLE IF EXISTS artifact_snapshots;
         DROP TABLE IF EXISTS embedding_config;
@@ -2351,15 +2451,11 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
         "#,
     )
     .map_err(|error| IndexError::Embedding(error.to_string()))?;
-    conn.execute_batch(sqlite::CURRENT_SCHEMA_DDL)
+    tx.execute_batch(sqlite::CURRENT_SCHEMA_DDL)
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
-    sqlite::recreate_vector_tables(conn, index.embedding_dimensions)
+    sqlite::recreate_vector_tables(&tx, index.embedding_dimensions)
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
-    sqlite::recreate_artifact_vector_table(conn, index.artifact_embedding_dimensions)
-        .map_err(|error| IndexError::Embedding(error.to_string()))?;
-
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
+    sqlite::recreate_artifact_vector_table(&tx, index.artifact_embedding_dimensions)
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
 
     {
@@ -2831,12 +2927,14 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
             .and_then(|value| value.parse::<usize>().ok()),
         embedding_base_url: runtime_config.get("baseUrl").cloned(),
         runtime_embedding_api_key: None,
+        runtime_embedding_config: None,
         runtime_query_instruction: None,
         artifact_embedding_provider: metadata.get("artifactEmbeddingProvider").cloned(),
         artifact_embedding_model: metadata.get("artifactEmbeddingModel").cloned(),
         artifact_embedding_dimensions,
         artifact_embedding_base_url: artifact_runtime_config.get("baseUrl").cloned(),
         runtime_artifact_embedding_api_key: None,
+        runtime_artifact_embedding_config: None,
         artifact_embedding_error: metadata.get("artifactEmbeddingError").cloned(),
         file_snapshots,
         artifact_snapshots,
@@ -2937,11 +3035,57 @@ pub fn load_index_from_file(
             index.context = Some(IndexContext {
                 index_file: index_file.to_path_buf(),
                 vault_path: vault_path.map(PathBuf::from),
+                snapshot_file: None,
             });
             Ok(Some(index))
         }
         Err(_) => Ok(None),
     }
+}
+
+/// Load a compatible committed snapshot without walking the vault. The service
+/// can serve it while a background scan verifies freshness.
+pub fn load_compatible_index_from_file(
+    index_file: &Path,
+    vault_path: Option<&Path>,
+    embedding_config: Option<&EmbeddingConfig>,
+    artifact_embedding_config: Option<&EmbeddingConfig>,
+) -> Result<Option<SearchIndex>> {
+    let Some(mut index) = load_index_from_file(index_file, vault_path)? else {
+        return if index_file.exists() {
+            Err(IndexError::IncompatibleIndex(
+                "stored index is unreadable or uses another schema version".to_string(),
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let text = normalized_embedding_config(embedding_config);
+    let artifacts = normalized_embedding_config(artifact_embedding_config);
+    // A sparse fallback built while the backend was unavailable still carries
+    // its intended provider/model; it is compatible with that same identity.
+    if index.embedding_provider.as_deref() != text.provider.as_ref().map(EmbeddingProvider::as_str)
+        || index.embedding_model.as_deref() != text.model.as_deref()
+    {
+        return Err(IndexError::IncompatibleIndex(format!(
+            "note embedding model/provider changed (indexed: {:?}/{:?}, configured: {:?}/{:?})",
+            index.embedding_provider,
+            index.embedding_model,
+            text.provider.as_ref().map(EmbeddingProvider::as_str),
+            text.model
+        )));
+    }
+    if index.artifact_embedding_provider.as_deref()
+        != artifacts.provider.as_ref().map(EmbeddingProvider::as_str)
+        || index.artifact_embedding_model.as_deref() != artifacts.model.as_deref()
+    {
+        return Err(IndexError::IncompatibleIndex(
+            "artifact embedding model/provider changed".to_string(),
+        ));
+    }
+    apply_runtime_embedding_config(&mut index, embedding_config);
+    apply_runtime_artifact_embedding_config(&mut index, artifact_embedding_config);
+    Ok(Some(index))
 }
 
 pub fn load_persisted_index_header(
@@ -3737,6 +3881,7 @@ fn refresh_index_incremental(
     loaded.context = Some(IndexContext {
         index_file: index_file.to_path_buf(),
         vault_path: source.local_vault_path().map(PathBuf::from),
+        snapshot_file: None,
     });
     apply_runtime_embedding_config(&mut loaded, embedding_config);
     apply_runtime_artifact_embedding_config(&mut loaded, artifact_embedding_config);
@@ -3944,6 +4089,9 @@ pub fn build_index_from_source_snapshots(
         } else {
             None
         },
+        runtime_embedding_config: index_config
+            .supports_embeddings()
+            .then(|| index_config.clone()),
         runtime_embedding_api_key: if index_config.supports_embeddings() {
             index_config.api_key.clone()
         } else {
@@ -3976,6 +4124,9 @@ pub fn build_index_from_source_snapshots(
         } else {
             None
         },
+        runtime_artifact_embedding_config: artifact_config
+            .supports_embeddings()
+            .then(|| artifact_config.clone()),
         runtime_artifact_embedding_api_key: if artifact_config.supports_embeddings() {
             artifact_config.api_key.clone()
         } else {
@@ -3996,6 +4147,7 @@ pub fn build_index_from_source_snapshots(
         context: Some(IndexContext {
             index_file: index_file.to_path_buf(),
             vault_path: source.local_vault_path().map(PathBuf::from),
+            snapshot_file: None,
         }),
     };
 
@@ -4593,6 +4745,74 @@ mod tests {
         let files = list_markdown_files(&root).expect("list");
         assert_eq!(files, vec!["Home.md", "Projects/Brew Service.md"]);
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rebuild_commits_without_blocking_a_reader_of_the_previous_snapshot() {
+        let root = unique_temp_dir("concurrent_rebuild");
+        write_fixture(&root, "Old.md", "# Old\nold text");
+        let old = build_index(&root, None, None).unwrap();
+        let reader = open_index_connection_for_index(&old, true).unwrap();
+        let count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        write_fixture(&root, "New.md", "# New\nnew text");
+        // The open read transaction must neither block the rebuild nor see its DDL.
+        let rebuilt = build_index(&root, None, None).unwrap();
+        assert_eq!(rebuilt.note_count, 2);
+        let paths: Vec<String> = reader
+            .prepare("SELECT path FROM notes ORDER BY path")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(paths, vec!["Old.md"]);
+        drop(reader);
+        assert_eq!(load_index(&root, None).unwrap().unwrap().note_count, 2);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn frozen_index_queries_and_file_lifetime_survive_subsequent_rebuilds() {
+        let root = unique_temp_dir("frozen_rebuild");
+        write_fixture(&root, "Old.md", "# Old\nold text");
+        let frozen = freeze_search_index(build_index(&root, None, None).unwrap()).unwrap();
+        let frozen_path = frozen.context.as_ref().unwrap().index_file.clone();
+        let clone = frozen.clone();
+        fs::remove_file(root.join("Old.md")).unwrap();
+        write_fixture(&root, "New.md", "# New\nnew text");
+        build_index(&root, None, None).unwrap();
+        let matches = crate::search::bm25_search(&frozen, "old").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, "Old.md");
+        drop(frozen);
+        assert!(
+            frozen_path.exists(),
+            "an in-flight query retains the snapshot"
+        );
+        drop(clone);
+        assert!(!frozen_path.exists(), "released generations are removed");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn failed_full_rebuild_rolls_back_its_destructive_schema_changes() {
+        let root = unique_temp_dir("rebuild_rollback");
+        write_fixture(&root, "Old.md", "# Old\nold text");
+        let mut malformed = build_index(&root, None, None).unwrap();
+        // An invalid duplicate path fails only after the old tables were dropped.
+        malformed.notes.push(malformed.notes[0].clone());
+        let mut connection = open_index_connection(&index_file_path(&root, None), false).unwrap();
+        assert!(write_search_index_to_connection(&mut connection, &malformed).is_err());
+        drop(connection);
+        let preserved = load_index(&root, None)
+            .unwrap()
+            .expect("previous index survives rollback");
+        assert_eq!(preserved.note_count, 1);
+        assert_eq!(preserved.notes[0].path, "Old.md");
         fs::remove_dir_all(root).ok();
     }
 
@@ -5216,11 +5436,27 @@ mod tests {
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
         }
-        .normalize();
+        .with_context_tokens(1024);
 
         let (loaded, rebuilt) = get_search_index(&root, None, Some(&runtime_config)).expect("load");
 
         assert!(!rebuilt);
+        let query_config = embedding_runtime_config(&loaded).unwrap();
+        assert_eq!(query_config.context_tokens, 1024);
+        assert_eq!(query_config.max_input_tokens, 716);
+        assert_eq!(query_config.effective_max_chars(), 1790);
+        let changed = runtime_config.clone().with_context_tokens(2048);
+        assert!(!same_semantic_config(&loaded, Some(&changed)));
+        let (reloaded, rebuilt) = get_search_index(&root, None, Some(&changed)).unwrap();
+        assert!(!rebuilt);
+        assert_eq!(
+            embedding_runtime_config(&reloaded).unwrap().context_tokens,
+            2048
+        );
+        // Runtime configuration (including credentials) never enters serialized index data.
+        let json = serde_json::to_string(&loaded).unwrap();
+        assert!(!json.contains("runtime-secret"));
+        assert!(!json.contains("runtime_embedding_config"));
         assert_eq!(loaded.generated_at, persisted.generated_at);
         assert_eq!(
             loaded.embedding_provider.as_deref(),
@@ -6031,12 +6267,14 @@ mod tests {
             embedding_dimensions: None,
             embedding_base_url: Some("http://unused".to_string()),
             runtime_embedding_api_key: None,
+            runtime_embedding_config: None,
             runtime_query_instruction: Some("Custom task".to_string()),
             artifact_embedding_provider: None,
             artifact_embedding_model: None,
             artifact_embedding_dimensions: None,
             artifact_embedding_base_url: None,
             runtime_artifact_embedding_api_key: None,
+            runtime_artifact_embedding_config: None,
             artifact_embedding_error: None,
             file_snapshots: Vec::new(),
             artifact_snapshots: Vec::new(),
@@ -6083,12 +6321,14 @@ mod tests {
             embedding_dimensions: None,
             embedding_base_url: Some("http://unused".to_string()),
             runtime_embedding_api_key: None,
+            runtime_embedding_config: None,
             runtime_query_instruction: None,
             artifact_embedding_provider: None,
             artifact_embedding_model: None,
             artifact_embedding_dimensions: None,
             artifact_embedding_base_url: None,
             runtime_artifact_embedding_api_key: None,
+            runtime_artifact_embedding_config: None,
             artifact_embedding_error: None,
             file_snapshots: Vec::new(),
             artifact_snapshots: Vec::new(),

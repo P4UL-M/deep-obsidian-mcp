@@ -225,6 +225,55 @@ error. With neither, no API key is sent, which supports local endpoints such as 
 This override applies only to text embeddings: `artifactEmbedding.apiKeyRef` remains
 independent so text-provider credentials are not sent to an artifact endpoint.
 
+### Embedding context size
+
+`embedding.contextTokens` is the only input-size setting. Omit it (or set it to
+`null`) for automatic discovery, or set a positive integer to override it:
+
+```json
+{
+  "embedding": {
+    "contextTokens": 1024
+  }
+}
+```
+
+In automatic mode, the service probes Ollama's `/api/show` and `/api/ps` through the
+configured endpoint, using the same API key and proxy path prefix. It uses the
+smallest known native model capacity, Modelfile `num_ctx`, and loaded context
+window. An unloaded model with no `num_ctx` is capped at 4096; if metadata is
+unavailable (including providers/proxies that only expose `/v1`), the fallback is
+**4096**. Discovery does not load a model or change Ollama's settings. Each probe
+has a three-second timeout. Successful detection is cached **6 hours**, keyed by
+model name, endpoint and credential scope. A new model or endpoint gets a fresh
+lookup immediately; expired entries are removed and the cache is bounded to 64
+entries. Fallback results are cached only **5 minutes** before retrying. The cache
+is in memory, so restarting the process performs discovery again. The startup log
+names the chosen context and its source, including fallback. Automatic values stay in memory, so config rewrites
+keep automatic mode enabled. Index refreshes renew expired metadata without
+requesting it on every indexing or search operation.
+
+An explicit `contextTokens` bypasses discovery and is used exactly as configured.
+It declares the client's input limit; it does **not** increase the server's window
+or the model's native capacity. Set it to the actual supported/allocated window.
+
+Both indexing and search derive the same budgets:
+
+- `maxInputTokens = max(1, floor(contextTokens * 0.70))`
+- `maxChars = max(1, floor(maxInputTokens * 2.5))`
+
+For 1024 this is 716 estimated tokens / 1790 characters; for 4096 it is
+2867 estimated tokens / 7167 characters. Batch request token totals also respect
+this input budget. The 30% margin accommodates tokenizer variation; character
+counting remains an estimate, not an exact token-count guarantee for every model
+and language.
+
+The old `maxInputTokens` and `maxChars` config fields are no longer accepted;
+remove them and configure only `contextTokens`. This setting is config-file only
+and survives CLI/wizard rewrites and index reloads. `artifactEmbedding` accepts
+its own independent `contextTokens` for the text search queries sent to that
+provider; it does not size or truncate binary artifact payloads.
+
 ### Embedding request limits
 
 Optionally add these fields to the existing `embedding` block in `config.json`:
@@ -307,7 +356,38 @@ deep-obsidian-mcp serve --vault ~/Vault \
 deep-obsidian-mcp serve --vault ~/Vault --auto-reindex false
 ```
 
-The `build_index` tool is still available for an explicit forced rebuild.
+`build_index` starts a forced rebuild in the background and returns immediately with
+`accepted: true` and a per-mount status (`queued`, `already_running`, or `skipped`).
+Repeated calls coalesce into one job per mount. Set `wait: true` to wait for the same
+background jobs and receive their final counts, with a five-minute deadline. A timeout
+returns `timedOut: true`; the rebuild continues and other requests remain independent.
+
+Index-backed tools and resources only read the last complete snapshot. They never scan,
+refresh, or rebuild an index as a side effect. Automatic watching and periodic refreshes
+remain controlled by `autoReindex`; when disabled, startup only loads a compatible
+persisted index and changes require an explicit `build_index` (or CLI indexing command).
+Missing indexes report `requiresBuild: true`, unless an explicit or automatic job is
+already running. Model/provider or persisted schema incompatibility is reported with an
+explicit instruction to rebuild, instead of silently embedding the vault again.
+
+`vault_info` and `obsidian://vault/info` only inspect in-memory diagnostics: `ready`,
+`indexStatus`, `refreshInFlight`, `snapshotStale`, and `lastError`. Counts are `null` before
+the first snapshot. They make no embedding or remote conflict probe, and do not claim
+that the embedding server is currently reachable. `lastSuccessfulEmbeddingAt` and
+`lastSuccessfulArtifactEmbeddingAt` report the UTC timestamps of real successful
+requests to each configured provider/endpoint/model, observed since this process started.
+They are `null` before an observed success; failed calls preserve the previous success.
+These historical values are read from memory without a network call or credential lookup.
+They do not assert current availability and are not persisted across restarts. At most
+64 backend histories are retained, evicting the oldest if more are used.
+Embedding-backed searches can still
+contact their configured model for the query itself. A failed rebuild preserves the
+previous snapshot. SQLite rebuilds replace their tables in one transaction, with WAL
+enabled so concurrent readers see a committed index.
+Each published runtime snapshot also holds a disposable SQLite copy, so a query that
+outlives a rebuild still uses the same tables and vector dimensions as its metadata.
+These copies are stored beside the index and removed when their last reader releases
+them; disk usage temporarily includes the current snapshot and any active older readers.
 
 ## Transport & stdio modes
 

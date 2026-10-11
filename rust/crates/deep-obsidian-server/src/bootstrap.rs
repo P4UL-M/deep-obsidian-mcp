@@ -360,6 +360,9 @@ fn upload_base_url(config: &ResolvedServiceConfig) -> String {
 pub async fn run_http_service(
     config: ResolvedServiceConfig,
 ) -> Result<ServiceBootstrapContext, io::Error> {
+    let config = crate::runtime::resolve_embedding_contexts(config)
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     if !matches!(config.transport, TransportMode::Http) {
         warn!(
             "HTTP service requested with non-http transport; coercing to HTTP for native runtime"

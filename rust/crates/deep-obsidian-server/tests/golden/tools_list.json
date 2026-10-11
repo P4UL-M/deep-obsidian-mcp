@@ -265,7 +265,9 @@
       "type"
     ],
     "name": "build_index",
-    "properties": [],
+    "properties": [
+      "wait"
+    ],
     "required": null
   },
   {

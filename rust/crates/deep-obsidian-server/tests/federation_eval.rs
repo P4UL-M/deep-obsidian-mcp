@@ -742,8 +742,7 @@ fn eval_embedding(base_url: &str) -> EmbeddingConfig {
         model: Some("pseudo-eval-model".to_string()),
         base_url: Some(base_url.to_string()),
         api_key_ref: None,
-        max_chars: None,
-        max_input_tokens: None,
+
         context_tokens: None,
         // Generic (non-qwen3) eval model, so queries stay plain and the rankings match
         // `retrieval_eval`'s.
@@ -773,7 +772,7 @@ impl Harness {
     /// A missing vault directory rather than a killed process or a network fault: it is the
     /// one unavailability that is reproducible on every platform with no timing in it, and it
     /// reaches the tool layer through exactly the same path a real outage would — the mount's
-    /// `fresh_snapshot` returns an error and federation records it.
+    /// `serving_snapshot` returns an error and federation records it.
     async fn with_broken_mounts(
         label: &str,
         layout: Layout,
@@ -904,11 +903,7 @@ impl Harness {
     /// config is checked before a single metric is measured.
     async fn assert_every_mount_is_embedding_backed(&self) {
         for entry in self.state.runtimes.entries() {
-            let snapshot = entry
-                .runtime
-                .fresh_snapshot("federation_eval")
-                .await
-                .expect("index snapshot");
+            let snapshot = entry.runtime.snapshot().expect("index snapshot");
             assert_eq!(
                 snapshot.index.semantic_backend,
                 deep_obsidian_index::index::SemanticBackend::Embedding,

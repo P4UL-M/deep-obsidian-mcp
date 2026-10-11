@@ -2,6 +2,42 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.2.0-alpha.7 — 2026-10-11
+
+### Changed
+
+- `embedding.contextTokens` is the single input-size setting: automatic Ollama
+  discovery or a positive explicit override, with a 4096-token fallback. Indexing
+  and search derive conservative token/character budgets from that context, and
+  batches respect the aggregate input budget. Detected capacities are cached for
+  six hours by model, endpoint and credential scope; fallback values last five
+  minutes. `artifactEmbedding` supports its own context override for text queries.
+- Indexing publishes complete snapshots in the background. Readers keep using the
+  previous snapshot while a refresh runs; SQLite views stay stable across rebuilds.
+- Search and indexed read tools no longer trigger hidden refreshes or replacement
+  embeddings. Incompatible persisted indexes report an explicit rebuild error.
+  With `autoReindex: false`, startup only loads a compatible persisted index.
+- `build_index` queues a detached, deduplicated job per mount. `wait: true` waits
+  up to five minutes; timeout or client cancellation leaves the job running.
+- `vault_info` and `obsidian://vault/info` read cached diagnostics without network
+  probes. They expose nullable `lastSuccessfulEmbeddingAt` and
+  `lastSuccessfulArtifactEmbeddingAt`, updated only by successful real embedding
+  requests. These timestamps are historical observations, reset on restart.
+
+### Compatibility
+
+- Remove the old `maxInputTokens` and `maxChars` configuration fields and use
+  `contextTokens`. An override limits client inputs; it does not enlarge the
+  model's server-side context window.
+- `vault_info` no longer probes embedding availability or remote conflicts.
+  Use the dedicated divergence tools for conflict details. Configured watchers
+  and periodic automatic indexing remain available.
+
+### Validation
+
+- The completed workspace run passed 870 tests, with no failures and seven
+  ignored tests. No local test rerun was performed for this release preparation.
+
 ## v0.2.0-alpha.6 — 2026-10-10
 
 ### Added

@@ -121,14 +121,8 @@ pub struct EmbeddingConfig {
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_ref: Option<SecretRef>,
-    /// Hard per-input character ceiling (default applied if unset).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_chars: Option<usize>,
-    /// Per-input token budget (default applied if unset).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_input_tokens: Option<usize>,
-    /// Backend context window in tokens; must match the embedding server's
-    /// allocated `num_ctx` (default applied if unset).
+    /// Context token override. When unset, discover the backend/model context
+    /// automatically; input and character budgets are derived from this value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<usize>,
     /// Optional query-side task instruction for instruction-tuned embedding models
@@ -155,10 +149,6 @@ pub struct EmbeddingConfigInput {
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_ref: Option<SecretRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_chars: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_input_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]

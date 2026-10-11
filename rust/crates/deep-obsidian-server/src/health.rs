@@ -335,12 +335,9 @@ fn mount_count(summary: &MountIndexSummary, key: &str) -> u64 {
 ///
 /// # Why a lone remote mount deserves the detail
 ///
-/// `mounts[]` is where a caller finds a mount's `capabilities` and, on a couchdb mount,
-/// its `conflictedCount`. Withholding it from a single-mount fully-remote vault would
-/// mean a LiveSync vault with no filesystem mount beside it had NO surface at all for
-/// unreconciled sibling revisions, and no way to discover that `note_history` and
-/// `delete_note` work on it — for the sole reason that the operator did not also mount a
-/// local folder. That is an accident of the old restriction, not a decision.
+/// `mounts[]` exposes a remote mount's declared capabilities and index diagnostics,
+/// including support for `note_history` and `delete_note`. These are useful even
+/// when the vault has no filesystem mount.
 ///
 /// # Why no golden can move
 ///
@@ -524,6 +521,63 @@ pub fn build_vault_overview_payload(
         json!(config.auto_reindex.interval_ms),
     );
     Value::Object(payload)
+}
+
+fn last_embedding_success(config: &deep_obsidian_types::EmbeddingConfig) -> Option<String> {
+    let provider = match config.provider.as_ref()? {
+        deep_obsidian_types::EmbeddingProvider::OpenAiCompatible => "openai-compatible",
+    };
+    deep_obsidian_index::embedding_activity::last_successful_embedding_at(
+        provider,
+        config.base_url.as_deref()?,
+        config.model.as_deref()?,
+    )
+}
+
+/// The overview is a read of in-memory state, including during the first build.
+pub fn build_runtime_vault_overview_payload(
+    config: &ResolvedServiceConfig,
+    runtime: &std::sync::Arc<crate::runtime::RuntimeState>,
+) -> Value {
+    let diagnostics = runtime.diagnostics();
+    let mut payload = if let Some(snapshot) = &diagnostics.snapshot {
+        build_vault_overview_payload(config, snapshot)
+    } else {
+        json!({
+            "vaultPath": root_location(config),
+            "markdownFileCount": null, "noteCount": null, "chunkCount": null,
+            "indexGeneratedAt": null, "rebuilt": false,
+            "autoReindex": config.auto_reindex.enabled,
+        })
+    };
+    let object = payload.as_object_mut().expect("overview object");
+    object.insert(
+        "lastSuccessfulEmbeddingAt".to_string(),
+        json!(last_embedding_success(&config.embedding)),
+    );
+    object.insert(
+        "lastSuccessfulArtifactEmbeddingAt".to_string(),
+        json!(last_embedding_success(&config.artifact_embedding)),
+    );
+    object.insert("ready".to_string(), json!(diagnostics.snapshot.is_some()));
+    object.insert(
+        "indexStatus".to_string(),
+        json!(diagnostics.status.as_str()),
+    );
+    object.insert(
+        "refreshInFlight".to_string(),
+        json!(diagnostics.refresh_in_flight),
+    );
+    let freshness = runtime.freshness_diagnostics();
+    object.insert(
+        "snapshotStale".to_string(),
+        json!(freshness.snapshot_stale || diagnostics.refresh_in_flight),
+    );
+    insert_runtime_diagnostics(object, &diagnostics);
+    // Last-refresh timestamps are exposed by health/readiness; the overview already
+    // carries indexGeneratedAt. Keep the overview stable when a check finds no changes.
+    object.remove("lastRefresh");
+    payload
 }
 
 #[cfg(test)]

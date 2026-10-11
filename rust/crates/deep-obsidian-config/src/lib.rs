@@ -861,8 +861,7 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
             model: config.embedding.model.clone(),
             base_url: config.embedding.base_url.clone(),
             api_key_ref: config.embedding.api_key_ref.clone(),
-            max_chars: config.embedding.max_chars,
-            max_input_tokens: config.embedding.max_input_tokens,
+
             context_tokens: config.embedding.context_tokens,
             query_instruction: config.embedding.query_instruction.clone(),
             max_concurrency: config.embedding.max_concurrency,
@@ -880,8 +879,7 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
                 model: config.artifact_embedding.model.clone(),
                 base_url: config.artifact_embedding.base_url.clone(),
                 api_key_ref: config.artifact_embedding.api_key_ref.clone(),
-                max_chars: config.artifact_embedding.max_chars,
-                max_input_tokens: config.artifact_embedding.max_input_tokens,
+
                 context_tokens: config.artifact_embedding.context_tokens,
                 query_instruction: config.artifact_embedding.query_instruction.clone(),
                 max_concurrency: config.artifact_embedding.max_concurrency,
@@ -1106,6 +1104,11 @@ fn normalize_embedding_input(
             "timeoutSeconds must be greater than zero",
         ));
     }
+    if input.context_tokens == Some(0) {
+        return Err(ConfigError::InvalidEmbedding(
+            "contextTokens must be greater than zero",
+        ));
+    }
     let provider = match input.provider {
         Some(EmbeddingProvider::OpenAiCompatible) => Some(EmbeddingProvider::OpenAiCompatible),
         None if input.model.is_some()
@@ -1122,8 +1125,7 @@ fn normalize_embedding_input(
         model: trim_optional(input.model),
         base_url: trim_optional(input.base_url),
         api_key_ref: input.api_key_ref,
-        max_chars: input.max_chars,
-        max_input_tokens: input.max_input_tokens,
+
         context_tokens: input.context_tokens,
         query_instruction: trim_optional(input.query_instruction),
         max_concurrency: input.max_concurrency,
@@ -1250,14 +1252,22 @@ mod tests {
             let path = root.join(format!("config.{extension}"));
             let input: PersistedServiceConfig = serde_json::from_value(serde_json::json!({
                 "vaultPath": root,
-                "embedding": { "maxConcurrency": 1, "timeoutSeconds": 180 },
-                "artifactEmbedding": { "maxConcurrency": 2, "timeoutSeconds": 90 }
+                "embedding": { "contextTokens": 1024, "maxConcurrency": 1, "timeoutSeconds": 180 },
+                "artifactEmbedding": { "contextTokens": 2048, "maxConcurrency": 2, "timeoutSeconds": 90 }
             }))
             .unwrap();
             let resolved = normalize_persisted_config(input).unwrap();
             write_config_file(&path, &resolved).unwrap();
             let loaded = read_config_file(&path).unwrap().unwrap();
             let resolved = normalize_persisted_config(loaded).unwrap();
+            assert_eq!(
+                resolved.embedding.as_ref().unwrap().context_tokens,
+                Some(1024)
+            );
+            assert_eq!(
+                resolved.artifact_embedding.as_ref().unwrap().context_tokens,
+                Some(2048)
+            );
             assert_eq!(
                 resolved.embedding.as_ref().unwrap().max_concurrency,
                 Some(1)
@@ -1293,7 +1303,7 @@ mod tests {
     #[test]
     fn embedding_request_settings_reject_zero_and_negative_values() {
         for section in ["embedding", "artifactEmbedding"] {
-            for field in ["maxConcurrency", "timeoutSeconds"] {
+            for field in ["contextTokens", "maxConcurrency", "timeoutSeconds"] {
                 let input: PersistedServiceConfig = serde_json::from_value(serde_json::json!({
                     "vaultPath": "/tmp/vault", section: { field: 0 }
                 }))
@@ -1309,6 +1319,17 @@ mod tests {
                     .is_err()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn obsolete_embedding_size_settings_are_rejected_instead_of_ignored() {
+        for field in ["maxInputTokens", "maxChars"] {
+            let error = serde_json::from_value::<PersistedServiceConfig>(serde_json::json!({
+                "vaultPath": "/tmp/vault", "embedding": {field: 1024}
+            }))
+            .unwrap_err();
+            assert!(error.to_string().contains(field));
         }
     }
 

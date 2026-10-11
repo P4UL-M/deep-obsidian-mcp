@@ -4,7 +4,7 @@
   "result": {
     "content": [
       {
-        "text": "{\n  \"autoReindex\": false,\n  \"chunkCount\": 4,\n  \"indexGeneratedAt\": \"<TIMESTAMP>\",\n  \"markdownFileCount\": 3,\n  \"noteCount\": 3,\n  \"rebuilt\": \"<BOOL>\",\n  \"reindexDebounceMs\": 0,\n  \"reindexIntervalMs\": 0,\n  \"semanticBackend\": \"sparse\",\n  \"storageBackend\": \"sqlite\",\n  \"vaultPath\": \"<VAULT>\",\n  \"vectorSearchBackend\": \"sparse-terms\"\n}",
+        "text": "{\n  \"autoReindex\": false,\n  \"chunkCount\": 4,\n  \"indexGeneratedAt\": \"<TIMESTAMP>\",\n  \"indexStatus\": \"ready\",\n  \"lastSuccessfulArtifactEmbeddingAt\": null,\n  \"lastSuccessfulEmbeddingAt\": null,\n  \"markdownFileCount\": 3,\n  \"noteCount\": 3,\n  \"ready\": true,\n  \"rebuilt\": \"<BOOL>\",\n  \"refreshInFlight\": false,\n  \"reindexDebounceMs\": 0,\n  \"reindexIntervalMs\": 0,\n  \"semanticBackend\": \"sparse\",\n  \"snapshotStale\": false,\n  \"storageBackend\": \"sqlite\",\n  \"vaultPath\": \"<VAULT>\",\n  \"vectorSearchBackend\": \"sparse-terms\"\n}",
         "type": "text"
       }
     ],
@@ -12,12 +12,18 @@
       "autoReindex": false,
       "chunkCount": 4,
       "indexGeneratedAt": "<TIMESTAMP>",
+      "indexStatus": "ready",
+      "lastSuccessfulArtifactEmbeddingAt": null,
+      "lastSuccessfulEmbeddingAt": null,
       "markdownFileCount": 3,
       "noteCount": 3,
+      "ready": true,
       "rebuilt": "<BOOL>",
+      "refreshInFlight": false,
       "reindexDebounceMs": 0,
       "reindexIntervalMs": 0,
       "semanticBackend": "sparse",
+      "snapshotStale": false,
       "storageBackend": "sqlite",
       "vaultPath": "<VAULT>",
       "vectorSearchBackend": "sparse-terms"

@@ -92,11 +92,20 @@ fn send_message(stdout: &mut impl Write, message: &Value, mode: StdioMode) -> io
 }
 
 pub async fn run_stdio_service(config: ResolvedServiceConfig) -> io::Result<()> {
+    let config = crate::runtime::resolve_embedding_contexts(config)
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     // Built once and shared; see `crate::mounts`.
     let backends = MountBackends::build(&config);
-    let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends)
-        .await
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    // Keep invalid local-root paths fail-fast, without waiting for embeddings to
+    // finish before answering initialize or vault_info.
+    if let Some(vault_path) = config.vault_path.as_deref() {
+        deep_obsidian_index::index::ensure_vault_path(vault_path)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    }
+    let runtimes = MountRuntimes::new(&config, &backends);
+    let _initial_refresh = runtimes.start_initial_refresh();
+    let _auto_reindex = runtimes.start_auto_reindex();
     let state = AppState::with_backends(config.clone(), runtimes, &backends);
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();

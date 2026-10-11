@@ -7,7 +7,7 @@ use deep_obsidian_core::text::{extract_block_sections, extract_heading_sections}
 use serde_json::json;
 use urlencoding::decode;
 
-use crate::health::{build_vault_overview_payload, insert_mount_index_detail};
+use crate::health::{build_runtime_vault_overview_payload, insert_mount_index_detail};
 use crate::mcp::AppState;
 use crate::protocol::{
     ResourceContents, ResourceDefinition, ResourceListResult, ResourceReadResult,
@@ -132,38 +132,27 @@ fn note_resource(path: &str) -> ResourceDefinition {
 /// ranked recall.
 ///
 /// Its failure is fatal to the listing by name, on the same terms as an indexed mount's.
-async fn all_logical_note_paths(state: &AppState, reason: &str) -> Result<Vec<String>, String> {
+async fn all_logical_note_paths(state: &AppState) -> Result<Vec<String>, String> {
     let mut paths: Vec<String> = Vec::new();
-    for entry in state.runtimes.entries() {
-        let snapshot = entry
-            .runtime
-            .fresh_snapshot(reason)
-            .await
-            .map_err(|error| {
-                if entry.is_root() {
-                    error
-                } else {
-                    format!("mount '{}' cannot be listed: {error}", entry.id)
-                }
-            })?;
-        paths.extend(
-            snapshot
-                .index
-                .file_snapshots
-                .iter()
-                // Index paths are mount-relative; the identity for the root mount.
-                .map(|file| {
-                    if entry.mount_at.is_empty() {
-                        file.path.clone()
-                    } else {
-                        format!("{}/{}", entry.mount_at, file.path)
-                    }
-                }),
-        );
-    }
     for mount in state.router.mounts() {
-        if state.runtimes.for_mount(&mount.id).is_some() {
-            continue;
+        if let Some(runtime) = state.runtimes.for_mount(&mount.id) {
+            match runtime.serving_snapshot() {
+                Ok(snapshot) => {
+                    paths.extend(
+                        snapshot
+                            .index
+                            .file_snapshots
+                            .iter()
+                            .map(|file| mount.to_logical(&file.path)),
+                    );
+                    continue;
+                }
+                // Enumeration has a live backend fallback before the first index.
+                Err(error) if error == crate::runtime::INDEX_LOADING_MESSAGE => {}
+                Err(error) => {
+                    return Err(format!("mount '{}' cannot be listed: {error}", mount.id))
+                }
+            }
         }
         let notes = mount
             .backend
@@ -182,7 +171,7 @@ async fn all_logical_note_paths(state: &AppState, reason: &str) -> Result<Vec<St
 }
 
 pub async fn list_resources(state: &AppState) -> Result<ResourceListResult, String> {
-    let note_paths = all_logical_note_paths(state, "resources/list").await?;
+    let note_paths = all_logical_note_paths(state).await?;
     let note_count = note_paths.len();
     let listed_count = note_count.min(NOTE_RESOURCE_LIST_LIMIT);
 
@@ -335,10 +324,8 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
         // `tools::root_index`. An algolia-rooted vault has no root index and this
         // resource is index-derived, so refusing is the only true answer; its per-mount
         // detail is still reachable through `vault_info`'s `mounts[]`.
-        let snapshot = crate::tools::root_index(state, "the vault overview resource")?
-            .fresh_snapshot("resources/read:vault-info")
-            .await?;
-        let mut payload = build_vault_overview_payload(&state.config, &snapshot);
+        let runtime = crate::tools::root_index(state, "the vault overview resource")?;
+        let mut payload = build_runtime_vault_overview_payload(&state.config, &runtime);
         // Additive, multi-mount only: the counts above are the ROOT mount's, so make
         // them cover the whole logical vault and report each mount's own state.
         insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
@@ -355,7 +342,7 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadRe
     if uri == NOTES_INDEX_URI {
         // Every mount, in one globally sorted list of logical paths. See
         // `all_logical_note_paths` for why enumeration federates and ranking does not.
-        let note_paths = all_logical_note_paths(state, "resources/read:notes-index").await?;
+        let note_paths = all_logical_note_paths(state).await?;
         let notes = note_paths
             .iter()
             .map(|path| {

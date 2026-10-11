@@ -21,7 +21,7 @@ use regex::RegexBuilder;
 use serde_json::{json, Map, Value};
 
 use crate::federation;
-use crate::health::{build_vault_overview_payload, insert_mount_index_detail};
+use crate::health::{build_runtime_vault_overview_payload, insert_mount_index_detail};
 use crate::mcp::AppState;
 use crate::protocol::{ToolCallResult, ToolContent, ToolDefinition};
 use crate::resources::{artifact_uri, block_uri, heading_uri, note_name, note_uri};
@@ -983,7 +983,7 @@ fn insert_capability_tools(definitions: &mut Vec<ToolDefinition>, capabilities: 
         annotations: Some(tool_annotations(true, None, None)),
         execution: Some(json!({"taskSupport":"forbidden"})),
         input_schema: object_schema(
-            vec![("path", json!({"type":"string","description":"Logical vault-relative note path whose hasDivergence is set (vault_info.mounts[].conflictedPaths lists them)."}))],
+            vec![("path", json!({"type":"string","description":"Logical vault-relative note path whose hasDivergence is set."}))],
             vec!["path"],
         ),
     });
@@ -1288,10 +1288,10 @@ fn tool_definitions(
         },
         ToolDefinition {
             name: "build_index".to_string(),
-            description: "Force a rebuild of the local chunk index used for semantic and related-note search.".to_string(),
+            description: "Start an index rebuild in the background. Set wait:true to await completion for up to 5 minutes; a timeout leaves the rebuild running. Poll vault_info for refreshInFlight and lastError; searches keep using the previous index.".to_string(),
             annotations: Some(tool_annotations(false, Some(false), Some(true))),
             execution: Some(json!({"taskSupport":"forbidden"})),
-            input_schema: object_schema(vec![], vec![]),
+            input_schema: object_schema(vec![("wait", json!({"type":"boolean","default":false,"description":"Wait up to 5 minutes for the background rebuild. On timeout it continues running."}))], vec![]),
         },
         ToolDefinition {
             name: "hybrid_search".to_string(),
@@ -1792,8 +1792,6 @@ impl FederatedRecallMount {
 struct FederatedRecallSource<'a> {
     mounts: &'a mut Vec<FederatedRecallMount>,
     query: String,
-    /// The refresh reason recorded against a local mount's index snapshot.
-    reason: &'static str,
     retrieval: FederatedRetrieval,
 }
 
@@ -1817,7 +1815,6 @@ impl federation::CandidateSource for FederatedRecallSource<'_> {
         page_size: usize,
     ) -> Result<federation::CandidatePage, String> {
         let query = self.query.clone();
-        let reason = self.reason;
         let plan = match &self.mounts[list_index].kind {
             FederatedRecallKind::Local { runtime, queried } => {
                 if *queried {
@@ -1845,7 +1842,7 @@ impl federation::CandidateSource for FederatedRecallSource<'_> {
                 exhausted,
             }),
             FederatedFetchPlan::Local(runtime) => {
-                let snapshot = runtime.fresh_snapshot(reason).await?;
+                let snapshot = runtime.serving_snapshot()?;
                 let index = snapshot.index.clone();
                 let mount_index = list_index;
                 let count = match self.retrieval {
@@ -2068,7 +2065,6 @@ fn federated_recall_mounts(
 /// `search_artifacts` render the same fused list three different ways.
 async fn federated_recall(
     state: &AppState,
-    reason: &'static str,
     retrieval: FederatedRetrieval,
     query: &str,
     limit: usize,
@@ -2077,7 +2073,6 @@ async fn federated_recall(
     let mut source = FederatedRecallSource {
         mounts: &mut mounts,
         query: query.to_string(),
-        reason,
         retrieval,
     };
     // Fused to the RERANK WINDOW rather than to `limit`: the rerank can only reorder what it
@@ -2523,14 +2518,8 @@ async fn federated_hybrid_search_payload(
     limit: usize,
     options: TextPayloadOptions,
 ) -> Result<Value, String> {
-    let (mut outcome, mounts) = federated_recall(
-        state,
-        "hybrid_search",
-        FederatedRetrieval::Chunks,
-        query,
-        limit,
-    )
-    .await;
+    let (mut outcome, mounts) =
+        federated_recall(state, FederatedRetrieval::Chunks, query, limit).await;
     let rerank = finish_federated_recall(state, &mut outcome, &mounts, query, limit).await;
     let mut match_values = federated_matches_json(&outcome, &mounts, options);
     let response_truncated =
@@ -2606,14 +2595,8 @@ async fn federated_search_artifacts_payload(
     query: &str,
     limit: usize,
 ) -> Result<Value, String> {
-    let (mut outcome, mounts) = federated_recall(
-        state,
-        "search_artifacts",
-        FederatedRetrieval::Artifacts,
-        query,
-        limit,
-    )
-    .await;
+    let (mut outcome, mounts) =
+        federated_recall(state, FederatedRetrieval::Artifacts, query, limit).await;
     // Artifacts go through the same rerank, but on a WEAKER signal than chunks do, and the
     // difference is worth knowing rather than discovering.
     //
@@ -2703,14 +2686,8 @@ async fn federated_load_knowledge_payload(
         .flatten()
         .collect::<Vec<_>>()
         .join(" ");
-    let (mut outcome, mounts) = federated_recall(
-        state,
-        "load_knowledge",
-        FederatedRetrieval::Chunks,
-        &query,
-        limit_chunks,
-    )
-    .await;
+    let (mut outcome, mounts) =
+        federated_recall(state, FederatedRetrieval::Chunks, &query, limit_chunks).await;
     let rerank = finish_federated_recall(state, &mut outcome, &mounts, &query, limit_chunks).await;
 
     let mut chunks = federated_matches_json(&outcome, &mounts, options);
@@ -2772,7 +2749,7 @@ async fn federated_load_knowledge_payload(
         if let Some(top) = outcome.hits.first() {
             if let Some(runtime) = state.runtimes.for_mount(&top.mount_id) {
                 let mount = mounts.iter().find(|mount| mount.id == top.mount_id);
-                let snapshot = runtime.fresh_snapshot("load_knowledge").await?;
+                let snapshot = runtime.serving_snapshot()?;
                 // The graph is addressed in the mount's OWN namespace, so the fused
                 // logical path has to be stripped back down before the traversal and
                 // re-prefixed on the way out.
@@ -3455,13 +3432,6 @@ fn sum_mount_field(mounts: &[Value], key: &str) -> u64 {
         .sum()
 }
 
-/// Merge each mount's declared capabilities into a `mounts` array that
-/// [`insert_mount_index_detail`] has already placed in `payload`.
-///
-/// The two halves of a mount's description come from two places — the backend
-/// declares what it can do, the runtime reports how its index is doing — and
-/// `vault_info` is the one payload that wants both, so they are joined here rather
-/// than either side reaching into the other.
 fn insert_mount_capabilities(payload: &mut Value, router: &deep_obsidian_backend::VaultRouter) {
     let Some(mounts) = payload
         .as_object_mut()
@@ -3486,104 +3456,6 @@ fn insert_mount_capabilities(payload: &mut Value, router: &deep_obsidian_backend
                 "capabilities".to_string(),
                 json!(mount.backend.descriptor().capabilities),
             );
-        }
-    }
-}
-
-/// Cap on the conflicted paths named in a `vault_info` payload.
-///
-/// The COUNT is always exact; only the list is truncated. A vault with hundreds of
-/// conflicts has a systemic sync problem, and the right answer to it is "you have 412
-/// conflicts, here are the first few", not a payload the size of the manifest.
-const MAX_REPORTED_CONFLICTED_PATHS: usize = 20;
-
-/// Join each mount's conflicted-entry report into the `mounts` array.
-///
-/// # Why here, and why nowhere else
-///
-/// A LiveSync entry can have sibling revisions that CouchDB has not reconciled — two
-/// devices edited the same note offline. Reads serve the winning revision, which is
-/// correct but hides the fact that a losing edit exists. Somewhere has to say so.
-///
-/// It goes in `vault_info.mounts[]` and not in a read payload for two reasons. The read
-/// payloads (`read_file`, `list_children`, `resources/read`) are frozen by the
-/// single-mount goldens, and widening one would change bytes a client already depends
-/// on. And `mounts[]` is purely additive, appearing only where no golden describes the
-/// payload — see [`crate::health::insert_mount_index_detail`], which places the array
-/// this joins onto and owns that condition. Note that "no golden describes it" is no
-/// longer the same as "multi-mount": a couchdb mount CAN now be the only mount in a
-/// table, because it can be the root, and such a vault does get this report.
-///
-/// It is best-effort: a mount whose remote is unreachable contributes NO field rather
-/// than an error or a zero. Reporting `conflictedCount: 0` for a vault nobody could
-/// reach would be a lie, and failing `vault_info` because of it would break the one
-/// tool a user runs to find out what is wrong.
-///
-/// The conflicted flag rides on manifest entries that a listing already collects, so on
-/// a warm mount this costs no extra round trip.
-async fn insert_mount_conflicts(payload: &mut Value, router: &deep_obsidian_backend::VaultRouter) {
-    let mut reports: HashMap<String, (usize, Vec<String>)> = HashMap::new();
-    for mount in router.mounts() {
-        match mount.backend.conflicted_paths().await {
-            // The backend's storage has no sibling-version notion, so there is nothing
-            // to report and no field to add. See `VaultBackend::conflicted_paths` for
-            // why that is distinct from "zero conflicts".
-            Ok(None) => {}
-            Ok(Some(paths)) => {
-                let total = paths.len();
-                let logical = paths
-                    .iter()
-                    .take(MAX_REPORTED_CONFLICTED_PATHS)
-                    // Rendered in the LOGICAL namespace, because that is the only
-                    // namespace a client can act on.
-                    .map(|path| mount.to_logical(path))
-                    .collect();
-                if total > 0 {
-                    tracing::warn!(
-                        "mount '{}' has {total} entr{} with unreconciled conflict revisions; \
-                         reads serve the winning revision and the losing edits are not visible \
-                         in it",
-                        mount.id,
-                        if total == 1 { "y" } else { "ies" }
-                    );
-                }
-                reports.insert(mount.id.clone(), (total, logical));
-            }
-            Err(error) => {
-                tracing::debug!(
-                    "could not collect conflicted paths for mount '{}': {error}",
-                    mount.id
-                );
-            }
-        }
-    }
-    if reports.is_empty() {
-        return;
-    }
-
-    let Some(mounts) = payload
-        .as_object_mut()
-        .and_then(|object| object.get_mut("mounts"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    for entry in mounts.iter_mut() {
-        let Some(object) = entry.as_object_mut() else {
-            continue;
-        };
-        let Some((total, paths)) = object
-            .get("id")
-            .and_then(Value::as_str)
-            .and_then(|id| reports.get(id))
-        else {
-            continue;
-        };
-        object.insert("conflictedCount".to_string(), json!(total));
-        // Named only when there ARE any, so a healthy mount does not carry an empty
-        // array a reader has to interpret.
-        if *total > 0 {
-            object.insert("conflictedPaths".to_string(), json!(paths));
         }
     }
 }
@@ -4058,7 +3930,45 @@ async fn hybrid_search_matches(
     .map_err(|error| error.to_string())?
 }
 
+/// Only an explicit build_index wait can await writers. Dropping this future
+/// never cancels the detached jobs.
+async fn wait_for_index_jobs(state: &AppState, timeout: std::time::Duration) -> bool {
+    tokio::time::timeout(timeout, async {
+        while state
+            .runtimes
+            .entries()
+            .iter()
+            .any(|entry| entry.runtime.diagnostics().refresh_in_flight)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 pub async fn call_tool(
+    state: &AppState,
+    name: &str,
+    arguments: &Value,
+) -> Result<ToolCallResult, String> {
+    match call_tool_inner(state, name, arguments).await {
+        Err(error) if error == crate::runtime::INDEX_LOADING_MESSAGE => {
+            let diagnostics = state.runtimes.aggregate_diagnostics();
+            let mut payload = json!({
+                "ready": false, "indexStatus": diagnostics.status.as_str(), "retryable": diagnostics.refresh_in_flight, "requiresBuild": !diagnostics.refresh_in_flight, "message": error,
+            });
+            if let Some(last_error) = diagnostics.last_error {
+                payload["lastError"] =
+                    json!({"message": last_error.message, "reason": last_error.reason});
+            }
+            Ok(json_text_result(payload))
+        }
+        result => result,
+    }
+}
+
+async fn call_tool_inner(
     state: &AppState,
     name: &str,
     arguments: &Value,
@@ -4066,44 +3976,11 @@ pub async fn call_tool(
     let config = state.config.as_ref();
     match name {
         "vault_info" => {
-            let snapshot = root_index(state, "vault_info")?
-                .fresh_snapshot("vault_info")
-                .await?;
-            let mut payload = build_vault_overview_payload(config, &snapshot);
-            // Non-fatal live health probe for the note embedding backend. vault_info must
-            // never error when the backend is down — it reports the status as a field.
-            // The probe is a bounded blocking HTTP call, so run it off the async runtime.
-            let probe_index = snapshot.index.clone();
-            let health = tokio::task::spawn_blocking(move || {
-                index_search::probe_embedding_backend(probe_index.as_ref())
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-            // Additive and multi-mount ONLY. A single-mount config (legacy
-            // `vaultPath` or one explicit root mount) must render byte-identically
-            // to the frozen golden, so the fields are absent rather than
-            // one-element arrays. `build_vault_overview_payload` is deliberately NOT
-            // the place for this: it also feeds the `obsidian://vault/info` resource
-            // and both health payloads, which add the same detail themselves.
-            //
-            // The counts above describe the ROOT mount's index; this makes them
-            // cover the whole logical vault and adds each mount's own numbers.
+            let runtime = root_index(state, "vault_info")?;
+            // Informational only: no index refresh, embed probe or remote walk.
+            let mut payload = build_runtime_vault_overview_payload(config, &runtime);
             insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
             insert_mount_capabilities(&mut payload, state.router.as_ref());
-            insert_mount_conflicts(&mut payload, state.router.as_ref()).await;
-            if let Some(object) = payload.as_object_mut() {
-                match health {
-                    // Sparse backend: nothing to probe, so omit the status field entirely.
-                    index_search::EmbeddingBackendHealth::NotApplicable => {}
-                    index_search::EmbeddingBackendHealth::Reachable => {
-                        object.insert("embeddingBackendStatus".to_string(), json!("reachable"));
-                    }
-                    index_search::EmbeddingBackendHealth::Unreachable(reason) => {
-                        object.insert("embeddingBackendStatus".to_string(), json!("unreachable"));
-                        object.insert("embeddingBackendError".to_string(), json!(reason));
-                    }
-                }
-            }
             Ok(json_text_result(payload))
         }
         "list_children" => {
@@ -4450,12 +4327,51 @@ pub async fn call_tool(
             ))
         }
         "build_index" => {
-            // Every mount, sequentially. `build_index` is the one recall-adjacent tool
-            // that needs no scope: rebuilding is exhaustive by nature, so doing all
-            // mounts is the complete answer rather than a merge of partial ones.
-            let root_snapshot = root_index(state, "build_index")?
-                .rebuild("manual build_index")
-                .await?;
+            if let Some(value) = arguments.get("wait") {
+                if !value.is_boolean() {
+                    return Err("wait must be a boolean".to_string());
+                }
+            }
+            // Validate before scheduling anything, including the no-root-index case.
+            root_index(state, "build_index")?;
+            let mut mounts = Vec::new();
+            for entry in state.runtimes.entries() {
+                let scheduled = entry.runtime.request_rebuild("manual build_index");
+                mounts.push(json!({"id": entry.id, "mountAt": entry.mount_at,
+                    "status": if scheduled { "queued" } else { "already_running" },
+                    "ready": entry.runtime.diagnostics().snapshot.is_some()}));
+            }
+            for mount in state.router.mounts() {
+                if state.runtimes.for_mount(&mount.id).is_none() {
+                    mounts.push(json!({"id": mount.id, "mountAt": mount.mount_at, "status": "skipped", "reason": "backend has no local index"}));
+                }
+            }
+            let mut accepted = json!({"accepted": true, "status": "indexing", "mounts": mounts,
+                "message": "Rebuild runs in the background. Poll vault_info for refreshInFlight and lastError."});
+            if !bool_arg(arguments, "wait", false) {
+                return Ok(json_text_result(accepted));
+            }
+            if !wait_for_index_jobs(state, std::time::Duration::from_secs(300)).await {
+                accepted["timedOut"] = json!(true);
+                accepted["message"] = json!("Wait timed out after 5 minutes; rebuild continues in the background. Poll vault_info.");
+                return Ok(json_text_result(accepted));
+            }
+            let failed_jobs = state
+                .runtimes
+                .entries()
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .runtime
+                        .diagnostics()
+                        .last_error
+                        .map(|error| format!("'{}': {}", entry.id, error.message))
+                })
+                .collect::<Vec<_>>();
+            if !failed_jobs.is_empty() {
+                return Err(format!("build_index failed for {}", failed_jobs.join("; ")));
+            }
+            let root_snapshot = root_index(state, "build_index")?.snapshot()?;
             let mut mount_results = Vec::new();
             let mut failures = Vec::new();
             for entry in state.runtimes.entries() {
@@ -4467,7 +4383,7 @@ pub async fn call_tool(
                     ));
                     continue;
                 }
-                match entry.runtime.rebuild("manual build_index").await {
+                match entry.runtime.snapshot() {
                     Ok(snapshot) => mount_results.push(build_index_mount_json(
                         &entry.id,
                         &entry.mount_at,
@@ -4611,7 +4527,7 @@ pub async fn call_tool(
             let semantic_weight = clamped_f64_arg(arguments, "semanticWeight", 1.0, 0.0, 1.0);
             let bm25_weight = clamped_f64_arg(arguments, "bm25Weight", 1.0, 0.0, 1.0);
             let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
-            let snapshot = scoped.runtime.fresh_snapshot("hybrid_search").await?;
+            let snapshot = scoped.runtime.serving_snapshot()?;
             let index = snapshot.index;
             let outcome = hybrid_search_matches(
                 index.clone(),
@@ -4693,7 +4609,7 @@ pub async fn call_tool(
                     )
                 }
             };
-            let snapshot = scoped.runtime.fresh_snapshot("search_artifacts").await?;
+            let snapshot = scoped.runtime.serving_snapshot()?;
             let matches = artifact_search_matches(snapshot.index, query.clone(), limit).await?;
             Ok(json_text_result_from_arguments(
                 arguments,
@@ -4717,7 +4633,7 @@ pub async fn call_tool(
             // Served by whichever mount owns the path, from that mount's index.
             let (scoped, mount_path) = resolve_recall_path(state, "related_notes", &path)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
-            let snapshot = scoped.runtime.fresh_snapshot("related_notes").await?;
+            let snapshot = scoped.runtime.serving_snapshot()?;
             let index = snapshot.index;
             let matches = index_search::related_notes_with_options(
                 &index,
@@ -4748,7 +4664,7 @@ pub async fn call_tool(
             .unwrap_or_else(|| "both".to_string());
             let depth = clamped_usize_arg(arguments, "depth", 1, 1, 6);
             let limit = clamped_usize_arg(arguments, "limit", 100, 1, 500);
-            let snapshot = scoped.runtime.fresh_snapshot("graph_traverse").await?;
+            let snapshot = scoped.runtime.serving_snapshot()?;
             let index = snapshot.index;
             let graph_direction = match direction.as_str() {
                 "incoming" => index_graph::GraphDirection::Incoming,
@@ -4857,7 +4773,7 @@ pub async fn call_tool(
             };
             let graph_depth = clamped_usize_arg(arguments, "graphDepth", 1, 1, 3);
             let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
-            let snapshot = scoped.runtime.fresh_snapshot("load_knowledge").await?;
+            let snapshot = scoped.runtime.serving_snapshot()?;
             let index = snapshot.index;
             let query = [Some(subject.clone()), project.clone()]
                 .into_iter()
@@ -5037,9 +4953,7 @@ pub async fn call_tool(
                     "scores": []
                 })));
             }
-            let snapshot = root_index(state, "recommend_folder")?
-                .fresh_snapshot("recommend_folder")
-                .await?;
+            let snapshot = root_index(state, "recommend_folder")?.serving_snapshot()?;
             let index = snapshot.index;
             let query = [Some(topic.clone()), project.clone()]
                 .into_iter()
@@ -5417,6 +5331,94 @@ mod tests {
     ///
     /// The one payload of this slice that no golden covers, hence the explicit test.
     #[tokio::test]
+    async fn vault_info_and_index_tools_report_initial_loading_without_waiting() {
+        let vault = temp_dir("vault-info-loading");
+        fs::write(vault.join("Note.md"), "# Note\nbody").unwrap();
+        let config = test_config(vault.clone());
+        let backends = crate::mounts::MountBackends::build(&config);
+        let runtimes = MountRuntimes::new(&config, &backends);
+        let state = AppState::with_backends(config, runtimes, &backends);
+        // Current-thread tokio: no background job can run while this synchronous
+        // tool chain completes; thus the first overview genuinely has no snapshot.
+        let info = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            call_tool(&state, "vault_info", &json!({})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(info.structured_content["ready"], false);
+        assert_eq!(info.structured_content["indexStatus"], "loading");
+        assert!(info.structured_content["noteCount"].is_null());
+        let resource = crate::resources::read_resource(&state, "obsidian://vault/info")
+            .await
+            .unwrap();
+        let resource_payload: serde_json::Value =
+            serde_json::from_str(&resource.contents[0].text).unwrap();
+        assert_eq!(resource_payload["ready"], false);
+        let indexed = call_tool(&state, "related_notes", &json!({"path":"Note.md"}))
+            .await
+            .unwrap();
+        assert_eq!(indexed.structured_content["retryable"], false);
+        assert_eq!(indexed.structured_content["ready"], false);
+        assert!(!state.runtime().unwrap().diagnostics().refresh_in_flight);
+        let build = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            call_tool(&state, "build_index", &json!({})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(build.structured_content["accepted"], true);
+        assert!(build.structured_content.get("rebuilt").is_none());
+        assert_eq!(build.structured_content["mounts"][0]["status"], "queued");
+        let resources = crate::resources::list_resources(&state).await.unwrap();
+        assert!(resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri.contains("Note.md")));
+        let read = call_tool(&state, "read_file", &json!({"path": "Note.md"}))
+            .await
+            .unwrap();
+        assert!(read.structured_content["text"]
+            .as_str()
+            .unwrap()
+            .contains("body"));
+        // Explicitly finish background work before removing its source.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.runtime().unwrap().diagnostics().refresh_in_flight {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        fs::remove_dir_all(vault).ok();
+    }
+
+    #[tokio::test]
+    async fn explicit_wait_deadline_does_not_cancel_rebuild() {
+        let vault = temp_dir("wait-deadline");
+        fs::write(vault.join("Note.md"), "# Note\nbody").unwrap();
+        let config = test_config(vault.clone());
+        let backends = crate::mounts::MountBackends::build(&config);
+        let runtimes = MountRuntimes::new(&config, &backends);
+        let state = AppState::with_backends(config, runtimes, &backends);
+        let invalid = call_tool(&state, "build_index", &json!({"wait": "true"})).await;
+        assert!(invalid.unwrap_err().contains("wait must be a boolean"));
+        assert!(!state.runtime().unwrap().diagnostics().refresh_in_flight);
+        let accepted = call_tool(&state, "build_index", &json!({})).await.unwrap();
+        assert_eq!(accepted.structured_content["accepted"], true);
+        assert!(!super::wait_for_index_jobs(&state, std::time::Duration::ZERO).await);
+        let finished = call_tool(&state, "build_index", &json!({"wait": true}))
+            .await
+            .unwrap();
+        assert_eq!(finished.structured_content["rebuilt"], true);
+        assert_eq!(finished.structured_content["noteCount"], 1);
+        assert!(!state.runtime().unwrap().diagnostics().refresh_in_flight);
+        fs::remove_dir_all(vault).ok();
+    }
+
+    #[tokio::test]
     async fn build_index_on_a_single_mount_reports_exactly_the_root_index() {
         let vault_path = temp_dir("build-index-single-mount");
         fs::write(
@@ -5425,7 +5427,7 @@ mod tests {
         )
         .expect("write note");
         let state = test_state(vault_path).await;
-        let result = call_tool(&state, "build_index", &json!({}))
+        let result = call_tool(&state, "build_index", &json!({"wait": true}))
             .await
             .expect("build_index should succeed");
         let payload = &result.structured_content;
@@ -5489,6 +5491,101 @@ mod tests {
         .expect("load_knowledge should succeed");
         assert_eq!(result.structured_content["degraded"], json!(false));
         assert!(result.structured_content.get("degradationReason").is_none());
+    }
+
+    #[tokio::test]
+    async fn vault_info_observes_real_index_and_query_successes_without_probing() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = requests.clone();
+        let mock = std::thread::spawn(move || {
+            // Exactly one index embedding and one query embedding. No probes.
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 2048];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                assert!(String::from_utf8_lossy(&request).starts_with("POST /v1/embeddings "));
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = r#"{"data":[{"index":0,"embedding":[1.0,0.0]}]}"#;
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let vault = temp_dir("vault-info-real-activity");
+        fs::write(vault.join("Note.md"), "# Note\nbody to embed").unwrap();
+        let mut config = test_config(vault.clone());
+        config.embedding.provider = Some(EmbeddingProvider::OpenAiCompatible);
+        config.embedding.model = Some("activity-test".into());
+        config.embedding.base_url = Some(endpoint);
+        config.embedding.context_tokens = Some(1024);
+        let backends = crate::mounts::MountBackends::build(&config);
+        let runtimes = MountRuntimes::new(&config, &backends);
+        let mut state = AppState::with_backends(config, runtimes, &backends);
+        let initial = call_tool(&state, "vault_info", &json!({})).await.unwrap();
+        assert!(initial.structured_content["lastSuccessfulEmbeddingAt"].is_null());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        call_tool(&state, "build_index", &json!({"wait":true}))
+            .await
+            .unwrap();
+        let built = call_tool(&state, "vault_info", &json!({})).await.unwrap();
+        let first = built.structured_content["lastSuccessfulEmbeddingAt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(built.structured_content["lastSuccessfulArtifactEmbeddingAt"].is_null());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        call_tool(&state, "hybrid_search", &json!({"query":"body"}))
+            .await
+            .unwrap();
+        mock.join().unwrap(); // Backend is gone; the overview must remain a memory read.
+        std::sync::Arc::make_mut(&mut state.config)
+            .embedding
+            .api_key_ref = Some(deep_obsidian_types::SecretRef::EncryptedFile {
+            id: "missing-activity-test-secret".into(),
+        });
+        let queried = call_tool(&state, "vault_info", &json!({})).await.unwrap();
+        let last = queried.structured_content["lastSuccessfulEmbeddingAt"]
+            .as_str()
+            .unwrap();
+        assert!(last >= first.as_str());
+        assert!(queried
+            .structured_content
+            .get("embeddingBackendStatus")
+            .is_none());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let resource = crate::resources::read_resource(&state, "obsidian://vault/info")
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&resource.contents[0].text).unwrap();
+        assert_eq!(payload["lastSuccessfulEmbeddingAt"], json!(last));
+        std::sync::Arc::make_mut(&mut state.config).embedding.model =
+            Some("other-activity-model".into());
+        let changed = call_tool(&state, "vault_info", &json!({})).await.unwrap();
+        assert!(changed.structured_content["lastSuccessfulEmbeddingAt"].is_null());
+        fs::remove_dir_all(vault).ok();
     }
 
     /// vault_info must NEVER error and, on a sparse index, must not claim an embedding

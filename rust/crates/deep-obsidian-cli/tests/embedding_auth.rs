@@ -132,7 +132,8 @@ async fn real_cli_preserves_secret_references_overrides_and_mcp_auth() {
             },
             "embedding": {
                 "provider": "openai-compatible", "model": "test-embedding",
-                "baseUrl": format!("http://{embedding_address}/v1")
+                "baseUrl": format!("http://{embedding_address}/v1"),
+                "contextTokens": 1024
             }
         });
         if has_reference {
@@ -191,6 +192,25 @@ async fn real_cli_preserves_secret_references_overrides_and_mcp_auth() {
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
+        // Manual mode starts without embedding; only this explicit request builds the index.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(response) = client
+                    .post(format!("http://127.0.0.1:{port}/mcp"))
+                    .bearer_auth("existing-mcp-owner-token")
+                    .header("accept", "application/json, text/event-stream")
+                    .json(&json!({"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":"build_index","arguments":{}}}))
+                    .send().await
+                {
+                    if response.status().is_success() {
+                        let body: Value = response.json().await.unwrap();
+                        assert_eq!(body["result"]["structuredContent"]["accepted"], true, "{body}");
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await.expect("explicit build_index request is accepted");
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 assert!(

@@ -571,39 +571,6 @@ fn embed_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
     Ok(normalize_dense_vector(&vector))
 }
 
-/// Outcome of a non-fatal embedding-backend health probe (see [`probe_embedding_backend`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EmbeddingBackendHealth {
-    /// The index is not on the Embedding backend (sparse), so there is no backend to probe.
-    NotApplicable,
-    /// A tiny embed round-trip succeeded: the backend is reachable.
-    Reachable,
-    /// The backend was unreachable / errored. Carries a short cause for status reporting.
-    Unreachable(String),
-}
-
-/// Bounded, NON-fatal health probe for the note embedding backend, used by `vault_info` to
-/// surface backend availability without ever erroring. Issues a single tiny embed against a
-/// SHORT-timeout client (so a hung/dead backend resolves quickly rather than blocking on the
-/// 60s default). Returns `NotApplicable` for sparse indexes (nothing to probe), `Reachable`
-/// on success, and `Unreachable` on any failure. This never returns `Err`.
-pub fn probe_embedding_backend(index: &SearchIndex) -> EmbeddingBackendHealth {
-    let Some(config) = embedding_runtime_config(index) else {
-        return EmbeddingBackendHealth::NotApplicable;
-    };
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => return EmbeddingBackendHealth::Unreachable(error.to_string()),
-    };
-    match crate::embeddings::embed_texts_with_client(&["ping".to_string()], &config, &client) {
-        Ok(_) => EmbeddingBackendHealth::Reachable,
-        Err(error) => EmbeddingBackendHealth::Unreachable(error.to_string()),
-    }
-}
-
 fn embed_artifact_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
     if let Some(error) = &index.artifact_embedding_error {
         return Err(IndexError::Embedding(format!(
@@ -2143,34 +2110,6 @@ mod tests {
                 .expect("legacy wrapper must degrade, not error");
         assert!(!matches.is_empty());
         fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn probe_embedding_backend_reports_reachable_then_unreachable() {
-        let (mut index, root) = embedding_backed_index();
-        // Healthy backend (the build server is still accepting): reachable.
-        assert_eq!(
-            probe_embedding_backend(&index),
-            EmbeddingBackendHealth::Reachable
-        );
-        // Point at a refused port: unreachable, but NEVER an Err.
-        index.embedding_base_url = Some(DEAD_BACKEND_URL.to_string());
-        assert!(matches!(
-            probe_embedding_backend(&index),
-            EmbeddingBackendHealth::Unreachable(_)
-        ));
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn probe_embedding_backend_is_not_applicable_for_sparse_index() {
-        // A sparse index has no embedding backend to probe.
-        let index = sample_index();
-        assert_eq!(index.semantic_backend, SemanticBackend::Sparse);
-        assert_eq!(
-            probe_embedding_backend(&index),
-            EmbeddingBackendHealth::NotApplicable
-        );
     }
 
     #[test]

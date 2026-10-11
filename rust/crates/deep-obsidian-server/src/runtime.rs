@@ -8,9 +8,9 @@ use deep_obsidian_config::default_mount_index_dir;
 use deep_obsidian_config::secrets::SecretResolver;
 use deep_obsidian_index::embeddings::{
     EmbeddingConfig as IndexEmbeddingConfig, EmbeddingProvider as IndexEmbeddingProvider,
-    DEFAULT_CHARS_PER_TOKEN, DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_CONTEXT_TOKENS,
-    DEFAULT_EMBEDDING_MAX_CHARS, DEFAULT_EMBEDDING_MAX_CONCURRENCY,
-    DEFAULT_EMBEDDING_MAX_INPUT_TOKENS, DEFAULT_EMBEDDING_TIMEOUT_SECONDS,
+    DEFAULT_CHARS_PER_TOKEN, DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_MAX_CHARS,
+    DEFAULT_EMBEDDING_MAX_CONCURRENCY, DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
+    DEFAULT_EMBEDDING_TIMEOUT_SECONDS,
 };
 use deep_obsidian_index::index::{
     build_index_from_source, get_search_index_from_source, same_artifact_embedding_config,
@@ -28,7 +28,15 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-pub const DEFAULT_FRESH_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(2);
+/// Signals a temporarily unavailable index without waiting for its initial build.
+pub const INDEX_LOADING_MESSAGE: &str = "index is not ready; check vault_info or run build_index";
+// Restores diagnostics even when an awaited refresh is cancelled.
+struct RefreshFlag<'a>(&'a AtomicBool);
+impl Drop for RefreshFlag<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 /// How long the startup vault scan may run before the watchdog warns that it
 /// may be blocked (e.g. on a macOS permission prompt). A healthy scan of even
@@ -121,9 +129,45 @@ pub struct RuntimeFreshnessDiagnostics {
 }
 
 fn index_embedding_config(config: &ResolvedServiceConfig) -> Result<IndexEmbeddingConfig, String> {
-    index_embedding_config_with_env(config, &SecretResolver::new(), |name| {
-        std::env::var(name).ok()
-    })
+    let config_for_index =
+        index_embedding_config_with_env(config, &SecretResolver::new(), |name| {
+            std::env::var(name).ok()
+        })?;
+    let resolved = deep_obsidian_index::embedding_context::resolve_context(
+        &config_for_index,
+        config.embedding.context_tokens,
+    );
+    Ok(config_for_index.with_context_tokens(resolved.tokens))
+}
+
+/// Warm context discovery before constructing mount runtimes and report its source.
+/// Keep auto mode unset: refreshes use the cache and renew metadata after its TTL.
+pub(crate) async fn resolve_embedding_contexts(
+    config: ResolvedServiceConfig,
+) -> Result<ResolvedServiceConfig, String> {
+    tokio::task::spawn_blocking(move || {
+        if config.embedding.provider.is_some() && config.embedding.model.is_some() {
+            let index_config = index_embedding_config(&config)?;
+            let resolved = deep_obsidian_index::embedding_context::resolve_context(
+                &index_config, config.embedding.context_tokens,
+            );
+            let limits = index_config.with_context_tokens(resolved.tokens);
+            // The CLI does not install a tracing subscriber; stderr is also safe for stdio MCP.
+            eprintln!("embedding context: {} tokens ({}) -> maxInputTokens={}, maxChars={}",
+                resolved.tokens, resolved.source, limits.max_input_tokens, limits.max_chars);
+            if resolved.source == "fallback" {
+                eprintln!("embedding context: backend metadata unavailable; using 4096. Set embedding.contextTokens to override the input limit for your model.");
+            }
+        }
+        if config.artifact_embedding.provider.is_some() && config.artifact_embedding.model.is_some() {
+            let index_config = index_artifact_embedding_config(&config)?;
+            let resolved = deep_obsidian_index::embedding_context::resolve_context(
+                &index_config, config.artifact_embedding.context_tokens,
+            );
+            eprintln!("artifact embedding context: {} tokens ({})", resolved.tokens, resolved.source);
+        }
+        Ok(config)
+    }).await.map_err(|error| error.to_string())?
 }
 
 /// Environment overrides belong to text embeddings only: artifact embeddings may
@@ -163,10 +207,7 @@ key its 'embedding.apiKeyRef' points at; unset the variable to use the configure
         model: config.embedding.model.clone(),
         base_url: config.embedding.base_url.clone(),
         api_key,
-        max_chars: config
-            .embedding
-            .max_chars
-            .unwrap_or(DEFAULT_EMBEDDING_MAX_CHARS),
+        max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
         batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
         max_concurrency: config
             .embedding
@@ -176,18 +217,20 @@ key its 'embedding.apiKeyRef' points at; unset the variable to use the configure
             .embedding
             .timeout_seconds
             .unwrap_or(DEFAULT_EMBEDDING_TIMEOUT_SECONDS),
-        max_input_tokens: config
-            .embedding
-            .max_input_tokens
-            .unwrap_or(DEFAULT_EMBEDDING_MAX_INPUT_TOKENS),
+        max_input_tokens: DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
         context_tokens: config
             .embedding
             .context_tokens
-            .unwrap_or(DEFAULT_EMBEDDING_CONTEXT_TOKENS),
+            .unwrap_or(deep_obsidian_index::embedding_context::FALLBACK_CONTEXT_TOKENS),
         chars_per_token: DEFAULT_CHARS_PER_TOKEN,
         query_instruction: config.embedding.query_instruction.clone(),
     }
-    .normalize())
+    .with_context_tokens(
+        config
+            .embedding
+            .context_tokens
+            .unwrap_or(deep_obsidian_index::embedding_context::FALLBACK_CONTEXT_TOKENS),
+    ))
 }
 
 fn index_artifact_embedding_config(
@@ -204,15 +247,12 @@ fn index_artifact_embedding_config(
         .map_err(|error| error.to_string())?
         .map(|secret| secret.expose_secret().to_string());
 
-    Ok(IndexEmbeddingConfig {
+    let config_for_index = IndexEmbeddingConfig {
         provider,
         model: config.artifact_embedding.model.clone(),
         base_url: config.artifact_embedding.base_url.clone(),
         api_key,
-        max_chars: config
-            .artifact_embedding
-            .max_chars
-            .unwrap_or(DEFAULT_EMBEDDING_MAX_CHARS),
+        max_chars: DEFAULT_EMBEDDING_MAX_CHARS,
         batch_size: DEFAULT_EMBEDDING_BATCH_SIZE,
         max_concurrency: config
             .artifact_embedding
@@ -222,19 +262,26 @@ fn index_artifact_embedding_config(
             .artifact_embedding
             .timeout_seconds
             .unwrap_or(DEFAULT_EMBEDDING_TIMEOUT_SECONDS),
-        max_input_tokens: config
-            .artifact_embedding
-            .max_input_tokens
-            .unwrap_or(DEFAULT_EMBEDDING_MAX_INPUT_TOKENS),
+        max_input_tokens: DEFAULT_EMBEDDING_MAX_INPUT_TOKENS,
         context_tokens: config
             .artifact_embedding
             .context_tokens
-            .unwrap_or(DEFAULT_EMBEDDING_CONTEXT_TOKENS),
+            .unwrap_or(deep_obsidian_index::embedding_context::FALLBACK_CONTEXT_TOKENS),
         chars_per_token: DEFAULT_CHARS_PER_TOKEN,
         // Artifacts are intentionally out of scope for query-instruction wrapping.
         query_instruction: None,
     }
-    .normalize())
+    .with_context_tokens(
+        config
+            .artifact_embedding
+            .context_tokens
+            .unwrap_or(deep_obsidian_index::embedding_context::FALLBACK_CONTEXT_TOKENS),
+    );
+    let resolved = deep_obsidian_index::embedding_context::resolve_context(
+        &config_for_index,
+        config.artifact_embedding.context_tokens,
+    );
+    Ok(config_for_index.with_context_tokens(resolved.tokens))
 }
 
 /// The vault one [`RuntimeState`] indexes, and where its SQLite file lives.
@@ -325,6 +372,8 @@ pub struct RuntimeState {
     refresh_lock: Mutex<()>,
     refresh_in_flight: AtomicBool,
     refresh_required: AtomicBool,
+    background_rebuild: AtomicBool,
+    stale_generation: AtomicU64,
     generation: AtomicU64,
     last_watch_signal_unix_ms: AtomicU64,
     last_success: RwLock<Option<RuntimeRefreshSummary>>,
@@ -421,6 +470,8 @@ impl RuntimeState {
             refresh_lock: Mutex::new(()),
             refresh_in_flight: AtomicBool::new(false),
             refresh_required: AtomicBool::new(false),
+            background_rebuild: AtomicBool::new(false),
+            stale_generation: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             last_watch_signal_unix_ms: AtomicU64::new(0),
             last_success: RwLock::new(None),
@@ -434,7 +485,67 @@ impl RuntimeState {
     /// most likely cause. A macOS TCC consent dialog suspends the scan's
     /// `open()` syscall inside the kernel, so without this warning the server
     /// hangs with no output at all — nothing else can observe the stall.
-    async fn startup_refresh_with_watchdog(&self) -> Result<RuntimeIndexSnapshot, String> {
+    async fn startup_refresh_with_watchdog(
+        self: &Arc<Self>,
+    ) -> Result<RuntimeIndexSnapshot, String> {
+        self.preload_cached_snapshot().await;
+        self.refresh_with_watchdog().await
+    }
+
+    async fn preload_cached_snapshot(&self) {
+        if self.snapshot().is_ok() {
+            return;
+        }
+        let config = self.config.clone();
+        let index_file = self.target.index_file.clone();
+        let source = self.target.source();
+        let cached = tokio::task::spawn_blocking(move || {
+            let embedding = index_embedding_config(&config)?;
+            let artifacts = index_artifact_embedding_config(&config)?;
+            deep_obsidian_index::index::load_compatible_index_from_file(
+                &index_file,
+                source.local_vault_path(),
+                Some(&embedding),
+                Some(&artifacts),
+            )
+            .and_then(|index| {
+                index
+                    .map(deep_obsidian_index::index::freeze_search_index)
+                    .transpose()
+            })
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|result| result);
+        match cached {
+            Ok(Some(index)) => {
+                if let Ok(mut snapshot) = self.snapshot.write() {
+                    if snapshot.is_none() {
+                        *snapshot = Some(RuntimeIndexSnapshot {
+                            index: Arc::new(index),
+                            rebuilt: false,
+                            reason: "startup-cache".to_string(),
+                        });
+                    }
+                }
+                self.mark_stale("startup-cache validation");
+            }
+            Err(error) => {
+                if let Ok(mut failure) = self.last_error.write() {
+                    *failure = Some(RuntimeRefreshError {
+                        reason: "startup-cache".to_string(),
+                        message: error.clone(),
+                        finished_at_unix_ms: unix_time_ms(),
+                    });
+                }
+                warn!("could not preload cached index: {error}");
+            }
+            Ok(None) => {}
+        }
+    }
+
+    async fn refresh_with_watchdog(self: &Arc<Self>) -> Result<RuntimeIndexSnapshot, String> {
         let refresh = self.refresh("startup");
         tokio::pin!(refresh);
         match tokio::time::timeout(STARTUP_SCAN_WARN_AFTER, &mut refresh).await {
@@ -499,7 +610,8 @@ busy; check the mount's url and the service log for the backend's own diagnostic
             .ok()
             .and_then(|guard| guard.clone());
         let last_error = self.last_error.read().ok().and_then(|guard| guard.clone());
-        let refresh_in_flight = self.refresh_in_flight.load(Ordering::SeqCst);
+        let refresh_in_flight = self.refresh_in_flight.load(Ordering::SeqCst)
+            || self.background_rebuild.load(Ordering::SeqCst);
         let status = if snapshot.is_some() {
             RuntimeReadiness::Ready
         } else if last_error.is_some() {
@@ -541,75 +653,86 @@ busy; check the mount's url and the service log for the backend's own diagnostic
             .map(|finished_at| unix_time_ms().saturating_sub(finished_at))
     }
 
-    pub async fn rebuild(&self, reason: impl Into<String>) -> Result<RuntimeIndexSnapshot, String> {
-        self.run_index_operation(reason.into(), true).await
-    }
-
-    pub async fn refresh(&self, reason: impl Into<String>) -> Result<RuntimeIndexSnapshot, String> {
-        self.run_index_operation(reason.into(), false).await
-    }
-
-    pub async fn fresh_snapshot(
-        &self,
+    pub async fn rebuild(
+        self: &Arc<Self>,
         reason: impl Into<String>,
     ) -> Result<RuntimeIndexSnapshot, String> {
-        self.snapshot_or_refresh(reason, DEFAULT_FRESH_SNAPSHOT_MAX_AGE)
+        self.await_index_operation(reason.into(), true).await
+    }
+
+    pub async fn refresh(
+        self: &Arc<Self>,
+        reason: impl Into<String>,
+    ) -> Result<RuntimeIndexSnapshot, String> {
+        self.await_index_operation(reason.into(), false).await
+    }
+
+    async fn await_index_operation(
+        self: &Arc<Self>,
+        reason: String,
+        force: bool,
+    ) -> Result<RuntimeIndexSnapshot, String> {
+        let runtime = self.clone();
+        // Dropping a caller's future detaches this job: the writer lock remains
+        // held until spawn_blocking has completed and the snapshot is published.
+        tokio::spawn(async move { runtime.run_index_operation(reason, force).await })
             .await
+            .map_err(|e| e.to_string())?
     }
 
-    pub async fn snapshot_or_refresh(
-        &self,
-        reason: impl Into<String>,
-        max_age: Duration,
-    ) -> Result<RuntimeIndexSnapshot, String> {
-        let reason = reason.into();
-        if !self.refresh_required.load(Ordering::SeqCst) {
-            if let Some(snapshot) = self.cached_snapshot_within(max_age)? {
-                return Ok(snapshot);
+    /// A request only reads a published snapshot. It cannot scan or embed notes.
+    pub fn serving_snapshot(&self) -> Result<RuntimeIndexSnapshot, String> {
+        self.snapshot().map_err(|error| {
+            if error != "runtime index is not ready" {
+                return error;
             }
-        }
+            if let Some(failure) = self.last_error.read().ok().and_then(|g| g.clone()) {
+                if failure.message.starts_with("index is incompatible:") {
+                    return failure.message;
+                }
+            }
+            INDEX_LOADING_MESSAGE.to_string()
+        })
+    }
 
-        self.refresh(reason).await
+    /// The MCP rebuild is always a detached, forced job, deduplicated per mount.
+    pub fn request_rebuild(self: &Arc<Self>, reason: impl Into<String>) -> bool {
+        if self
+            .background_rebuild
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        let runtime = self.clone();
+        let reason = reason.into();
+        tokio::spawn(async move {
+            let _scheduled = RefreshFlag(&runtime.background_rebuild);
+            if let Err(error) = runtime.run_index_operation(reason, true).await {
+                warn!("background index rebuild failed: {error}");
+            }
+        });
+        true
     }
 
     pub fn mark_stale(&self, reason: impl Into<String>) {
         let reason = reason.into();
+        let Ok(mut stale_reason) = self.stale_reason.write() else {
+            return;
+        };
+        self.stale_generation.fetch_add(1, Ordering::SeqCst);
         self.refresh_required.store(true, Ordering::SeqCst);
         self.last_watch_signal_unix_ms
             .store(unix_time_ms() as u64, Ordering::SeqCst);
-        if let Ok(mut guard) = self.stale_reason.write() {
-            *guard = Some(reason);
-        }
+        *stale_reason = Some(reason);
     }
 
-    fn cached_snapshot_within(
-        &self,
-        max_age: Duration,
-    ) -> Result<Option<RuntimeIndexSnapshot>, String> {
-        let Some(snapshot) = self
-            .snapshot
-            .read()
-            .map_err(|_| "runtime index lock poisoned".to_string())?
-            .clone()
-        else {
-            return Ok(None);
-        };
-
-        let Some(last_success) = self
-            .last_success
-            .read()
-            .map_err(|_| "runtime index lock poisoned".to_string())?
-            .clone()
-        else {
-            return Ok(None);
-        };
-
-        let max_age_ms = max_age.as_millis();
-        let age_ms = unix_time_ms().saturating_sub(last_success.finished_at_unix_ms);
-        if age_ms <= max_age_ms {
-            Ok(Some(snapshot))
-        } else {
-            Ok(None)
+    fn finish_freshness(&self, observed_stale_generation: u64) {
+        if let Ok(mut reason) = self.stale_reason.write() {
+            if self.stale_generation.load(Ordering::SeqCst) == observed_stale_generation {
+                self.refresh_required.store(false, Ordering::SeqCst);
+                *reason = None;
+            }
         }
     }
 
@@ -621,10 +744,37 @@ busy; check the mount's url and the service log for the backend's own diagnostic
         let observed_generation = self.generation.load(Ordering::SeqCst);
         let _guard = self.refresh_lock.lock().await;
 
-        if !force_rebuild && self.generation.load(Ordering::SeqCst) != observed_generation {
+        if !force_rebuild
+            && self.generation.load(Ordering::SeqCst) != observed_generation
+            && !self.refresh_required.load(Ordering::SeqCst)
+        {
             return self.snapshot();
         }
 
+        self.refresh_in_flight.store(true, Ordering::SeqCst);
+        let _in_flight = RefreshFlag(&self.refresh_in_flight);
+        let result = self
+            .run_locked_index_operation(&reason, force_rebuild)
+            .await;
+        if let Err(error) = &result {
+            self.refresh_required.store(true, Ordering::SeqCst);
+            if let Ok(mut guard) = self.last_error.write() {
+                *guard = Some(RuntimeRefreshError {
+                    reason,
+                    message: error.clone(),
+                    finished_at_unix_ms: unix_time_ms(),
+                });
+            }
+        }
+        result
+    }
+
+    async fn run_locked_index_operation(
+        &self,
+        reason: &str,
+        force_rebuild: bool,
+    ) -> Result<RuntimeIndexSnapshot, String> {
+        let observed_stale_generation = self.stale_generation.load(Ordering::SeqCst);
         // ONE source for this whole refresh: the reuse check and the build below both
         // read through it, so they cannot disagree about what the vault contains, and
         // the next refresh gets a fresh one. See `IndexTarget`.
@@ -632,7 +782,11 @@ busy; check the mount's url and the service log for the backend's own diagnostic
 
         if !force_rebuild {
             if let Some(snapshot) = self
-                .reuse_current_snapshot_if_unchanged(&reason, source.clone())
+                .reuse_current_snapshot_if_unchanged(
+                    reason,
+                    source.clone(),
+                    observed_stale_generation,
+                )
                 .await?
             {
                 return Ok(snapshot);
@@ -641,7 +795,6 @@ busy; check the mount's url and the service log for the backend's own diagnostic
 
         let config = self.config.clone();
         let index_file = self.target.index_file.clone();
-        self.refresh_in_flight.store(true, Ordering::SeqCst);
         let operation_result = if force_rebuild {
             let source = source.clone();
             tokio::task::spawn_blocking(move || {
@@ -653,6 +806,7 @@ busy; check the mount's url and the service log for the backend's own diagnostic
                     Some(&embedding_config),
                     Some(&artifact_embedding_config),
                 )
+                .and_then(deep_obsidian_index::index::freeze_search_index)
                 .map(|index| (index, true))
                 .map_err(|error| error.to_string())
             })
@@ -664,26 +818,37 @@ busy; check the mount's url and the service log for the backend's own diagnostic
             tokio::task::spawn_blocking(move || {
                 let embedding_config = index_embedding_config(&config)?;
                 let artifact_embedding_config = index_artifact_embedding_config(&config)?;
+                // A changed embedding identity or schema requires an explicit rebuild.
+                deep_obsidian_index::index::load_compatible_index_from_file(
+                    &index_file,
+                    source.local_vault_path(),
+                    Some(&embedding_config),
+                    Some(&artifact_embedding_config),
+                )
+                .map_err(|error| error.to_string())?;
                 get_search_index_from_source(
                     source.as_ref(),
                     &index_file,
                     Some(&embedding_config),
                     Some(&artifact_embedding_config),
                 )
+                .and_then(|(index, rebuilt)| {
+                    deep_obsidian_index::index::freeze_search_index(index)
+                        .map(|index| (index, rebuilt))
+                })
                 .map_err(|error| error.to_string())
             })
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result)
         };
-        self.refresh_in_flight.store(false, Ordering::SeqCst);
 
         match operation_result {
             Ok((index, rebuilt)) => {
                 let snapshot = RuntimeIndexSnapshot {
                     index: Arc::new(index),
                     rebuilt,
-                    reason: reason.clone(),
+                    reason: reason.to_string(),
                 };
                 {
                     let mut guard = self
@@ -698,32 +863,20 @@ busy; check the mount's url and the service log for the backend's own diagnostic
                         .write()
                         .map_err(|_| "runtime index lock poisoned".to_string())?;
                     *guard = Some(RuntimeRefreshSummary {
-                        reason,
+                        reason: reason.to_string(),
                         rebuilt,
                         generated_at: snapshot.index.generated_at.clone(),
                         finished_at_unix_ms: unix_time_ms(),
                     });
                 }
-                self.refresh_required.store(false, Ordering::SeqCst);
-                if let Ok(mut guard) = self.stale_reason.write() {
-                    *guard = None;
-                }
+                self.finish_freshness(observed_stale_generation);
                 if let Ok(mut guard) = self.last_error.write() {
                     *guard = None;
                 }
                 self.generation.fetch_add(1, Ordering::SeqCst);
                 Ok(snapshot)
             }
-            Err(error) => {
-                if let Ok(mut guard) = self.last_error.write() {
-                    *guard = Some(RuntimeRefreshError {
-                        reason,
-                        message: error.clone(),
-                        finished_at_unix_ms: unix_time_ms(),
-                    });
-                }
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -733,6 +886,7 @@ busy; check the mount's url and the service log for the backend's own diagnostic
         &self,
         reason: &str,
         source: Arc<dyn NoteSource>,
+        observed_stale_generation: u64,
     ) -> Result<Option<RuntimeIndexSnapshot>, String> {
         let Some(current) = self
             .snapshot
@@ -787,7 +941,11 @@ busy; check the mount's url and the service log for the backend's own diagnostic
                 finished_at_unix_ms: unix_time_ms(),
             });
         }
-        self.refresh_required.store(false, Ordering::SeqCst);
+        self.finish_freshness(observed_stale_generation);
+        if let Ok(mut guard) = self.last_error.write() {
+            *guard = None;
+        }
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(Some(snapshot))
     }
 }
@@ -1043,7 +1201,7 @@ impl MountRuntime {
 /// A mount whose backend serves its own recall has NO local index and therefore no
 /// entry — see [`mount_has_local_index`]. So `entries()` is a subset of the router's
 /// mount table, and anything that must enumerate ALL mounts (capabilities,
-/// `vault_info.mounts[]`, the conflict report) reads the ROUTER instead.
+/// `vault_info.mounts[]`) reads the ROUTER instead.
 #[derive(Debug)]
 pub struct MountRuntimes {
     entries: Vec<MountRuntime>,
@@ -1159,7 +1317,13 @@ which the mount retries by itself"
         let runtimes = self.clone();
         tokio::spawn(async move {
             for entry in &runtimes.entries {
-                match entry.runtime.startup_refresh_with_watchdog().await {
+                entry.runtime.preload_cached_snapshot().await;
+            }
+            if !runtimes.config().auto_reindex.enabled {
+                return;
+            }
+            for entry in &runtimes.entries {
+                match entry.runtime.refresh_with_watchdog().await {
                     Ok(snapshot) => {
                         info!(
                             "initial index for mount '{}' {} at {}",
@@ -1552,9 +1716,13 @@ mod tests {
         let defaults = index_embedding_config_with_env(&config, &resolver, |_| None).unwrap();
         assert_eq!(defaults.max_concurrency, 4);
         assert_eq!(defaults.timeout_seconds, 60);
+        config.embedding.context_tokens = Some(1024);
         config.embedding.max_concurrency = Some(1);
         config.embedding.timeout_seconds = Some(180);
         let runtime = index_embedding_config_with_env(&config, &resolver, |_| None).unwrap();
+        assert_eq!(runtime.context_tokens, 1024);
+        assert_eq!(runtime.max_input_tokens, 716);
+        assert_eq!(runtime.effective_max_chars(), 1790);
         assert_eq!(runtime.max_concurrency, 1);
         assert_eq!(runtime.timeout_seconds, 180);
         config.artifact_embedding.max_concurrency = Some(2);
@@ -1984,7 +2152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_or_refresh_reuses_recent_clean_snapshot() {
+    async fn serving_snapshot_reuses_published_snapshot_without_refresh() {
         let root = temp_path("reuse_recent");
         let vault_path = root.join("vault");
         let index_dir = root.join("index");
@@ -1993,10 +2161,7 @@ mod tests {
 
         let runtime = RuntimeState::new(test_config(vault_path, index_dir));
         let initial = runtime.refresh("initial").await.expect("initial refresh");
-        let reused = runtime
-            .snapshot_or_refresh("tool-read", Duration::from_secs(60))
-            .await
-            .expect("cached snapshot");
+        let reused = runtime.serving_snapshot().expect("cached snapshot");
 
         assert!(Arc::ptr_eq(&initial.index, &reused.index));
         assert_eq!(reused.reason, "initial");
@@ -2013,7 +2178,195 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_signal_forces_snapshot_or_refresh_even_with_fresh_snapshot() {
+    async fn serving_snapshot_does_not_wait_for_a_rebuild_and_coalesces_requests() {
+        let root = temp_path("nonblocking_snapshot");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("Note.md"), "# Note\nold content").unwrap();
+        let runtime = RuntimeState::new(test_config(vault, root.join("index")));
+        let initial = runtime.refresh("initial").await.unwrap();
+        // A refresh cannot advance while this guard is held. Reads still complete.
+        let guard = runtime.refresh_lock.lock().await;
+        runtime.mark_stale("changed");
+        let current = runtime.serving_snapshot().unwrap();
+        assert!(!runtime.diagnostics().refresh_in_flight);
+        assert!(runtime.request_rebuild("explicit build"));
+        assert!(Arc::ptr_eq(&initial.index, &current.index));
+        assert!(runtime.diagnostics().refresh_in_flight);
+        assert!(!runtime.request_rebuild("second build"));
+        assert!(!runtime.request_rebuild("duplicate build"));
+        assert!(!runtime.request_rebuild("another duplicate build"));
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.diagnostics().refresh_in_flight {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(runtime.diagnostics().last_error.is_none());
+        assert!(!runtime.freshness_diagnostics().snapshot_stale);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiting_request_does_not_cancel_its_index_job() {
+        let root = temp_path("cancelled_refresh_request");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Note.md"), "# Note\ncontent").unwrap();
+        let runtime = RuntimeState::new(test_config(root.clone(), root.join("index")));
+        let guard = runtime.refresh_lock.lock().await;
+        let worker = runtime.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            started_tx.send(()).ok();
+            worker.refresh("cancelled caller").await
+        });
+        started_rx.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.snapshot().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runtime.snapshot().unwrap().index.note_count, 1);
+        assert_eq!(runtime.snapshot().unwrap().reason, "cancelled caller");
+        drop(runtime);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_manifest_check_keeps_the_previous_index_and_reports_the_error() {
+        let root = temp_path("failed_snapshot_refresh");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("Note.md"), "# Note\nold content").unwrap();
+        let runtime = RuntimeState::new(test_config(vault.clone(), root.join("index")));
+        let initial = runtime.refresh("initial").await.unwrap();
+        fs::remove_dir_all(&vault).unwrap();
+        assert!(runtime.refresh("failed manifest").await.is_err());
+        assert!(runtime.diagnostics().last_error.is_some());
+        assert!(!runtime.diagnostics().refresh_in_flight);
+        let current = runtime.serving_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&initial.index, &current.index));
+        runtime.serving_snapshot().unwrap();
+        assert!(!runtime.diagnostics().refresh_in_flight);
+        assert!(runtime.freshness_diagnostics().snapshot_stale);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn first_snapshot_is_loading_without_waiting_and_new_signals_are_preserved() {
+        let root = temp_path("loading_snapshot");
+        fs::create_dir_all(&root).unwrap();
+        let runtime = RuntimeState::new(test_config(root.clone(), root.join("index")));
+        let guard = runtime.refresh_lock.lock().await;
+        assert_eq!(
+            runtime.serving_snapshot().unwrap_err(),
+            INDEX_LOADING_MESSAGE
+        );
+        let observed = runtime.stale_generation.load(Ordering::SeqCst);
+        runtime.mark_stale("change during scan");
+        runtime.finish_freshness(observed);
+        assert!(runtime.freshness_diagnostics().snapshot_stale);
+        assert_eq!(
+            runtime.freshness_diagnostics().stale_reason.as_deref(),
+            Some("change during scan")
+        );
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.diagnostics().refresh_in_flight {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn manual_startup_only_loads_persisted_index_and_reports_model_changes() {
+        let root = temp_path("manual_startup");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("Note.md"), "# Note\nold content").unwrap();
+        let config = test_config(vault.clone(), root.join("index"));
+        let backends = MountBackends::build(&config);
+        let empty = MountRuntimes::new(&config, &backends);
+        empty.start_initial_refresh().await.unwrap();
+        assert!(empty.root().unwrap().serving_snapshot().is_err());
+        assert!(!empty.root().unwrap().diagnostics().refresh_in_flight);
+        empty
+            .root()
+            .unwrap()
+            .rebuild("explicit initial build")
+            .await
+            .unwrap();
+        fs::write(vault.join("Added.md"), "# Added\nnew content").unwrap();
+        let loaded = MountRuntimes::new(&config, &backends);
+        loaded.start_initial_refresh().await.unwrap();
+        assert_eq!(
+            loaded
+                .root()
+                .unwrap()
+                .serving_snapshot()
+                .unwrap()
+                .index
+                .note_count,
+            1
+        );
+        assert!(!loaded.root().unwrap().diagnostics().refresh_in_flight);
+        let mut changed = config.clone();
+        changed.embedding.provider = Some(deep_obsidian_types::EmbeddingProvider::OpenAiCompatible);
+        changed.embedding.model = Some("changed-model".into());
+        changed.embedding.base_url = Some("http://127.0.0.1:1".into());
+        let changed_backends = MountBackends::build(&changed);
+        let incompatible = MountRuntimes::new(&changed, &changed_backends);
+        incompatible.start_initial_refresh().await.unwrap();
+        let error = incompatible.root().unwrap().serving_snapshot().unwrap_err();
+        assert!(error.starts_with("index is incompatible:"), "{error}");
+        assert!(error.contains("run build_index"), "{error}");
+        assert!(!incompatible.root().unwrap().diagnostics().refresh_in_flight);
+        assert_eq!(
+            loaded.root().unwrap().snapshot().unwrap().index.note_count,
+            1
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn cached_startup_snapshot_is_available_before_validation() {
+        let root = temp_path("startup_cached_snapshot");
+        let vault = root.join("vault");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("Note.md"), "# Note\nold content").unwrap();
+        let config = test_config(vault, root.join("index"));
+        let first = RuntimeState::new(config.clone());
+        first.refresh("persisted").await.unwrap();
+        let runtime = RuntimeState::new(config);
+        let guard = runtime.refresh_lock.lock().await;
+        let started = runtime.clone();
+        let task = tokio::spawn(async move { started.startup_refresh_with_watchdog().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.snapshot().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runtime.snapshot().unwrap().reason, "startup-cache");
+        assert_eq!(runtime.snapshot().unwrap().index.note_count, 1);
+        drop(guard);
+        task.await.unwrap().unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn explicit_refresh_observes_stale_signal() {
         let root = temp_path("stale_forces_refresh");
         let vault_path = root.join("vault");
         let index_dir = root.join("index");
@@ -2034,7 +2387,7 @@ mod tests {
 
         fs::write(vault_path.join("note.md"), "# Note\n\nhello refreshed").expect("update note");
         let refreshed = runtime
-            .snapshot_or_refresh("tool-read", Duration::from_secs(60))
+            .refresh("tool-read")
             .await
             .expect("refresh after stale signal");
 

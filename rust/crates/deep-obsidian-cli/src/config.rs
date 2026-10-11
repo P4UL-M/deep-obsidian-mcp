@@ -274,9 +274,12 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
                     .as_ref()
                     .and_then(|embedding| embedding.timeout_seconds)
             }),
-            max_chars: None,
-            max_input_tokens: None,
-            context_tokens: None,
+            context_tokens: config_file.as_ref().and_then(|config| {
+                config
+                    .embedding
+                    .as_ref()
+                    .and_then(|embedding| embedding.context_tokens)
+            }),
             // Query-side instruction is config-file only (no dedicated CLI flag);
             // preserve any value from the config file so the user override round-trips.
             query_instruction: config_file.as_ref().and_then(|config| {
@@ -658,16 +661,20 @@ mod tests {
         fs::write(
             &path,
             serde_json::json!({
-                "embedding": { "maxConcurrency": 1, "timeoutSeconds": 180 }
+                "embedding": { "contextTokens": 1024, "maxConcurrency": 1, "timeoutSeconds": 180 }
             })
             .to_string(),
         )
         .unwrap();
         let resolved = resolve_runtime_config(&service_options(path, vault)).unwrap();
+        assert_eq!(resolved.service.embedding.context_tokens, Some(1024));
         assert_eq!(resolved.service.embedding.max_concurrency, Some(1));
         assert_eq!(resolved.service.embedding.timeout_seconds, Some(180));
         let persisted = deep_obsidian_config::to_persisted_config(&resolved.service);
         let json = serde_json::to_value(persisted).unwrap();
+        assert_eq!(json["embedding"]["contextTokens"], 1024);
+        assert!(json["embedding"].get("maxInputTokens").is_none());
+        assert!(json["embedding"].get("maxChars").is_none());
         assert_eq!(json["embedding"]["maxConcurrency"], 1);
         assert_eq!(json["embedding"]["timeoutSeconds"], 180);
         fs::remove_dir_all(root).unwrap();

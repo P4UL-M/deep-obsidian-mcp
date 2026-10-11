@@ -20,9 +20,9 @@ pub const DEFAULT_EMBEDDING_MAX_CHARS: usize = 8_000;
 pub const DEFAULT_EMBEDDING_CONTEXT_TOKENS: usize = 4_096;
 /// Per-input token budget, kept with margin (~30%) under the context window.
 pub const DEFAULT_EMBEDDING_MAX_INPUT_TOKENS: usize = 2_800;
-/// Conservative chars-per-token estimate. Dense markdown / code pack ~2.7-2.9
-/// tokens per char (observed on technical vaults), so we keep this low to
-/// over-estimate token counts and stay safe.
+/// Character/token estimate, deliberately lower than observed technical English
+/// text (~2.7-2.9 chars/token). This is not a tokenizer and may under-estimate
+/// tokens for other scripts, dense code or arbitrary text.
 pub const DEFAULT_CHARS_PER_TOKEN: f64 = 2.5;
 pub const DEFAULT_EMBEDDING_TIMEOUT_SECONDS: u64 = 60;
 #[cfg(test)]
@@ -109,13 +109,26 @@ impl EmbeddingConfig {
         }
     }
 
+    /// Derive a 70% token budget and its character equivalent from one context
+    /// limit. The remaining 30% is margin for tokenizer variance/special tokens.
+    /// Character/token estimates are not an exact tokenizer measurement.
+    pub fn with_context_tokens(mut self, context_tokens: usize) -> Self {
+        self.context_tokens = context_tokens.max(1);
+        // Integer arithmetic, including contexts near usize::MAX, without overflow.
+        self.max_input_tokens =
+            (self.context_tokens / 10 * 7 + self.context_tokens % 10 * 7 / 10).max(1);
+        self.chars_per_token = DEFAULT_CHARS_PER_TOKEN;
+        self.max_chars = self.max_input_tokens.saturating_mul(5) / 2;
+        self.normalize()
+    }
+
     pub fn normalize(mut self) -> Self {
         self.batch_size = self.batch_size.max(1);
         self.max_concurrency = self.max_concurrency.max(1);
         self.timeout_seconds = self.timeout_seconds.max(1);
         self.max_chars = self.max_chars.max(1);
-        self.max_input_tokens = self.max_input_tokens.max(1);
-        self.context_tokens = self.context_tokens.max(self.max_input_tokens);
+        self.context_tokens = self.context_tokens.max(1);
+        self.max_input_tokens = self.max_input_tokens.max(1).min(self.context_tokens);
         if !(self.chars_per_token.is_finite() && self.chars_per_token >= 1.0) {
             self.chars_per_token = DEFAULT_CHARS_PER_TOKEN;
         }
@@ -125,7 +138,8 @@ impl EmbeddingConfig {
     /// Effective per-input character cap: the smaller of the hard char ceiling and
     /// the char-equivalent of the per-input token budget.
     pub fn effective_max_chars(&self) -> usize {
-        let token_chars = (self.max_input_tokens as f64 * self.chars_per_token).floor();
+        let token_chars =
+            (self.max_input_tokens.min(self.context_tokens) as f64 * self.chars_per_token).floor();
         let token_chars = if token_chars.is_finite() && token_chars >= 1.0 {
             token_chars as usize
         } else {
@@ -225,7 +239,7 @@ impl EmbeddingBatchOptions {
             // worker's `num_ctx`. llama.cpp can crash (heap corruption) when a
             // request exceeds the window, so we keep request totals modest rather
             // than packing up to the full context.
-            max_request_tokens: config.max_input_tokens.max(1),
+            max_request_tokens: config.max_input_tokens.min(config.context_tokens).max(1),
         }
     }
 
@@ -615,10 +629,12 @@ pub fn embed_texts_with_client(
     }
 
     let dimensions = vectors.first().map(|vector| vector.len()).unwrap_or(0);
-    Ok(EmbeddingResult {
+    let result = EmbeddingResult {
         vectors,
         dimensions,
-    })
+    };
+    crate::embedding_activity::record_success(config, &result);
+    Ok(result)
 }
 
 pub fn embed_artifacts(
@@ -717,7 +733,9 @@ pub fn embed_artifacts_with_client(
                 status: status.as_u16(),
                 body: error.to_string(),
             })?;
-    parse_embedding_payload(payload, artifacts.len())
+    let result = parse_embedding_payload(payload, artifacts.len())?;
+    crate::embedding_activity::record_success(config, &result);
+    Ok(result)
 }
 
 fn parse_embedding_payload(
@@ -774,6 +792,84 @@ mod tests {
         sync::{Arc, Mutex},
         thread::JoinHandle,
     };
+
+    #[test]
+    fn real_embedding_activity_tracks_text_and_artifacts_without_extra_requests() {
+        use crate::embedding_activity::last_successful_embedding_at;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let config = test_config(endpoint.clone());
+        let success = r#"{"data":[{"index":0,"embedding":[1.0,2.0]}]}"#;
+        let handle = thread::spawn(move || {
+            let responses = [
+                ("200 OK", success),
+                ("200 OK", success),
+                ("200 OK", r#"{"data":[]}"#),
+                ("503 Service Unavailable", "unavailable"),
+            ];
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while request_body(&request).is_none() {
+                    let mut buffer = [0; 2048];
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                assert!(String::from_utf8_lossy(&request).starts_with("POST /embeddings "));
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let lookup =
+            || last_successful_embedding_at("openai-compatible", &endpoint, "test-embedding-model");
+        assert_eq!(lookup(), None);
+        embed_texts(&[], &config).unwrap();
+        assert_eq!(lookup(), None);
+        embed_texts(&["real document or query".into()], &config).unwrap();
+        let first = lookup().expect("real text success recorded");
+        chrono::DateTime::parse_from_rfc3339(&first).unwrap();
+        assert_eq!(
+            last_successful_embedding_at(
+                "openai-compatible",
+                &format!("{endpoint}/"),
+                "test-embedding-model"
+            ),
+            Some(first.clone())
+        );
+        assert_eq!(
+            last_successful_embedding_at("openai-compatible", &endpoint, "another-model"),
+            None
+        );
+        assert_eq!(
+            last_successful_embedding_at("another-provider", &endpoint, "test-embedding-model"),
+            None
+        );
+        assert_eq!(
+            last_successful_embedding_at(
+                "openai-compatible",
+                &format!("{endpoint}/other"),
+                "test-embedding-model"
+            ),
+            None
+        );
+        let artifact = ArtifactEmbeddingInput {
+            path: "Guide.pdf".into(),
+            kind: "pdf".into(),
+            mime_type: "application/pdf".into(),
+            bytes: vec![1, 2, 3],
+        };
+        embed_artifacts(&[artifact], &config).unwrap();
+        let last = lookup().unwrap();
+        assert!(last >= first);
+        assert!(embed_texts(&["malformed reply".into()], &config).is_err());
+        assert_eq!(lookup(), Some(last.clone()));
+        assert!(embed_texts(&["backend unavailable".into()], &config).is_err());
+        assert_eq!(lookup(), Some(last));
+        handle.join().unwrap();
+    }
 
     fn test_config(base_url: String) -> EmbeddingConfig {
         EmbeddingConfig {
@@ -1088,6 +1184,40 @@ mod tests {
             actual: 3,
         }
         .is_transient());
+    }
+
+    #[test]
+    fn context_override_bounds_inputs_and_request_payloads() {
+        let (base_url, requests, handle) = spawn_embedding_server(vec![2, 2, 2]);
+        let mut config = test_config(base_url).with_context_tokens(1024);
+        config.max_concurrency = 1;
+        assert_eq!(config.context_tokens, 1024);
+        assert_eq!(config.max_input_tokens, 716);
+        assert_eq!(config.max_chars, 1790);
+        let texts = vec!["a".repeat(10_000), "b".repeat(10_000), "c".repeat(10_000)];
+        let result = embed_text_batches(&texts, &config, None).expect("bounded embedding");
+        assert_eq!(result.vectors.len(), 3);
+        handle.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for batch in requests.iter() {
+            assert_eq!(batch[0].chars().count(), 1790);
+            assert!(
+                batch
+                    .iter()
+                    .map(|input| config.estimate_tokens(input))
+                    .sum::<usize>()
+                    <= 716
+            );
+        }
+        // normalize must reduce the input budget, never inflate the context.
+        let config = EmbeddingConfig {
+            context_tokens: 1024,
+            ..test_config("http://unused".into())
+        }
+        .normalize();
+        assert_eq!(config.context_tokens, 1024);
+        assert_eq!(config.max_input_tokens, 1024);
     }
 
     #[test]

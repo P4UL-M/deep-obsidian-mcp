@@ -53,7 +53,15 @@ pub fn open_index_connection(
     } else {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
     };
-    Connection::open_with_flags(index_file, flags)
+    let connection = Connection::open_with_flags(index_file, flags)?;
+    connection.busy_timeout(std::time::Duration::from_secs(1))?;
+    if !read_only {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+    } else {
+        // Pin one committed view across a query's multiple SQL statements.
+        connection.execute_batch("BEGIN DEFERRED")?;
+    }
+    Ok(connection)
 }
 
 pub const CURRENT_SCHEMA_DDL: &str = r#"

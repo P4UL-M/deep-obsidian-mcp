@@ -1,5 +1,11 @@
 # Fix: Ollama `llama-server` crash from oversized embedding inputs
 
+> Historical alpha.7 incident report. The current implementation uses one size setting,
+> `contextTokens`, with automatic Ollama discovery, a 4096 fallback and derived
+> input/character budgets. The former `maxInputTokens` / `maxChars` config knobs
+> mentioned below have been removed. See [current configuration](../CONFIGURATION.md#embedding-context-size).
+
+
 Status: implemented + empirically verified (2026-06-04)
 
 ## Symptom
