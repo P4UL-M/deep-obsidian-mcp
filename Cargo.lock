@@ -684,6 +684,7 @@ dependencies = [
  "base64",
  "chrono",
  "deep-obsidian-core",
+ "deep-obsidian-types",
  "reqwest",
  "rusqlite",
  "serde",

@@ -592,6 +592,7 @@ mod tests {
 
     fn test_config() -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             vault_path: Some(PathBuf::from("/tmp/deep-obsidian-test-vault")),
             index_dir: PathBuf::from("/tmp/deep-obsidian-test-index"),

@@ -108,6 +108,7 @@ impl Fixture {
 
     fn config(&self) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             vault_path: Some(self.vault_path.clone()),
             index_dir: self.index_dir.clone(),

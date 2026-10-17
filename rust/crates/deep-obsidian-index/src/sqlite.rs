@@ -17,7 +17,9 @@ pub const INDEX_FILENAME: &str = "index.sqlite";
 // vectors, so they must rebuild to drop them; the version mismatch forces it. No DDL
 // change — the (now-empty) `note_embeddings_vec` table is still created so the load
 // gate and `has_vector_tables` (which expects 2 vector tables) stay unchanged.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+// D+2 chunk vectors use encoding metadata in v7. v6 caches can be converted
+// locally; older binaries must reject v7 rather than send D-sized queries to it.
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 static SQLITE_VEC_REGISTER: Once = Once::new();
 

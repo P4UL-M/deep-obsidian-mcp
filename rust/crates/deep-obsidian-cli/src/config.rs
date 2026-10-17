@@ -237,6 +237,7 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
         // Config-file only, for the same reason as `mounts`: there is no CLI flag or env var
         // for it, and a per-invocation override of a retrieval-quality setting would make two
         // runs of the same server rank differently with nothing in the config to explain it.
+        freshness: config_file.as_ref().and_then(|config| config.freshness),
         federated_rerank: config_file
             .as_ref()
             .and_then(|config| config.federated_rerank),

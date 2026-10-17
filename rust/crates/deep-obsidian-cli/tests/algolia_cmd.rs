@@ -99,6 +99,7 @@ impl Fixture {
 
     fn config(&self, writable: bool) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             vault_path: Some(self.vault()),
             mounts: vec![

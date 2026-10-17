@@ -505,6 +505,7 @@ mod tests {
 
     fn config_with(host: &str, auth_enabled: bool) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             vault_path: Some(PathBuf::from("/tmp/vault")),
             index_dir: PathBuf::from("/tmp/index"),

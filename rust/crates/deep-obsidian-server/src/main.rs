@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         auth: None,
         // The dev binary has no flag for it; `None` takes the default (enabled).
         federated_rerank: None,
+        freshness: None,
         config_file_path: None,
     };
 

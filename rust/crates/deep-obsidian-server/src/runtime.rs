@@ -510,7 +510,10 @@ impl RuntimeState {
             )
             .and_then(|index| {
                 index
-                    .map(deep_obsidian_index::index::freeze_search_index)
+                    .map(|mut index| {
+                        deep_obsidian_index::freshness::configure(&mut index, config.freshness)?;
+                        deep_obsidian_index::index::freeze_search_index(index)
+                    })
                     .transpose()
             })
             .map_err(|e| e.to_string())
@@ -806,7 +809,10 @@ busy; check the mount's url and the service log for the backend's own diagnostic
                     Some(&embedding_config),
                     Some(&artifact_embedding_config),
                 )
-                .and_then(deep_obsidian_index::index::freeze_search_index)
+                .and_then(|mut index| {
+                    deep_obsidian_index::freshness::configure(&mut index, config.freshness)?;
+                    deep_obsidian_index::index::freeze_search_index(index)
+                })
                 .map(|index| (index, true))
                 .map_err(|error| error.to_string())
             })
@@ -832,7 +838,8 @@ busy; check the mount's url and the service log for the backend's own diagnostic
                     Some(&embedding_config),
                     Some(&artifact_embedding_config),
                 )
-                .and_then(|(index, rebuilt)| {
+                .and_then(|(mut index, rebuilt)| {
+                    deep_obsidian_index::freshness::configure(&mut index, config.freshness)?;
                     deep_obsidian_index::index::freeze_search_index(index)
                         .map(|index| (index, rebuilt))
                 })
@@ -1083,8 +1090,8 @@ pub fn mount_has_local_index(mount: &MountConfig) -> bool {
 
 /// The config a single mount's [`RuntimeState`] runs against.
 ///
-/// [`RuntimeState`] reads exactly four things out of its config — `vault_path`,
-/// `index_dir`, `embedding`/`artifact_embedding`, and `auto_reindex` — so giving
+/// [`RuntimeState`] reads `vault_path`, `index_dir`, embedding settings,
+/// `auto_reindex` and `freshness` from its config, so giving
 /// each mount a clone with the first two rewritten is enough to give it its own
 /// index, its own watcher and its own refresh lifecycle, with no change to the
 /// index crate (which stays path-based, one vault at a time).
@@ -1303,13 +1310,19 @@ which the mount retries by itself"
     /// Start the background watcher/periodic-sync task for every mount, when
     /// auto-reindex is enabled. One watcher per mount, each on its own vault.
     pub fn start_auto_reindex(&self) -> Vec<AutoReindexHandle> {
-        if !self.config().auto_reindex.enabled {
-            return Vec::new();
+        let mut handles = Vec::new();
+        for entry in &self.entries {
+            if self.config().auto_reindex.enabled {
+                handles.push(start_auto_reindex_tasks(
+                    entry.runtime.clone(),
+                    &entry.change_source,
+                ));
+            }
+            if !self.config().freshness.is_disabled() {
+                handles.push(start_freshness_maintenance(entry.runtime.clone()));
+            }
         }
-        self.entries
-            .iter()
-            .map(|entry| start_auto_reindex_tasks(entry.runtime.clone(), &entry.change_source))
-            .collect()
+        handles
     }
 
     /// Refresh every mount's index in the background, logging per mount.
@@ -1649,6 +1662,89 @@ pub fn storage_backend_name() -> &'static str {
     "sqlite"
 }
 
+/// Renew the writable cache and reuse the runtime's existing query snapshots.
+fn maintain_freshness_snapshot(
+    index: &SearchIndex,
+    index_file: &Path,
+) -> deep_obsidian_index::index::Result<Option<SearchIndex>> {
+    use deep_obsidian_index::{freshness, index::IndexError, sqlite::open_index_connection};
+    let old_context = index
+        .context
+        .as_ref()
+        .ok_or(IndexError::MissingIndexContext)?;
+    let old_connection = open_index_connection(&old_context.index_file, true)
+        .map_err(|e| IndexError::Embedding(e.to_string()))?;
+    let old_encoding = freshness::active(&old_connection)?;
+    drop(old_connection);
+    let mut index = index.clone();
+    let context = index
+        .context
+        .as_mut()
+        .ok_or(IndexError::MissingIndexContext)?;
+    context.index_file = index_file.to_path_buf();
+    context.snapshot_file = None;
+    let changed = freshness::maintain_now(&index)?;
+    let connection = open_index_connection(index_file, true)
+        .map_err(|e| IndexError::Embedding(e.to_string()))?;
+    let encoding = freshness::active(&connection)?;
+    drop(connection);
+    // Also retry publication after a previous snapshot-copy failure, even if
+    // the canonical renewal already committed successfully.
+    if changed || old_encoding != encoding {
+        deep_obsidian_index::index::freeze_search_index(index).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Independent of source polling: the temporal encoding must renew even for
+/// an idle vault with auto-reindex disabled. Deadlines live in SQLite, not here.
+fn start_freshness_maintenance(runtime: Arc<RuntimeState>) -> AutoReindexHandle {
+    let stopped = Arc::new(AtomicBool::new(false));
+    let task_stopped = stopped.clone();
+    let join_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            if task_stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            let _guard = runtime.refresh_lock.lock().await;
+            let index = runtime
+                .snapshot
+                .read()
+                .ok()
+                .and_then(|s| s.as_ref().map(|s| s.index.clone()));
+            let Some(index) = index else {
+                continue;
+            };
+            let index_file = runtime.target.index_file.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                maintain_freshness_snapshot(&index, &index_file)
+            })
+            .await;
+            match result {
+                Ok(Ok(Some(index))) => {
+                    if let Ok(mut snapshot) = runtime.snapshot.write() {
+                        if let Some(snapshot) = snapshot.as_mut() {
+                            snapshot.index = Arc::new(index);
+                        }
+                    }
+                    runtime.generation.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(Ok(None)) => {}
+                other => warn!(
+                    "freshness maintenance failed; will retry on next hourly check: {other:?}"
+                ),
+            }
+        }
+    });
+    AutoReindexHandle {
+        stopped,
+        join_handle,
+    }
+}
+
 pub fn vector_search_backend_name(index: &SearchIndex) -> &'static str {
     match index.semantic_backend {
         SemanticBackend::Sparse => "sparse-terms",
@@ -1676,6 +1772,7 @@ mod tests {
 
     fn test_config(vault_path: PathBuf, index_dir: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             vault_path: Some(vault_path),
             index_dir,
@@ -1918,6 +2015,99 @@ mod tests {
     ///
     /// `#[tokio::test]` because `MountRuntimes::new` captures the current runtime
     /// handle for a source that needs to bridge sync→async.
+    #[test]
+    fn freshness_maintenance_updates_canonical_cache_and_republishes_snapshot() {
+        use deep_obsidian_index::{
+            freshness,
+            index::{build_index, freeze_search_index},
+            sqlite::open_index_connection,
+        };
+        let vault = temp_path("freshness_snapshot");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(vault.join("Note.md"), "# Note\n\nStorage decision.\n").unwrap();
+        let mut index = build_index(&vault, None, None).unwrap();
+        let canonical = index.context.as_ref().unwrap().index_file.clone();
+        let conn = open_index_connection(&canonical, false).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE chunk_embeddings_vec USING vec0(embedding float[2])",
+        )
+        .unwrap();
+        let blob: Vec<u8> = [1.0_f32, 0.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        conn.execute(
+            "INSERT INTO chunk_embeddings_vec(rowid,embedding) SELECT id,?1 FROM chunks",
+            [blob],
+        )
+        .unwrap();
+        index.embedding_dimensions = Some(2);
+        freshness::configure(&mut index, deep_obsidian_types::FreshnessLevel::Classic).unwrap();
+        let frozen = freeze_search_index(index).unwrap();
+        let previous_path = frozen.context.as_ref().unwrap().index_file.clone();
+        assert!(maintain_freshness_snapshot(&frozen, &canonical)
+            .unwrap()
+            .is_none());
+        conn.execute("UPDATE metadata SET value=json_set(value,'$.renew_ms',0) WHERE key='freshnessEncoding'", []).unwrap();
+        let next = maintain_freshness_snapshot(&frozen, &canonical)
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.context.as_ref().unwrap().index_file, previous_path);
+        assert!(freshness::active(&conn).unwrap().unwrap().renew_ms > 0);
+        let next_conn =
+            open_index_connection(&next.context.as_ref().unwrap().index_file, true).unwrap();
+        assert_eq!(
+            freshness::active(&next_conn).unwrap(),
+            freshness::active(&conn).unwrap()
+        );
+        // A committed cache update whose publication failed is retried too.
+        conn.execute("UPDATE metadata SET value=json_set(value,'$.created_ms',1) WHERE key='freshnessEncoding'", []).unwrap();
+        assert!(maintain_freshness_snapshot(&next, &canonical)
+            .unwrap()
+            .is_some());
+        assert!(
+            previous_path.exists(),
+            "an existing reader retains its snapshot"
+        );
+        drop(next_conn);
+        drop(next);
+        drop(frozen);
+        drop(conn);
+        fs::remove_dir_all(vault).ok();
+    }
+
+    #[tokio::test]
+    async fn freshness_is_configured_on_refresh_and_maintained_without_source_auto_reindex() {
+        let vault = temp_path("freshness_vault");
+        let index_dir = temp_path("freshness_index");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("Decision.md"),
+            "# Decision\n\nCurrent storage decision.",
+        )
+        .unwrap();
+        let mut config = test_config(vault.clone(), index_dir.clone());
+        config.freshness = deep_obsidian_types::FreshnessLevel::Classic;
+        assert!(!config.auto_reindex.enabled);
+        let backends = MountBackends::build(&config);
+        let runtimes = MountRuntimes::new(&config, &backends);
+        let runtime = runtimes.root().unwrap();
+        let snapshot = runtime.refresh("freshness-test").await.unwrap();
+        assert_eq!(snapshot.index.freshness, config.freshness);
+        assert_eq!(
+            runtime.refresh("unchanged").await.unwrap().index.freshness,
+            config.freshness
+        );
+        let handles = runtimes.start_auto_reindex();
+        assert_eq!(handles.len(), 1, "freshness has its own maintenance task");
+        drop(handles);
+        config.freshness = Default::default();
+        let disabled = MountRuntimes::new(&config, &backends);
+        assert!(disabled.start_auto_reindex().is_empty());
+        fs::remove_dir_all(vault).ok();
+        fs::remove_dir_all(index_dir).ok();
+    }
+
     #[tokio::test]
     async fn every_mount_gets_a_distinct_runtime() {
         let config = two_mount_config(temp_path("root_vault"), temp_path("team_vault"));

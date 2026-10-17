@@ -155,6 +155,8 @@ pub struct SearchArtifact {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchIndex {
+    #[serde(skip)]
+    pub freshness: deep_obsidian_types::FreshnessLevel,
     pub version: u32,
     pub generated_at: String,
     pub semantic_backend: SemanticBackend,
@@ -1902,7 +1904,7 @@ fn header_from_metadata_and_snapshots(
         .get("version")
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or_else(|| IndexError::Embedding("missing version metadata".to_string()))?;
-    if version != INDEX_VERSION {
+    if version != INDEX_VERSION && version != 6 {
         return Err(IndexError::Embedding(
             "unsupported index version".to_string(),
         ));
@@ -1929,7 +1931,7 @@ fn header_from_metadata_and_snapshots(
     })
 }
 
-fn embedding_blob(vector: &[f64]) -> Vec<u8> {
+pub(crate) fn embedding_blob(vector: &[f64]) -> Vec<u8> {
     let mut blob = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());
     for value in vector {
         blob.extend_from_slice(&(*value as f32).to_le_bytes());
@@ -2433,6 +2435,7 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    crate::freshness::clear(&tx)?;
     tx.execute_batch(
         r#"
         DROP TABLE IF EXISTS metadata;
@@ -2732,7 +2735,7 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
         .get("version")
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or_else(|| IndexError::Embedding("missing version metadata".to_string()))?;
-    if version != INDEX_VERSION {
+    if version != INDEX_VERSION && version != 6 {
         return Err(IndexError::Embedding(
             "unsupported index version".to_string(),
         ));
@@ -2914,6 +2917,7 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
     };
 
     Ok(SearchIndex {
+        freshness: Default::default(),
         version,
         generated_at: metadata
             .get("generatedAt")
@@ -3335,7 +3339,10 @@ fn insert_prepared_note(
             if let Some(embedding) = chunk.embedding.as_ref() {
                 tx.execute(
                     "INSERT INTO chunk_embeddings_vec (rowid, embedding) VALUES (?1, ?2)",
-                    params![chunk_id, embedding_blob(embedding)],
+                    params![
+                        chunk_id,
+                        crate::freshness::stored_blob(tx, embedding, prepared.snapshot.mtime_ms)?
+                    ],
                 )
                 .map_err(|error| IndexError::Embedding(error.to_string()))?;
             }
@@ -3526,7 +3533,7 @@ fn replace_index_metadata(
         .filter(|snapshot| snapshot.size > DEFAULT_MAX_ARTIFACT_BYTES)
         .count();
 
-    tx.execute("DELETE FROM metadata", [])
+    tx.execute("DELETE FROM metadata WHERE key <> 'freshnessEncoding'", [])
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     let metadata_entries: Vec<(&str, String)> = vec![
         ("version", INDEX_VERSION.to_string()),
@@ -4064,6 +4071,7 @@ pub fn build_index_from_source_snapshots(
     };
 
     let index = SearchIndex {
+        freshness: Default::default(),
         version: INDEX_VERSION,
         generated_at: now_utc_string(),
         semantic_backend,
@@ -5206,7 +5214,7 @@ mod tests {
             connection
                 .execute(
                     "UPDATE metadata SET value = ?1 WHERE key = 'version'",
-                    params![(INDEX_VERSION - 1).to_string()],
+                    params![(INDEX_VERSION - 2).to_string()],
                 )
                 .expect("downgrade version");
         }
@@ -5395,6 +5403,7 @@ mod tests {
 
         let index_file = index_file_path(&root, None);
         let mut persisted = build_index(&root, None, None).expect("build");
+        persisted.version = 6; // Existing D-only cache, reused without model calls.
         persisted.semantic_backend = SemanticBackend::Embedding;
         persisted.embedding_provider = Some("openai-compatible".to_string());
         persisted.embedding_model = Some("text-embedding-3-small".to_string());
@@ -5438,7 +5447,8 @@ mod tests {
         }
         .with_context_tokens(1024);
 
-        let (loaded, rebuilt) = get_search_index(&root, None, Some(&runtime_config)).expect("load");
+        let (mut loaded, rebuilt) =
+            get_search_index(&root, None, Some(&runtime_config)).expect("load");
 
         assert!(!rebuilt);
         let query_config = embedding_runtime_config(&loaded).unwrap();
@@ -5475,6 +5485,84 @@ mod tests {
             Some("runtime-secret")
         );
 
+        crate::freshness::configure(&mut loaded, deep_obsidian_types::FreshnessLevel::Disabled)
+            .unwrap();
+        assert_eq!(loaded.version, INDEX_VERSION);
+        let migrated = load_index(&root, None).unwrap().unwrap();
+        assert_eq!(migrated.version, INDEX_VERSION);
+        let dimensions: i64 = connection
+            .query_row(
+                "SELECT vec_length(embedding) FROM chunk_embeddings_vec LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dimensions, 5, "v6 D-only cache converted locally to D+2");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn freshness_encoding_follows_incremental_edits_and_deletes_without_reembedding() {
+        use deep_obsidian_types::FreshnessLevel;
+        let root = unique_temp_dir("freshness-incremental");
+        fs::create_dir_all(&root).unwrap();
+        write_fixture(&root, "Home.md", "# Home\n\nStorage decision.\n");
+        write_fixture(&root, "Other.md", "# Other\n\nStable reference.\n");
+        let (url, requests) = start_embedding_server(2);
+        let config = embedding_test_config(url);
+        let mut index = build_index(&root, None, Some(&config)).unwrap();
+        crate::freshness::configure(&mut index, FreshnessLevel::Classic).unwrap();
+        let conn = open_index_connection(&index_file_path(&root, None), true).unwrap();
+        let initial = crate::freshness::active(&conn).unwrap().unwrap();
+        drop(conn);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "derived generation does not call the model"
+        );
+        write_fixture(
+            &root,
+            "Home.md",
+            "# Home\n\nA revised storage decision with different content.\n",
+        );
+        write_fixture(&root, "New.md", "# New\n\nNew decision context.\n");
+        let (mut changed, _) = get_search_index(&root, None, Some(&config)).unwrap();
+        crate::freshness::configure(&mut changed, FreshnessLevel::High).unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        fs::remove_file(root.join("Other.md")).unwrap();
+        let (mut deleted, _) = get_search_index(&root, None, Some(&config)).unwrap();
+        crate::freshness::configure(&mut deleted, FreshnessLevel::Classic).unwrap();
+        let conn = open_index_connection(&index_file_path(&root, None), true).unwrap();
+        let generation = crate::freshness::active(&conn).unwrap().unwrap();
+        assert_eq!(
+            (
+                generation.created_ms,
+                generation.anchor_ms,
+                generation.renew_ms
+            ),
+            (initial.created_ms, initial.anchor_ms, initial.renew_ms)
+        );
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {}", "chunk_embeddings_vec"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, deleted.chunk_count as i64);
+        assert_eq!(vector_counts(&root).1, deleted.chunk_count);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            2,
+            "deletion and preset changes must not reembed"
+        );
+        drop(conn);
+        build_index(&root, None, None).unwrap();
+        let conn = open_index_connection(&index_file_path(&root, None), true).unwrap();
+        assert!(
+            crate::freshness::active(&conn).unwrap().is_none(),
+            "full rebuild retires derived vectors before row IDs can be reused"
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -6259,6 +6347,7 @@ mod tests {
     fn explicit_query_instruction_overrides_auto_default() {
         // A user-set instruction wins even on a qwen3 model.
         let mut index = SearchIndex {
+            freshness: Default::default(),
             version: 1,
             generated_at: String::new(),
             semantic_backend: SemanticBackend::Embedding,
@@ -6313,6 +6402,7 @@ mod tests {
         // user config sets the non-persisted `runtime_query_instruction`, so an
         // explicit override survives a plain index load (not just a rebuild).
         let mut index = SearchIndex {
+            freshness: Default::default(),
             version: 1,
             generated_at: String::new(),
             semantic_backend: SemanticBackend::Embedding,

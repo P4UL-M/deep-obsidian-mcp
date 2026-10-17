@@ -764,6 +764,7 @@ pub fn normalize_service_config(
         // Absent means enabled: the rerank is what makes a federated answer RANKED rather
         // than merely merged, so a config that never mentions it gets it.
         federated_rerank: input.federated_rerank.unwrap_or(true),
+        freshness: input.freshness.unwrap_or_default(),
         vault_path,
         mounts,
         experimental,
@@ -808,6 +809,7 @@ pub fn normalize_persisted_config(
         artifact_embedding: input.artifact_embedding,
         auth: input.auth,
         federated_rerank: input.federated_rerank,
+        freshness: input.freshness,
         config_file_path: None,
     })?;
 
@@ -912,6 +914,11 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
             None
         } else {
             Some(false)
+        },
+        freshness: if config.freshness.is_disabled() {
+            None
+        } else {
+            Some(config.freshness)
         },
         // Empty here because a `ResolvedServiceConfig` does not carry them: the
         // resolved form is the SERVER's view, and threading a bag of keys it cannot
@@ -2777,5 +2784,43 @@ mod oauth_config_tests {
         for ttl in [2592001, u64::MAX] {
             assert!(load(serde_json::json!({"oauth":{"issuerUrl":"https://server.example", "refreshTokenTtlSeconds":ttl}})).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    use deep_obsidian_types::FreshnessLevel;
+
+    #[test]
+    fn freshness_is_opt_in_and_each_preset_round_trips() {
+        let legacy: PersistedServiceConfig =
+            serde_json::from_value(serde_json::json!({"vaultPath":"/tmp/freshness-config-test"}))
+                .unwrap();
+        let normalized = normalize_persisted_config(legacy.clone()).unwrap();
+        assert!(normalized.freshness.is_none());
+        assert!(serde_json::to_value(normalized)
+            .unwrap()
+            .get("freshness")
+            .is_none());
+        for (level, semantic, keyword) in [
+            (FreshnessLevel::Low, 0.01, 0.01),
+            (FreshnessLevel::Classic, 0.02, 0.03),
+            (FreshnessLevel::High, 0.05, 0.05),
+        ] {
+            let mut input = legacy.clone();
+            input.freshness = Some(level);
+            let normalized = normalize_persisted_config(input).unwrap();
+            assert_eq!(normalized.freshness, Some(level));
+            let again: PersistedServiceConfig =
+                serde_json::from_value(serde_json::to_value(normalized).unwrap()).unwrap();
+            assert_eq!(again.freshness, Some(level));
+            assert_eq!(level.semantic_weight(), semantic);
+            assert_eq!(level.keyword_weight(), keyword);
+        }
+        assert!(serde_json::from_value::<PersistedServiceConfig>(
+            serde_json::json!({"freshness":"enormous"})
+        )
+        .is_err());
     }
 }

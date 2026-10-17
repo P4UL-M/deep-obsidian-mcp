@@ -691,6 +691,21 @@ async fn drive(
     println!();
     let embeddings = ask_embeddings(request, io, existing.as_ref(), state)?;
 
+    println!();
+    let levels = [
+        deep_obsidian_types::FreshnessLevel::Disabled,
+        deep_obsidian_types::FreshnessLevel::Low,
+        deep_obsidian_types::FreshnessLevel::Classic,
+        deep_obsidian_types::FreshnessLevel::High,
+    ];
+    let current = working.freshness.unwrap_or_default();
+    let choice = io.answers.choice(
+        "Prefer recently modified notes in search? (90-day half-life; modification does not prove validity)",
+        &["Disabled", "Low", "Classic", "High"],
+        levels.iter().position(|level| *level == current).unwrap_or(0),
+    )?;
+    working.freshness = Some(levels[choice]);
+
     // ---- Screen 4: transport.
     println!();
     let transport = ask_transport(io, existing.as_ref())?;
@@ -1346,6 +1361,7 @@ async fn finish_through_setup_service(
 ) -> Result<SetupServiceReport> {
     let FinishInputs {
         config_path,
+        working,
         local_root,
         embeddings,
         transport,
@@ -1368,6 +1384,7 @@ async fn finish_through_setup_service(
     }
 
     let mut resolved = crate::config::resolve_runtime_config(&options)?;
+    resolved.service.freshness = working.freshness.unwrap_or_default();
     resolved.service.embedding.api_key_ref = embeddings.api_key_ref.clone();
     if transport.auth.is_some() {
         resolved.service.auth.oauth = transport.oauth.clone();

@@ -848,6 +848,7 @@ impl Harness {
             .collect();
 
         let config = ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: rerank,
             vault_path: Some(base.join("root-vault")),
             mounts,
@@ -1508,6 +1509,7 @@ async fn a_mount_that_cannot_hold_artifacts_is_skipped_rather_than_reported_miss
         .expect("store the fixture api key");
 
     let config = ResolvedServiceConfig {
+        freshness: Default::default(),
         federated_rerank: true,
         vault_path: Some(root_vault.clone()),
         mounts: vec![

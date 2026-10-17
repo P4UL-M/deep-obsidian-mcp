@@ -630,6 +630,40 @@ impl ExperimentalConfig {
     }
 }
 
+/// One user-facing setting, with independently calibrated retrieval coefficients.
+/// Absent in legacy configurations means disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FreshnessLevel {
+    #[default]
+    Disabled,
+    Low,
+    Classic,
+    High,
+}
+
+impl FreshnessLevel {
+    pub fn is_disabled(&self) -> bool {
+        *self == Self::Disabled
+    }
+    pub fn semantic_weight(self) -> f64 {
+        match self {
+            Self::Disabled => 0.,
+            Self::Low => 0.01,
+            Self::Classic => 0.02,
+            Self::High => 0.05,
+        }
+    }
+    pub fn keyword_weight(self) -> f64 {
+        match self {
+            Self::Disabled => 0.,
+            Self::Low => 0.01,
+            Self::Classic => 0.03,
+            Self::High => 0.05,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceConfigInput {
@@ -648,6 +682,7 @@ pub struct ServiceConfigInput {
     pub auth: Option<AuthConfigInput>,
     /// See [`ResolvedServiceConfig::federated_rerank`]. `None` means the default (enabled).
     pub federated_rerank: Option<bool>,
+    pub freshness: Option<FreshnessLevel>,
     pub config_file_path: Option<PathBuf>,
 }
 
@@ -674,6 +709,8 @@ pub struct PersistedServiceConfig {
     /// save/load round trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub federated_rerank: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<FreshnessLevel>,
     /// Top-level keys this build does not know. See [`UnknownFields`].
     ///
     /// This is the struct a config FILE is parsed into (`read_config_file`) as well as
@@ -754,6 +791,8 @@ pub struct ResolvedServiceConfig {
     /// which stage produced the order either way.
     #[serde(default = "default_federated_rerank", skip_serializing_if = "is_true")]
     pub federated_rerank: bool,
+    #[serde(default, skip_serializing_if = "FreshnessLevel::is_disabled")]
+    pub freshness: FreshnessLevel,
     pub config_file_path: Option<PathBuf>,
 }
 
