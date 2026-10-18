@@ -344,6 +344,7 @@ any configured token reference.
 ## Search freshness
 
 The wizard offers **Disabled / Low / Classic / High** after the embedding questions.
+**Classic is selected by default**, including when `freshness` is absent from an existing configuration. Set `disabled` explicitly to turn it off.
 The equivalent config-file setting is:
 
 ```json
@@ -352,9 +353,9 @@ The equivalent config-file setting is:
 
 | Level | Semantic freshness weight | Maximum BM25 bonus |
 |---|---:|---:|
-| `disabled` (default) | 0% | 0% |
+| `disabled` | 0% | 0% |
 | `low` | 1% | 1% |
-| `classic` | 2% | 3% |
+| `classic` (default) | 2% | 3% |
 | `high` | 5% | 5% |
 
 Both branches use the note's last modification time and a fixed **90-day half-life**.

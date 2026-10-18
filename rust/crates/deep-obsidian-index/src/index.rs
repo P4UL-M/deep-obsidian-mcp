@@ -2917,7 +2917,7 @@ fn load_search_index_from_connection(conn: &Connection) -> Result<SearchIndex> {
     };
 
     Ok(SearchIndex {
-        freshness: Default::default(),
+        freshness: deep_obsidian_types::FreshnessLevel::Disabled,
         version,
         generated_at: metadata
             .get("generatedAt")
@@ -4071,7 +4071,7 @@ pub fn build_index_from_source_snapshots(
     };
 
     let index = SearchIndex {
-        freshness: Default::default(),
+        freshness: deep_obsidian_types::FreshnessLevel::Disabled,
         version: INDEX_VERSION,
         generated_at: now_utc_string(),
         semantic_backend,
@@ -6347,7 +6347,7 @@ mod tests {
     fn explicit_query_instruction_overrides_auto_default() {
         // A user-set instruction wins even on a qwen3 model.
         let mut index = SearchIndex {
-            freshness: Default::default(),
+            freshness: deep_obsidian_types::FreshnessLevel::Disabled,
             version: 1,
             generated_at: String::new(),
             semantic_backend: SemanticBackend::Embedding,
@@ -6402,7 +6402,7 @@ mod tests {
         // user config sets the non-persisted `runtime_query_instruction`, so an
         // explicit override survives a plain index load (not just a rebuild).
         let mut index = SearchIndex {
-            freshness: Default::default(),
+            freshness: deep_obsidian_types::FreshnessLevel::Disabled,
             version: 1,
             generated_at: String::new(),
             semantic_backend: SemanticBackend::Embedding,

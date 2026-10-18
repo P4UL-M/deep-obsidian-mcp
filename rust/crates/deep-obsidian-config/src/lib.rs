@@ -915,7 +915,7 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
         } else {
             Some(false)
         },
-        freshness: if config.freshness.is_disabled() {
+        freshness: if config.freshness.is_classic() {
             None
         } else {
             Some(config.freshness)
@@ -2793,10 +2793,28 @@ mod freshness_tests {
     use deep_obsidian_types::FreshnessLevel;
 
     #[test]
-    fn freshness_is_opt_in_and_each_preset_round_trips() {
+    fn freshness_defaults_to_classic_and_each_preset_round_trips() {
         let legacy: PersistedServiceConfig =
             serde_json::from_value(serde_json::json!({"vaultPath":"/tmp/freshness-config-test"}))
                 .unwrap();
+        let resolved = normalize_service_config(ServiceConfigInput {
+            vault_path: legacy.vault_path.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(resolved.freshness, FreshnessLevel::Classic);
+        let mut disabled = resolved.clone();
+        disabled.freshness = FreshnessLevel::Disabled;
+        let persisted = to_persisted_config(&disabled);
+        assert_eq!(persisted.freshness, Some(FreshnessLevel::Disabled));
+        let serialized = serde_json::to_value(&disabled).unwrap();
+        assert_eq!(serialized["freshness"], "disabled");
+        assert_eq!(
+            serde_json::from_value::<ResolvedServiceConfig>(serialized)
+                .unwrap()
+                .freshness,
+            FreshnessLevel::Disabled
+        );
         let normalized = normalize_persisted_config(legacy.clone()).unwrap();
         assert!(normalized.freshness.is_none());
         assert!(serde_json::to_value(normalized)
@@ -2804,6 +2822,7 @@ mod freshness_tests {
             .get("freshness")
             .is_none());
         for (level, semantic, keyword) in [
+            (FreshnessLevel::Disabled, 0.0, 0.0),
             (FreshnessLevel::Low, 0.01, 0.01),
             (FreshnessLevel::Classic, 0.02, 0.03),
             (FreshnessLevel::High, 0.05, 0.05),
@@ -2811,10 +2830,10 @@ mod freshness_tests {
             let mut input = legacy.clone();
             input.freshness = Some(level);
             let normalized = normalize_persisted_config(input).unwrap();
-            assert_eq!(normalized.freshness, Some(level));
+            assert_eq!(normalized.freshness.unwrap_or_default(), level);
             let again: PersistedServiceConfig =
                 serde_json::from_value(serde_json::to_value(normalized).unwrap()).unwrap();
-            assert_eq!(again.freshness, Some(level));
+            assert_eq!(again.freshness.unwrap_or_default(), level);
             assert_eq!(level.semantic_weight(), semantic);
             assert_eq!(level.keyword_weight(), keyword);
         }

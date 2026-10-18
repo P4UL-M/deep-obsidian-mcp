@@ -39,7 +39,7 @@ forces an explicit rebuild.
 
 ## Freshness encoding
 
-`freshness` is opt-in; presets and formulas are documented in
+`freshness` defaults to `classic`; presets and formulas are documented in
 [CONFIGURATION.md](../CONFIGURATION.md#search-freshness). Runtime initialization
 converts an existing D-dimensional cache locally, without model calls. There is
 **one stored D+2 vector per chunk**, in `chunk_embeddings_vec`, and no permanent

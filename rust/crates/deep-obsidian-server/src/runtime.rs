@@ -2087,7 +2087,7 @@ mod tests {
         )
         .unwrap();
         let mut config = test_config(vault.clone(), index_dir.clone());
-        config.freshness = deep_obsidian_types::FreshnessLevel::Classic;
+        assert_eq!(config.freshness, deep_obsidian_types::FreshnessLevel::Classic);
         assert!(!config.auto_reindex.enabled);
         let backends = MountBackends::build(&config);
         let runtimes = MountRuntimes::new(&config, &backends);
@@ -2101,7 +2101,7 @@ mod tests {
         let handles = runtimes.start_auto_reindex();
         assert_eq!(handles.len(), 1, "freshness has its own maintenance task");
         drop(handles);
-        config.freshness = Default::default();
+        config.freshness = deep_obsidian_types::FreshnessLevel::Disabled;
         let disabled = MountRuntimes::new(&config, &backends);
         assert!(disabled.start_auto_reindex().is_empty());
         fs::remove_dir_all(vault).ok();

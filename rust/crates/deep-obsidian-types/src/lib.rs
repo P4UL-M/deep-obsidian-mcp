@@ -631,18 +631,21 @@ impl ExperimentalConfig {
 }
 
 /// One user-facing setting, with independently calibrated retrieval coefficients.
-/// Absent in legacy configurations means disabled.
+/// Absent in configurations means classic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FreshnessLevel {
-    #[default]
     Disabled,
     Low,
+    #[default]
     Classic,
     High,
 }
 
 impl FreshnessLevel {
+    pub fn is_classic(&self) -> bool {
+        *self == Self::Classic
+    }
     pub fn is_disabled(&self) -> bool {
         *self == Self::Disabled
     }
@@ -791,7 +794,7 @@ pub struct ResolvedServiceConfig {
     /// which stage produced the order either way.
     #[serde(default = "default_federated_rerank", skip_serializing_if = "is_true")]
     pub federated_rerank: bool,
-    #[serde(default, skip_serializing_if = "FreshnessLevel::is_disabled")]
+    #[serde(default, skip_serializing_if = "FreshnessLevel::is_classic")]
     pub freshness: FreshnessLevel,
     pub config_file_path: Option<PathBuf>,
 }
