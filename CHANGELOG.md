@@ -2,6 +2,41 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.2.0-alpha.8 — 2026-10-18
+
+### Added
+
+- Search freshness is configurable as `disabled`, `low`, `classic` or `high` in
+  the wizard and configuration. **Classic is the default**, including when an
+  existing configuration omits the field; set `freshness: "disabled"` explicitly
+  to turn it off. Semantic weights are 0/1/2/5%; maximum BM25 bonuses are 0/1/3/5%.
+- Filesystem and CouchDB retrieval apply freshness before semantic and keyword
+  candidate selection, using modification time and a 90-day half-life. Hybrid
+  fusion and the existing graph bonus receive no additional temporal bonus.
+- Temporal encoding uses one D+2 float32 vector per chunk, an 18-month anchor,
+  and automatic renewal after 16 months. Renewal runs locally without embedding
+  model calls, including startup catch-up and hourly checks independent of
+  source auto-indexing. It uses an ordinary SQLite transaction and restarts
+  from the beginning after interruption, with no persistent resume protocol.
+
+### Compatibility
+
+- Existing schema-v6 embedding caches migrate locally to schema v7 at runtime
+  initialization without calling the model. Older binaries reject v7 caches;
+  downgrading requires rebuilding the index. See
+  [migration and rollback](docs/migration-and-rollback.md).
+- Disabling freshness uses beta=0 on the same vector representation. Related-note
+  queries remain semantic. Modification time is a ranking hint, not proof that
+  an edited decision supersedes an older one.
+- Algolia native search remains unchanged and receives no freshness bonus.
+  Algolia, CouchDB and multi-vault configurations remain experimental.
+
+### Validation
+
+- Workspace tests passed: 879 succeeded, eight ignored, no failures. The PR's
+  AMD64/ARM64 package and Docker build/smoke checks passed. Real-model retrieval
+  quality and end-to-end freshness latency remain to be measured.
+
 ## v0.2.0-alpha.7 — 2026-10-11
 
 ### Changed
