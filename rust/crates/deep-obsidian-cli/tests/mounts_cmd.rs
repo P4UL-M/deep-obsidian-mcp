@@ -160,6 +160,7 @@ fn resolved_shape(config_path: &Path) -> (Option<PathBuf>, PathBuf) {
             artifact_embedding: file.artifact_embedding,
             auth: file.auth,
             federated_rerank: file.federated_rerank,
+            freshness: file.freshness,
             config_file_path: Some(config_path.to_path_buf()),
         })
         .expect("the config resolves");

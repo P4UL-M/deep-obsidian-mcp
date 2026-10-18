@@ -173,6 +173,7 @@ async fn a_first_local_install_writes_a_legacy_shaped_config_and_no_backup() {
             "",                                  // it does not exist: create it? -> yes
             "",                                  // add another vault? -> no
             "",                                  // enable embeddings? -> no
+            "",                                  // freshness -> classic
             "",                                  // transport -> stdio
             "",                                  // install packaged skills? -> no
             "",                                  // install Obsidian snippets? -> no
@@ -279,6 +280,7 @@ async fn embedding_answers_are_prefilled_from_the_existing_config() {
             "",  // which endpoint -> Ollama preset
             "",  // embedding model -> the configured one wins over the preset
             "",  // embedding base URL -> likewise
+            "",  // freshness -> classic
             "",  // transport -> stdio
             "",  // skills -> no
             "",  // snippets -> no
@@ -323,6 +325,7 @@ async fn the_ollama_preset_fills_the_endpoint_and_the_key_becomes_a_reference() 
             "",                             // endpoint -> Ollama
             "",                             // model -> the preset's
             "",                             // base URL -> the preset's
+            "",                             // freshness -> classic
             "",                             // transport -> stdio
             "",                             // skills -> no
             "",                             // snippets -> no
@@ -371,6 +374,7 @@ async fn choosing_http_takes_a_port_and_a_declined_auth_stays_off() {
             vault.to_str().expect("utf-8"), // vault folder
             "",                             // add another vault? -> no
             "",                             // embeddings -> no
+            "",                             // freshness -> classic
             "2",                            // transport -> HTTP
             "4321",                         // port
             "n",                            // enable bearer auth? -> no
@@ -421,6 +425,7 @@ async fn accepting_http_auth_on_a_local_root_stores_a_token_by_reference() {
             vault.to_str().expect("utf-8"), // vault folder
             "",                             // add another vault? -> no
             "",                             // embeddings -> no
+            "",                             // freshness -> classic
             "2",                            // transport -> HTTP
             "4321",                         // port
             "y",                            // enable bearer auth
@@ -468,6 +473,7 @@ async fn accepting_http_auth_stores_a_token_by_reference() {
     answers.extend([
         "",     // add another vault? -> no
         "",     // embeddings -> no
+        "",     // freshness -> classic
         "2",    // transport -> HTTP
         "4321", // port
         "y",    // enable bearer auth
@@ -532,6 +538,7 @@ async fn an_algolia_root_becomes_a_one_mount_table_with_a_confirmed_flag() {
     answers.extend([
         "", // add another vault? -> no
         "", // embeddings -> no
+        "", // freshness -> classic
         "", // transport -> stdio
         "", // skills -> no
         // No snippets question: a remote root has no local vault folder to install into.
@@ -656,6 +663,7 @@ async fn a_failed_probe_can_be_kept_anyway() {
         "y", // add the mount anyway? -> yes
         "",  // add another vault? -> no
         "",  // embeddings -> no
+        "",  // freshness -> classic
         "",  // transport -> stdio
         "",  // skills -> no
         "",  // write it -> yes
@@ -703,6 +711,7 @@ async fn a_couchdb_root_asks_the_whole_sequence_and_dry_run_stores_nothing() {
             "y",                     // enable experimental.couchdbVaults
             "",                      // add another vault? -> no
             "",                      // embeddings -> no
+            "",                      // freshness -> classic
             "",                      // transport -> stdio
             "",                      // skills -> no
             "",                      // write it -> yes
@@ -763,6 +772,7 @@ async fn the_additional_mounts_loop_suggests_an_id_and_migrates_the_root() {
             "y",                            // enable experimental.multiVault
             "",                             // add another vault? -> no
             "",                             // embeddings -> no
+            "",                             // freshness -> classic
             "",                             // transport -> stdio
             "",                             // skills -> no
             "",                             // snippets -> no
@@ -827,6 +837,7 @@ async fn a_typed_mount_id_overrides_the_suggestion() {
             "y",                           // multiVault
             "",                            // no more mounts
             "",                            // no embeddings
+            "",                            // freshness -> classic
             "",                            // stdio
             "",                            // no skills
             "",                            // no snippets
@@ -907,6 +918,7 @@ async fn an_end_of_input_at_any_question_aborts_without_writing() {
     answers.extend([
         "", // add another vault? -> no
         "", // embeddings -> no
+        "", // freshness -> classic
         "", // transport -> stdio
         "", // skills -> no
             // and then the input ends, at "Write it?"
@@ -940,6 +952,7 @@ async fn declining_the_recap_writes_nothing_and_rolls_back() {
     answers.extend([
         "",  // no more mounts
         "",  // no embeddings
+        "",  // freshness -> classic
         "",  // stdio
         "",  // no skills
         "n", // write it? -> NO
@@ -1219,6 +1232,7 @@ fn cli_argv_completes_a_local_install_and_prints_its_report_once() {
         "",                             // create it? -> yes
         "",                             // add another vault? -> no
         "",                             // embeddings -> no
+        "",                             // freshness -> classic
         "",                             // transport -> stdio
         "",                             // skills -> no
         "",                             // snippets -> no
@@ -1348,6 +1362,7 @@ async fn local_http_wizard_enables_additive_oauth_without_storing_plaintext() {
             vault.to_str().unwrap(),
             "",
             "",
+            "", // freshness -> classic
             "2",
             "4321",
             "y",
@@ -1386,6 +1401,7 @@ async fn remote_http_wizard_enables_additive_oauth() {
     answers.extend([
         "",
         "",
+        "", // freshness -> classic
         "2",
         "4321",
         "y",
@@ -1431,7 +1447,7 @@ async fn editing_an_existing_oauth_setup_preserves_secret_defaults_and_stdio_con
     let options = fixture.options();
     // Keep HTTP, existing authentication mode, issuer and lifetime through defaults.
     let mut io = fixture.io(
-        vec!["1", "", "", "", "2", "", "", "", "", "n", "", "", ""],
+        vec!["1", "", "", "", "", "2", "", "", "", "", "n", "", "", ""],
         Vec::new(),
     );
     run_with_io(&request(&options, false), &mut io)
@@ -1450,14 +1466,14 @@ async fn editing_an_existing_oauth_setup_preserves_secret_defaults_and_stdio_con
         "fake-unchanged-owner-secret"
     );
     // Switching to stdio preserves the entire HTTP authentication setup.
-    let mut io = fixture.io(vec!["1", "", "", "", "1", "n", "", "", ""], Vec::new());
+    let mut io = fixture.io(vec!["1", "", "", "", "", "1", "n", "", "", ""], Vec::new());
     run_with_io(&request(&options, false), &mut io)
         .await
         .unwrap();
     assert_eq!(fixture.config_json()["auth"], saved["auth"]);
     // Switching back to HTTP with legacy-only removes OAuth, keeps the original credential.
     let mut io = fixture.io(
-        vec!["1", "", "", "", "2", "", "y", "1", "n", "", "", ""],
+        vec!["1", "", "", "", "", "2", "", "y", "1", "n", "", "", ""],
         Vec::new(),
     );
     run_with_io(&request(&options, false), &mut io)
@@ -1476,4 +1492,48 @@ async fn editing_an_existing_oauth_setup_preserves_secret_defaults_and_stdio_con
         "fake-unchanged-owner-secret"
     );
     let _ = std::fs::remove_dir_all(&fixture.base);
+}
+
+#[tokio::test]
+async fn freshness_choice_is_persisted_and_prefilled_on_local_and_mount_table_paths() {
+    use deep_obsidian_types::FreshnessLevel;
+    let fixture = Fixture::new("freshness-local");
+    let vault = fixture.base.join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let options = fixture.options();
+    for choice in ["", "3", ""] {
+        let mut io = fixture.io(
+            vec!["1", vault.to_str().unwrap(), "", "", choice, "", "", "", ""],
+            vec![],
+        );
+        run_with_io(&request(&options, false), &mut io)
+            .await
+            .unwrap();
+        let persisted = deep_obsidian_config::read_config_file(&fixture.config_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.freshness.unwrap_or_default(),
+            FreshnessLevel::Classic
+        );
+        assert_eq!(
+            deep_obsidian_cli::config::resolve_runtime_config(&options)
+                .unwrap()
+                .service
+                .freshness,
+            FreshnessLevel::Classic
+        );
+    }
+    let remote = Fixture::new("freshness-mount-table");
+    let (base_url, _mock) = spawn_mock().await;
+    let options = remote.options();
+    let mut answers = algolia_root_answers(&base_url);
+    answers.extend(["", "", "4", "", "", ""]);
+    let mut io = remote.io(answers, vec![API_KEY]);
+    run_with_io(&request(&options, false), &mut io)
+        .await
+        .unwrap();
+    assert_eq!(remote.config_json()["freshness"], "high");
+    let _ = std::fs::remove_dir_all(&fixture.base);
+    let _ = std::fs::remove_dir_all(&remote.base);
 }

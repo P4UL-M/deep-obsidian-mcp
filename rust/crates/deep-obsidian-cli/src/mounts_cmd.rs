@@ -740,6 +740,7 @@ fn input_from_persisted(config: PersistedServiceConfig, config_path: &Path) -> S
         artifact_embedding,
         auth,
         federated_rerank,
+        freshness,
         // Not part of the input type: unknown keys are restored on the way OUT, by
         // `carry_unknown_fields`, because the resolved config cannot carry them.
         unknown: _,
@@ -757,6 +758,7 @@ fn input_from_persisted(config: PersistedServiceConfig, config_path: &Path) -> S
         artifact_embedding,
         auth,
         federated_rerank,
+        freshness,
         config_file_path: Some(config_path.to_path_buf()),
     }
 }

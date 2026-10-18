@@ -202,6 +202,7 @@ impl Fixture {
     /// A two-mount config: a filesystem root plus the couchdb mount under test.
     fn config(&self, couch: &MockCouch, writable: bool) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             vault_path: Some(self.base.join("root-vault")),
             mounts: vec![

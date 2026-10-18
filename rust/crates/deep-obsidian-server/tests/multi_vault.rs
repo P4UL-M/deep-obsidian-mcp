@@ -102,6 +102,7 @@ impl Fixture {
     /// broken mount can be built by naming a directory that does not exist.
     fn config_with_team_vault(&self, team_vault: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             // Still the ROOT mount's path: it is what `vaultPath` has always meant,
             // and the root mount's own runtime is built from this config verbatim.

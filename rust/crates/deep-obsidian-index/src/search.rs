@@ -1,3 +1,4 @@
+use crate::freshness;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::graph::resolve_wiki_link_target;
@@ -182,15 +183,27 @@ fn hybrid_candidate_limit(chunk_count: usize, requested_limit: usize) -> usize {
     candidate_limit.min(chunk_count.max(1))
 }
 
-fn semantic_search_with_query_vector_sql(
+pub(crate) fn semantic_search_with_query_vector_sql(
     index: &SearchIndex,
     query_embedding: &[f64],
     limit: usize,
 ) -> Result<Vec<SearchMatch>> {
     let connection = open_index_connection_for_index(index, true)?;
-    let mut statement = connection
-        .prepare(
-            r#"
+    // Read the encoding and vector table in the same SQLite snapshot.
+    let table = "chunk_embeddings_vec";
+    let (vector, norm2) = if let Some(encoding) = freshness::active(&connection)? {
+        let (vector, norm2) = freshness::query_vector(
+            query_embedding,
+            &encoding,
+            index.freshness,
+            chrono::Utc::now().timestamp_millis(),
+        )?;
+        (vector, Some(norm2))
+    } else {
+        (query_embedding.to_vec(), None)
+    };
+    let query_sql = format!(
+        r#"
             SELECT
               c.path,
               c.title,
@@ -201,20 +214,24 @@ fn semantic_search_with_query_vector_sql(
               matches.distance
             FROM (
               SELECT rowid, distance
-              FROM chunk_embeddings_vec
+              FROM {table}
               WHERE embedding MATCH ?1 AND k = ?2
             ) matches
             JOIN chunks c ON c.id = matches.rowid
             ORDER BY matches.distance
-            "#,
-        )
+            "#
+    );
+    let mut statement = connection
+        .prepare(&query_sql)
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     let rows = statement
         .query_map(
-            params![query_vector_blob(query_embedding), limit.max(1) as i64],
+            params![query_vector_blob(&vector), limit.max(1) as i64],
             |row| {
                 let distance = row.get::<_, f64>(6)?;
-                let score = sql_distance_score(distance);
+                let score = norm2
+                    .map(|norm2| freshness::distance_score(distance, norm2))
+                    .unwrap_or_else(|| sql_distance_score(distance));
                 Ok(SearchMatch {
                     path: row.get::<_, String>(0)?,
                     title: row.get::<_, String>(1)?,
@@ -299,6 +316,17 @@ pub fn semantic_score_for_vectors(query: &[f64], document: &[f64]) -> f64 {
     sql_distance_score(distance)
 }
 
+/// Common semantic scale for native federated hits without stored timestamps.
+pub fn semantic_score_for_vectors_with_freshness(
+    query: &[f64],
+    document: &[f64],
+    level: deep_obsidian_types::FreshnessLevel,
+    mtime_ms: u64,
+    now_ms: i64,
+) -> f64 {
+    freshness::semantic_score(dense_cosine(query, document), level, mtime_ms, now_ms)
+}
+
 /// Semantic scores for NAMED chunks of this index, parallel to `chunks`.
 ///
 /// `None` for a chunk this index does not hold, or holds without a vector (a note that
@@ -340,6 +368,8 @@ pub fn semantic_scores_for_chunks(
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
 
     let mut scores = Vec::with_capacity(chunks.len());
+    let mtimes = freshness::timestamps(index);
+    let now = chrono::Utc::now().timestamp_millis();
     for (path, chunk_index) in chunks {
         let blob: Option<Vec<u8>> = statement
             .query_row(params![path, *chunk_index as i64], |row| {
@@ -349,7 +379,15 @@ pub fn semantic_scores_for_chunks(
             .map_err(|error| IndexError::Embedding(error.to_string()))?;
         scores.push(
             blob.and_then(|blob| decode_embedding_blob(&blob))
-                .map(|document| semantic_score_for_vectors(query_embedding, &document)),
+                .map(|mut document| {
+                    document.truncate(index.embedding_dimensions.unwrap_or(document.len()));
+                    freshness::semantic_score(
+                        dense_cosine(query_embedding, &document),
+                        index.freshness,
+                        mtimes.get(path.as_str()).copied().unwrap_or(0),
+                        now,
+                    )
+                }),
         );
     }
     Ok(scores)
@@ -418,6 +456,7 @@ fn related_notes_with_embeddings_sql(
     let note_links: BTreeSet<_> = note.links.iter().cloned().collect();
     let connection = open_index_connection_for_index(index, true)?;
 
+    let encoding = freshness::active(&connection)?;
     // The source note's own chunk vectors are the "queries" for late interaction.
     let source_vectors: Vec<Vec<u8>> = {
         let mut statement = connection
@@ -467,14 +506,29 @@ fn related_notes_with_embeddings_sql(
     let mut scored: HashMap<String, (String, String, f64)> = HashMap::new();
 
     for source_vector in &source_vectors {
+        // Related notes use only semantic coordinates, with beta=0.
+        let (source_vector, norm2) = if let Some(encoding) = &encoding {
+            let mut vector = decode_embedding_blob(source_vector)
+                .ok_or_else(|| IndexError::Embedding("invalid related-note vector".into()))?;
+            vector.truncate(encoding.dimensions);
+            let mut vector = normalize_dense_vector(&vector);
+            let norm2 = vector.iter().map(|x| x * x).sum::<f64>();
+            vector.extend([0., 0.]);
+            (query_vector_blob(&vector), Some(norm2))
+        } else {
+            (source_vector.clone(), None)
+        };
         // This source chunk's best (max) similarity to each candidate note.
         let hits: Vec<(String, String, String, f64)> = statement
             .query_map(params![source_vector, k, note_path], |row| {
+                let distance = row.get::<_, f64>(3)?;
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    sql_distance_score(row.get::<_, f64>(3)?),
+                    norm2
+                        .map(|norm2| freshness::distance_score(distance, norm2))
+                        .unwrap_or_else(|| sql_distance_score(distance)),
                 ))
             })
             .map_err(|error| IndexError::Embedding(error.to_string()))?
@@ -798,6 +852,7 @@ fn bm25_search_in_memory(
         .filter(|match_item| match_item.score > 0.0)
         .collect::<Vec<_>>();
 
+    apply_keyword_recency(index, &mut matches);
     matches.sort_by(|left, right| {
         right
             .score
@@ -905,6 +960,7 @@ fn bm25_search_with_sql_candidates(
         });
     }
 
+    apply_keyword_recency(index, &mut matches);
     matches.sort_by(|left, right| {
         right
             .score
@@ -920,6 +976,22 @@ pub fn semantic_search(index: &SearchIndex, query: &str) -> Result<Vec<SearchMat
     semantic_search_with_options(index, query, RankingOptions::default())
 }
 
+fn apply_keyword_recency(index: &SearchIndex, matches: &mut [SearchMatch]) {
+    if index.freshness.is_disabled() {
+        return;
+    }
+    let mtimes = freshness::timestamps(index);
+    let now = chrono::Utc::now().timestamp_millis();
+    for hit in matches {
+        hit.score = freshness::keyword_score(
+            hit.bm25_score,
+            index.freshness,
+            mtimes.get(hit.path.as_str()).copied().unwrap_or(0),
+            now,
+        );
+    }
+}
+
 pub fn semantic_search_with_options(
     index: &SearchIndex,
     query: &str,
@@ -931,6 +1003,8 @@ pub fn semantic_search_with_options(
     } else {
         let query_term_counts = count_terms(query);
         let query_norm = vector_norm(&query_term_counts);
+        let mtimes = freshness::timestamps(index);
+        let now = chrono::Utc::now().timestamp_millis();
         index
             .chunks
             .iter()
@@ -941,6 +1015,16 @@ pub fn semantic_search_with_options(
                     &chunk.term_counts,
                     chunk.norm,
                 );
+                let score = if score > 0.0 {
+                    (1. - index.freshness.semantic_weight()) * score
+                        + index.freshness.semantic_weight()
+                            * freshness::factor(
+                                mtimes.get(chunk.path.as_str()).copied().unwrap_or(0),
+                                now,
+                            )
+                } else {
+                    score
+                };
                 SearchMatch {
                     path: chunk.path.clone(),
                     title: chunk.title.clone(),
@@ -1123,7 +1207,7 @@ fn hybrid_search_with_candidate_limit(
             let semantic = semantic_by_key.remove(&key);
             let bm25 = bm25_by_key.remove(&key);
             let semantic_score = semantic.as_ref().map(|item| item.score).unwrap_or(0.0);
-            let bm25_score = bm25.as_ref().map(|item| item.score).unwrap_or(0.0);
+            let bm25_score = bm25.as_ref().map(|item| item.bm25_score).unwrap_or(0.0);
             // Prefer the semantic record for the displayed text/metadata, falling back
             // to the BM25 record; one of the two must exist for the key to appear.
             let base = semantic.or(bm25)?;
@@ -1905,6 +1989,46 @@ mod tests {
             }
         });
         format!("http://{}", address)
+    }
+
+    #[test]
+    fn freshness_recovers_a_note_before_both_candidate_cuts_then_uses_plain_rrf() {
+        use deep_obsidian_types::FreshnessLevel;
+        let root = unique_temp_dir("freshness-hybrid");
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..96 {
+            let path = root.join(format!("note-{i:03}.md"));
+            // Punctuation changes the mock dense vector slightly, keeping the
+            // latest note below the old dense candidates without changing BM25.
+            let suffix = if i == 95 { ".." } else { "." };
+            fs::write(
+                &path,
+                format!("# Shared decision\n\nStorage strategy decision{suffix}\n"),
+            )
+            .unwrap();
+            let age = std::time::Duration::from_secs(if i == 95 { 14 } else { 730 } * 86400);
+            fs::File::open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now() - age))
+                .unwrap();
+        }
+        let config = embedding_backend_config(start_healthy_embedding_server());
+        let mut index = crate::index::build_index(&root, None, Some(&config)).unwrap();
+        let options = RankingOptions {
+            limit: 8,
+            ..Default::default()
+        };
+        let before =
+            hybrid_search_with_options(&index, "storage strategy", options.clone()).unwrap();
+        assert!(!before.iter().any(|h| h.path == "note-095.md"));
+        crate::freshness::configure(&mut index, FreshnessLevel::Classic).unwrap();
+        let after = hybrid_search_with_options(&index, "storage strategy", options).unwrap();
+        assert_eq!(after[0].path, "note-095.md");
+        assert!(
+            (after[0].score - 2. / 61.).abs() < 1e-12,
+            "the final score is ordinary rank-1 RRF, with no extra date bonus"
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     fn embedding_backend_config(base_url: String) -> crate::embeddings::EmbeddingConfig {

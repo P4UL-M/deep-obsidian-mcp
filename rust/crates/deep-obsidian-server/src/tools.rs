@@ -2157,6 +2157,11 @@ async fn apply_federated_rerank(
         return federation::RerankOutcome::not_applicable();
     };
 
+    let freshness_level = scorer.freshness;
+    let freshness_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
     let scorer = scorer.clone();
     let query_owned = query.to_string();
     let query_vector = match tokio::task::spawn_blocking(move || {
@@ -2239,7 +2244,15 @@ async fn apply_federated_rerank(
                 index_search::embed_texts_for_index(&scorer, &texts).map(|vectors| {
                     vectors
                         .iter()
-                        .map(|document| index_search::semantic_score_for_vectors(&vector, document))
+                        .map(|document| {
+                            index_search::semantic_score_for_vectors_with_freshness(
+                                &vector,
+                                document,
+                                freshness_level,
+                                0,
+                                freshness_now,
+                            )
+                        })
                         .collect::<Vec<f64>>()
                 })
             })
@@ -2290,14 +2303,36 @@ async fn apply_federated_rerank(
     let lexical: Vec<f64> = term_counts
         .iter()
         .zip(&lengths)
-        .map(|(counts, length)| {
-            deep_obsidian_index::index::bm25_score(
+        .enumerate()
+        .map(|(position, (counts, length))| {
+            let raw = deep_obsidian_index::index::bm25_score(
                 &query_terms,
                 counts,
                 &document_frequencies,
                 term_counts.len(),
                 *length as usize,
                 average_length,
+            );
+            let hit = &outcome.hits[position];
+            let mtime = mounts
+                .iter()
+                .find(|m| m.id == hit.mount_id)
+                .and_then(|mount| {
+                    let path = mount.to_mount_relative(&hit.key.0);
+                    mount
+                        .index
+                        .as_ref()?
+                        .file_snapshots
+                        .iter()
+                        .find(|s| s.path == path)
+                        .map(|s| s.mtime_ms)
+                })
+                .unwrap_or(0);
+            deep_obsidian_index::freshness::keyword_score(
+                raw,
+                freshness_level,
+                mtime,
+                freshness_now,
             )
         })
         .collect();
@@ -5286,6 +5321,7 @@ mod tests {
 
     fn test_config(vault_path: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             index_dir: vault_path.join(".deep-obsidian-mcp-test"),
             vault_path: Some(vault_path),

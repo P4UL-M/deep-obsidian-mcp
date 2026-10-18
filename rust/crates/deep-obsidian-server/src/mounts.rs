@@ -688,6 +688,7 @@ mod tests {
 
     fn config_with(mounts: Vec<MountConfig>, index_dir: PathBuf) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             vault_path: Some(PathBuf::from("/tmp/root-vault")),
             mounts,

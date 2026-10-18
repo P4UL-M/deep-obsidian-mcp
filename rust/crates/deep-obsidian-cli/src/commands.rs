@@ -4286,6 +4286,7 @@ mod tests {
 
     fn resolved_config(vault_path: &Path, index_dir: &Path) -> ResolvedServiceConfig {
         ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             vault_path: Some(vault_path.to_path_buf()),
             index_dir: index_dir.to_path_buf(),

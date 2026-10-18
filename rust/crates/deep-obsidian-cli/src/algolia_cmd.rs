@@ -2161,6 +2161,7 @@ mod tests {
             },
         };
         let config = ResolvedServiceConfig {
+            freshness: Default::default(),
             federated_rerank: true,
             vault_path: Some(PathBuf::from("/vault")),
             mounts: vec![mount.clone()],

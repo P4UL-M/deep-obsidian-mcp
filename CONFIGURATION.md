@@ -341,6 +341,49 @@ For containers, tunnels, or headless hosts where the OS keyring is unavailable,
 set `DEEP_OBSIDIAN_AUTH_TOKEN` to a literal token; it enables auth and overrides
 any configured token reference.
 
+## Search freshness
+
+The wizard offers **Disabled / Low / Classic / High** after the embedding questions.
+**Classic is selected by default**, including when `freshness` is absent from an existing configuration. Set `disabled` explicitly to turn it off.
+The equivalent config-file setting is:
+
+```json
+{ "freshness": "classic" }
+```
+
+| Level | Semantic freshness weight | Maximum BM25 bonus |
+|---|---:|---:|
+| `disabled` | 0% | 0% |
+| `low` | 1% | 1% |
+| `classic` (default) | 2% | 3% |
+| `high` | 5% | 5% |
+
+Both branches use the note's last modification time and a fixed **90-day half-life**.
+For age `a` in days, freshness is `f = 2^(-a/90)`. Semantic retrieval ranks
+`(1-beta) × cosine + beta × f`; keyword retrieval ranks `BM25 × (1+alpha × f)`.
+These adjustments happen **before each branch selects its candidates**. RRF and
+the existing graph bonus then run normally, without another temporal bonus.
+
+The percentages have different meanings in the two formulas. At Classic, BM25
+increases by at most 3% today, 1.5% at 90 days and 0.75% at 180 days. Modification
+time measures activity; an old decision edited for punctuation can still be obsolete.
+
+Existing configurations stay disabled unless explicitly enabled. Restart the service
+after changing the level; changing levels reuses the existing
+D+2 vectors (Disabled sets beta to zero). With a mount table, edit the config file
+directly (the wizard
+does not edit existing mount tables). Native remote recall without timestamps cannot
+receive this local preselection adjustment. Artifacts and related-note ranking are
+unchanged.
+
+The semantic encoding uses a fixed anchor eighteen calendar months after creation
+and renews at sixteen months. An hourly check runs independently of source
+auto-reindex; startup catches up after downtime. Renewal rewrites the single
+vector table locally from its semantic coordinates, without a model call. Search
+may wait or fail while it runs. There is no parallel serving index or checkpoint
+recovery: an interrupted attempt restarts. SQLite's ordinary transaction rollback
+is retained. See [indexing details](docs/architecture.md#freshness-encoding).
+
 ## Automatic reindexing
 
 The local index updates itself in the background: an initial build/check at

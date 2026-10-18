@@ -29,6 +29,7 @@ Canonical config shape:
 - `autoReindex.enabled`
 - `autoReindex.debounceMs`
 - `autoReindex.intervalMs`
+- `freshness` (`disabled` / `low` / `classic` / `high`, default `classic`)
 - `embedding.provider`
 - `embedding.model`
 - `embedding.baseUrl`
