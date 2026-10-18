@@ -4,7 +4,7 @@ class DeepObsidianMcp < Formula
   desc "Filesystem-first MCP server for deep Obsidian vault access"
   homepage "https://github.com/P4UL-M/deep-obsidian-mcp"
   url "https://github.com/P4UL-M/deep-obsidian-mcp/archive/refs/tags/v0.2.0-alpha.8.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "d4903b9ead3c62b21b2fbecc8fcb74b54f88975323a9a8894bee1c4a8c3dffbb"
   license "MIT"
 
   depends_on "rust" => :build
