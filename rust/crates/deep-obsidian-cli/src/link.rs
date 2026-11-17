@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use serde::{Deserialize, Serialize};
 
 const FORWARDED: &str = "DEEP_OBSIDIAN_CLI_FORWARDED";
@@ -66,6 +66,11 @@ struct LinkOptions {
     /// Emit routing metadata as JSON; never includes backend secrets.
     #[arg(long)]
     json: bool,
+}
+
+/// Share the actual link flags with the local help tree.
+pub(crate) fn help_command() -> clap::Command {
+    LinkOptions::command().name("link")
 }
 
 struct Output {

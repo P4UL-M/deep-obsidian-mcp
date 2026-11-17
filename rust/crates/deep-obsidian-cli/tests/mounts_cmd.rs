@@ -1396,10 +1396,10 @@ fn cli_argv_never_enables_an_experimental_flag_without_an_answer() {
     assert!(!fixture.backup_path().exists());
 }
 
-/// `mounts --help` reaches clap's derived help rather than the hand-written summary, and
+/// `mounts --help` and each nested command expose their own flags, and
 /// every other command keeps the summary it has always printed.
 #[test]
-fn cli_argv_mounts_help_is_claps_and_the_rest_is_unchanged() {
+fn cli_argv_mounts_and_doctor_help_stay_command_specific() {
     let mounts_help = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .args(["mounts", "--help"])
         .output()
@@ -1425,19 +1425,12 @@ fn cli_argv_mounts_help_is_claps_and_the_rest_is_unchanged() {
     // And it says the password is never a flag value.
     assert!(text.contains("prompted masked"), "{text}");
 
-    // The global summary still answers for everything else, and now advertises `mounts`.
     let doctor_help = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .args(["doctor", "--help"])
         .output()
         .expect("run --help");
-    let text = String::from_utf8_lossy(&doctor_help.stdout).to_string();
-    assert!(
-        text.starts_with("Usage:\n  deep-obsidian-cli <command>"),
-        "{text}"
-    );
-    // `[--id <id>]` rather than `--id <id>`: the identifying flags are OPTIONAL now, because
-    // an omitted one is a question the guided mode asks. The summary has to say so, or it
-    // documents a usage error that no longer happens.
-    assert!(text.contains("mounts add filesystem [--id <id>]"), "{text}");
-    assert!(text.contains("mounts remove --id <id>"), "{text}");
+    let text = String::from_utf8_lossy(&doctor_help.stdout);
+    assert!(text.contains("Usage: deep-obsidian-cli doctor"), "{text}");
+    assert!(text.contains("--probe-remote"), "{text}");
+    assert!(!text.contains("mounts add filesystem"), "{text}");
 }

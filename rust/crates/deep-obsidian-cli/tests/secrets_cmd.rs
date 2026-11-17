@@ -1248,27 +1248,34 @@ fn cli_argv_reports_the_refusals() {
     assert!(!xdg.join("deep-obsidian-mcp").join("secrets.json").exists());
 }
 
-/// `secrets --help` keeps the hand-written summary, which now documents the family.
-///
-/// Only `mounts` falls through to clap's derived help (see `commands::run`), so this also
-/// guards that exception from spreading by accident.
+/// Family help exposes subcommands; leaf help carries credential-handling details.
 #[test]
-fn cli_argv_secrets_help_is_the_hand_written_summary() {
+fn cli_argv_secrets_help_is_specific_to_the_requested_command() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .args(["secrets", "--help"])
         .output()
         .expect("run --help");
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Usage: deep-obsidian-cli secrets"), "{text}");
+    assert!(text.contains("set") && text.contains("check"), "{text}");
+    assert!(!text.contains("setup-service --vault"), "{text}");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
+        .args(["secrets", "set", "--help"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
     assert!(
-        text.starts_with("Usage:\n  deep-obsidian-cli <command>"),
+        text.contains("Usage: deep-obsidian-cli secrets set"),
         "{text}"
     );
     assert!(
-        text.contains("secrets set --mount <id> [--field password|e2ee-passphrase|api-key]"),
+        text.contains("--target") && text.contains("--stdin"),
         "{text}"
     );
-    assert!(text.contains("secrets check [--json]"), "{text}");
-    // The two claims the family lives or dies by.
-    assert!(text.contains("never\nmodifies the config file"), "{text}");
-    assert!(text.contains("rotation is not migration"), "{text}");
+    assert!(text.contains("prompted masked"), "{text}");
+    assert!(
+        text.contains("existing") && text.contains("store and reference"),
+        "{text}"
+    );
 }

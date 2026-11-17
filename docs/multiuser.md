@@ -4,28 +4,12 @@
 
 Multiuser is opt-in. Without it, the service retains classic access to all configured mounts, with its existing bearer/OAuth authentication and no username.
 
-## Link the CLI to a backend
+## Choose the backend first
 
-```sh
-deep-obsidian-cli link
-deep-obsidian-cli link --container deep-obsidian --context default
-deep-obsidian-cli link --local-config /absolute/path/config.json
-deep-obsidian-cli link --status
-deep-obsidian-cli unlink
-```
-
-Discovery uses the selected Docker context and known local configurations. One candidate is selected automatically; multiple candidates require an interactive selection or an explicit target. Remote Docker contexts work through Docker's existing connection configuration.
-
-The client profile lives in `$XDG_CONFIG_HOME/deep-obsidian-mcp/client.json` (normally `~/.config/deep-obsidian-mcp/client.json`). It contains routing metadata, not users or backend secrets. Explicit `--config PATH` or `--local` overrides a saved link. An unavailable saved target fails without falling back to a different backend. Client installation flags stay local.
-
-Linked Docker commands execute the CLI inside the container, with stdin, arguments and exit status preserved. Paths in backend commands refer to the container. For example, an enablement plan must be readable inside that container. Direct execution is equivalent:
-
-```sh
-docker exec -it deep-obsidian deep-obsidian-cli \
-  --config /var/lib/deep-obsidian-mcp/config.json users enable --wizard
-```
-
-Docker/host access is trusted operator access; linking does not authenticate an ordinary application user.
+Use the [CLI guide](cli.md#choose-a-backend) to link to the intended Docker or
+local backend before changing users. The saved client link contains routing
+metadata; accounts and vault roles live in that backend's control database.
+Docker/host access is trusted operator access.
 
 ## Enable and manage users
 

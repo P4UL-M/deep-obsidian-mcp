@@ -19,7 +19,7 @@ pub enum StdioMode {
 #[command(
     name = "deep-obsidian-cli",
     version,
-    about = "Rust prototype CLI for deep-obsidian-mcp",
+    about = "Configure and manage Deep Obsidian backends",
     disable_help_subcommand = true,
     disable_version_flag = true
 )]
@@ -33,70 +33,92 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct ServiceOptions {
+    /// Use a local configuration file.
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Preview changes without writing.
     #[arg(long = "dry-run", global = true, action = clap::ArgAction::SetTrue, overrides_with = "no_dry_run")]
     pub dry_run: bool,
 
+    /// Apply changes rather than previewing.
     #[arg(long = "no-dry-run", global = true, action = clap::ArgAction::SetTrue)]
     pub no_dry_run: bool,
 
+    /// Print machine-readable JSON.
     #[arg(long, global = true, action = clap::ArgAction::SetTrue, overrides_with = "no_json")]
     pub json: bool,
 
+    /// Print human-readable output.
     #[arg(long = "no-json", global = true, action = clap::ArgAction::SetTrue)]
     pub no_json: bool,
 
+    /// Local vault directory to configure.
     #[arg(long = "vault", global = true)]
     pub vault_path: Option<PathBuf>,
 
+    /// Store the derived index in this directory.
     #[arg(long = "index-dir", global = true)]
     pub index_dir: Option<PathBuf>,
 
+    /// Keep the default index outside the vault.
     #[arg(long = "packaged", global = true, action = clap::ArgAction::SetTrue)]
     pub packaged: bool,
 
     /// Allow binding a non-loopback host without authentication (escape hatch).
+    /// Allow HTTP without authentication.
     #[arg(long = "insecure-no-auth", global = true, action = clap::ArgAction::SetTrue)]
     pub insecure_no_auth: bool,
 
+    /// Configure stdio or HTTP transport.
     #[arg(long, global = true, value_enum)]
     pub transport: Option<TransportMode>,
 
+    /// Set stdio message framing.
     #[arg(long = "stdio-mode", global = true, value_enum)]
     pub stdio_mode: Option<StdioMode>,
 
+    /// HTTP bind address.
     #[arg(long, global = true)]
     pub host: Option<String>,
 
+    /// HTTP listening port.
     #[arg(long, global = true)]
     pub port: Option<u16>,
 
+    /// Path of the HTTP MCP endpoint.
     #[arg(long = "mcp-path", global = true)]
     pub mcp_path: Option<String>,
 
+    /// Path of the HTTP liveness endpoint.
     #[arg(long = "health-path", global = true)]
     pub health_path: Option<String>,
 
+    /// Refresh the index when vault contents change.
     #[arg(long = "auto-reindex", global = true)]
     pub auto_reindex: bool,
 
+    /// Disable automatic index refresh.
     #[arg(long = "no-auto-reindex", global = true)]
     pub no_auto_reindex: bool,
 
+    /// Wait this many milliseconds after a filesystem change.
     #[arg(long = "reindex-debounce-ms", global = true)]
     pub reindex_debounce_ms: Option<u64>,
 
+    /// Periodic refresh interval in milliseconds.
     #[arg(long = "reindex-interval-ms", global = true)]
     pub reindex_interval_ms: Option<u64>,
 
+    /// Embedding provider for semantic search.
     #[arg(long = "embedding-provider", global = true)]
     pub embedding_provider: Option<String>,
 
+    /// Embedding model name.
     #[arg(long = "embedding-model", global = true)]
     pub embedding_model: Option<String>,
 
+    /// Embedding API endpoint.
     #[arg(long = "embedding-base-url", global = true)]
     pub embedding_base_url: Option<String>,
 }
@@ -108,16 +130,23 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::users_cmd::UsersCommand,
     },
+    #[command(hide = true)]
     Serve,
+    /// Set up a backend and connect local MCP clients.
     SetupService {
+        /// Replace existing generated configuration and client files.
         #[arg(long)]
         overwrite: bool,
+        /// Choose settings interactively and confirm before saving.
         #[arg(long, action = clap::ArgAction::SetTrue)]
         wizard: bool,
+        /// Configure MCP entries for local agent clients.
         #[arg(long, action = clap::ArgAction::SetTrue)]
         mcp: bool,
+        /// Install packaged skills into local agent directories.
         #[arg(long, action = clap::ArgAction::SetTrue)]
         skills: bool,
+        /// Install and enable the packaged Obsidian CSS snippets.
         #[arg(long = "vault-snippets", action = clap::ArgAction::SetTrue)]
         vault_snippets: bool,
         /// Enable HTTP bearer auth: generate a token, store it, and print it once.
@@ -129,7 +158,9 @@ pub enum Command {
         #[arg(long = "no-auth", action = clap::ArgAction::SetTrue)]
         no_auth: bool,
     },
+    /// Diagnose configuration, vault access and dependencies.
     Doctor {
+        /// Timeout for HTTP health checks, in milliseconds.
         #[arg(long = "probe-timeout-ms", default_value_t = 5_000)]
         probe_timeout_ms: u64,
         /// Also contact each remote-backed mount (couchdb, algolia) read-only.
@@ -142,11 +173,15 @@ pub enum Command {
         #[arg(long = "probe-remote")]
         probe_remote: bool,
     },
+    /// Inspect the resolved configuration and secret references.
     PrintConfig {
+        /// Include all persisted identifiers; secret values are never resolved.
         #[arg(long)]
         no_redact: bool,
     },
+    /// Check the HTTP health and MCP endpoints.
     Probe {
+        /// Request timeout in milliseconds.
         #[arg(long = "timeout-ms", default_value_t = 5_000)]
         timeout_ms: u64,
     },
@@ -170,7 +205,9 @@ pub enum Command {
         #[command(subcommand)]
         command: SecretsCommand,
     },
+    /// Show help for a command.
     Help,
+    /// Print the installed version.
     Version,
 }
 

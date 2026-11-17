@@ -30,6 +30,7 @@ pub enum UsersCommand {
         name: String,
         #[arg(long)]
         mount: String,
+        /// Vault role: reader, editor or owner.
         #[arg(long, value_parser=parse_role)]
         role: Role,
     },

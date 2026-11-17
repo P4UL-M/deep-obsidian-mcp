@@ -2,13 +2,14 @@ pub mod algolia_cmd;
 pub mod cli;
 pub mod commands;
 pub mod config;
-pub mod link;
 pub mod couchdb_transfer;
+mod help;
+pub mod link;
 pub mod mounts_cmd;
 pub mod secrets_cmd;
 pub mod service_entry;
-pub mod wizard;
 pub mod users_cmd;
+pub mod wizard;
 
 pub use cli::{
     Cli, Command, SecretField, SecretTarget, SecretsCommand, ServiceOptions, StdioMode,
