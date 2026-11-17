@@ -68,6 +68,7 @@ COPY rust/crates/deep-obsidian-algolia/Cargo.toml ./rust/crates/deep-obsidian-al
 COPY rust/crates/deep-obsidian-backend/Cargo.toml ./rust/crates/deep-obsidian-backend/
 COPY rust/crates/deep-obsidian-cli/Cargo.toml ./rust/crates/deep-obsidian-cli/
 COPY rust/crates/deep-obsidian-config/Cargo.toml ./rust/crates/deep-obsidian-config/
+COPY rust/crates/deep-obsidian-control/Cargo.toml ./rust/crates/deep-obsidian-control/
 COPY rust/crates/deep-obsidian-core/Cargo.toml ./rust/crates/deep-obsidian-core/
 COPY rust/crates/deep-obsidian-index/Cargo.toml ./rust/crates/deep-obsidian-index/
 COPY rust/crates/deep-obsidian-server/Cargo.toml ./rust/crates/deep-obsidian-server/

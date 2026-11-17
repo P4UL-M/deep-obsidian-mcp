@@ -5,12 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 # Needed to implement `VaultBackend` for the refusing stub a mount degrades to.
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
 deep-obsidian-backend = { path = "../deep-obsidian-backend" }
+deep-obsidian-control = { path = "../deep-obsidian-control" }
 deep-obsidian-config = { path = "../deep-obsidian-config" }
 deep-obsidian-core = { path = "../deep-obsidian-core" }
 deep-obsidian-index = { path = "../deep-obsidian-index" }

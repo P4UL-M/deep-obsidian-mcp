@@ -54,11 +54,80 @@ pub fn generate_token() -> String {
 /// enabled). Returns `403` for a disallowed origin and `401` (with a
 /// bearer challenge) for a missing or invalid token. OAuth mode adds resource
 /// metadata discovery; legacy-only challenges remain unchanged.
-pub async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if let Some(rejection) = authorize(request.headers(), state.auth.as_ref()) {
+pub async fn require_auth(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let multiuser = match state
+        .control
+        .as_ref()
+        .map(|control| control.enabled())
+        .transpose()
+    {
+        Ok(value) => value.unwrap_or(false),
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication unavailable",
+            )
+                .into_response()
+        }
+    };
+    if multiuser {
+        if let Some(rejection) = validate_origin(request.headers(), state.auth.as_ref()) {
+            return rejection;
+        }
+        let token = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(extract_bearer);
+        let principal = token.and_then(|token| {
+            state
+                .auth
+                .oauth
+                .as_ref()
+                .and_then(|oauth| oauth.principal(token))
+                .or_else(|| {
+                    state
+                        .control
+                        .as_ref()
+                        .and_then(|control| control.session(token).ok().flatten())
+                })
+        });
+        let Some(principal) = principal else {
+            return unauthorized(state.auth.as_ref());
+        };
+        request.extensions_mut().insert(principal);
+    } else if let Some(rejection) = authorize(request.headers(), state.auth.as_ref()) {
         return rejection;
     }
     next.run(request).await
+}
+
+fn unauthorized(auth: &AuthState) -> Response {
+    let mut response =
+        (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    response.headers_mut().insert(header::WWW_AUTHENTICATE, auth.oauth.as_ref().map_or_else(
+        || HeaderValue::from_static("Bearer"),
+        |oauth| HeaderValue::from_str(&format!("Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\", scope=\"obsidian\"", oauth.issuer())).expect("validated issuer"),
+    ));
+    response
+}
+
+fn validate_origin(headers: &HeaderMap, auth: &AuthState) -> Option<Response> {
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin.to_str().unwrap_or_default();
+        if !auth
+            .allowed_origins
+            .iter()
+            .any(|candidate| candidate == origin)
+        {
+            return Some((StatusCode::FORBIDDEN, "origin not allowed").into_response());
+        }
+    }
+    None
 }
 
 /// Pure authorization decision over request headers. Returns `Some(response)`
@@ -68,15 +137,8 @@ pub async fn require_auth(State(state): State<AppState>, request: Request, next:
 /// (DNS-rebinding defence): a browser always sends `Origin`, while non-browser
 /// MCP clients (Claude Code, curl) omit it and pass through.
 fn authorize(headers: &HeaderMap, auth: &AuthState) -> Option<Response> {
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let origin = origin.to_str().unwrap_or_default();
-        let allowed = auth
-            .allowed_origins
-            .iter()
-            .any(|candidate| candidate == origin);
-        if !allowed {
-            return Some((StatusCode::FORBIDDEN, "origin not allowed").into_response());
-        }
+    if let Some(rejection) = validate_origin(headers, auth) {
+        return Some(rejection);
     }
 
     let oauth_matches = auth.oauth.as_ref().is_some_and(|oauth| {
@@ -87,15 +149,7 @@ fn authorize(headers: &HeaderMap, auth: &AuthState) -> Option<Response> {
             .is_some_and(|token| oauth.accepts(token))
     });
     if auth.enabled && !bearer_matches(headers, auth.token.as_ref()) && !oauth_matches {
-        let mut response =
-            (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
-        response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, auth.oauth.as_ref().map_or_else(
-                || HeaderValue::from_static("Bearer"),
-                |oauth| HeaderValue::from_str(&format!("Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\", scope=\"obsidian\"", oauth.issuer())).expect("validated issuer"),
-            ));
-        return Some(response);
+        return Some(unauthorized(auth));
     }
 
     None

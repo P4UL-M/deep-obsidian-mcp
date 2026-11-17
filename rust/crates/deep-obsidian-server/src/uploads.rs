@@ -67,9 +67,46 @@ pub enum ClaimError {
 #[derive(Clone, Default)]
 pub struct UploadStore {
     inner: Arc<Mutex<HashMap<String, PendingUpload>>>,
+    owners: Arc<Mutex<HashMap<String, (String, u64)>>>,
 }
 
 impl UploadStore {
+    pub fn bind_owner(&self, token: &str, principal: &deep_obsidian_control::Principal) {
+        // Mint purges expired tokens. Keep owner bindings bounded by that same
+        // outstanding-token set, without holding both locks simultaneously.
+        let active: std::collections::HashSet<_> = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let mut owners = self.owners.lock().unwrap_or_else(|p| p.into_inner());
+        owners.retain(|key, _| active.contains(key));
+        if active.contains(token) {
+            owners.insert(
+                token.into(),
+                (principal.user_id.clone(), principal.credential_version),
+            );
+        }
+    }
+    pub fn owner_matches(
+        &self,
+        token: &str,
+        principal: Option<&deep_obsidian_control::Principal>,
+    ) -> bool {
+        match self
+            .owners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(token)
+        {
+            Some((id, version)) => {
+                principal.is_some_and(|p| &p.user_id == id && p.credential_version == *version)
+            }
+            None => principal.is_none(),
+        }
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -127,6 +164,10 @@ impl UploadStore {
 
     /// Consume a token after a successful commit (remove it permanently).
     pub fn consume(&self, token: &str) {
+        self.owners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(token);
         let mut map = self
             .inner
             .lock()

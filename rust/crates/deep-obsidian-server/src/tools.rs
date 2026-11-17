@@ -3415,6 +3415,9 @@ fn mount_index(
 /// natively-served recall a `NativeRecall` mount can still answer. Inventing a
 /// root-specific message would have said less and drifted.
 pub(crate) fn root_index(state: &AppState, tool: &str) -> Result<Arc<RuntimeState>, String> {
+    if state.access.is_some() && state.router.mounts().is_empty() {
+        return Err("no accessible vault".into());
+    }
     if let Some(runtime) = state.runtime() {
         return Ok(runtime.clone());
     }
@@ -3423,7 +3426,7 @@ pub(crate) fn root_index(state: &AppState, tool: &str) -> Result<Arc<RuntimeStat
         .root()
         // `normalize_service_config` rejects a rootless mount table
         // (`ConfigError::MissingRootMount`), so this cannot happen for a resolved config.
-        .expect("a resolved config to declare a root mount");
+        .ok_or_else(|| "no accessible local index".to_string())?;
     mount_index(state, tool, root).map(|scoped| scoped.runtime)
 }
 
@@ -3987,20 +3990,63 @@ pub async fn call_tool(
     name: &str,
     arguments: &Value,
 ) -> Result<ToolCallResult, String> {
-    match call_tool_inner(state, name, arguments).await {
+    let fresh;
+    let state = if let Some(access) = &state.access {
+        fresh = state
+            .for_principal(access.principal.clone())
+            .map_err(|e| e.to_string())?;
+        &fresh
+    } else {
+        state
+    };
+    let prepared = state
+        .prepare_arguments(name, arguments)
+        .map_err(|e| e.to_string())?;
+    let arguments = &prepared;
+    state
+        .check_tool(name, arguments)
+        .map_err(|e| e.to_string())?;
+    if name == "set_vault_membership" {
+        return state
+            .membership_tool(arguments)
+            .map(json_text_result)
+            .map_err(|e| e.to_string());
+    }
+    if name == "vault_info" && state.access.is_some() {
+        return Ok(json_text_result(state.user_vault_info()));
+    }
+    let mut result = match call_tool_inner(state, name, arguments).await {
         Err(error) if error == crate::runtime::INDEX_LOADING_MESSAGE => {
             let diagnostics = state.runtimes.aggregate_diagnostics();
-            let mut payload = json!({
-                "ready": false, "indexStatus": diagnostics.status.as_str(), "retryable": diagnostics.refresh_in_flight, "requiresBuild": !diagnostics.refresh_in_flight, "message": error,
-            });
-            if let Some(last_error) = diagnostics.last_error {
-                payload["lastError"] =
-                    json!({"message": last_error.message, "reason": last_error.reason});
-            }
-            Ok(json_text_result(payload))
+            Ok(json_text_result(
+                json!({"ready":false,"indexStatus":diagnostics.status.as_str(),"retryable":diagnostics.refresh_in_flight,"requiresBuild":!diagnostics.refresh_in_flight,"message":error}),
+            ))
         }
         result => result,
+    }?;
+    state
+        .check_tool(name, arguments)
+        .map_err(|e| e.to_string())?;
+    if state.access.is_some() {
+        crate::multiuser::filter_paths(&mut result.structured_content, state);
+        for block in &mut result.content {
+            if let Ok(mut payload) = serde_json::from_str::<Value>(&block.text) {
+                crate::multiuser::filter_paths(&mut payload, state);
+                block.text = payload.to_string();
+            }
+        }
+        if let (Some(access), Some(store)) = (&state.access, &state.control) {
+            let mount = ["path", "folder", "scope"]
+                .iter()
+                .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+                .and_then(|path| access.original_router.resolve(path).ok())
+                .map(|resolved| resolved.mount.id.clone());
+            store
+                .record_event(&access.principal.user_id, mount.as_deref(), name)
+                .map_err(|e| e.to_string())?;
+        }
     }
+    Ok(result)
 }
 
 async fn call_tool_inner(
@@ -4010,6 +4056,7 @@ async fn call_tool_inner(
 ) -> Result<ToolCallResult, String> {
     let config = state.config.as_ref();
     match name {
+        "vault_info" if state.access.is_some() => Ok(json_text_result(state.user_vault_info())),
         "vault_info" => {
             let runtime = root_index(state, "vault_info")?;
             // Informational only: no index refresh, embed probe or remote walk.
@@ -5208,6 +5255,9 @@ async fn call_tool_inner(
                 expires_at,
                 in_flight: false,
             })?;
+            if let Some(access) = &state.access {
+                state.uploads.bind_owner(&token, &access.principal);
+            }
             let upload_url = format!("{}/upload/{}", base.trim_end_matches('/'), token);
             Ok(json_text_result(json!({
                 "uploadUrl": upload_url,
@@ -6328,6 +6378,8 @@ mod tests {
             rg_available: false,
             uploads: crate::uploads::UploadStore::new(),
             upload_base: None,
+            control: None,
+            access: None,
         };
 
         let error = super::call_tool(&state, "grep_search", &json!({"query": "needle"}))

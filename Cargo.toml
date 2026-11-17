@@ -6,6 +6,7 @@ members = [
   "rust/crates/deep-obsidian-core",
   "rust/crates/deep-obsidian-cli",
   "rust/crates/deep-obsidian-config",
+  "rust/crates/deep-obsidian-control",
   "rust/crates/deep-obsidian-index",
   "rust/crates/deep-obsidian-server",
   "rust/crates/deep-obsidian-types",
@@ -27,6 +28,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = "0.5"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
