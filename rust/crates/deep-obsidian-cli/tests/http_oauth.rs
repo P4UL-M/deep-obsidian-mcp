@@ -98,6 +98,36 @@ impl Server {
 }
 
 #[tokio::test]
+async fn cli_probe_reports_http_authentication_errors_and_accepts_the_service_token() {
+    let server = Server::start(false).await;
+    for authenticated in [false, true] {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"));
+        command
+            .arg("--config")
+            .arg(server.directory.join("config.json"))
+            .args(["--json", "probe"])
+            .env("XDG_CONFIG_HOME", server.directory.join("probe-client"))
+            .env_remove("DEEP_OBSIDIAN_AUTH_TOKEN");
+        if authenticated {
+            command.env("DEEP_OBSIDIAN_AUTH_TOKEN", SECRET);
+        }
+        let output = command.output().await.unwrap();
+        assert_eq!(output.status.success(), authenticated);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["health"]["ok"], true);
+        assert_eq!(report["mcp"]["ok"], authenticated);
+        if !authenticated {
+            let error = report["mcp"]["error"].as_str().unwrap();
+            assert!(error.contains("HTTP 401 Unauthorized"), "{error}");
+            assert!(error.contains("bearer token"), "{error}");
+            assert!(!error.contains("decoding response body"), "{error}");
+        }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(SECRET));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET));
+    }
+}
+
+#[tokio::test]
 async fn real_http_legacy_bearer_and_mcp_api_remain_unchanged() {
     let server = Server::start(false).await;
     let response = server.mcp(None, "initialize", json!({})).await;

@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-control"
-version = "0.2.0-alpha.8"
+version = "0.2.0-alpha.9"
 dependencies = [
  "anyhow",
  "argon2",

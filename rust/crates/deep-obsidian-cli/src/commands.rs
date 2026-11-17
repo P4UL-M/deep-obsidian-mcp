@@ -2752,6 +2752,18 @@ async fn probe_health(client: &Client, url: &str) -> HealthProbeReport {
     }
 }
 
+fn check_mcp_http_status(status: reqwest::StatusCode) -> Result<()> {
+    if !status.is_success() {
+        let hint = match status {
+            reqwest::StatusCode::UNAUTHORIZED => "; check the MCP bearer token",
+            reqwest::StatusCode::FORBIDDEN => "; check MCP permissions and allowed origins",
+            _ => "",
+        };
+        return Err(anyhow!("MCP endpoint returned HTTP {status}{hint}"));
+    }
+    Ok(())
+}
+
 async fn post_json_rpc(client: &Client, url: &str, payload: Value) -> Result<Value> {
     let response = client
         .post(url)
@@ -2759,20 +2771,21 @@ async fn post_json_rpc(client: &Client, url: &str, payload: Value) -> Result<Val
         .send()
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
-    response
-        .json::<Value>()
-        .await
-        .map_err(|error| anyhow!(error.to_string()))
+    let status = response.status();
+    check_mcp_http_status(status)?;
+    response.json::<Value>().await.map_err(|_| {
+        anyhow!("MCP endpoint returned HTTP {status}, but its response was not valid JSON")
+    })
 }
 
 async fn post_json_rpc_notification(client: &Client, url: &str, payload: Value) -> Result<()> {
-    client
+    let response = client
         .post(url)
         .json(&payload)
         .send()
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
-    Ok(())
+    check_mcp_http_status(response.status())
 }
 
 fn json_rpc_result(value: Value, label: &str) -> Result<Value> {
