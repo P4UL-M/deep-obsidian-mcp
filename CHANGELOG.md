@@ -2,6 +2,51 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.2.0-alpha.9 — 2026-11-17
+
+### Changed
+
+- Split the service and management into two real executables. `deep-obsidian-mcp`
+  runs the HTTP/stdio service; `deep-obsidian-cli` handles setup, mounts, secrets,
+  diagnostics and configuration. Docker, Debian, Homebrew and native service
+  launchers install and use both binaries.
+- Management commands previously invoked as `deep-obsidian-mcp <command>` now use
+  `deep-obsidian-cli <command>`. Existing MCP service commands and startup flags
+  remain on `deep-obsidian-mcp`; the management executable defaults to help.
+- Docker routes explicit service startup flags to the MCP executable and
+  management commands to the CLI, while the default HTTP server remains PID 1.
+
+### Added
+
+- `deep-obsidian-cli link` discovers running Deep Obsidian containers in the
+  selected Docker context and known local configurations. It asks when there
+  are multiple candidates and remembers the selected target separately from
+  service configuration. `link --status`, `unlink`, `--local` and explicit
+  `--config` selection are supported.
+- Linked commands execute the container's own CLI with arguments, stdin and
+  exit status preserved. An unavailable saved target produces an error without
+  redirecting a management operation to another backend. Client installation
+  actions remain local.
+
+### Compatibility
+
+- This release contains the executable split and linking from PR #83 only.
+  Application users, per-vault grants and the multiuser wizard from PRs #84/#85
+  are not included. Existing classic authentication and vault access remain.
+- Update management scripts to call `deep-obsidian-cli`. Existing mount and
+  secret configuration does not require migration. Backend paths in linked
+  Docker commands refer to the container.
+
+### Validation
+
+- Release preparation passed 897 workspace tests, with eight ignored and no
+  failures. Clippy completed with existing workspace warnings.
+
+- PR #83 passed workspace tests, OAuth browser consent, sidecar tests, Docker
+  build/smoke checks on amd64/arm64, and Debian/APT package installation checks.
+- Federation fixtures use fixed modification times so freshness scoring does
+  not depend on fixture write timing; corpus, queries and assertions are unchanged.
+
 ## v0.2.0-alpha.8 — 2026-10-18
 
 ### Added
