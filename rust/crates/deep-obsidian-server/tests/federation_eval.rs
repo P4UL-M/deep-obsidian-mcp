@@ -732,6 +732,16 @@ fn write_note(root: &Path, relative: &str, content: &str) {
         fs::create_dir_all(parent).expect("mkdir");
     }
     fs::write(&absolute, content).expect("write note");
+    // Retrieval fixtures must not acquire different freshness scores depending on
+    // write speed or concurrent test scheduling. Keep the same corpus age in
+    // healthy, degraded and unified layouts without disabling freshness.
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_735_689_600);
+    fs::File::options()
+        .write(true)
+        .open(&absolute)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
 }
 
 fn eval_embedding(base_url: &str) -> EmbeddingConfig {
