@@ -1309,7 +1309,7 @@ fn cli_argv_reaches_the_mounts_subcommands() {
     );
     assert!(stdout.contains(&team.display().to_string()), "{stdout}");
     assert!(
-        stdout.contains("enabled experimental.multiVault"),
+        stdout.contains("approved experimental.multiVault"),
         "{stdout}"
     );
 

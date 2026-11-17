@@ -131,18 +131,18 @@ compose). `mcpPath` is free to change: nothing in the image depends on it.
 
 ## Secrets are ephemeral
 
-Five files, all optional, all read from `$DO_SECRETS_DIR` (`/run/secrets`, which is
+Backend-wide and legacy secret files are read from `$DO_SECRETS_DIR` (`/run/secrets`, which is
 where `secrets:` in compose mounts them):
 
 | File | Goes to |
 | --- | --- |
 | `auth_token` | Exported as `DEEP_OBSIDIAN_AUTH_TOKEN` for the server process. Required unless `DO_INSECURE_NO_AUTH=1`. |
-| `couchdb_password` | `secrets set --mount <id> --field password` on the config's couchdb mount. |
-| `e2ee_passphrase` | `secrets set --mount <id> --field e2ee-passphrase`. |
-| `algolia_api_key` | `secrets set --mount <id> --field api-key`. |
+| `couchdb_password` | Password for the CouchDB root, or sole CouchDB mount. |
+| `e2ee_passphrase` | Encryption passphrase for the CouchDB root, or sole encrypted CouchDB mount. |
+| `algolia_api_key` | API key for the Algolia root, or sole Algolia mount. |
 | `embedding_api_key` | `secrets set --target embedding-api-key` into the text embedding config's existing `embedding.apiKeyRef`. |
 
-The mount is found by reading the config, so the same files work for a derived
+The legacy target is found by reading the config, so the same files work for a derived
 config and for a mounted one. Only the first line of each file is used, with the
 newline stripped; a blank file is an error, not "no secret".
 
@@ -159,7 +159,40 @@ on the directory and `644` on the files, or run the service as the owning uid wi
 compose's `user:`. An unreadable file is refused with a message that says exactly
 this — it is never silently treated as absent.
 
-**Backend secret values are ephemeral.** The encrypted secret store lives at
+For multiple mounts, give each additional mount its own file:
+
+| File | Credential |
+| --- | --- |
+| `mount-<id>-password` | CouchDB password |
+| `mount-<id>-e2ee-passphrase` | LiveSync encryption passphrase |
+| `mount-<id>-api-key` | Algolia API key |
+
+Per-mount files take precedence over legacy files. A legacy file is never shared
+across multiple vaults: it applies only to the matching root, or the sole matching
+mount. Missing private-mount files and unreadable/empty files fail validation before
+the existing ephemeral store is cleared. Mount the files through Compose secrets,
+or a read-only secrets directory, so recreation can restore every credential.
+
+For example, keep the existing `couchdb_password` for the root and mount Laura's
+own CouchDB password as `/run/secrets/mount-laura-private-password`:
+
+```yaml
+services:
+  deep-obsidian:
+    secrets:
+      - couchdb_password
+      - mount-laura-private-password
+secrets:
+  mount-laura-private-password:
+    file: ./secrets/mount-laura-private-password
+```
+
+Merge these entries into your existing Compose file, preserving its other secrets.
+`mounts add` prompts store a credential in the running container, but do not create
+host Compose secret files. Provision those separately before a future container
+recreation. Live mount reload does not run the container entrypoint or clear secrets.
+
+**Backend secret values are ephemeral.** The encrypted backend secret store lives at
 `$XDG_CONFIG_HOME/deep-obsidian-mcp/secrets.json`, and `XDG_CONFIG_HOME` points into
 the container's home directory — *not* into the volume. The entrypoint deletes the
 store and re-injects every secret on every boot. Three consequences worth stating:
@@ -374,11 +407,6 @@ the bundle in any of the three channels.
   non-interactive way to declare the root mount (`mounts add --allow-empty-base`, or
   `setup-service --root <kind>`) would let the entrypoint collapse into two
   `mounts add` calls.
-- **One remote mount per container, for secret injection.** The four secret
-  filenames map onto whichever mount of that kind the config declares; a config with
-  two couchdb mounts is refused with a message naming them, because there is no
-  per-mount filename convention yet. Rotate those by hand with
-  `docker compose run --rm deep-obsidian secrets set --mount <id>`.
 - **CouchDB's own credentials come from the environment**, not from a file: the
   official image supports no `*_FILE` variant. The example compose generates `.env`
   from the secret file so there is still one source of truth.

@@ -300,62 +300,19 @@ cli print-config >&2 || die "$CONFIG is not a config this build can load (see th
 # ---------------------------------------------------------------------------
 # 4. Re-inject every secret, from scratch
 # ---------------------------------------------------------------------------
+# Validate the complete source mapping BEFORE clearing the ephemeral store.
+# A separate file per mount prevents accidentally reusing an admin credential.
+secret_plan=$(node /opt/deep-obsidian-mcp/bin/mount-secrets.mjs "$CONFIG" "$DO_SECRETS_DIR") \
+    || die "mount secret validation failed; no secret values were changed"
 rm -f "$SECRETS_STORE"
 mkdir -p "$(dirname "$SECRETS_STORE")"
-
-# Which mount owns which credential is read out of the config rather than assumed,
-# so a mounted config with a differently-named root works without extra variables.
-mounts_of_kind() {
-    node -e '
-const fs = require("fs");
-const [file, kind, needle] = process.argv.slice(1);
-// Deliberately unguarded: `print-config` has already parsed this file through the
-// real loader, so a throw here means the file changed underneath us or the loader
-// and JSON.parse disagree — either way a silent empty answer would report "no mount
-// to inject into" for a config that has one, and the credential would go missing
-// without anyone being told.
-const config = JSON.parse(fs.readFileSync(file, "utf8"));
-for (const mount of config.mounts ?? []) {
-    const backend = mount.backend ?? {};
-    if (backend.kind !== kind) continue;
-    if (needle === "e2ee" && !backend.e2ee) continue;
-    console.log(mount.id);
-}
-' "$CONFIG" "$1" "${2:-}"
-}
-
-# One secret file -> one reference. The value is piped, never passed as an argument,
-# so it never reaches `ps` or a shell history; `secrets set --stdin` reads the first
-# line with the newline stripped and refuses a blank one.
-inject_mount_secret() {
-    file="$1"
-    kind="$2"
-    field="$3"
-    needle="${4:-}"
-
-    [ -f "$file" ] || return 0
-    # A file the container cannot READ is its own failure mode, and a distinct
-    # message: the usual cause is `chmod 600` on the host, which leaves the file
-    # readable only by the host uid that owns it while this process is uid 10001.
-    [ -r "$file" ] || die "$file exists but is not readable by $(id -un) (uid $(id -u)). Secret files are bind-mounted with their host permissions: use mode 644 inside a directory only you can enter (chmod 700 secrets && chmod 644 secrets/*), or run the container as the owning uid with compose's 'user:'."
-    ids=$(mounts_of_kind "$kind" "$needle")
-    if [ -z "$ids" ]; then
-        log "WARNING: $file was provided but $CONFIG declares no $kind mount${needle:+ with e2ee} to inject it into; ignoring it"
-        return 0
-    fi
-    if [ "$(printf '%s\n' "$ids" | wc -l)" -gt 1 ]; then
-        die "$file is a single value but $CONFIG declares several $kind mounts ($(printf '%s' "$ids" | tr '\n' ' ')); a per-mount secret file convention does not exist yet, so mount one config per service or rotate these by hand with 'secrets set --mount <id>'"
-    fi
-    log "injecting $(basename "$file") into mount '$ids' ($field)"
-    # A failure here is fatal on purpose: the alternative is a mount that cannot
-    # authenticate and a startup log that looked fine.
-    head -n 1 "$file" | cli secrets set --mount "$ids" --field "$field" --stdin >&2 \
-        || die "could not store $(basename "$file") for mount '$ids'. If the config's reference is an 'osKeyring' one, change it to {\"kind\":\"encryptedFile\",\"id\":\"...\"}: a container has no keyring, and 'secrets set' preserves a reference's kind rather than silently writing somewhere the config does not point."
-}
-
-inject_mount_secret "$DO_SECRETS_DIR/couchdb_password" couchdb password
-inject_mount_secret "$DO_SECRETS_DIR/e2ee_passphrase" couchdb e2ee-passphrase e2ee
-inject_mount_secret "$DO_SECRETS_DIR/algolia_api_key" algolia api-key
+if [ -n "$secret_plan" ]; then
+    printf '%s\n' "$secret_plan" | while IFS="$(printf '\t')" read -r mount_id field file; do
+        log "injecting $(basename "$file") into mount '$mount_id' ($field)"
+        head -n 1 "$file" | cli secrets set --mount "$mount_id" --field "$field" --stdin >&2 \
+            || die "could not inject $field for mount '$mount_id'; use encryptedFile secret references in Docker"
+    done
+fi
 
 inject_target_secret() {
     file="$1"

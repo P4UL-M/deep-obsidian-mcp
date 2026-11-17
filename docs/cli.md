@@ -135,3 +135,22 @@ Follow [token recovery](authentication.md#recover-a-lost-bearer-token) for Docke
 secret files, macOS Keychain references and the encrypted-file fallback. Bearer
 tokens, OAuth authorizations and multiuser passwords have different recovery
 paths; see the [authentication guide](authentication.md).
+
+
+## Apply mount changes without reconnecting
+
+With an alpha.11-or-newer backend, `mounts add` and `mounts remove` automatically
+reload the running backend after saving. The listener, OAuth state and existing
+client sessions remain active; requests use the current grants and routing.
+There can be a short index warm-up for affected mounts. A rejected reload retains
+its previous live table and names the saved change as pending. Apply a corrected
+or previously saved configuration with:
+
+```sh
+deep-obsidian-cli mounts reload
+```
+
+When the backend is stopped, changes are saved for its next startup. Changes to
+the root mount, listener or authentication still require a service restart.
+`--purge-index` requires a stopped backend; remove a live mount without that flag.
+Upgrade the linked container as well as the host CLI before using live reload.

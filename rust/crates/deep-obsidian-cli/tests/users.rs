@@ -146,3 +146,82 @@ fn invalid_plan_and_dry_run_do_not_create_users_or_enable_multiuser() {
     let config: Value = serde_json::from_slice(&std::fs::read(&f.config).unwrap()).unwrap();
     assert!(config.get("multiuser").is_none());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn adding_a_mount_reloads_the_live_backend_before_the_next_grant() {
+    use deep_obsidian_cli::{resolve_runtime_config, ServiceOptions};
+    use deep_obsidian_server::{
+        control, mcp::AppState, mounts::MountBackends, runtime::MountRuntimes,
+    };
+    let f = Fixture::new();
+    f.result(&["users", "enable", "--plan", path_string(&f.plan()), "--yes"]);
+    let config = resolve_runtime_config(&ServiceOptions {
+        config: Some(f.config.clone()),
+        ..Default::default()
+    })
+    .unwrap()
+    .service;
+    let backends = MountBackends::build(&config);
+    let runtimes = MountRuntimes::new(&config, &backends);
+    let state = deep_obsidian_server::multiuser::attach(AppState::with_backends(
+        config, runtimes, &backends,
+    ))
+    .unwrap();
+    let _control = control::start(&state).unwrap();
+    let extra = f.root.join("extra");
+    std::fs::create_dir(&extra).unwrap();
+    let path = f.config.clone();
+    let added = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
+            .arg("--config")
+            .arg(path)
+            .args([
+                "--json",
+                "mounts",
+                "add",
+                "filesystem",
+                "--id",
+                "extra",
+                "--mount-at",
+                "Extra",
+                "--vault-path",
+            ])
+            .arg(extra)
+            .arg("--yes")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(String::from_utf8_lossy(&added.stdout).contains("reloaded"));
+    assert!(state
+        .current()
+        .router
+        .mounts()
+        .iter()
+        .any(|m| m.id == "extra"));
+    let path = f.config.clone();
+    let granted = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
+            .arg("--config")
+            .arg(path)
+            .args([
+                "users", "grant", "laura", "--mount", "extra", "--role", "owner",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        granted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&granted.stderr)
+    );
+}

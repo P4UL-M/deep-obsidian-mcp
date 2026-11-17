@@ -270,17 +270,18 @@ impl AppState {
 
     /// Scope BEFORE any candidate retrieval, resource enumeration or metadata rendering.
     pub fn for_principal(&self, principal: Principal) -> Result<Self> {
-        let store = self.control.as_ref().context("multiuser is unavailable")?;
+        let current = self.current();
+        let store = current.control.as_ref().context("multiuser is unavailable")?;
         if !store.principal_valid(&principal)? || !store.enabled()? {
             bail!("access denied");
         }
         let grants = store.grants(&principal.user_id)?;
         let allowed: Vec<_> = grants.iter().map(|g| g.mount_id.clone()).collect();
-        let original = self
+        let original = current
             .access
             .as_ref()
             .map(|a| a.original_router.clone())
-            .unwrap_or_else(|| self.router.clone());
+            .unwrap_or_else(|| current.router.clone());
         let mounts = original
             .mounts()
             .iter()
@@ -298,12 +299,12 @@ impl AppState {
                 )
             })
             .collect();
-        let full_runtimes = self
+        let full_runtimes = current
             .access
             .as_ref()
             .map(|a| a.original_runtimes.clone())
-            .unwrap_or_else(|| self.runtimes.clone());
-        let mut scoped = self.clone();
+            .unwrap_or_else(|| current.runtimes.clone());
+        let mut scoped = current.clone();
         scoped.router = Arc::new(VaultRouter::new(mounts)?);
         scoped.runtimes = full_runtimes.restricted(&allowed, principal.default_mount.as_deref());
         // The root-only convenience handle must never refer to an unauthorized backend.
@@ -319,11 +320,11 @@ impl AppState {
             .mounts()
             .iter()
             .any(|m| m.backend.descriptor().supports(Capability::GrepSearch));
-        let original_config = self
+        let original_config = current
             .access
             .as_ref()
             .map(|a| a.original_config.clone())
-            .unwrap_or_else(|| self.config.clone());
+            .unwrap_or_else(|| current.config.clone());
         let mut config = (*original_config).clone();
         config.mounts = original_config
             .mount_table()

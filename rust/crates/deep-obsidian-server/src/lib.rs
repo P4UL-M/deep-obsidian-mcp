@@ -12,6 +12,7 @@ pub mod oauth;
 pub mod prompts;
 pub mod protocol;
 pub mod resources;
+pub mod reload;
 pub mod runtime;
 pub mod stdio;
 pub mod tools;

@@ -690,6 +690,48 @@ if [ "$UP" = 1 ]; then
       head -c 600 "$TMP/ready.json"; echo
       docker logs "$C4" 2>&1 | tail -40
     fi
+
+    step "two CouchDB vaults: live reload and independent secrets across recreation"
+    PRIVATE_PASS=private-smoke-$RANDOM
+    curl -fsS "${CURL_AUTH[@]}" -X PUT "$COUCH/privatevault" >/dev/null || fail "create private database"
+    curl -fsS "${CURL_AUTH[@]}" -X PUT "$COUCH/_users/org.couchdb.user:laura" \
+      -H 'Content-Type: application/json' \
+      -d "{\"name\":\"laura\",\"password\":\"$PRIVATE_PASS\",\"roles\":[],\"type\":\"user\"}" >/dev/null || fail "create private CouchDB user"
+    curl -fsS "${CURL_AUTH[@]}" -X PUT "$COUCH/privatevault/_security" \
+      -H 'Content-Type: application/json' \
+      -d '{"admins":{"names":[],"roles":["_admin"]},"members":{"names":["laura"],"roles":[]}}' >/dev/null || fail "secure private database"
+    curl -fsS "${CURL_AUTH[@]}" -X PUT "$COUCH/privatevault/obsydian_livesync_version" \
+      -H 'Content-Type: application/json' -d '{"type":"versioninfo","version":12}' >/dev/null || fail "initialize private schema"
+    printf '%s\n' "$PRIVATE_PASS" > "$TMP/secrets/mount-private-password"
+    chmod 644 "$TMP/secrets/mount-private-password"
+    BEFORE_RELOAD=$(docker inspect -f '{{.State.StartedAt}}' "$C4")
+    if printf '%s\n' "$PRIVATE_PASS" | docker exec -i "$C4" deep-obsidian-cli \
+      --config /var/lib/deep-obsidian-mcp/config.json mounts add couchdb --id private --mount-at Private \
+      --url "http://$CDB:5984" --database privatevault --username laura --writable --password-stdin --yes > "$TMP/live-add.txt" 2>&1; then
+      check "mount addition reports automatic reload" grep -e 'reloaded' "$TMP/live-add.txt"
+      [ "$BEFORE_RELOAD" = "$(docker inspect -f '{{.State.StartedAt}}' "$C4")" ] \
+        && pass "live mount reload did not restart the container" || fail "mount addition restarted the container"
+    else
+      fail "live addition of the private CouchDB mount"
+      cat "$TMP/live-add.txt"
+    fi
+    # Recreate (not merely restart) to prove credentials are re-injected from
+    # independent files; no previous ephemeral secret store survives this step.
+    docker rm -f "$C4" >/dev/null
+    docker run -d --name "$C4" --network "$NET" \
+      -p "127.0.0.1:$PORT:4100" -v "$VOL3:/var/lib/deep-obsidian-mcp" \
+      -v "$TMP/secrets:/run/secrets:ro" "$IMAGE" >/dev/null
+    if wait_for_health "$C4"; then
+      check "both CouchDB credentials resolve after recreation" docker exec "$C4" deep-obsidian-cli \
+        --config /var/lib/deep-obsidian-mcp/config.json doctor --probe-remote
+      docker logs "$C4" 2>&1 | grep -e "injecting mount-private-password into mount 'private'" >/dev/null \
+        && pass "private mount restored its own credential" || fail "private credential was not re-injected"
+      docker logs "$C4" 2>&1 | grep -e "injecting couchdb_password into mount 'vault'" >/dev/null \
+        && pass "legacy root credential remained scoped to the root" || fail "legacy root credential was not retained"
+    else
+      fail "two-mount backend failed after recreation"
+      docker logs "$C4" 2>&1 | tail -30
+    fi
   else
     fail "the container did not come up against a live CouchDB"
     docker logs "$C4" 2>&1 | tail -40

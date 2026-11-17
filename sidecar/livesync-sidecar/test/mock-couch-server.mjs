@@ -91,6 +91,7 @@ if (!build) {
 const vault = build();
 
 const couch = new MockCouch({
+    ...(process.env.MOCK_COUCH_PASSWORD ? {expectedAuth: "Basic " + Buffer.from("laura:" + process.env.MOCK_COUCH_PASSWORD).toString("base64")} : {}),
     docs: vault.docs ?? {},
     localDocs: vault.localDocs ?? {},
     conflicts: vault.conflicts ?? {},

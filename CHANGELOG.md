@@ -2,6 +2,26 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.2.0-alpha.11 — 2026-11-17
+
+### Fixed
+
+- Mount additions and removals now reload the running backend automatically.
+  `deep-obsidian-cli mounts reload` applies an already saved table. Reloads keep
+  the HTTP listener, OAuth state and application sessions, validate a replacement
+  before publishing it, and immediately reconcile mount grants. Failed reloads
+  retain the previous live table and report the saved configuration as pending.
+- Docker restores independent credentials from `mount-<id>-password`,
+  `mount-<id>-e2ee-passphrase` and `mount-<id>-api-key` secret files. Legacy names
+  remain scoped to the matching root or sole mount. A complete source check runs
+  before the ephemeral store is cleared, preventing one credential from being
+  broadcast to private vaults. Two-CouchDB recreation is covered by smoke tests.
+- Interactive CouchDB mount setup names the CouchDB login, retries rejected
+  credentials up to twice, and removes each failed attempt's stored secrets.
+  Scripted stdin remains noninteractive. Real terminal tests cover masked
+  special-character input and wrong-password-then-correct-password recovery;
+  the original user's prompt failure was not conclusively reproduced.
+
 ## v0.2.0-alpha.10 — 2026-11-17
 
 ### Added

@@ -6367,6 +6367,7 @@ mod tests {
                 vault_path.join("definitely-missing-rg"),
             ));
         let state = AppState {
+            live: std::sync::Arc::default(),
             router: std::sync::Arc::new(deep_obsidian_backend::VaultRouter::single(
                 "vault",
                 backend.clone(),

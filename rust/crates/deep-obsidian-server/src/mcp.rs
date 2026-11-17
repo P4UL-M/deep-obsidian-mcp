@@ -18,6 +18,7 @@ use crate::{prompts, resources, tools};
 
 #[derive(Clone)]
 pub struct AppState {
+    pub live: Arc<crate::reload::LiveMounts>,
     pub control: Option<deep_obsidian_control::ControlStore>,
     pub access: Option<crate::multiuser::Access>,
     pub config: Arc<ResolvedServiceConfig>,
@@ -129,6 +130,7 @@ impl AppState {
             .iter()
             .any(|mount| mount.backend.descriptor().supports(Capability::GrepSearch));
         Self {
+            live: Arc::default(),
             control: None,
             access: None,
             config: Arc::new(config),
@@ -247,6 +249,7 @@ pub async fn handle_request(
     state: AppState,
     request: JsonRpcRequest,
 ) -> Result<Option<Value>, JsonRpcErrorResponse> {
+    let state = state.current();
     let id = request.id.unwrap_or(Value::Null);
     let state = if state.multiuser_enabled() {
         let principal = state

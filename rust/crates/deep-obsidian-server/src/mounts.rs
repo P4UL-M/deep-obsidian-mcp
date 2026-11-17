@@ -158,6 +158,34 @@ impl MountBackends {
         Self::build_with_resolver(config, &SecretResolver::new())
     }
 
+    /// Reuse unchanged backend connections during a live mount reload.
+    pub(crate) fn reload(config: &ResolvedServiceConfig, old: &crate::mcp::AppState) -> Self {
+        let previous = old.config.mount_table();
+        let resolver = SecretResolver::new();
+        let entries = config
+            .mount_table()
+            .into_iter()
+            .map(|mount| {
+                if previous.iter().any(|m| m == &mount) {
+                    if let Some(existing) = old.router.mounts().iter().find(|m| m.id == mount.id) {
+                        let supervisor = existing
+                            .backend
+                            .as_couchdb()
+                            .map(|backend| backend.supervisor().clone());
+                        return MountBackendEntry {
+                            index_dir: mount_index_dir(config, &mount),
+                            mount,
+                            backend: existing.backend.clone(),
+                            supervisor,
+                        };
+                    }
+                }
+                build_entry(config, mount, &resolver)
+            })
+            .collect();
+        Self { entries }
+    }
+
     /// [`Self::build`] against an explicit secret store.
     ///
     /// Exists so a test can point at a temp secrets file instead of mutating

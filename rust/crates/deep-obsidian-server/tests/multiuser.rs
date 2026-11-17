@@ -672,3 +672,83 @@ async fn folders_only_listing_does_not_disclose_a_denied_mount() {
         data["folders"].as_array().unwrap().len()
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn live_reload_preserves_sessions_and_updates_grants_without_restarting() {
+    use deep_obsidian_server::control::{call_local, start};
+    let f = Fixture::new(Role::Reader).await;
+    let session = f.as_laura();
+    let auth = f.state.auth.clone();
+    let root = f.state.router.root().unwrap().backend.clone();
+    let _control = start(&f.state).unwrap();
+    let path = f.state.config.config_file_path.as_ref().unwrap();
+    let private = f.base.join("new-private");
+    fs::create_dir(&private).unwrap();
+    fs::write(private.join("New.md"), "new-private-secret").unwrap();
+    let mut saved =
+        serde_json::to_value(deep_obsidian_config::to_persisted_config(&f.state.config)).unwrap();
+    saved["multiuser"] = json!({"enabled":true});
+    saved["mounts"].as_array_mut().unwrap().push(json!({
+        "id":"new-private","mountAt":"NewPrivate","backend":{"kind":"filesystem","vaultPath":private}
+    }));
+    fs::write(path, saved.to_string()).unwrap();
+    let result = call_local(&f.state.config, json!({"operation":"mounts.reload"}))
+        .await
+        .unwrap();
+    assert_eq!(result["sessionsPreserved"], true);
+    assert!(std::sync::Arc::ptr_eq(&auth, &f.state.current().auth));
+    assert!(std::sync::Arc::ptr_eq(
+        &root,
+        &f.state.current().router.root().unwrap().backend
+    ));
+    denied(&tool(&session, "read_file", json!({"path":"NewPrivate/New.md"})).await);
+    call_local(
+        &f.state.config,
+        json!({"operation":"users.grant","name":"laura","mount":"new-private","role":"owner"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        structured(&tool(&session, "read_file", json!({"path":"NewPrivate/New.md"})).await)["text"]
+            .as_str()
+            .unwrap()
+            .contains("new-private-secret")
+    );
+    // Removal affects the existing session and prunes grants before this ID can be reused.
+    saved["mounts"].as_array_mut().unwrap().pop();
+    fs::write(path, saved.to_string()).unwrap();
+    call_local(&f.state.config, json!({"operation":"mounts.reload"}))
+        .await
+        .unwrap();
+    denied(&tool(&session, "read_file", json!({"path":"NewPrivate/New.md"})).await);
+    assert!(!f
+        .state
+        .control
+        .as_ref()
+        .unwrap()
+        .grants(&f.laura.user_id)
+        .unwrap()
+        .iter()
+        .any(|g| g.mount_id == "new-private"));
+    // A rejected candidate keeps the live routing and session usable.
+    let duplicate = saved["mounts"][0].clone();
+    saved["mounts"].as_array_mut().unwrap().push(duplicate);
+    fs::write(path, saved.to_string()).unwrap();
+    assert!(
+        call_local(&f.state.config, json!({"operation":"mounts.reload"}))
+            .await
+            .is_err()
+    );
+    assert!(structured(
+        &tool(
+            &session,
+            "read_file",
+            json!({"path":"Laura/LauraSecret.md"})
+        )
+        .await
+    )["text"]
+        .as_str()
+        .unwrap()
+        .contains("privatelauraword"));
+}

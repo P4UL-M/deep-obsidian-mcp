@@ -318,6 +318,8 @@ pub enum SecretsCommand {
 /// then refuse to load.
 #[derive(Debug, Clone, Subcommand)]
 pub enum MountsCommand {
+    /// Apply saved mount changes without restarting the backend or OAuth sessions.
+    Reload,
     /// Append a mount to the table, validating the whole table before writing.
     ///
     /// On a legacy `vaultPath`-only config the existing vault is first converted to an

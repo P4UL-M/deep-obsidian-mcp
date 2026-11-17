@@ -81,15 +81,11 @@ pub fn start(state: &AppState) -> Result<ControlGuard> {
         }
         let listener = tokio::net::UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-        let config = state.config.clone();
-        let store = state.control.clone().context("control store missing")?;
-        let runtimes = state.runtimes.clone();
+        let state = state.clone();
         let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let config = config.clone();
-                let store = store.clone();
-                let runtimes = runtimes.clone();
+                let state = state.clone();
                 let gate = gate.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -103,7 +99,18 @@ pub fn start(state: &AppState) -> Result<ControlGuard> {
                     let response = if matches!(request,Ok(Ok(n)) if n > 0 && n <= 65536) {
                         let _serial = gate.lock().await;
                         match serde_json::from_str::<Value>(&line) {
+                            Ok(request) if request["operation"] == "mounts.reload" => {
+                                match tokio::time::timeout(std::time::Duration::from_secs(25), crate::reload::apply(&state)).await {
+                                    Ok(Ok(result)) => json!({"ok":true,"result":result}),
+                                    Ok(Err(error)) => json!({"ok":false,"error":error.to_string()}),
+                                    Err(_) => json!({"ok":false,"error":"mount reload timed out; previous live mounts were retained"}),
+                                }
+                            }
                             Ok(request) => {
+                                let active = state.current();
+                                let config = active.config.clone();
+                                let store = active.control.clone().expect("control store missing");
+                                let runtimes = active.runtimes.clone();
                                 let transition = matches!(
                                     request["operation"].as_str(),
                                     Some("multiuser.enable" | "multiuser.disable")
@@ -154,7 +161,7 @@ pub fn start(state: &AppState) -> Result<ControlGuard> {
 }
 
 /// CLI sends changes to a live server, or locks an offline config for initial setup.
-pub async fn call_local(config: &ResolvedServiceConfig, request: Value) -> Result<Value> {
+pub async fn try_call_running(config: &ResolvedServiceConfig, request: Value) -> Result<Option<Value>> {
     #[cfg(unix)]
     {
         match tokio::net::UnixStream::connect(multiuser::socket_path(config)).await {
@@ -178,7 +185,7 @@ pub async fn call_local(config: &ResolvedServiceConfig, request: Value) -> Resul
                             .unwrap_or("management operation failed")
                     );
                 }
-                return Ok(reply["result"].clone());
+                return Ok(Some(reply["result"].clone()));
             }
             Err(e)
                 if matches!(
@@ -188,6 +195,11 @@ pub async fn call_local(config: &ResolvedServiceConfig, request: Value) -> Resul
             Err(e) => return Err(e.into()),
         }
     }
+    Ok(None)
+}
+
+pub async fn call_local(config: &ResolvedServiceConfig, request: Value) -> Result<Value> {
+    if let Some(result) = try_call_running(config, request.clone()).await? { return Ok(result); }
     let _lock = lock(config)?;
     let store = ControlStore::open(multiuser::database_path(config))?;
     execute(config, &store, request)
@@ -253,6 +265,7 @@ pub fn execute(
     }
     let old_enabled = store.enabled()?;
     let result = match operation {
+        "mounts.status" => json!({"mounts":mounts}),
         "multiuser.status" => json!({"enabled":store.enabled()?,"users":store.list_users()?}),
         "multiuser.enable" => {
             multiuser::validate_mounts(config)?;

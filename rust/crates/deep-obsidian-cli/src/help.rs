@@ -107,7 +107,7 @@ fn style(command: Command, parents: &[String]) -> Command {
     let action = path.get(1).map(String::as_str);
     let writing = match family {
         Some("setup-service") => true,
-        Some("mounts") => matches!(action, Some("add" | "remove")),
+        Some("mounts") => matches!(action, Some("add" | "remove" | "reload")),
         Some("secrets") => action == Some("set"),
         Some("users") => matches!(
             action,
@@ -212,7 +212,7 @@ fn style(command: Command, parents: &[String]) -> Command {
         ["doctor"] => command.after_help("Local checks run by default. Add --probe-remote to check remote mounts read-only.\nUse probe to test the HTTP health and MCP endpoints."),
         ["secrets"] => command.after_help("Use check to identify each secret's store; set replaces a stored value.\nBearer-token recovery and Docker secret files: docs/cli.md#recover-a-lost-bearer-token"),
         ["secrets", "set"] => command.after_help("Examples:\n  deep-obsidian-cli secrets set --target auth-token\n  deep-obsidian-cli secrets set --mount team\n\nThe replacement is prompted masked, or read with --stdin. Rotation keeps the existing\nstore and reference; it does not change configuration or migrate credentials."),
-        ["mounts"] => command.after_help("Examples:\n  deep-obsidian-cli mounts list\n  deep-obsidian-cli mounts add couchdb --help\n\nRemoving a mount preserves its backing data and stored credentials."),
+        ["mounts"] => command.after_help("Examples:\n  deep-obsidian-cli mounts list\n  deep-obsidian-cli mounts add couchdb --help\n\nChanges reload the running backend automatically without disconnecting sessions.\nUse mounts reload to apply an already saved mount table.\nRemoving a mount preserves its backing data and stored credentials."),
         ["users"] => command.after_help("Start with: deep-obsidian-cli users enable --wizard\nPasswords are generated once at creation; recover a lost password with rotate-password.\nDisabling multiuser deletes all application users and restores classic all-vault access."),
         _ => command,
     };

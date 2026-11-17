@@ -14,6 +14,12 @@ local backend before changing users. The saved client link contains routing
 metadata; accounts and vault roles live in that backend's control database.
 Docker/host access is trusted operator access.
 
+Mount additions/removals reload automatically on alpha.11-or-newer backends, preserving
+existing client sessions. If a mount was saved before upgrading, run
+`deep-obsidian-cli mounts reload` before assigning its grants. See the
+[Docker per-mount secret files](docker.md#secrets-are-ephemeral) for credential
+restoration after recreation.
+
 ## Enable and manage users
 
 Use `deep-obsidian-cli users enable --wizard` for an existing configuration. The setup wizard also offers multiuser activation after configuring mounts and authentication. It asks for at least one user, a role or no access on each mount, and a default destination. Each mount exposed to users needs an owner. The final confirmation commits the entire identity/grant plan; cancellation or dry-run creates no users or passwords.

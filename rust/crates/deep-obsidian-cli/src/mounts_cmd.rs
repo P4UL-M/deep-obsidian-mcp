@@ -504,8 +504,16 @@ fn store_secrets(
 ) -> Result<MountSecretRefs> {
     match kind {
         MountSpec::Filesystem { .. } => Ok(MountSecretRefs::default()),
-        MountSpec::Couchdb { common, e2ee, .. } => {
-            let password = secrets.next("CouchDB password")?;
+        MountSpec::Couchdb {
+            common,
+            e2ee,
+            username,
+            ..
+        } => {
+            let password = secrets.next(&format!(
+                "CouchDB password for {}",
+                username.as_deref().unwrap_or("the configured user")
+            ))?;
             let password_ref = store_mount_secret(
                 resolver,
                 &common.id,
@@ -1017,14 +1025,21 @@ async fn probe_mount(
             }
         }
         MountBackendConfig::Couchdb { .. } => {
-            match crate::couchdb_transfer::probe_compatibility_with_resolver(
+            match crate::couchdb_transfer::probe_compatibility_report_with_resolver(
                 resolved, &mount.id, resolver,
             )
             .await
             {
                 Ok(status) => MountProbeReport {
-                    ok: status == "ok",
-                    verdict: format!("sidecar compatibility: {status}"),
+                    ok: status.status.as_str() == "ok",
+                    verdict: format!(
+                        "sidecar compatibility: {}{}",
+                        status.status.as_str(),
+                        status
+                            .detail
+                            .map(|detail| format!(" ({detail})"))
+                            .unwrap_or_default()
+                    ),
                     kind,
                 },
                 Err(error) => MountProbeReport {
@@ -1169,7 +1184,9 @@ pub(crate) async fn append_mount(
         }
         set_experimental_flag(&mut experimental, flag);
         experimental_enabled.push(flag.to_string());
-        messages.push(format!("enabled experimental.{flag}"));
+        messages.push(format!(
+            "approved experimental.{flag} for this pending change"
+        ));
     }
 
     // 3. Full-table validation, before the credential is even asked for. A duplicate id or
@@ -1213,45 +1230,62 @@ pub(crate) async fn append_mount(
         });
     }
 
-    // 4. Credentials. Stored under references derived from the (now validated) mount id;
-    //    only the reference ever reaches the config file.
-    let mut stored = Vec::new();
-    let refs = store_secrets(
-        spec,
-        io.resolver,
-        io.prefer_os_keyring,
-        io.secrets,
-        &mut stored,
-        &mut messages,
-    )?;
-    for descriptor in refs.describe() {
-        messages.push(format!(
-            "stored credential at {descriptor} (the config holds this reference only)"
-        ));
-    }
+    let mut attempt = 0;
+    let (mount, mounts, resolved, refs, stored, probe) = loop {
+        attempt += 1;
+        // 4. Credentials. Stored under references derived from the (now validated) mount id;
+        //    only the reference ever reaches the config file.
+        let mut stored = Vec::new();
+        let refs = match store_secrets(
+            spec,
+            io.resolver,
+            io.prefer_os_keyring,
+            io.secrets,
+            &mut stored,
+            &mut messages,
+        ) {
+            Ok(refs) => refs,
+            Err(error) => {
+                roll_back_stored_secrets(io.resolver, &stored, &mut messages);
+                return Err(error);
+            }
+        };
+        for descriptor in refs.describe() {
+            messages.push(format!(
+                "stored credential at {descriptor} (the config holds this reference only)"
+            ));
+        }
 
-    // The final ref shapes may differ from the derived ones when the keyring was
-    // unavailable, so the table is rebuilt and re-validated rather than assumed. Cheap,
-    // and it keeps "what was validated" and "what is written" the same object.
-    let mount = build_mount(spec, index_dir, &refs)?;
-    let mounts = {
-        let mut mounts = mounts;
-        mounts.pop();
-        mounts.push(mount.clone());
-        mounts
+        // The final ref shapes may differ from the derived ones when the keyring was
+        // unavailable, so the table is rebuilt and re-validated rather than assumed. Cheap,
+        // and it keeps "what was validated" and "what is written" the same object.
+        let mount = build_mount(spec, index_dir, &refs)?;
+        let candidate_mounts = {
+            let mut mounts = mounts.clone();
+            mounts.pop();
+            mounts.push(mount.clone());
+            mounts
+        };
+        // A failure here has already stored a credential, so the narration is carried and the
+        // caller's rollback still applies — `stored` travels out inside the error's sibling
+        // path only because this validation cannot fail in practice (the shapes are the ones
+        // just validated); if it ever does, the refusal names the file and writes nothing.
+        let resolved = validate_for_write(
+            candidate_config(existing, &candidate_mounts, &experimental),
+            config_path,
+            &messages,
+        )?;
+
+        // 5. Blocking probe. The VERDICT is the result; whether it blocks is the caller's.
+        let probe = probe_mount(&resolved, &mount, io.resolver).await;
+
+        if !common.keep_anyway && should_retry_auth(&probe, io.secrets.lines.is_none(), attempt) {
+            roll_back_stored_secrets(io.resolver, &stored, &mut messages);
+            eprintln!("CouchDB rejected the login or database access. Enter the password for the CouchDB username, not the Deep Obsidian account. Retry {attempt}/2; --password-stdin is available for scripts.");
+            continue;
+        }
+        break (mount, candidate_mounts, resolved, refs, stored, probe);
     };
-    // A failure here has already stored a credential, so the narration is carried and the
-    // caller's rollback still applies — `stored` travels out inside the error's sibling
-    // path only because this validation cannot fail in practice (the shapes are the ones
-    // just validated); if it ever does, the refusal names the file and writes nothing.
-    let resolved = validate_for_write(
-        candidate_config(existing, &mounts, &experimental),
-        config_path,
-        &messages,
-    )?;
-
-    // 5. Blocking probe. The VERDICT is the result; whether it blocks is the caller's.
-    let probe = probe_mount(&resolved, &mount, io.resolver).await;
 
     Ok(AppendedMount {
         mounts,
@@ -1895,6 +1929,24 @@ pub async fn run(
         .unwrap_or_else(deep_obsidian_config::default_config_path);
 
     match command {
+        MountsCommand::Reload => {
+            let result = reload_running(&config_path, dry_run).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if dry_run {
+                println!("Dry run; no live mounts were changed.");
+            } else {
+                println!(
+                    "{}",
+                    if result["reloaded"] == true {
+                        "Mounts reloaded; existing sessions remain connected."
+                    } else {
+                        "Backend is not running; saved mounts will load on startup."
+                    }
+                );
+            }
+            Ok(())
+        }
         MountsCommand::Add { kind } => {
             // Guided mode FIRST: the flags are pre-answers, and anything they left out is
             // asked here (or reported as missing, together, when there is no terminal to
@@ -1913,6 +1965,13 @@ pub async fn run(
                 &mut secrets,
             )
             .await?;
+            let mut report = report;
+            if report.written {
+                match reload_running(&config_path, false).await {
+                    Ok(result) => report.messages.push(reload_message(&result)),
+                    Err(error) => bail!("mount configuration was saved, but live reload failed: {error}. The previous live mounts remain active; fix the configuration and run `deep-obsidian-cli mounts reload`."),
+                }
+            }
             crate::commands::print_report(json, &report, || render_add_report(&report))
         }
         MountsCommand::List => {
@@ -1924,7 +1983,30 @@ pub async fn run(
             purge_index,
             yes,
         } => {
+            if purge_index && !dry_run {
+                let options = ServiceOptions {
+                    config: Some(config_path.clone()),
+                    ..Default::default()
+                };
+                let config = crate::config::resolve_runtime_config(&options)?.service;
+                if deep_obsidian_server::control::try_call_running(
+                    &config,
+                    serde_json::json!({"operation":"mounts.status"}),
+                )
+                .await?
+                .is_some()
+                {
+                    bail!("--purge-index requires a stopped backend; remove the mount without --purge-index to reload it live");
+                }
+            }
             let report = remove(&config_path, &id, purge_index, yes, dry_run)?;
+            let mut report = report;
+            if report.written {
+                match reload_running(&config_path, false).await {
+                    Ok(result) => report.messages.push(reload_message(&result)),
+                    Err(error) => bail!("mount configuration was saved, but live reload failed: {error}. Run `deep-obsidian-cli mounts reload` after correcting the configuration."),
+                }
+            }
             crate::commands::print_report(json, &report, || render_remove_report(&report))
         }
     }
@@ -1937,4 +2019,36 @@ pub(crate) fn uses_stdin_secret(kind: &MountSpec) -> bool {
         MountSpec::Couchdb { password_stdin, .. } => *password_stdin,
         MountSpec::Algolia { api_key_stdin, .. } => *api_key_stdin,
     }
+}
+
+async fn reload_running(path: &std::path::Path, dry_run: bool) -> Result<serde_json::Value> {
+    if dry_run {
+        return Ok(serde_json::json!({"dryRun":true,"reloaded":false}));
+    }
+    let options = ServiceOptions {
+        config: Some(path.to_path_buf()),
+        ..Default::default()
+    };
+    let resolved = crate::config::resolve_runtime_config(&options)?;
+    Ok(deep_obsidian_server::control::try_call_running(
+        &resolved.service,
+        serde_json::json!({"operation":"mounts.reload"}),
+    )
+    .await?
+    .unwrap_or_else(|| serde_json::json!({"reloaded":false,"backendRunning":false})))
+}
+fn reload_message(result: &serde_json::Value) -> String {
+    if result["reloaded"] == true {
+        "mounts reloaded automatically; existing sessions remain connected".into()
+    } else {
+        "backend is not running; saved mounts will load on startup".into()
+    }
+}
+
+fn should_retry_auth(probe: &MountProbeReport, interactive: bool, attempt: usize) -> bool {
+    interactive
+        && attempt < 3
+        && probe.kind == "couchdb"
+        && probe.verdict.contains("auth-failed")
+        && probe.verdict.contains("HTTP 401")
 }

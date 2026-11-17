@@ -121,7 +121,7 @@ FROM ${NODE_IMAGE} AS runtime
 
 # Keep in step with `[workspace.package] version` in Cargo.toml; CI passes the tag
 # version explicitly when an image is published (docs/release-checklist.md).
-ARG VERSION=0.2.0-alpha.10
+ARG VERSION=0.2.0-alpha.11
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="deep-obsidian-mcp" \
@@ -160,6 +160,7 @@ COPY skills /opt/deep-obsidian-mcp/share/deep-obsidian-mcp/skills
 COPY obsidian-snippets /opt/deep-obsidian-mcp/share/deep-obsidian-mcp/obsidian-snippets
 COPY assets /opt/deep-obsidian-mcp/share/deep-obsidian-mcp/assets
 COPY docker/entrypoint.sh /opt/deep-obsidian-mcp/bin/entrypoint.sh
+COPY docker/mount-secrets.mjs /opt/deep-obsidian-mcp/bin/mount-secrets.mjs
 RUN chmod 0755 /opt/deep-obsidian-mcp/bin/entrypoint.sh
 
 ENV PATH="/opt/deep-obsidian-mcp/bin:${PATH}"

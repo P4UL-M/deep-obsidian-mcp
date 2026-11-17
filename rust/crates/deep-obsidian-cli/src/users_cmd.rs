@@ -147,7 +147,15 @@ pub async fn run(
         );
         return Ok(());
     }
-    let result = deep_obsidian_server::control::call_local(config, request).await?;
+    let mount = request["mount"].as_str().map(str::to_owned);
+    let result = deep_obsidian_server::control::call_local(config, request).await.map_err(|error| {
+        if let Some(mount) = mount.filter(|mount| config.mount_table().iter().any(|m| &m.id == mount)) {
+            if error.to_string() == format!("unknown mount {mount}") {
+                return anyhow::anyhow!("mount '{mount}' is configured but the running backend has not loaded it; run `deep-obsidian-cli mounts reload` (requires an alpha.11-or-newer backend)");
+            }
+        }
+        error
+    })?;
     print_result(&result, json_output)
 }
 

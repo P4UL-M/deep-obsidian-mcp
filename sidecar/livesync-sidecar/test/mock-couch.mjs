@@ -77,6 +77,7 @@ export class MockCouch {
         this.localDocs = new Map();
         this.conflicts = new Map(Object.entries(options.conflicts ?? {}));
         this.authStatus = options.authStatus;
+        this.expectedAuth = options.expectedAuth;
         this.writable = options.writable === true;
         this.changes = [];
         this.seq = 0;
@@ -259,6 +260,9 @@ export class MockCouch {
             return send(res, 500, { error: "internal_server_error", reason: "injected outage" });
         }
 
+        if (this.expectedAuth && req.headers.authorization !== this.expectedAuth) {
+            return send(res, 401, { error: "unauthorized", reason: "test credential rejected" });
+        }
         if (this.authStatus !== undefined) {
             return send(res, this.authStatus, { error: "unauthorized", reason: "mock" });
         }

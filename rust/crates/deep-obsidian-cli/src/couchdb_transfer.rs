@@ -289,6 +289,20 @@ pub async fn probe_compatibility_with_resolver(
     mount_id: &str,
     resolver: &SecretResolver,
 ) -> Result<String> {
+    Ok(
+        probe_compatibility_report_with_resolver(config, mount_id, resolver)
+            .await?
+            .status
+            .as_str()
+            .to_string(),
+    )
+}
+
+pub(crate) async fn probe_compatibility_report_with_resolver(
+    config: &ResolvedServiceConfig,
+    mount_id: &str,
+    resolver: &SecretResolver,
+) -> Result<deep_obsidian_backend::sidecar::Compatibility> {
     let backend = couchdb_backend_for_mount(config, mount_id, resolver)?;
     let couchdb = require_couchdb(&backend, mount_id)?;
     let supervisor = couchdb.supervisor().clone();
@@ -302,7 +316,7 @@ pub async fn probe_compatibility_with_resolver(
 
     started.with_context(|| format!("could not start the sidecar for mount {mount_id:?}"))?;
     match compatibility {
-        Some(compatibility) => Ok(compatibility.status.as_str().to_string()),
+        Some(compatibility) => Ok(compatibility),
         // A completed `ensure_started` always records one, so this is a contract
         // violation rather than a remote problem — named as such instead of reported as
         // an unreachable vault, which would send the reader to the wrong place.

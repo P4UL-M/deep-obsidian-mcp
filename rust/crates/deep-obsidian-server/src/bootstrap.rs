@@ -27,7 +27,7 @@ use crate::health::{
 use crate::mcp::{handle_request, AppState};
 use crate::mounts::MountBackends;
 use crate::protocol::JsonRpcRequest;
-use crate::runtime::{AutoReindexHandle, MountRuntimes};
+use crate::runtime::MountRuntimes;
 
 /// Environment variable carrying a literal bearer token. When set and non-empty
 /// it enables authentication and overrides any configured `token_ref` — useful
@@ -154,8 +154,7 @@ pub struct ServiceBootstrapContext {
     pub endpoints: ServiceEndpoints,
     /// One handle per mount, when auto-reindex is enabled. Dropping them stops
     /// every watcher.
-    pub auto_reindex: Vec<AutoReindexHandle>,
-    pub initial_index: tokio::task::JoinHandle<()>,
+    live_state: AppState,
     pub server_handle: tokio::task::JoinHandle<io::Result<()>>,
     /// Sidecar supervisors to stop when the service stops. Empty unless a couchdb
     /// mount is configured.
@@ -172,6 +171,11 @@ impl ServiceBootstrapContext {
     /// it relies on `kill_on_drop(true)`, set when the child is spawned, so no
     /// sidecar can outlive the server either way.
     pub async fn shutdown_sidecars(&self) {
+        for mount in self.live_state.current().router.mounts() {
+            if let Some(backend) = mount.backend.as_couchdb() {
+                backend.supervisor().shutdown().await;
+            }
+        }
         for supervisor in &self.sidecars {
             supervisor.shutdown().await;
         }
@@ -180,7 +184,7 @@ impl ServiceBootstrapContext {
 
 impl Drop for ServiceBootstrapContext {
     fn drop(&mut self) {
-        self.initial_index.abort();
+        self.live_state.stop_mount_background();
         self.server_handle.abort();
         // The supervisors' own `Drop` (and the child's `kill_on_drop`) does the
         // killing; dropping the last handle here is what triggers it.
@@ -189,6 +193,7 @@ impl Drop for ServiceBootstrapContext {
 }
 
 async fn health_handler(State(state): State<AppState>) -> axum::response::Response {
+    let state = state.current();
     if state.multiuser_enabled() {
         return (StatusCode::OK, Json(json!({"status":"ok"}))).into_response();
     }
@@ -201,6 +206,7 @@ async fn health_handler(State(state): State<AppState>) -> axum::response::Respon
 }
 
 async fn ready_handler(State(state): State<AppState>) -> axum::response::Response {
+    let state = state.current();
     if state.multiuser_enabled() {
         let d = state.runtimes.aggregate_diagnostics();
         return (
@@ -258,6 +264,7 @@ pub(crate) async fn upload_handler(
     body: Body,
 ) -> impl IntoResponse {
     use crate::uploads::{commit_stream_via_backend, ClaimError, CommitError};
+    let state = state.current();
     let principal = principal.map(|p| p.0);
     if !state.uploads.owner_matches(&token, principal.as_ref()) {
         return (StatusCode::FORBIDDEN, "invalid upload token").into_response();
@@ -429,7 +436,6 @@ pub async fn run_http_service(
             .with_upload_base(upload_base_url(&config)),
     )
     .map_err(io::Error::other)?;
-    let control = crate::control::start(&state).map_err(io::Error::other)?;
 
     // Startup validation gate, applied PER MOUNT rather than through the router's
     // all-mounts overview.
@@ -493,6 +499,8 @@ readiness reports it as such",
 
     let endpoints = build_service_endpoints(&config);
     let state = state.with_auth(auth_state);
+    let control = crate::control::start(&state).map_err(io::Error::other)?;
+    let live_state = state.clone();
 
     // Protected routes share an auth/origin middleware layer; health and
     // readiness are intentionally left open for liveness probes.
@@ -534,14 +542,12 @@ readiness reports it as such",
     });
     // Every mount is refreshed and watched. A non-root mount that fails is logged
     // and left degraded rather than taking the service down with it.
-    let initial_index = runtimes.start_initial_refresh();
-    let auto_reindex = runtimes.start_auto_reindex();
+    live_state.start_mount_background();
 
     Ok(ServiceBootstrapContext {
         config,
         endpoints,
-        auto_reindex,
-        initial_index,
+        live_state,
         server_handle,
         sidecars: backends.supervisors(),
         _control: control,
