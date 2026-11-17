@@ -93,7 +93,7 @@ $SUDO apt-get install -y deep-obsidian-mcp
 
 echo
 echo "Installed. Next steps:"
-echo "  deep-obsidian-mcp setup-service --vault ~/Vault"
+echo "  deep-obsidian-cli setup-service --vault ~/Vault"
 echo "  systemctl --user enable --now deep-obsidian-mcp"
 SCRIPT
 } > install.sh

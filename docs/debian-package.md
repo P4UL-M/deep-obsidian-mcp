@@ -79,7 +79,7 @@ the systemd unit carries no `Environment=DEEP_OBSIDIAN_LIVESYNC_SIDECAR` line.
 Check the result — no CouchDB and no credentials required:
 
 ```bash
-deep-obsidian-mcp doctor        # per couchdb mount: bundle located? node >= 20?
+deep-obsidian-cli doctor        # per couchdb mount: bundle located? node >= 20?
 ```
 
 `scripts/linux-smoke-test.sh` asserts exactly this in CI, running `doctor` from `/` against
@@ -93,9 +93,9 @@ packaged mode, under `$XDG_DATA_HOME/deep-obsidian-mcp/indexes/` — typically
 `~/.local/share/deep-obsidian-mcp/indexes/`):
 
 ```bash
-deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
+deep-obsidian-cli setup-service --vault ~/Vault --mcp --skills --vault-snippets
 # Optional: enable HTTP bearer auth (prints a token once):
-deep-obsidian-mcp setup-service --vault ~/Vault --auth
+deep-obsidian-cli setup-service --vault ~/Vault --auth
 ```
 
 ## Run as a service
@@ -113,7 +113,7 @@ loginctl enable-linger "$USER"
 Verify:
 
 ```bash
-deep-obsidian-mcp doctor
+deep-obsidian-cli doctor
 curl -fsS http://127.0.0.1:4100/readyz
 journalctl --user -u deep-obsidian-mcp -f   # logs
 ```

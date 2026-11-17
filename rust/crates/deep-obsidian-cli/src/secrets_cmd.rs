@@ -141,7 +141,7 @@ fn load_config_file(config_path: &Path) -> Result<PersistedServiceConfig> {
         .ok_or_else(|| {
             anyhow!(
                 "no config file at {}: `secrets` rotates and checks the references an existing \
-                 config holds. Run `deep-obsidian-mcp setup-service --wizard` first.",
+                 config holds. Run `deep-obsidian-cli setup-service --wizard` first.",
                 config_path.display()
             )
         })
@@ -156,7 +156,7 @@ fn find_mount<'a>(
     let Some(mounts) = config.mounts.as_ref().filter(|mounts| !mounts.is_empty()) else {
         bail!(
             "{} declares no mount table, so no mount has a credential to rotate: its vault is \
-             the top-level `vaultPath`, which needs none. `deep-obsidian-mcp secrets check` \
+             the top-level `vaultPath`, which needs none. `deep-obsidian-cli secrets check` \
              lists the references this config does hold.",
             config_path.display()
         );
@@ -242,7 +242,7 @@ fn mount_field_reference(
     let wrong_field = |available: &str| -> anyhow::Error {
         anyhow!(
             "mount '{}' is a {} mount and has no {}: its rotatable field(s) are {available}. Run \
-             `deep-obsidian-mcp secrets check` to see every reference {} holds.",
+             `deep-obsidian-cli secrets check` to see every reference {} holds.",
             mount.id,
             mount.backend.kind_name(),
             field_config_path(field),
@@ -268,7 +268,7 @@ fn mount_field_reference(
                      MOUNT-CONFIG change, not a rotation — a mount that claims to be encrypted \
                      when the vault is not (or the other way round) fails every read in a way \
                      that looks like corruption. Edit the mount's `e2ee` section in {}, or \
-                     re-add the mount with `deep-obsidian-mcp mounts add couchdb --e2ee`, and \
+                     re-add the mount with `deep-obsidian-cli mounts add couchdb --e2ee`, and \
                      rotate the passphrase afterwards.",
                     mount.id,
                     config_path.display(),
@@ -304,7 +304,7 @@ fn target_reference(
             .ok_or_else(|| {
                 anyhow!(
                     "no HTTP bearer token is configured in {}: `auth.tokenRef` is unset, so there \
-                     is no reference to rotate. `deep-obsidian-mcp setup-service --auth` \
+                     is no reference to rotate. `deep-obsidian-cli setup-service --auth` \
                      generates a token, stores it and writes the reference; `secrets set` only \
                      replaces the value an existing reference points at.",
                     config_path.display()
@@ -318,7 +318,7 @@ fn target_reference(
                 anyhow!(
                     "no embedding API key is configured in {}: `embedding.apiKeyRef` is unset, so \
                      there is no reference to rotate. The embedding screen of \
-                     `deep-obsidian-mcp setup-service --wizard` stores a key and writes the \
+                     `deep-obsidian-cli setup-service --wizard` stores a key and writes the \
                      reference; `secrets set` only replaces the value an existing reference \
                      points at. A local endpoint such as Ollama needs no key at all.",
                     config_path.display()
@@ -421,7 +421,7 @@ fn rotate(
     let read_back = resolver.get(&rotation.reference).map_err(|error| {
         anyhow!(
             "the new value was written to {descriptor} but could not be read back: {error}. Run \
-             `deep-obsidian-mcp secrets check` before relying on it."
+             `deep-obsidian-cli secrets check` before relying on it."
         )
     })?;
     let matches = read_back
@@ -430,7 +430,7 @@ fn rotate(
     if !matches {
         bail!(
             "the new value was written to {descriptor} but the store did not return it again. \
-             Treat this rotation as NOT done: run `deep-obsidian-mcp secrets check` and inspect \
+             Treat this rotation as NOT done: run `deep-obsidian-cli secrets check` and inspect \
              the store before relying on it."
         );
     }
@@ -505,7 +505,7 @@ pub fn set_mount_with_resolver(
         label: field_label(field),
         follow_up: Some(format!(
             "the mount was NOT contacted: this command only writes to the store. Run \
-             `deep-obsidian-mcp doctor --probe-remote` to confirm mount '{mount_id}' can still \
+             `deep-obsidian-cli doctor --probe-remote` to confirm mount '{mount_id}' can still \
              authenticate with the new {}.",
             field_flag_value(field)
         )),
@@ -762,7 +762,7 @@ pub fn render_check_report(report: &SecretsCheckReport) -> String {
         lines.push(entry.line.clone());
         if let Some(rotate_with) = &entry.rotate_with {
             if entry.status != "ok" {
-                lines.push(format!("  rotate with: deep-obsidian-mcp {rotate_with}"));
+                lines.push(format!("  rotate with: deep-obsidian-cli {rotate_with}"));
             }
         } else if entry.status != "ok" {
             lines.push(

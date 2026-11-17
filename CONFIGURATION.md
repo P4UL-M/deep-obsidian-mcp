@@ -12,7 +12,7 @@
 ## The setup wizard
 
 ```bash
-deep-obsidian-mcp setup-service --wizard
+deep-obsidian-cli setup-service --wizard
 ```
 
 The first-init flow. [USAGE.md](./USAGE.md#1-set-up-your-vault) lists the six screens;
@@ -59,7 +59,7 @@ and writes nothing.
 
 `setup-service` writes normalized JSON to
 `~/.config/deep-obsidian-mcp/config.json` (override with `--config <path>`).
-Inspect the resolved config any time with `deep-obsidian-mcp print-config`
+Inspect the resolved config any time with `deep-obsidian-cli print-config`
 (secrets are redacted).
 
 Settings resolve in this order:
@@ -109,17 +109,17 @@ warrants better than obfuscation, hand it to the service manager instead: `syste
 the unit as a file, and the token can also be supplied out of band through
 `DEEP_OBSIDIAN_AUTH_TOKEN` (see [Authentication](#authentication)).
 
-`deep-obsidian-mcp secrets check` tells you which store each reference actually resolves in,
+`deep-obsidian-cli secrets check` tells you which store each reference actually resolves in,
 without printing any value — see [Rotating a stored secret](#rotating-a-stored-secret).
 
 ## Rotating a stored secret
 
 ```bash
-deep-obsidian-mcp secrets check                                   # where does every reference resolve?
-deep-obsidian-mcp secrets set --mount team                        # rotate that mount's credential
-deep-obsidian-mcp secrets set --mount team --field e2ee-passphrase
-deep-obsidian-mcp secrets set --target auth-token
-deep-obsidian-mcp secrets set --target embedding-api-key
+deep-obsidian-cli secrets check                                   # where does every reference resolve?
+deep-obsidian-cli secrets set --mount team                        # rotate that mount's credential
+deep-obsidian-cli secrets set --mount team --field e2ee-passphrase
+deep-obsidian-cli secrets set --target auth-token
+deep-obsidian-cli secrets set --target embedding-api-key
 ```
 
 `secrets check` prints one line per reference the config holds — every mount credential, the
@@ -130,7 +130,7 @@ when any reference is `MISSING`, so it works as a gate in a script.
 ```
 [ok     ] mounts.team.passwordRef          osKeyring service=deep-obsidian-mcp account=mount-team-password
 [MISSING] mounts.team.e2ee.passphraseRef   osKeyring service=deep-obsidian-mcp account=mount-team-e2ee-passphrase
-  rotate with: deep-obsidian-mcp secrets set --mount team --field e2ee-passphrase
+  rotate with: deep-obsidian-cli secrets set --mount team --field e2ee-passphrase
 [ok     ] mounts.wiki.apiKeyRef            encryptedFile id=mount-wiki-api-key
 [ok     ] auth.tokenRef                    encryptedFile id=http-auth-token
 4 reference(s) checked, 3 resolved.
@@ -192,7 +192,7 @@ Enable embeddings through [the wizard](#the-setup-wizard), which offers an Ollam
 a reference rather than in the file:
 
 ```bash
-deep-obsidian-mcp setup-service --wizard
+deep-obsidian-cli setup-service --wizard
 ```
 
 Without an embedding endpoint, retrieval stays lexical and says so: results report
@@ -307,14 +307,14 @@ tunnel).
 Enable it (on first setup, generates a 256-bit token, stores it securely and prints it once; existing token references are preserved):
 
 ```bash
-deep-obsidian-mcp setup-service --wizard     # answer yes to authentication
-deep-obsidian-mcp setup-service --vault ~/Vault --auth   # non-interactive
+deep-obsidian-cli setup-service --wizard     # answer yes to authentication
+deep-obsidian-cli setup-service --vault ~/Vault --auth   # non-interactive
 ```
 
 Disable it again (also deletes the stored token):
 
 ```bash
-deep-obsidian-mcp setup-service --no-auth
+deep-obsidian-cli setup-service --no-auth
 ```
 
 Send the token from your client:
@@ -505,7 +505,7 @@ existing config keep serving the old vault with no signal at all. Migrating mean
 
 ### Building the table: the `mounts` CLI
 
-**Use `deep-obsidian-mcp mounts` rather than an editor.** The JSON above is the reference
+**Use `deep-obsidian-cli mounts` rather than an editor.** The JSON above is the reference
 for what the fields *mean*; it is not the recommended way to produce one. A mount table has
 invariants a text editor cannot check — unique ids and prefixes, exactly one root mount, an
 `experimental` flag per remote backend, a credential that belongs in the secret store rather
@@ -516,25 +516,25 @@ gap closed:
 ```bash
 # What is mounted where, and which experimental flags are on. Works on a legacy
 # vaultPath-only config too, where it shows the implicit root as such.
-deep-obsidian-mcp mounts list
+deep-obsidian-cli mounts list
 
 # Graft a second local vault onto /Team.
-deep-obsidian-mcp mounts add filesystem --id team --mount-at Team --vault-path ~/TeamVault
+deep-obsidian-cli mounts add filesystem --id team --mount-at Team --vault-path ~/TeamVault
 
 # A LiveSync vault. The password is PROMPTED masked; --password-stdin for scripts.
-deep-obsidian-mcp mounts add couchdb --id phone --mount-at LiveSync \
+deep-obsidian-cli mounts add couchdb --id phone --mount-at LiveSync \
   --url https://couch.example --database obsidian --username obsidian
 
 # A shared Algolia corpus, writable. The API key is prompted masked.
-deep-obsidian-mcp mounts add algolia --id team-wiki --mount-at _Wiki \
+deep-obsidian-cli mounts add algolia --id team-wiki --mount-at _Wiki \
   --app-id ABC1234XYZ --index-name team-wiki --writable
 
 # Unmount. Nothing is deleted from the remote.
-deep-obsidian-mcp mounts remove --id phone
+deep-obsidian-cli mounts remove --id phone
 ```
 
 Add `--json` to any of them for a structured report, and `--dry-run` to validate without
-writing. `deep-obsidian-mcp mounts add --help` lists every kind's flags.
+writing. `deep-obsidian-cli mounts add --help` lists every kind's flags.
 
 **Leave a flag out and `mounts add` asks for it.** On a terminal, the flags you did give
 are treated as answers already supplied and only the gaps are prompted for — the same
@@ -543,7 +543,7 @@ implementation:
 
 ```bash
 # Prompts for --id, --mount-at and --database; --url is already answered.
-deep-obsidian-mcp mounts add couchdb --url https://couch.example
+deep-obsidian-cli mounts add couchdb --url https://couch.example
 ```
 
 The id is suggested as a slug of the `mountAt` you type (`Team/Alpha` → `team-alpha`) and
@@ -600,7 +600,7 @@ warning and the loader's reason rather than going dark on the file that most nee
 one of the ways to fix such a table: it validates the table it is about to *write*, not the
 one it started from.
 
-Editing the file by hand still works, and `deep-obsidian-mcp doctor` still checks the result.
+Editing the file by hand still works, and `deep-obsidian-cli doctor` still checks the result.
 
 ### The table
 
@@ -645,7 +645,7 @@ attachments, and the only one with no experimental gate.
 **`couchdb`** — a Self-hosted LiveSync vault in CouchDB, reached through the
 supervised Node sidecar. Needs `experimental.couchdbVaults`. See
 [docs/homebrew-service.md](./docs/homebrew-service.md) and
-`deep-obsidian-mcp couchdb export --help`.
+`deep-obsidian-cli couchdb export --help`.
 
 | Field | Meaning |
 |---|---|

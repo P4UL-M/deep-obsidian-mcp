@@ -922,7 +922,7 @@ async fn a_mount_with_no_stored_key_is_named_in_the_failure() {
 /// without `--yes` — reads EOF and takes the safe branch instead of blocking forever. That
 /// is also what makes the abort path testable.
 async fn run(config_path: &Path, args: &[&str]) -> (bool, String, String) {
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"))
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .arg("--config")
         .arg(config_path)
         .args(args)

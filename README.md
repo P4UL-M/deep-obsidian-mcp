@@ -36,7 +36,7 @@ brew install deep-obsidian-mcp
 curl -fsSL https://p4ul-m.github.io/deep-obsidian-mcp/install.sh | sudo bash
 ```
 
-**From source:** `cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp`
+**From source:** `cargo build --release -p deep-obsidian-cli --bins`
 
 **Docker** — for a server rather than a laptop, and the natural home for a
 CouchDB-backed vault: `docker build -t deep-obsidian-mcp .` plus the ready-made
@@ -49,18 +49,21 @@ never written to the volume. See [docs/docker.md](./docs/docker.md).
 Full install options, manual apt steps, updating, and uninstalling are in
 [INSTALL.md](./INSTALL.md).
 
+`deep-obsidian-mcp` is the server process. Use the separate
+`deep-obsidian-cli` executable for setup, mounts and diagnostics.
+
 ## Quick start
 
 ```bash
 # 1. Point it at your vault (and connect local agents)
-deep-obsidian-mcp setup-service --wizard
+deep-obsidian-cli setup-service --wizard
 
 # 2. Run it as a background service
 brew services start deep-obsidian-mcp               # macOS
 # systemctl --user enable --now deep-obsidian-mcp   # Linux (apt)
 
 # 3. Confirm it's healthy
-deep-obsidian-mcp doctor
+deep-obsidian-cli doctor
 curl -fsS http://127.0.0.1:4100/readyz
 ```
 

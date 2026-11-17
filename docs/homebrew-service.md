@@ -9,9 +9,9 @@ The Rust implementation exposes the service-oriented commands needed for this wo
 ```bash
 brew tap <tap-name>
 brew install deep-obsidian-mcp
-deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
+deep-obsidian-cli setup-service --vault ~/Vault --mcp --skills --vault-snippets
 brew services start deep-obsidian-mcp
-deep-obsidian-mcp doctor
+deep-obsidian-cli doctor
 ```
 
 On macOS, `setup-service` performs an interactive vault access preflight before writing the service config. It intentionally tries to read the configured vault from the Homebrew-installed binary so macOS can show its Documents/Desktop/iCloud permission prompt while the user is present. If macOS denies access without showing a prompt, the command opens Privacy & Security > Full Disk Access and prints the Homebrew service binary paths to add manually.
@@ -19,8 +19,8 @@ On macOS, `setup-service` performs an interactive vault access preflight before 
 Optional inspection commands:
 
 ```bash
-deep-obsidian-mcp print-config
-deep-obsidian-mcp probe
+deep-obsidian-cli print-config
+deep-obsidian-cli probe
 curl -fsS http://127.0.0.1:4100/healthz
 curl -fsS http://127.0.0.1:4100/readyz
 ```
@@ -34,7 +34,7 @@ curl -fsS http://127.0.0.1:4100/readyz
 - `doctor` checks the vault path, config file, writable index directory, local SQLite index diagnostics, `rg` availability, port availability, and a running health endpoint when one is available.
 - `print-config` shows the normalized resolved config so the user can see what the service will actually read.
 - `probe` performs a minimal health or MCP connectivity check.
-- `serve` starts the long-lived HTTP service using the resolved config.
+- `deep-obsidian-mcp` is the long-lived server process using the resolved config.
 
 ## Configuration Model
 
@@ -103,8 +103,8 @@ After changing config, upgrading the binary, or changing signing state, restart 
 
 ```bash
 brew services restart deep-obsidian-mcp
-deep-obsidian-mcp doctor
-deep-obsidian-mcp probe
+deep-obsidian-cli doctor
+deep-obsidian-cli probe
 curl -fsS http://127.0.0.1:4100/readyz
 ```
 
@@ -122,8 +122,8 @@ Readiness is the packaging gate: `/healthz` can be healthy while the index is st
 
 ## Transitional Notes
 
-The existing `scripts/install-launchd-service.sh` and `scripts/run-http-service.sh` now delegate to the same `serve` command and are still useful for local development, but they are not the target product workflow.
+The existing `scripts/install-launchd-service.sh` and `scripts/run-http-service.sh` now invoke the server executable directly and are still useful for local development, but they are not the target product workflow.
 
-The formula in `Formula/deep-obsidian-mcp.rb` installs the CLI, installs project icon assets under `pkgshare/assets`, installs packaged agent skills under `pkgshare/skills`, installs packaged Obsidian CSS snippets under `pkgshare/obsidian-snippets`, creates the Homebrew log directory, runs `serve --packaged --transport http`, sets `DEEP_OBSIDIAN_PACKAGED=1`, and validates the packaged binary with `help` and `version` smoke tests. Users can then run `setup-service --mcp --skills --vault-snippets` to install the MCP client entries, agent skills, and vault snippets from the packaged assets.
+The formula in `Formula/deep-obsidian-mcp.rb` installs the separate CLI and server executables, installs project icon assets under `pkgshare/assets`, installs packaged agent skills under `pkgshare/skills`, installs packaged Obsidian CSS snippets under `pkgshare/obsidian-snippets`, creates the Homebrew log directory, runs the server binary with `--packaged --transport http`, sets `DEEP_OBSIDIAN_PACKAGED=1`, and validates the packaged binary with `help` and `version` smoke tests. Users can then run `setup-service --mcp --skills --vault-snippets` to install the MCP client entries, agent skills, and vault snippets from the packaged assets.
 
 Current packaging gaps are tracked in [docs/homebrew-gap-todo.md](./homebrew-gap-todo.md).

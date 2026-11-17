@@ -2,9 +2,11 @@ pub mod algolia_cmd;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod link;
 pub mod couchdb_transfer;
 pub mod mounts_cmd;
 pub mod secrets_cmd;
+pub mod service_entry;
 pub mod wizard;
 
 pub use cli::{

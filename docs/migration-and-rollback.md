@@ -11,7 +11,7 @@ are `diff -r`. Run the round trip on a copy before you run it on your notes.
 
 ## Before You Start
 
-Build the mount table with **`deep-obsidian-mcp mounts`**, not an editor. It validates the
+Build the mount table with **`deep-obsidian-cli mounts`**, not an editor. It validates the
 whole table through the same loader the server uses, converts a legacy `vaultPath` config to
 an explicit root mount for you, prompts for the credential masked and stores only the
 reference, probes the mount before writing anything, and leaves the previous file at
@@ -22,8 +22,8 @@ Hand editing still works, and is still what you fall back to for the fields `mou
 does not expose (`options`, `cache`, `retention`, `recallWeight`). What does **not** work is
 `setup-service`: it refuses to rewrite a config that declares a `mounts` table — with or
 without `--overwrite` — and refuses an auth change on one, because it cannot write the
-reference a token would need. Use `deep-obsidian-mcp print-config` to see exactly what this
-build reads from your file, and `deep-obsidian-mcp mounts list` for what is mounted where.
+reference a token would need. Use `deep-obsidian-cli print-config` to see exactly what this
+build reads from your file, and `deep-obsidian-cli mounts list` for what is mounted where.
 
 Take a copy of the config before you change it:
 
@@ -34,7 +34,7 @@ cp ~/.config/deep-obsidian-mcp/config.json ~/.config/deep-obsidian-mcp/config.js
 Then check the local prerequisites — this contacts nothing and needs no credentials:
 
 ```bash
-deep-obsidian-mcp doctor
+deep-obsidian-cli doctor
 ```
 
 For a `couchdb` mount it reports whether the LiveSync sidecar bundle was located and
@@ -55,7 +55,7 @@ into one. There is deliberately no "push my folder into CouchDB" command.
    each flag it needs and asks:
 
    ```bash
-   deep-obsidian-mcp mounts add couchdb --id live --mount-at Live \
+   deep-obsidian-cli mounts add couchdb --id live --mount-at Live \
      --url https://couch.example --database obsidian --username obsidian
    ```
 
@@ -78,21 +78,21 @@ into one. There is deliberately no "push my folder into CouchDB" command.
 3. `options` (chunking/hashing) is **not** a `mounts add` flag: it must match how the vault
    was written, or content is reassembled wrongly, and a value guessed from a command line
    would fail silently. Add it to the mount by hand if your vault needs it.
-4. `deep-obsidian-mcp doctor --probe-remote` and confirm the mount's compatibility status
+4. `deep-obsidian-cli doctor --probe-remote` and confirm the mount's compatibility status
    is `ok`. Any other value (`locked`, `auth-failed`, `unknown-schema`, …) is the
    sidecar's own diagnosis of the remote, and the mount will not serve data until it reads
    `ok`. (`mounts add` already refused anything else, unless you passed `--keep-anyway`.)
 5. **Take a snapshot before granting writes**, and verify the round trip:
 
 ```bash
-deep-obsidian-mcp couchdb export --mount live --out ~/backups/live-$(date +%F)
+deep-obsidian-cli couchdb export --mount live --out ~/backups/live-$(date +%F)
 ```
 
 Two exports of an unchanged vault are byte-identical, manifest included. That is what
 makes the snapshot a verification rather than a hope:
 
 ```bash
-deep-obsidian-mcp couchdb export --mount live --out /tmp/live-again
+deep-obsidian-cli couchdb export --mount live --out /tmp/live-again
 diff -r ~/backups/live-$(date +%F) /tmp/live-again && echo "round trip verified"
 ```
 
@@ -104,7 +104,7 @@ The export directory **is** the way out: it is a plain tree of files.
 
 ```bash
 # 1. Snapshot, and check what you got.
-deep-obsidian-mcp couchdb export --mount live --out ~/live-final
+deep-obsidian-cli couchdb export --mount live --out ~/live-final
 ls -R ~/live-final          # ordinary files; manifest.json records revision + hash per entry
 
 # 2. Move the tree into your filesystem vault.
@@ -115,12 +115,12 @@ rsync -a --exclude manifest.json ~/live-final/ ~/Vault/Live/
 #    deleted from CouchDB; the previous config is kept at config.json.bak, and the stored
 #    password is kept and named so you can clean your keyring yourself. `secrets check`
 #    afterwards no longer lists it: nothing references it any more.
-deep-obsidian-mcp mounts remove --id live
+deep-obsidian-cli mounts remove --id live
 
 # 4. Confirm.
-deep-obsidian-mcp mounts list
-deep-obsidian-mcp print-config
-deep-obsidian-mcp doctor
+deep-obsidian-cli mounts list
+deep-obsidian-cli print-config
+deep-obsidian-cli doctor
 ```
 
 To go back the other way — push a snapshot into the database — `couchdb restore` writes a
@@ -130,7 +130,7 @@ skips identical ones, and **refuses** entries whose remote content differs unles
 exactly what a real run would do and works on a read-only mount:
 
 ```bash
-deep-obsidian-mcp couchdb restore --mount live --from ~/live-final --dry-run
+deep-obsidian-cli couchdb restore --mount live --from ~/live-final --dry-run
 ```
 
 Note what restore does **not** do: it never deletes. A note someone added after your
@@ -148,7 +148,7 @@ before you put anything real in one.
    too whenever the table has more than one entry. `mounts add` names each flag and asks:
 
    ```bash
-   deep-obsidian-mcp mounts add algolia --id wiki --mount-at Wiki \
+   deep-obsidian-cli mounts add algolia --id wiki --mount-at Wiki \
      --app-id ABC1234XYZ --index-name team-wiki
    ```
 
@@ -169,16 +169,16 @@ before you put anything real in one.
    [§ A remote mount at the vault root](../CONFIGURATION.md#a-remote-mount-at-the-vault-root).
 2. `$DEEP_OBSIDIAN_ALGOLIA_API_KEY` still shadows the stored key, with a `warn`, if you
    would rather supply it per-process than store it.
-3. Check it: `deep-obsidian-mcp algolia status --mount wiki`, or
-   `deep-obsidian-mcp doctor --probe-remote`.
+3. Check it: `deep-obsidian-cli algolia status --mount wiki`, or
+   `deep-obsidian-cli doctor --probe-remote`.
 4. Import the folder the mount shadows — **once**:
 
 ```bash
 # See what would happen first. Always.
-deep-obsidian-mcp algolia seed --mount wiki --dry-run
+deep-obsidian-cli algolia seed --mount wiki --dry-run
 
 # Import (creates and updates only; never deletes from the index to match the source).
-deep-obsidian-mcp algolia seed --mount wiki
+deep-obsidian-cli algolia seed --mount wiki
 ```
 
 `--move` deletes each local original, but only after re-reading the index and confirming it
@@ -189,8 +189,8 @@ Non-`.md` files are refused: the corpus stores Markdown only, and no flag lifts 
 
 ```bash
 # 1. Dump. Two dumps of an unchanged corpus are byte-identical, so this verifies itself.
-deep-obsidian-mcp algolia dump --mount wiki --out ~/wiki-final
-deep-obsidian-mcp algolia dump --mount wiki --out /tmp/wiki-again
+deep-obsidian-cli algolia dump --mount wiki --out ~/wiki-final
+deep-obsidian-cli algolia dump --mount wiki --out /tmp/wiki-again
 diff -r ~/wiki-final /tmp/wiki-again && echo "round trip verified"
 
 # 2. Move the notes into the vault folder the mount was shadowing.
@@ -199,8 +199,8 @@ rsync -a --exclude manifest.json ~/wiki-final/ ~/Vault/Wiki/
 
 # 3. Unmount, and confirm. Nothing is deleted from the index (see below); the previous
 #    config is kept at config.json.bak, and the stored API key is kept and named.
-deep-obsidian-mcp mounts remove --id wiki
-deep-obsidian-mcp mounts list && deep-obsidian-mcp doctor
+deep-obsidian-cli mounts remove --id wiki
+deep-obsidian-cli mounts list && deep-obsidian-cli doctor
 ```
 
 `algolia restore` writes a dump back, with the same refuse-on-divergence rule as couchdb
@@ -227,7 +227,7 @@ Rolling back is a copy:
 
 ```bash
 cp ~/.config/deep-obsidian-mcp/config.json.bak ~/.config/deep-obsidian-mcp/config.json
-deep-obsidian-mcp print-config     # confirm before restarting
+deep-obsidian-cli print-config     # confirm before restarting
 ```
 
 Only **one** generation is kept, and the next content-changing write replaces it. For a

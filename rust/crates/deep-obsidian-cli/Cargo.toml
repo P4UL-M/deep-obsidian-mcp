@@ -11,8 +11,12 @@ name = "deep_obsidian_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "deep-obsidian-mcp"
+name = "deep-obsidian-cli"
 path = "src/main.rs"
+
+[[bin]]
+name = "deep-obsidian-mcp"
+path = "src/service_main.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -57,9 +61,10 @@ extended-description = """\
 Deep Obsidian MCP is a filesystem-first Model Context Protocol server that gives \
 agents deep, indexed access to an Obsidian vault (search, graph traversal, \
 authoring). Run it as a long-lived HTTP service via the bundled systemd user \
-unit, then configure it with `deep-obsidian-mcp setup-service`."""
+unit, then configure it with `deep-obsidian-cli setup-service`."""
 assets = [
     ["target/release/deep-obsidian-mcp", "usr/bin/", "755"],
+    ["target/release/deep-obsidian-cli", "usr/bin/", "755"],
     ["../../../skills/**/*", "usr/share/deep-obsidian-mcp/skills/", "644"],
     ["../../../obsidian-snippets/**/*", "usr/share/deep-obsidian-mcp/obsidian-snippets/", "644"],
     ["../../../assets/**/*", "usr/share/deep-obsidian-mcp/assets/", "644"],

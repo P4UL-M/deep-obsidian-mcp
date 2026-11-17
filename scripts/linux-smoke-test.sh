@@ -32,6 +32,7 @@ check() {
 
 step "Binary and dependency presence"
 check "deep-obsidian-mcp on PATH" command -v deep-obsidian-mcp
+check "deep-obsidian-cli on PATH" command -v deep-obsidian-cli
 check "ripgrep (rg) on PATH" command -v rg
 deep-obsidian-mcp version || FAIL=1
 
@@ -72,7 +73,7 @@ echo "vault created at $VAULT"
 PORT=27125
 
 step "setup-service writes user config"
-deep-obsidian-mcp setup-service --vault "$VAULT" --no-auth --port "$PORT" 2>&1 | tail -20
+deep-obsidian-cli setup-service --vault "$VAULT" --no-auth --port "$PORT" 2>&1 | tail -20
 CONF="$HOME/.config/deep-obsidian-mcp/config.json"
 check "config.json created" test -f "$CONF"
 [ -f "$CONF" ] && cat "$CONF"
@@ -111,7 +112,7 @@ cat > "$MOUNTS_CONF" <<JSON
   ]
 }
 JSON
-DOCTOR_JSON=$(cd / && deep-obsidian-mcp --config "$MOUNTS_CONF" doctor --json 2>&1) || true
+DOCTOR_JSON=$(cd / && deep-obsidian-cli --config "$MOUNTS_CONF" doctor --json 2>&1) || true
 BUNDLE_CHECK=$(printf '%s\n' "$DOCTOR_JSON" | grep -A1 -F '"name": "mount.live.sidecar-bundle"' || true)
 if printf '%s\n' "$BUNDLE_CHECK" | grep -q '"status": "ok"'; then
   echo "PASS: doctor located the packaged sidecar bundle"
@@ -139,7 +140,7 @@ fi
 
 step "HTTP serve smoke test (packaged mode, as the systemd unit runs it)"
 export DEEP_OBSIDIAN_PACKAGED=1
-/usr/bin/deep-obsidian-mcp serve --packaged --transport http > /tmp/serve.log 2>&1 &
+/usr/bin/deep-obsidian-mcp --packaged --transport http > /tmp/serve.log 2>&1 &
 SRV=$!
 UP=0
 HEALTH=""

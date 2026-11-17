@@ -156,7 +156,7 @@ the `brew services` plist. The env var stays a user-facing override.
     unconditionally — not just for couchdb users);
   - the caveats still describe the bundle as installed, with a hand-build only for source
     installs;
-  - `brew install` then `deep-obsidian-mcp doctor` reports the bundle located at the
+  - `brew install` then `deep-obsidian-cli doctor` reports the bundle located at the
     `pkgshare` path (with a couchdb mount declared).
 
 ## The Container Image
@@ -196,10 +196,10 @@ Full configuration and recovery instructions: [docker.md](./docker.md#release-im
 
 - [ ] `brew install <formula>`
 - [ ] `deep-obsidian-mcp version` prints the tag version without the leading `v`.
-- [ ] `deep-obsidian-mcp setup-service --vault <vault>`
+- [ ] `deep-obsidian-cli setup-service --vault <vault>`
 - [ ] `brew services start deep-obsidian-mcp`
-- [ ] `deep-obsidian-mcp doctor`
-- [ ] `deep-obsidian-mcp probe`
+- [ ] `deep-obsidian-cli doctor`
+- [ ] `deep-obsidian-cli probe`
 - [ ] `test -s "$(brew --prefix)/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs"`
       — the `resource` landed at the probed path. Nothing else in the install needs it, so
       a silently-missing bundle would only surface for a couchdb user.

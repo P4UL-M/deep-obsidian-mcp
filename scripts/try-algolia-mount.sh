@@ -27,6 +27,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$REPO/target/debug/deep-obsidian-mcp"
+CLI="$REPO/target/debug/deep-obsidian-cli"
 SRC_CONFIG="${DEEP_OBSIDIAN_CONFIG:-$HOME/.config/deep-obsidian-mcp/config.json}"
 WRITABLE=false
 MOUNT_FILTER=""
@@ -42,7 +43,7 @@ done
 
 [[ -f "$SRC_CONFIG" ]] || {
   echo "no config at $SRC_CONFIG" >&2
-  echo "set DEEP_OBSIDIAN_CONFIG, or run: deep-obsidian-mcp setup-service --wizard" >&2
+  echo "set DEEP_OBSIDIAN_CONFIG, or run: deep-obsidian-cli setup-service --wizard" >&2
   exit 1
 }
 
@@ -132,8 +133,8 @@ echo
 echo "Sandbox ready: $SANDBOX"
 echo
 echo "Smoke test (no agent needed):"
-echo "  $BIN --config $SANDBOX/config.json algolia status --mount $MOUNT_ID"
-echo "  $BIN --config $SANDBOX/config.json doctor"
+echo "  $CLI --config $SANDBOX/config.json algolia status --mount $MOUNT_ID"
+echo "  $CLI --config $SANDBOX/config.json doctor"
 echo
 echo "Point an agent at it:"
 echo "  cd $SANDBOX && claude"
@@ -146,7 +147,7 @@ if [[ "$WRITABLE" == "true" ]]; then
   echo
   echo "WRITABLE: the agent can author into mount '$MOUNT_ID'."
   echo "Back it up first:"
-  echo "  $BIN --config $SANDBOX/config.json algolia dump --mount $MOUNT_ID --out ~/Backups/$MOUNT_ID"
+  echo "  $CLI --config $SANDBOX/config.json algolia dump --mount $MOUNT_ID --out ~/Backups/$MOUNT_ID"
 fi
 echo
 echo "Throw it away when done:  rm -rf $SANDBOX"

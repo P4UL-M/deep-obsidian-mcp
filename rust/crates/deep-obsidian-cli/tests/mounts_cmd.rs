@@ -1244,7 +1244,7 @@ fn remove_can_repair_a_config_the_loader_refuses() {
 /// prompts reads EOF and takes the safe (refusing) branch instead of hanging the suite,
 /// and that is exactly the branch worth proving for the experimental-flag confirmation.
 fn run(config_path: &Path, args: &[&str]) -> (bool, String, String) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .arg("--config")
         .arg(config_path)
         .args(args)
@@ -1400,13 +1400,13 @@ fn cli_argv_never_enables_an_experimental_flag_without_an_answer() {
 /// every other command keeps the summary it has always printed.
 #[test]
 fn cli_argv_mounts_help_is_claps_and_the_rest_is_unchanged() {
-    let mounts_help = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"))
+    let mounts_help = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .args(["mounts", "--help"])
         .output()
         .expect("run --help");
     let text = String::from_utf8_lossy(&mounts_help.stdout).to_string();
     assert!(
-        text.contains("Usage: deep-obsidian-mcp mounts"),
+        text.contains("Usage: deep-obsidian-cli mounts"),
         "mounts --help did not reach clap: {text}"
     );
     for subcommand in ["add", "list", "remove"] {
@@ -1414,7 +1414,7 @@ fn cli_argv_mounts_help_is_claps_and_the_rest_is_unchanged() {
     }
 
     // Per-kind help exists and names the kind's own required flags.
-    let kind_help = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"))
+    let kind_help = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .args(["mounts", "add", "couchdb", "--help"])
         .output()
         .expect("run --help");
@@ -1426,13 +1426,13 @@ fn cli_argv_mounts_help_is_claps_and_the_rest_is_unchanged() {
     assert!(text.contains("prompted masked"), "{text}");
 
     // The global summary still answers for everything else, and now advertises `mounts`.
-    let doctor_help = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"))
+    let doctor_help = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .args(["doctor", "--help"])
         .output()
         .expect("run --help");
     let text = String::from_utf8_lossy(&doctor_help.stdout).to_string();
     assert!(
-        text.starts_with("Usage:\n  deep-obsidian-mcp [serve]"),
+        text.starts_with("Usage:\n  deep-obsidian-cli <command>"),
         "{text}"
     );
     // `[--id <id>]` rather than `--id <id>`: the identifying flags are OPTIONAL now, because

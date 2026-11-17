@@ -73,7 +73,7 @@ if [[ ! -s "$SIDECAR_BUNDLE" ]]; then
 fi
 
 # Build the release binary first so cargo-deb packages an optimized build.
-cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp
+cargo build --release -p deep-obsidian-cli --bins
 
 ARGS=(deb -p deep-obsidian-cli --no-build)
 if [[ -n "$DEB_VERSION" ]]; then
