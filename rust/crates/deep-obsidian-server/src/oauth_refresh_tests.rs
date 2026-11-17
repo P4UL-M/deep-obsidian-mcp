@@ -323,3 +323,62 @@ async fn refresh_history_capacity_does_not_consume_a_valid_credential() {
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn explicit_revocation_ends_only_one_client_authorization() {
+    let f = fixture().await;
+    let first_client = register_client(&f).await;
+    let second_client = register_client(&f).await;
+    let first = renewable_grant(&f, &first_client).await;
+    let second = renewable_grant(&f, &second_client).await;
+    let credential = first["refresh_token"].as_str().unwrap();
+    let blocked = f
+        .client
+        .post(format!("{}/revoke", f.base))
+        .header(header::ORIGIN, "https://untrusted.example")
+        .form(&[("token", credential)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+    assert!(f.oauth.accepts(first["access_token"].as_str().unwrap()));
+    let response = f
+        .client
+        .post(format!("{}/revoke", f.base))
+        .form(&[("token", credential)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(!f.oauth.accepts(first["access_token"].as_str().unwrap()));
+    assert_eq!(
+        renew(&f, &first_client, credential, None, None)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert!(f.oauth.accepts(second["access_token"].as_str().unwrap()));
+    assert_eq!(
+        renew(
+            &f,
+            &second_client,
+            second["refresh_token"].as_str().unwrap(),
+            None,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.client
+            .post(format!("{}/revoke", f.base))
+            .form(&[("token", "unknown")])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}

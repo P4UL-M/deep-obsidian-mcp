@@ -106,7 +106,31 @@ pub async fn run_stdio_service(config: ResolvedServiceConfig) -> io::Result<()> 
     let runtimes = MountRuntimes::new(&config, &backends);
     let _initial_refresh = runtimes.start_initial_refresh();
     let _auto_reindex = runtimes.start_auto_reindex();
-    let state = AppState::with_backends(config.clone(), runtimes, &backends);
+    let state =
+        crate::multiuser::attach(AppState::with_backends(config.clone(), runtimes, &backends))
+            .map_err(io::Error::other)?;
+    let _control = crate::control::start(&state).map_err(io::Error::other)?;
+    let state = if state.multiuser_enabled() {
+        let username = std::env::var("DEEP_OBSIDIAN_USERNAME").map_err(|_| {
+            io::Error::other(
+                "multiuser stdio requires DEEP_OBSIDIAN_USERNAME and DEEP_OBSIDIAN_PASSWORD",
+            )
+        })?;
+        let password = secrecy::SecretString::new(
+            std::env::var("DEEP_OBSIDIAN_PASSWORD").map_err(io::Error::other)?,
+        );
+        use secrecy::ExposeSecret;
+        let principal = state
+            .control
+            .as_ref()
+            .unwrap()
+            .authenticate(&username, password.expose_secret())
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("invalid user credentials"))?;
+        state.for_principal(principal).map_err(io::Error::other)?
+    } else {
+        state
+    };
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     let mut buffer = Vec::new();

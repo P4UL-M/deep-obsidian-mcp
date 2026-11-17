@@ -18,6 +18,8 @@ use crate::{prompts, resources, tools};
 
 #[derive(Clone)]
 pub struct AppState {
+    pub control: Option<deep_obsidian_control::ControlStore>,
+    pub access: Option<crate::multiuser::Access>,
     pub config: Arc<ResolvedServiceConfig>,
     /// One index runtime per mount, each with its own index directory, watcher and
     /// refresh lifecycle. A single-mount config holds exactly one, built from the
@@ -127,6 +129,8 @@ impl AppState {
             .iter()
             .any(|mount| mount.backend.descriptor().supports(Capability::GrepSearch));
         Self {
+            control: None,
+            access: None,
             config: Arc::new(config),
             runtimes,
             auth: Arc::new(AuthState::disabled()),
@@ -244,6 +248,25 @@ pub async fn handle_request(
     request: JsonRpcRequest,
 ) -> Result<Option<Value>, JsonRpcErrorResponse> {
     let id = request.id.unwrap_or(Value::Null);
+    let state = if state.multiuser_enabled() {
+        let principal = state
+            .access
+            .as_ref()
+            .map(|a| a.principal.clone())
+            .ok_or_else(|| json_error_response(id.clone(), -32001, "authentication required"))?;
+        state
+            .for_principal(principal)
+            .map_err(|_| json_error_response(id.clone(), -32001, "access denied"))?
+    } else {
+        if state.access.is_some() {
+            return Err(json_error_response(
+                id.clone(),
+                -32001,
+                "user authorization revoked",
+            ));
+        }
+        state
+    };
 
     match request.method.as_str() {
         "notifications/initialized" => Ok(None),
@@ -255,11 +278,16 @@ pub async fn handle_request(
             serde_json::to_value(json_response(
                 id,
                 ToolListResult {
-                    tools: tools::list_tools(
-                        state.rg_available,
-                        state.router.is_multi_mount(),
-                        tools::CapabilitySet::of(&state.router),
-                    ),
+                    tools: {
+                        let mut definitions=tools::list_tools(state.rg_available,state.router.is_multi_mount(),tools::CapabilitySet::of(&state.router));
+                        if state.access.is_some() { for definition in &mut definitions {
+                            if matches!(definition.name.as_str(),"upsert_note"|"upsert_session_note"|"edit_note"|"delete_note"|"request_vault_upload") {
+                                definition.input_schema["properties"]["mountId"]=json!({"type":"string","description":"Optional permitted mount ID, or default, to interpret path/folder relative to that vault. Omit for logical vault paths."});
+                            }
+                        } }
+                        if state.access.is_some() { definitions.push(crate::multiuser::membership_definition()); }
+                        definitions
+                    },
                 },
             ))
             .expect("tool list response to serialize"),

@@ -1,4 +1,4 @@
-//! Small single-owner OAuth authority. Public clients register exact redirects,
+//! Small OAuth authority. Public clients register exact redirects,
 //! then use Authorization Code + PKCE S256. The owner's legacy bearer is only
 //! entered into our consent form; it is never issued to an OAuth client.
 use std::{
@@ -20,6 +20,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
+use deep_obsidian_control::{ControlStore, Principal};
 use deep_obsidian_types::OAuthConfig;
 use reqwest::Url;
 use secrecy::ExposeSecret;
@@ -57,12 +58,20 @@ fn refresh_allowed_by_default() -> bool {
     true
 }
 
+#[derive(Clone)]
+enum TokenIdentity {
+    Classic { revision: Option<u64> },
+    User(Principal),
+}
+
 struct AccessToken {
+    identity: TokenIdentity,
     expires: Instant,
     family: Option<[u8; 32]>,
 }
 
 struct RefreshFamily {
+    identity: TokenIdentity,
     client_id: String,
     expires: Instant,
     current: [u8; 32],
@@ -92,6 +101,7 @@ struct Pending {
 }
 
 struct Code {
+    identity: TokenIdentity,
     request: AuthorizationRequest,
     expires: Instant,
 }
@@ -109,6 +119,7 @@ struct Store {
 }
 
 pub struct OAuthState {
+    control: Option<ControlStore>,
     issuer: String,
     resource: String,
     ttl: Duration,
@@ -181,6 +192,7 @@ impl OAuthState {
             ));
         }
         Ok(Self {
+            control: None,
             issuer: config.issuer_url.clone(),
             resource: format!("{}{mcp_path}", config.issuer_url),
             ttl: Duration::from_secs(config.access_token_ttl_seconds),
@@ -203,10 +215,65 @@ impl OAuthState {
         &self.issuer
     }
 
-    pub fn accepts(&self, token: &str) -> bool {
+    /// Bind this authority to live application identities and mode state.
+    pub fn with_control(mut self, control: ControlStore) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    fn identity_is_current(&self, identity: &TokenIdentity) -> bool {
+        match (identity, &self.control) {
+            (TokenIdentity::Classic { revision: None }, None) => true,
+            (
+                TokenIdentity::Classic {
+                    revision: Some(revision),
+                },
+                Some(control),
+            ) => {
+                control.enabled().ok() == Some(false) && control.revision().ok() == Some(*revision)
+            }
+            (TokenIdentity::User(principal), Some(control)) => {
+                control.principal_valid(principal).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    fn classic_identity(&self) -> Option<TokenIdentity> {
+        match &self.control {
+            None => Some(TokenIdentity::Classic { revision: None }),
+            Some(control) if control.enabled().ok() == Some(false) => {
+                Some(TokenIdentity::Classic {
+                    revision: Some(control.revision().ok()?),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn token_identity(&self, token: &str) -> Option<TokenIdentity> {
         let mut store = self.store.lock().expect("OAuth store lock");
         store.prune();
-        store.tokens.contains_key(&hash(token))
+        store
+            .tokens
+            .get(&hash(token))
+            .map(|token| token.identity.clone())
+    }
+
+    pub fn accepts(&self, token: &str) -> bool {
+        self.token_identity(token)
+            .is_some_and(|identity| self.identity_is_current(&identity))
+    }
+
+    /// Returns a current verified user for a multiuser access token.
+    pub fn principal(&self, token: &str) -> Option<Principal> {
+        let TokenIdentity::User(principal) = self.token_identity(token)? else {
+            return None;
+        };
+        self.control
+            .as_ref()?
+            .principal(&principal.user_id, principal.credential_version)
+            .ok()?
     }
 
     fn save_clients(&self, clients: &HashMap<String, Client>) -> io::Result<()> {
@@ -277,6 +344,7 @@ pub fn routes(mcp_path: &str) -> Router<AppState> {
         .route("/register", post(register))
         .route("/authorize", get(authorize).post(consent))
         .route("/token", post(token))
+        .route("/revoke", post(revoke_authorization))
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
 }
 
@@ -296,10 +364,47 @@ async fn server_metadata(State(state): State<AppState>) -> Response {
         "authorization_endpoint": format!("{}/authorize", oauth.issuer),
         "token_endpoint": format!("{}/token", oauth.issuer),
         "registration_endpoint": format!("{}/register", oauth.issuer),
+        "revocation_endpoint": format!("{}/revoke", oauth.issuer),
         "response_types_supported": ["code"], "grant_types_supported": if oauth.refresh_ttl.is_zero() { vec!["authorization_code"] } else { vec!["authorization_code", "refresh_token"] },
         "token_endpoint_auth_methods_supported": ["none"], "code_challenge_methods_supported": ["S256"],
         "scopes_supported": ["obsidian"]
     })).into_response())
+}
+
+#[derive(Deserialize)]
+struct Revocation {
+    token: String,
+}
+
+/// Possession proves authority to revoke this credential. A refresh-family
+/// revocation invalidates every access/refresh token issued in that family,
+/// leaving the same user's other clients authorized.
+async fn revoke_authorization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<Revocation>,
+) -> Response {
+    let secret = secrecy::SecretString::new(form.token);
+    let Some(oauth) = &state.auth.oauth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if headers.contains_key(header::ORIGIN) && !consent_origin_is_valid(&headers, &oauth.issuer) {
+        return error(StatusCode::FORBIDDEN, "invalid_request");
+    }
+    let digest = hash(secret.expose_secret());
+    let mut store = oauth.store.lock().expect("OAuth store lock");
+    store.prune();
+    let family = store
+        .refresh_tokens
+        .get(&digest)
+        .copied()
+        .or_else(|| store.tokens.get(&digest).and_then(|t| t.family));
+    if let Some(family) = family {
+        store.revoke_family(family);
+    } else {
+        store.tokens.remove(&digest);
+    }
+    secure(StatusCode::OK.into_response())
 }
 
 #[derive(Deserialize)]
@@ -484,8 +589,42 @@ async fn authorize(
     }
     let nonce = generate_token();
     let cookie = generate_token();
+    let multiuser = match state
+        .control
+        .as_ref()
+        .map(ControlStore::enabled)
+        .transpose()
+    {
+        Ok(value) => value.unwrap_or(false),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
+    };
     let page = format!(
         include_str!("oauth-consent.html"),
+        username_field = if multiuser {
+            "<label for=\"username\">Username</label><input id=\"username\" type=\"text\" name=\"username\" required autocomplete=\"username\">"
+        } else {
+            ""
+        },
+        password_label = if multiuser {
+            "Password"
+        } else {
+            "Server secret"
+        },
+        password_hint = if multiuser {
+            "Enter your generated account password. It is never shared with the application."
+        } else {
+            "Enter your server secret to approve. It is never shared with the application."
+        },
+        permission_title = if multiuser {
+            "Access your permitted vaults"
+        } else {
+            "Read and modify your notes"
+        },
+        permission_description = if multiuser {
+            "This application receives only the access allowed by your vault memberships."
+        } else {
+            "This application can access and make changes to your vault."
+        },
         stylesheet = CONSENT_CSS,
         logo = CONSENT_LOGO,
         permission_icon = CONSENT_PERMISSION_ICON,
@@ -529,6 +668,7 @@ async fn authorize(
 
 #[derive(Deserialize)]
 struct Consent {
+    username: Option<String>,
     request_id: String,
     password: Option<String>,
     decision: String,
@@ -588,22 +728,50 @@ async fn consent(
     if store.failed_logins >= 30 {
         return error(StatusCode::TOO_MANY_REQUESTS, "temporarily_unavailable");
     }
-    if form.decision != "deny"
-        && (form.decision != "allow"
-            || !state
-                .auth
-                .token
-                .as_ref()
-                .zip(password.as_ref())
-                .is_some_and(|(secret, password)| {
-                    bool::from(
-                        secret
-                            .expose_secret()
-                            .as_bytes()
-                            .ct_eq(password.expose_secret().as_bytes()),
-                    )
-                }))
+    let multiuser = match state
+        .control
+        .as_ref()
+        .map(ControlStore::enabled)
+        .transpose()
     {
+        Ok(value) => value.unwrap_or(false),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
+    };
+    let identity = if form.decision == "deny" {
+        None
+    } else if form.decision == "allow" && multiuser {
+        state.control.as_ref().and_then(|control| {
+            form.username
+                .as_deref()
+                .zip(password.as_ref())
+                .and_then(|(name, password)| {
+                    control
+                        .authenticate(name, password.expose_secret())
+                        .ok()
+                        .flatten()
+                        .map(TokenIdentity::User)
+                })
+        })
+    } else if form.decision == "allow" && !multiuser {
+        state
+            .auth
+            .token
+            .as_ref()
+            .zip(password.as_ref())
+            .and_then(|(secret, password)| {
+                bool::from(
+                    secret
+                        .expose_secret()
+                        .as_bytes()
+                        .ct_eq(password.expose_secret().as_bytes()),
+                )
+                .then(|| oauth.classic_identity())
+                .flatten()
+            })
+    } else {
+        None
+    };
+    if form.decision != "deny" && identity.is_none() {
         store.failed_logins += 1;
         store.pending.remove(&key);
         return error(StatusCode::UNAUTHORIZED, "access_denied");
@@ -623,6 +791,7 @@ async fn consent(
             store.codes.insert(
                 hash(&code),
                 Code {
+                    identity: identity.expect("validated login"),
                     request: pending.request.clone(),
                     expires: Instant::now() + CODE_TTL,
                 },
@@ -712,6 +881,9 @@ async fn token(
     let Some(code) = store.codes.remove(&hash(&request.code)) else {
         return error(StatusCode::BAD_REQUEST, "invalid_grant");
     };
+    if !oauth.identity_is_current(&code.identity) {
+        return error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(request.code_verifier.as_bytes()));
     if code.request.client_id != request.client_id
         || code.request.redirect_uri != request.redirect_uri
@@ -747,6 +919,7 @@ async fn token(
         store.families.insert(
             family,
             RefreshFamily {
+                identity: code.identity.clone(),
                 client_id: request.client_id,
                 expires: Instant::now() + oauth.refresh_ttl,
                 current: [0; 32],
@@ -756,7 +929,7 @@ async fn token(
     } else {
         None
     };
-    issue_tokens(oauth, &mut store, family)
+    issue_tokens(oauth, &mut store, family, code.identity)
 }
 
 fn refresh(oauth: &OAuthState, store: &mut Store, request: TokenRequest) -> Response {
@@ -774,6 +947,11 @@ fn refresh(oauth: &OAuthState, store: &mut Store, request: TokenRequest) -> Resp
         .families
         .get(&family_key)
         .expect("pruned refresh family");
+    if !oauth.identity_is_current(&family.identity) {
+        store.revoke_family(family_key);
+        return error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+    let identity = family.identity.clone();
     if family.client_id != request.client_id || oauth.refresh_ttl.is_zero() {
         return error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
@@ -799,10 +977,15 @@ fn refresh(oauth: &OAuthState, store: &mut Store, request: TokenRequest) -> Resp
     if store.tokens.len() >= CAPACITY || store.refresh_tokens.len() >= REFRESH_CAPACITY {
         return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
     }
-    issue_tokens(oauth, store, Some(family_key))
+    issue_tokens(oauth, store, Some(family_key), identity)
 }
 
-fn issue_tokens(oauth: &OAuthState, store: &mut Store, family_key: Option<[u8; 32]>) -> Response {
+fn issue_tokens(
+    oauth: &OAuthState,
+    store: &mut Store,
+    family_key: Option<[u8; 32]>,
+    identity: TokenIdentity,
+) -> Response {
     let now = Instant::now();
     let lifetime = family_key.map_or(oauth.ttl, |key| {
         oauth
@@ -819,6 +1002,7 @@ fn issue_tokens(oauth: &OAuthState, store: &mut Store, family_key: Option<[u8; 3
     store.tokens.insert(
         hash(&access),
         AccessToken {
+            identity,
             expires: now + lifetime,
             family: family_key,
         },
@@ -1600,6 +1784,7 @@ mod tests {
             store.tokens.insert(
                 hash("temporary-access"),
                 AccessToken {
+                    identity: TokenIdentity::Classic { revision: None },
                     expires: Instant::now() + CODE_TTL,
                     family: None,
                 },
