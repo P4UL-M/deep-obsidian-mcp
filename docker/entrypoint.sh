@@ -379,9 +379,17 @@ cli secrets check >&2 || log "WARNING: 'secrets check' reported a missing or unr
 # ---------------------------------------------------------------------------
 # 5. Anything other than `serve` runs and exits
 # ---------------------------------------------------------------------------
-if [ "$#" -gt 0 ] && [ "$1" != serve ]; then
-    log "running management command through deep-obsidian-cli"
-    exec "$CLI_BIN" --config "$CONFIG" "$@"
+if [ "$#" -gt 0 ] && { [ "$1" != serve ] || [ "$#" -gt 1 ]; }; then
+    case "$1" in
+        serve|-*)
+            log "passthrough: deep-obsidian-mcp startup options"
+            exec "$SERVER_BIN" --config "$CONFIG" "$@"
+            ;;
+        *)
+            log "passthrough: deep-obsidian-cli management command"
+            exec "$CLI_BIN" --config "$CONFIG" "$@"
+            ;;
+    esac
 fi
 
 # ---------------------------------------------------------------------------
