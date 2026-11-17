@@ -4,7 +4,8 @@ The image installs two real executables: `deep-obsidian-mcp` is the long-running
 server (PID 1); `deep-obsidian-cli` handles configuration and management.
 
 The container is a long-lived HTTP MCP server: bearer-authenticated, non-root, with
-its index on a volume and its credentials nowhere. It is the deployment shape for a
+configuration, indexes and application control state on a volume, and backend
+secret values injected from files at boot. It is the deployment shape for a
 CouchDB-backed vault in particular — the Obsidian LiveSync database that your
 devices already sync — but it serves a plain directory just as well.
 
