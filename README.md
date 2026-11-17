@@ -42,9 +42,10 @@ curl -fsSL https://p4ul-m.github.io/deep-obsidian-mcp/install.sh | sudo bash
 CouchDB-backed vault: `docker build -t deep-obsidian-mcp .` plus the ready-made
 [docker-compose.example.yml](./docker-compose.example.yml) brings up CouchDB and the
 MCP server together. The container is bearer-authenticated by default (it refuses to
-start without a token), runs as a non-root user, keeps its index on a volume and its
-credentials nowhere — they are re-injected from `/run/secrets` on every boot and
-never written to the volume. See [docs/docker.md](./docs/docker.md).
+start without a token) and runs as a non-root user. Configuration, indexes and
+application user/grant state persist on its state volume. Backend secret values
+are re-injected from `/run/secrets` on every boot. See [Docker](./docs/docker.md)
+and [control-state backups](./docs/multiuser.md#server-state-and-backups).
 
 Full install options, manual apt steps, updating, and uninstalling are in
 [INSTALL.md](./INSTALL.md).
@@ -96,6 +97,10 @@ for what a client can rely on, and
 [docs/algolia-mounts.md](./docs/algolia-mounts.md) for the shared-corpus design,
 its versioning model, and its limits.
 
+## Multiuser and backend linking
+
+The optional [multiuser workflow](docs/multiuser.md) gives users private and shared vaults on one backend. Use `deep-obsidian-cli link` to select a Docker or local backend, then `deep-obsidian-cli users enable --wizard` to assign users and vault roles. `deep-obsidian-mcp` remains the service executable.
+
 ## Documentation
 
 | Guide | What's in it |
@@ -104,6 +109,7 @@ its versioning model, and its limits.
 | [USAGE.md](./USAGE.md) | Set up your vault, connect an agent, run the service, troubleshoot |
 | [docs/cli.md](./docs/cli.md) | Choose a backend and find the right management command |
 | [docs/authentication.md](./docs/authentication.md) | Recover tokens, replace credentials and reconnect clients |
+| [docs/multiuser.md](./docs/multiuser.md) | Enable users, assign vault roles and back up control state |
 | [CONFIGURATION.md](./CONFIGURATION.md) | Settings reference: embeddings, authentication, reindexing, mounts |
 | [docs/docker.md](./docs/docker.md) | Run it in a container: env matrix, secrets, CouchDB compose |
 | [docs/mcp-reference.md](./docs/mcp-reference.md) | MCP tools, resources, and prompts |
@@ -116,7 +122,3 @@ More reference and maintainer notes are indexed in [docs/](./docs/README.md).
 ## License
 
 MIT.
-
-### Multiuser and backend linking
-
-The optional [multiuser workflow](docs/multiuser.md) gives users private and shared vaults on one backend. Use `deep-obsidian-cli link` to select a Docker or local backend, then `deep-obsidian-cli users enable --wizard` to assign users and vault roles. `deep-obsidian-mcp` remains the service executable.

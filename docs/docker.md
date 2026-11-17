@@ -159,13 +159,17 @@ on the directory and `644` on the files, or run the service as the owning uid wi
 compose's `user:`. An unreadable file is refused with a message that says exactly
 this — it is never silently treated as absent.
 
-**Nothing persists.** The encrypted secret store lives at
+**Backend secret values are ephemeral.** The encrypted secret store lives at
 `$XDG_CONFIG_HOME/deep-obsidian-mcp/secrets.json`, and `XDG_CONFIG_HOME` points into
 the container's home directory — *not* into the volume. The entrypoint deletes the
 store and re-injects every secret on every boot. Three consequences worth stating:
 
-- The volume holds an index and a config file, and never a credential. Losing it
-  costs a reindex, not a rotation.
+- The state volume holds configuration, derived indexes and application control
+  state. With multiuser, `control.sqlite` contains password verifiers, users and
+  grants, and `multiuser-mode.json` records the selected mode. Back up both with
+  the configuration; losing them requires restoring or recreating application
+  accounts and permissions. See [control-state backups](multiuser.md#server-state-and-backups).
+  Backend secret values are not copied into this volume.
 - The file store's honest weakness — its key is derived in the binary, not held by
   you; see *What the encrypted-file fallback actually protects against* in
   [CONFIGURATION.md](../CONFIGURATION.md) — stops mattering here, because the

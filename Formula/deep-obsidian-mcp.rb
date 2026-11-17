@@ -4,7 +4,7 @@ class DeepObsidianMcp < Formula
   desc "Filesystem-first MCP server for deep Obsidian vault access"
   homepage "https://github.com/P4UL-M/deep-obsidian-mcp"
   url "https://github.com/P4UL-M/deep-obsidian-mcp/archive/refs/tags/v0.2.0-alpha.10.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "cf6b1771355ede17d6f4206e728f55735f5af9b077d7ba4f3f87b0120e04e49a"
   license "MIT"
 
   depends_on "rust" => :build
@@ -23,7 +23,7 @@ class DeepObsidianMcp < Formula
   resource "livesync-sidecar" do
     url "https://github.com/P4UL-M/deep-obsidian-mcp/releases/download/v0.2.0-alpha.10/livesync-sidecar-0.2.0-alpha.10.mjs",
         using: :nounzip
-    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    sha256 "f6fbd09ed4f2a10082f55a440d218463c5748e3fb9467dc357bc98a70f2dd0e3"
   end
 
   def install

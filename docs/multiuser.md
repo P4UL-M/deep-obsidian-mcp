@@ -2,6 +2,9 @@
 
 `deep-obsidian-mcp` is the service process. `deep-obsidian-cli` manages it. Docker images, Homebrew and Debian packages install both executables. Existing storage connections and CouchDB/LiveSync credentials remain configured through the existing mounts and secrets commands.
 
+Multiuser requires an alpha.10-or-newer backend. For linked Docker management,
+upgrade the target container as well as the host CLI.
+
 Multiuser is opt-in. Without it, the service retains classic access to all configured mounts, with its existing bearer/OAuth authentication and no username.
 
 ## Choose the backend first
