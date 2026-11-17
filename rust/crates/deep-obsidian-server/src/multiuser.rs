@@ -527,11 +527,18 @@ pub fn filter_paths(value: &mut Value, state: &AppState) {
             }
         }
         Value::Object(object) => {
+            for key in ["folders", "sharedLinks"] {
+                if let Some(Value::Array(paths)) = object.get_mut(key) {
+                    paths.retain(|p| p.as_str().is_none_or(|p| state.visible_path(p)));
+                }
+            }
             for item in object.values_mut() {
                 filter_paths(item, state);
             }
             for (count, items) in [
                 ("count", "matches"),
+                ("count", "folders"),
+                ("count", "children"),
                 ("nodeCount", "nodes"),
                 ("edgeCount", "edges"),
             ] {
