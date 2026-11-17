@@ -511,6 +511,14 @@ impl RuntimeState {
             .and_then(|index| {
                 index
                     .map(|mut index| {
+                        for path in index
+                            .file_snapshots
+                            .iter()
+                            .map(|s| &s.path)
+                            .chain(index.artifact_snapshots.iter().map(|s| &s.path))
+                        {
+                            source.ensure_path(path)?;
+                        }
                         deep_obsidian_index::freshness::configure(&mut index, config.freshness)?;
                         deep_obsidian_index::index::freeze_search_index(index)
                     })
@@ -684,6 +692,12 @@ busy; check the mount's url and the service log for the backend's own diagnostic
     }
 
     /// A request only reads a published snapshot. It cannot scan or embed notes.
+    pub fn invalidate_snapshot(&self) {
+        if let Ok(mut snapshot) = self.snapshot.write() {
+            *snapshot = None;
+        }
+    }
+
     pub fn serving_snapshot(&self) -> Result<RuntimeIndexSnapshot, String> {
         self.snapshot().map_err(|error| {
             if error != "runtime index is not ready" {
@@ -1130,6 +1144,7 @@ fn mount_runtime_config(
 /// across sidecar restarts) and merely subscribed to. Modelling that as one thing
 /// would have meant either giving `notify` a fake path or giving the backend a fake
 /// watcher.
+#[derive(Clone)]
 pub enum ChangeSource {
     /// Watch a local directory with `notify`, exactly as before.
     LocalDirectory(PathBuf),
@@ -1149,7 +1164,7 @@ impl std::fmt::Debug for ChangeSource {
 }
 
 /// One mount's index runtime, with the logical prefix its index paths sit under.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MountRuntime {
     /// The mount id, matching `VaultRouter`'s mount of the same name.
     pub id: String,
@@ -1225,6 +1240,23 @@ pub struct MountRuntimes {
 }
 
 impl MountRuntimes {
+    pub fn restricted(&self, allowed: &[String], default: Option<&str>) -> Arc<Self> {
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| allowed.contains(&e.id))
+            .cloned()
+            .collect();
+        let root = default
+            .and_then(|id| entries.iter().position(|e| e.id == id))
+            .or_else(|| entries.iter().position(MountRuntime::is_root))
+            .or_else(|| (!entries.is_empty()).then_some(0));
+        Arc::new(Self {
+            entries,
+            root,
+            config: self.config.clone(),
+        })
+    }
     /// Construct one runtime per mount. Pure construction: no IO, no index build.
     ///
     /// Takes the already-built [`MountBackends`] rather than deriving everything from
@@ -1248,10 +1280,37 @@ impl MountRuntimes {
                     None => ChangeSource::Backend(entry.backend.clone()),
                 };
                 MountRuntime {
-                    runtime: RuntimeState::with_target(
-                        mount_runtime_config(config, &mount),
-                        entry.index_target(&handle),
-                    ),
+                    runtime: RuntimeState::with_target(mount_runtime_config(config, &mount), {
+                        let mut target = entry.index_target(&handle);
+                        let prefix = &mount.mount_at;
+                        let excluded: Vec<_> = backends
+                            .entries()
+                            .iter()
+                            .filter(|child| child.mount.id != mount.id)
+                            .filter_map(|child| {
+                                if prefix.is_empty() {
+                                    Some(child.mount.mount_at.clone())
+                                } else {
+                                    child
+                                        .mount
+                                        .mount_at
+                                        .strip_prefix(&format!("{prefix}/"))
+                                        .map(str::to_owned)
+                                }
+                            })
+                            .filter(|p| !p.is_empty())
+                            .collect();
+                        if !excluded.is_empty() {
+                            let original = target.source_factory.clone();
+                            target.source_factory = Arc::new(move || {
+                                Arc::new(crate::multiuser::BoundedSource {
+                                    inner: original(),
+                                    excluded: excluded.clone(),
+                                })
+                            });
+                        }
+                        target
+                    }),
                     fatal_on_startup_failure: root_failure_is_fatal(&mount),
                     id: mount.id,
                     mount_at: mount.mount_at,
@@ -2087,7 +2146,10 @@ mod tests {
         )
         .unwrap();
         let mut config = test_config(vault.clone(), index_dir.clone());
-        assert_eq!(config.freshness, deep_obsidian_types::FreshnessLevel::Classic);
+        assert_eq!(
+            config.freshness,
+            deep_obsidian_types::FreshnessLevel::Classic
+        );
         assert!(!config.auto_reindex.enabled);
         let backends = MountBackends::build(&config);
         let runtimes = MountRuntimes::new(&config, &backends);

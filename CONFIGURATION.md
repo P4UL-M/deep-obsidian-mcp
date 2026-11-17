@@ -15,8 +15,8 @@
 deep-obsidian-cli setup-service --wizard
 ```
 
-The first-init flow. [USAGE.md](./USAGE.md#1-set-up-your-vault) lists the six screens;
-this section is about the decisions behind them.
+The first-init flow. [USAGE.md](./USAGE.md#1-set-up-your-vault) covers the walkthrough;
+this section explains its storage and configuration decisions.
 
 **It can produce a mount table, and it asks about remote roots up front.** Screen 1
 offers a local folder (the default), a remote LiveSync/CouchDB vault, or a shared
@@ -298,6 +298,10 @@ or mount the persistent config and recreate the MCP container; its config surviv
 image upgrades. There are no new CLI flags or environment overrides.
 
 ## Authentication
+
+For recovery and replacement procedures, see the
+[authentication guide](docs/authentication.md). The settings below describe how
+the server reads and enforces authentication.
 
 HTTP bearer authentication is **optional and disabled by default**, so loopback
 (`127.0.0.1`) setups keep working unchanged. Enable it when you expose the
@@ -848,3 +852,7 @@ within a single index.
 Omit `auth.oauth` to keep legacy bearer authentication. Add `auth.oauth` to enable
 Authorization Code + PKCE alongside the existing bearer token. See [OAuth setup](docs/oauth.md)
 for configuration, discovery, registration and restart behavior.
+
+## Optional application users
+
+Use `deep-obsidian-cli users enable --wizard` to opt into multiuser. Users and grants live in the backend state directory, separately from mount definitions and the CLI link profile. See [multiuser configuration, state and backups](docs/multiuser.md). Disabling through `users disable` deletes application identities and restores classic access to all mounts.

@@ -6,6 +6,7 @@ members = [
   "rust/crates/deep-obsidian-core",
   "rust/crates/deep-obsidian-cli",
   "rust/crates/deep-obsidian-config",
+  "rust/crates/deep-obsidian-control",
   "rust/crates/deep-obsidian-index",
   "rust/crates/deep-obsidian-server",
   "rust/crates/deep-obsidian-types",
@@ -21,12 +22,13 @@ members = [
 # NOTE: the MCP `serverInfo.version` reported over the wire is deliberately NOT this
 # value (it is a frozen literal in deep-obsidian-server/src/mcp.rs, asserted by
 # tests/golden/initialize.json). Bumping here does not move that contract.
-version = "0.2.0-alpha.9"
+version = "0.2.0-alpha.10"
 edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = "0.5"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"

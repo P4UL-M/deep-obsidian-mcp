@@ -358,7 +358,7 @@ impl VaultRouter {
 
     /// True when more than one mount is in play.
     pub fn is_multi_mount(&self) -> bool {
-        self.mounts.len() > 1
+        self.mounts.len() != 1 || !self.mounts[0].is_root()
     }
 
     /// Which mount owns `logical_path`, by longest-prefix match on folder

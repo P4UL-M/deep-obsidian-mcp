@@ -276,10 +276,10 @@ fn missing_flags_error(kind_name: &str, missing: &[&str]) -> anyhow::Error {
         .join("\n");
     anyhow!(
         "the following required arguments were not provided:\n{flags}\n\n\
-         Usage: deep-obsidian-mcp mounts add {kind_name} --id <ID> --mount-at <PREFIX> ...\n\n\
+         Usage: deep-obsidian-cli mounts add {kind_name} --id <ID> --mount-at <PREFIX> ...\n\n\
          On a terminal these are asked for instead. There is none here — stdin is not a tty, \
          or --yes / --password-stdin / --api-key-stdin said not to ask — so they have to be \
-         flags. `deep-obsidian-mcp setup-service --wizard` walks the same questions for a \
+         flags. `deep-obsidian-cli setup-service --wizard` walks the same questions for a \
          first-time setup."
     )
 }
@@ -559,6 +559,7 @@ pub struct WizardRequest<'a> {
 /// credentials to roll back, and `messages` is the narration the failure is prefixed with.
 #[derive(Default)]
 struct WizardState {
+    pending_users: Option<Vec<deep_obsidian_control::InitialUser>>,
     messages: Vec<String>,
     /// Every secret reference this run created. See [`roll_back_stored_secrets`].
     stored: Vec<SecretRef>,
@@ -713,6 +714,35 @@ async fn drive(
     // ---- Screen 5: the extras.
     println!();
     let installs = ask_extras(request, io, &transport, local_root.as_deref(), state)?;
+
+    // Multiuser remains opt-in; collect only a plan before the final recap.
+    if io
+        .answers
+        .yes_no("Enable multiuser with per-user vault privileges?", false)?
+    {
+        let mounts = working
+            .mounts
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| {
+                vec![deep_obsidian_types::MountConfig {
+                    id: deep_obsidian_types::IMPLICIT_ROOT_MOUNT_ID.to_owned(),
+                    mount_at: String::new(),
+                    backend: deep_obsidian_types::MountBackendConfig::Filesystem {
+                        index_dir: None,
+                        vault_path: local_root
+                            .clone()
+                            .expect("local root without a mount table"),
+                    },
+                    recall_weight: None,
+                    unknown: Default::default(),
+                }]
+            });
+        state.pending_users = Some(crate::users_cmd::collect_initial_users(
+            &mut io.answers,
+            &mounts,
+        )?);
+    }
 
     // ---- Screen 6: recap, confirm, write, report.
     finish(
@@ -1318,7 +1348,7 @@ async fn finish(
 
 /// Print the recap and ask for the one confirmation that authorizes a write.
 ///
-/// Rendered with the same `print-config` machinery `deep-obsidian-mcp print-config` uses, and
+/// Rendered with the same `print-config` machinery `deep-obsidian-cli print-config` uses, and
 /// REDACTED — which on this config model is the identity, because a config stores secret
 /// references and never secrets. That is the property worth showing an operator: the file
 /// they are about to accept has their credentials' addresses in it, not their credentials.
@@ -1345,6 +1375,9 @@ fn recap_and_confirm(
             println!("  {reference}");
         }
         println!();
+    }
+    if state.pending_users.is_some() {
+        println!("Multiuser will be enabled with the explicit user/vault assignments shown above.");
     }
     if !io.answers.yes_no("Write it?", true)? {
         bail!("aborted at the recap: nothing was written.");
@@ -1448,7 +1481,7 @@ async fn finish_through_setup_service(
         request.dry_run,
         request.overwrite,
     )?;
-    let report = SetupServiceReport {
+    let mut report = SetupServiceReport {
         messages: state
             .messages
             .iter()
@@ -1460,6 +1493,7 @@ async fn finish_through_setup_service(
         vault_snippets,
         ..report
     };
+    apply_pending_multiuser(&mut report, state, &resolved.service, request.dry_run).await?;
     close_out(&report, state, &resolved.service, request.dry_run).await;
     Ok(report)
 }
@@ -1601,7 +1635,7 @@ async fn finish_with_mount_table(
         request.overwrite,
     )?;
 
-    let report = SetupServiceReport {
+    let mut report = SetupServiceReport {
         config_file_path: config_path,
         written,
         dry_run: request.dry_run,
@@ -1612,8 +1646,43 @@ async fn finish_with_mount_table(
         skills,
         vault_snippets,
     };
+    apply_pending_multiuser(&mut report, state, &resolved, request.dry_run).await?;
     close_out(&report, state, &resolved, request.dry_run).await;
     Ok(report)
+}
+
+/// The final recap has authorized this whole batch. The control client takes
+/// the backend's lifetime lock before an offline bootstrap, or asks the running
+/// service to commit it. Cancellation before the recap never reaches this point.
+async fn apply_pending_multiuser(
+    report: &mut SetupServiceReport,
+    state: &mut WizardState,
+    service: &ResolvedServiceConfig,
+    dry_run: bool,
+) -> Result<()> {
+    let Some(users) = state.pending_users.take() else {
+        return Ok(());
+    };
+    if dry_run {
+        report.messages.push(
+            "dry-run: multiuser assignments validated; no users or passwords created".to_owned(),
+        );
+        return Ok(());
+    }
+    // Configuration has been committed: never roll its referenced credentials
+    // back if the separate control transaction is refused or interrupted.
+    state.stored.clear();
+    let mut service = service.clone();
+    service.config_file_path = Some(report.config_file_path.clone());
+    let result = deep_obsidian_server::control::call_local(&service, serde_json::json!({"operation":"multiuser.enable","users":users})).await
+        .context("configuration was saved, but multiuser enablement did not complete; retry `deep-obsidian-cli users enable --wizard`")?;
+    crate::users_cmd::print_result(&result, false)?;
+    report.persisted_config = deep_obsidian_config::read_config_file(&report.config_file_path)?
+        .ok_or_else(|| anyhow!("saved configuration disappeared after enabling multiuser"))?;
+    report
+        .messages
+        .push("multiuser enabled; save the generated passwords displayed above".to_owned());
+    Ok(())
 }
 
 /// Apply the embedding answers to the flags `resolve_runtime_config` reads.
@@ -1666,7 +1735,7 @@ async fn close_out(
         // run `doctor` themselves. Saying so beats propagating an error that would read as
         // "the setup failed".
         Err(error) => {
-            println!("  could not run the local checks ({error}); run `deep-obsidian-mcp doctor`")
+            println!("  could not run the local checks ({error}); run `deep-obsidian-cli doctor`")
         }
     }
     for (mount, probe) in &state.probes {
@@ -1697,11 +1766,11 @@ async fn close_out(
             println!("    `systemctl --user enable --now deep-obsidian-mcp` (Linux)");
         }
     }
-    println!("  * check it: `deep-obsidian-mcp doctor`");
+    println!("  * check it: `deep-obsidian-cli doctor`");
     println!(
-        "  * try a search: ask your agent to search the vault, or run `deep-obsidian-mcp probe`"
+        "  * try a search: ask your agent to search the vault, or run `deep-obsidian-cli probe`"
     );
     if !state.probes.is_empty() {
-        println!("  * inspect the mount table: `deep-obsidian-mcp mounts list`");
+        println!("  * inspect the mount table: `deep-obsidian-cli mounts list`");
     }
 }

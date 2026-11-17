@@ -16,8 +16,8 @@
 <section class="permission" aria-label="Requested access">
 <span class="permission-icon" aria-hidden="true">{permission_icon}</span>
 <div>
-<h2>Read and modify your notes</h2>
-<p>This application can access and make changes to your vault.</p>
+<h2>{permission_title}</h2>
+<p>{permission_description}</p>
 </div>
 </section>
 <details open>
@@ -26,9 +26,10 @@
 </details>
 <form method="post" action="/authorize">
 <input type="hidden" name="request_id" value="{nonce}">
-<label for="password">Server secret</label>
+{username_field}
+<label for="password">{password_label}</label>
 <input id="password" type="password" name="password" required autocomplete="current-password" aria-describedby="secret-hint">
-<p class="hint" id="secret-hint">Enter your server secret to approve. It is never shared with the application.</p>
+<p class="hint" id="secret-hint">{password_hint}</p>
 <div class="actions"><button class="primary" name="decision" value="allow">Allow access</button><button class="cancel" name="decision" value="deny" formnovalidate>Cancel</button></div>
 </form>
 </main>

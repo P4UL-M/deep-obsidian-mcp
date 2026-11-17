@@ -400,6 +400,65 @@ else
   fail "server did not come back after a restart"
   docker logs "$C1" 2>&1 | tail -30
 fi
+# Exercise the external CLI against the container's own operator interface, then
+# recreate the container with the same state volume. Never print generated secrets.
+step "Multiuser: external CLI link, durable users, and classic opt-out"
+docker cp "$C1:$PREFIX/bin/deep-obsidian-cli" "$TMP/deep-obsidian-cli" >/dev/null
+chmod +x "$TMP/deep-obsidian-cli"
+linked_cli() { XDG_CONFIG_HOME="$TMP/client" "$TMP/deep-obsidian-cli" "$@"; }
+if linked_cli link --container "$C1" > "$TMP/link.txt"; then
+  pass "external CLI discovers and links the running container"
+else
+  fail "external CLI could not link the container"
+fi
+docker exec "$C1" node -e 'require("node:fs").writeFileSync("/tmp/initial-users.json", JSON.stringify([{name:"smoke-owner",default_mount:"vault",grants:[{mount_id:"vault",role:"owner"}]}]))'
+if linked_cli --json users enable --plan /tmp/initial-users.json --yes > "$TMP/generated-users.json"; then
+  pass "linked CLI enables multiuser through the running container"
+else
+  fail "linked CLI could not enable multiuser"
+fi
+CODE=$(mcp_initialize "$TOKEN")
+[ "$CODE" = 401 ] && pass "multiuser refuses the classic all-vault bearer" \
+  || fail "classic bearer was accepted while multiuser is enabled ($CODE)"
+linked_cli --json users list > "$TMP/users-before.json"
+check "control database permissions are private" docker exec "$C1" sh -c \
+  '[ "$(stat -c %a /var/lib/deep-obsidian-mcp/control.sqlite)" = 600 ]'
+docker rm -f "$C1" >/dev/null
+docker run -d --name "$C1" \
+  -p "127.0.0.1:$PORT:4100" \
+  -v "$VOL:/var/lib/deep-obsidian-mcp" \
+  -v "$TMP/vault:/vault" \
+  -v "$TMP/secrets:/run/secrets:ro" \
+  -e DO_AUTH_MODE=legacy+oauth \
+  -e DO_OAUTH_ISSUER_URL=https://mcp.example.test \
+  "$IMAGE" >/dev/null
+if wait_for_health "$C1"; then
+  linked_cli --json users list > "$TMP/users-after.json"
+  check "users survive container recreation and the saved link still routes" \
+    cmp "$TMP/users-before.json" "$TMP/users-after.json"
+  CODE=$(mcp_initialize "$TOKEN")
+  [ "$CODE" = 401 ] && pass "multiuser remains enabled after recreation" \
+    || fail "multiuser mode was lost after recreation ($CODE)"
+  if linked_cli --json users disable --yes > "$TMP/disabled.json"; then
+    pass "linked CLI disables multiuser without restarting the service"
+  else
+    fail "linked CLI could not disable multiuser"
+  fi
+  linked_cli --json users status > "$TMP/final-users.json"
+  if grep -e '"enabled": false' "$TMP/final-users.json" >/dev/null && \
+     grep -F -e '"users": []' "$TMP/final-users.json" >/dev/null; then
+    pass "disabling removes all application accounts"
+  else
+    fail "disabling retained accounts or multiuser mode"
+  fi
+  CODE=$(mcp_initialize "$TOKEN")
+  [ "$CODE" = 200 ] && pass "classic all-vault bearer works immediately after opt-out" \
+    || fail "classic access was not restored ($CODE)"
+  check "mode transitions preserve vault contents" test -f "$TMP/vault/Notes/Hello.md"
+else
+  fail "multiuser container did not start after recreation"
+fi
+linked_cli unlink > /dev/null
 docker rm -f "$C1" >/dev/null
 
 # ---------------------------------------------------------------------------

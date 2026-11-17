@@ -68,6 +68,7 @@ COPY rust/crates/deep-obsidian-algolia/Cargo.toml ./rust/crates/deep-obsidian-al
 COPY rust/crates/deep-obsidian-backend/Cargo.toml ./rust/crates/deep-obsidian-backend/
 COPY rust/crates/deep-obsidian-cli/Cargo.toml ./rust/crates/deep-obsidian-cli/
 COPY rust/crates/deep-obsidian-config/Cargo.toml ./rust/crates/deep-obsidian-config/
+COPY rust/crates/deep-obsidian-control/Cargo.toml ./rust/crates/deep-obsidian-control/
 COPY rust/crates/deep-obsidian-core/Cargo.toml ./rust/crates/deep-obsidian-core/
 COPY rust/crates/deep-obsidian-index/Cargo.toml ./rust/crates/deep-obsidian-index/
 COPY rust/crates/deep-obsidian-server/Cargo.toml ./rust/crates/deep-obsidian-server/
@@ -120,7 +121,7 @@ FROM ${NODE_IMAGE} AS runtime
 
 # Keep in step with `[workspace.package] version` in Cargo.toml; CI passes the tag
 # version explicitly when an image is published (docs/release-checklist.md).
-ARG VERSION=0.2.0-alpha.9
+ARG VERSION=0.2.0-alpha.10
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="deep-obsidian-mcp" \

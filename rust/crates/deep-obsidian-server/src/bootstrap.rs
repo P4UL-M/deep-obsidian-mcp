@@ -160,6 +160,7 @@ pub struct ServiceBootstrapContext {
     /// Sidecar supervisors to stop when the service stops. Empty unless a couchdb
     /// mount is configured.
     sidecars: Vec<Arc<deep_obsidian_backend::SidecarSupervisor>>,
+    _control: crate::control::ControlGuard,
 }
 
 impl ServiceBootstrapContext {
@@ -187,7 +188,10 @@ impl Drop for ServiceBootstrapContext {
     }
 }
 
-async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn health_handler(State(state): State<AppState>) -> axum::response::Response {
+    if state.multiuser_enabled() {
+        return (StatusCode::OK, Json(json!({"status":"ok"}))).into_response();
+    }
     // Aggregated across mounts: identical to the root runtime's diagnostics for a
     // single-mount config, worst-of across mounts otherwise.
     let diagnostics = state.runtimes.aggregate_diagnostics();
@@ -196,7 +200,15 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(payload)).into_response()
 }
 
-async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
+async fn ready_handler(State(state): State<AppState>) -> axum::response::Response {
+    if state.multiuser_enabled() {
+        let d = state.runtimes.aggregate_diagnostics();
+        return (
+            readiness_status_code(&d),
+            Json(json!({"ready":d.snapshot.is_some()})),
+        )
+            .into_response();
+    }
     let diagnostics = state.runtimes.aggregate_diagnostics();
     let mut payload = build_readiness_payload(&state.config, &diagnostics);
     insert_mount_index_detail(&mut payload, &state.mount_index_summaries());
@@ -205,8 +217,23 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn mcp_handler(
     State(state): State<AppState>,
+    principal: Option<axum::Extension<deep_obsidian_control::Principal>>,
     Json(request): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
+    let state = if state.multiuser_enabled() {
+        match principal.and_then(|p| state.for_principal(p.0).ok()) {
+            Some(state) => state,
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error":"authentication required"})),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        state
+    };
     match handle_request(state, request).await {
         Ok(Some(response)) => (StatusCode::OK, Json(response)).into_response(),
         Ok(None) => (StatusCode::NO_CONTENT, Json(Value::Null)).into_response(),
@@ -227,9 +254,22 @@ async fn mcp_handler(
 pub(crate) async fn upload_handler(
     State(state): State<AppState>,
     AxumPath(token): AxumPath<String>,
+    principal: Option<axum::Extension<deep_obsidian_control::Principal>>,
     body: Body,
 ) -> impl IntoResponse {
     use crate::uploads::{commit_stream_via_backend, ClaimError, CommitError};
+    let principal = principal.map(|p| p.0);
+    if !state.uploads.owner_matches(&token, principal.as_ref()) {
+        return (StatusCode::FORBIDDEN, "invalid upload token").into_response();
+    }
+    let state = if state.multiuser_enabled() {
+        match principal.and_then(|p| state.for_principal(p).ok()) {
+            Some(state) => state,
+            None => return (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+        }
+    } else {
+        state
+    };
 
     // Atomically claim the token (or reject). Generic errors only: never leak
     // whether a vault path exists.
@@ -243,6 +283,13 @@ pub(crate) async fn upload_handler(
         }
     };
 
+    if state
+        .check_path(&pending.dest_path, deep_obsidian_control::Action::Write)
+        .is_err()
+    {
+        state.uploads.release(&token);
+        return (StatusCode::FORBIDDEN, "access denied").into_response();
+    }
     // Bridge the async body stream into the backend's bounded commit, which pulls
     // the chunks synchronously on its own blocking thread. The lock is NOT held
     // during streaming, and the commit runs concurrently with the pump below.
@@ -377,8 +424,12 @@ pub async fn run_http_service(
     // couchdb mount means the same supervised sidecar process.
     let backends = MountBackends::build(&config);
     let runtimes = MountRuntimes::new(&config, &backends);
-    let state = AppState::with_backends(config.clone(), runtimes.clone(), &backends)
-        .with_upload_base(upload_base_url(&config));
+    let state = crate::multiuser::attach(
+        AppState::with_backends(config.clone(), runtimes.clone(), &backends)
+            .with_upload_base(upload_base_url(&config)),
+    )
+    .map_err(io::Error::other)?;
+    let control = crate::control::start(&state).map_err(io::Error::other)?;
 
     // Startup validation gate, applied PER MOUNT rather than through the router's
     // all-mounts overview.
@@ -425,7 +476,19 @@ readiness reports it as such",
         );
     }
 
-    let auth_state = resolve_auth_state(&config)?;
+    let mut auth_state = resolve_auth_state(&config)?;
+    if let Some(oauth) = auth_state.oauth.take() {
+        let oauth = Arc::try_unwrap(oauth)
+            .map_err(|_| io::Error::other("OAuth initialization shared too early"))?;
+        auth_state.oauth = Some(Arc::new(
+            oauth.with_control(
+                state
+                    .control
+                    .clone()
+                    .ok_or_else(|| io::Error::other("control store missing"))?,
+            ),
+        ));
+    }
     enforce_auth_exposure(&config, auth_state.enabled)?;
 
     let endpoints = build_service_endpoints(&config);
@@ -481,6 +544,7 @@ readiness reports it as such",
         initial_index,
         server_handle,
         sidecars: backends.supervisors(),
+        _control: control,
     })
 }
 

@@ -177,6 +177,7 @@ async fn a_first_local_install_writes_a_legacy_shaped_config_and_no_backup() {
             "",                                  // transport -> stdio
             "",                                  // install packaged skills? -> no
             "",                                  // install Obsidian snippets? -> no
+            "n",                                 // enable multiuser -> no
             "",                                  // write it? -> yes
         ],
         Vec::new(),
@@ -284,6 +285,7 @@ async fn embedding_answers_are_prefilled_from_the_existing_config() {
             "",  // transport -> stdio
             "",  // skills -> no
             "",  // snippets -> no
+            "n", // enable multiuser -> no
             "",  // write it -> yes
         ],
         // A blank line for the optional API key: the endpoint is local and needs none.
@@ -329,6 +331,7 @@ async fn the_ollama_preset_fills_the_endpoint_and_the_key_becomes_a_reference() 
             "",                             // transport -> stdio
             "",                             // skills -> no
             "",                             // snippets -> no
+            "n",                            // enable multiuser -> no
             "",                             // write it -> yes
         ],
         vec!["an-embedding-key"],
@@ -381,6 +384,7 @@ async fn choosing_http_takes_a_port_and_a_declined_auth_stays_off() {
             "n",                            // register with local agents? -> no
             "",                             // skills -> no
             "",                             // snippets -> no
+            "n",                            // enable multiuser -> no
             "",                             // write it -> yes
         ],
         Vec::new(),
@@ -433,6 +437,7 @@ async fn accepting_http_auth_on_a_local_root_stores_a_token_by_reference() {
             "n",                            // register with local agents? -> no
             "",                             // skills -> no
             "",                             // snippets -> no
+            "n",                            // enable multiuser -> no
             "",                             // write it -> yes
         ],
         Vec::new(),
@@ -481,7 +486,8 @@ async fn accepting_http_auth_stores_a_token_by_reference() {
         "n",    // register with local agents? -> no
         "",     // skills -> no
         // No snippets question: the root is remote.
-        "", // write it -> yes
+        "n", // enable multiuser -> no
+        "",  // write it -> yes
     ]);
     let mut io = fixture.io(answers, vec![API_KEY]);
 
@@ -542,7 +548,8 @@ async fn an_algolia_root_becomes_a_one_mount_table_with_a_confirmed_flag() {
         "", // transport -> stdio
         "", // skills -> no
         // No snippets question: a remote root has no local vault folder to install into.
-        "", // write it -> yes
+        "n", // enable multiuser -> no
+        "",  // write it -> yes
     ]);
     let mut io = fixture.io(answers, vec![API_KEY]);
 
@@ -666,6 +673,7 @@ async fn a_failed_probe_can_be_kept_anyway() {
         "",  // freshness -> classic
         "",  // transport -> stdio
         "",  // skills -> no
+        "n", // enable multiuser -> no
         "",  // write it -> yes
     ]);
     let mut io = fixture.io(answers, vec![API_KEY]);
@@ -714,6 +722,7 @@ async fn a_couchdb_root_asks_the_whole_sequence_and_dry_run_stores_nothing() {
             "",                      // freshness -> classic
             "",                      // transport -> stdio
             "",                      // skills -> no
+            "n",                     // enable multiuser -> no
             "",                      // write it -> yes
         ],
         // Never read: --dry-run returns before any credential is asked for.
@@ -776,6 +785,7 @@ async fn the_additional_mounts_loop_suggests_an_id_and_migrates_the_root() {
             "",                             // transport -> stdio
             "",                             // skills -> no
             "",                             // snippets -> no
+            "n",                            // enable multiuser -> no
             "",                             // write it -> yes
         ],
         Vec::new(),
@@ -841,6 +851,7 @@ async fn a_typed_mount_id_overrides_the_suggestion() {
             "",                            // stdio
             "",                            // no skills
             "",                            // no snippets
+            "n",                           // enable multiuser -> no
             "",                            // write it
         ],
         Vec::new(),
@@ -921,6 +932,7 @@ async fn an_end_of_input_at_any_question_aborts_without_writing() {
         "", // freshness -> classic
         "", // transport -> stdio
         "", // skills -> no
+        "n", // enable multiuser -> no
             // and then the input ends, at "Write it?"
     ]);
     let error = run_with_io(
@@ -955,6 +967,7 @@ async fn declining_the_recap_writes_nothing_and_rolls_back() {
         "",  // freshness -> classic
         "",  // stdio
         "",  // no skills
+        "n", // enable multiuser -> no
         "n", // write it? -> NO
     ]);
     let error = run_with_io(
@@ -1236,6 +1249,7 @@ fn cli_argv_completes_a_local_install_and_prints_its_report_once() {
         "",                             // transport -> stdio
         "",                             // skills -> no
         "",                             // snippets -> no
+        "n",                            // enable multiuser -> no
         "",                             // write it -> yes
     ]
     .join("\n")
@@ -1371,6 +1385,7 @@ async fn local_http_wizard_enables_additive_oauth_without_storing_plaintext() {
             "n",
             "",
             "",
+            "n", // enable multiuser -> no
             "",
         ],
         Vec::new(),
@@ -1409,6 +1424,7 @@ async fn remote_http_wizard_enables_additive_oauth() {
         "https://obsidian-mcp.example.com",
         "n",
         "",
+        "n", // enable multiuser -> no
         "",
     ]);
     let mut io = fixture.io(answers, vec![API_KEY]);
@@ -1447,7 +1463,9 @@ async fn editing_an_existing_oauth_setup_preserves_secret_defaults_and_stdio_con
     let options = fixture.options();
     // Keep HTTP, existing authentication mode, issuer and lifetime through defaults.
     let mut io = fixture.io(
-        vec!["1", "", "", "", "", "2", "", "", "", "", "n", "", "", ""],
+        vec![
+            "1", "", "", "", "", "2", "", "", "", "", "n", "", "", "n", "",
+        ],
         Vec::new(),
     );
     run_with_io(&request(&options, false), &mut io)
@@ -1473,7 +1491,7 @@ async fn editing_an_existing_oauth_setup_preserves_secret_defaults_and_stdio_con
     assert_eq!(fixture.config_json()["auth"], saved["auth"]);
     // Switching back to HTTP with legacy-only removes OAuth, keeps the original credential.
     let mut io = fixture.io(
-        vec!["1", "", "", "", "", "2", "", "y", "1", "n", "", "", ""],
+        vec!["1", "", "", "", "", "2", "", "y", "1", "n", "", "", "n", ""],
         Vec::new(),
     );
     run_with_io(&request(&options, false), &mut io)
@@ -1503,7 +1521,18 @@ async fn freshness_choice_is_persisted_and_prefilled_on_local_and_mount_table_pa
     let options = fixture.options();
     for choice in ["", "3", ""] {
         let mut io = fixture.io(
-            vec!["1", vault.to_str().unwrap(), "", "", choice, "", "", "", ""],
+            vec![
+                "1",
+                vault.to_str().unwrap(),
+                "",
+                "",
+                choice,
+                "",
+                "",
+                "",
+                "n",
+                "",
+            ],
             vec![],
         );
         run_with_io(&request(&options, false), &mut io)
@@ -1528,7 +1557,7 @@ async fn freshness_choice_is_persisted_and_prefilled_on_local_and_mount_table_pa
     let (base_url, _mock) = spawn_mock().await;
     let options = remote.options();
     let mut answers = algolia_root_answers(&base_url);
-    answers.extend(["", "", "4", "", "", ""]);
+    answers.extend(["", "", "4", "", "", "n", ""]);
     let mut io = remote.io(answers, vec![API_KEY]);
     run_with_io(&request(&options, false), &mut io)
         .await
@@ -1536,4 +1565,81 @@ async fn freshness_choice_is_persisted_and_prefilled_on_local_and_mount_table_pa
     assert_eq!(remote.config_json()["freshness"], "high");
     let _ = std::fs::remove_dir_all(&fixture.base);
     let _ = std::fs::remove_dir_all(&remote.base);
+}
+
+#[tokio::test]
+async fn multiuser_setup_creates_users_only_after_confirmed_assignments() {
+    let fixture = Fixture::new("multiuser-setup");
+    let vault = fixture.base.join("Vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let options = fixture.options();
+    let mut io = fixture.io(
+        vec![
+            "1",
+            vault.to_str().unwrap(),
+            "",  // add another vault
+            "",  // embeddings
+            "",  // freshness
+            "",  // stdio
+            "",  // skills
+            "",  // snippets
+            "y", // multiuser
+            "paul",
+            "4",
+            "n", // user, owner role, no additional user
+            "",  // final recap
+        ],
+        Vec::new(),
+    );
+    let report = run_with_io(&request(&options, false), &mut io)
+        .await
+        .expect("confirmed multiuser setup");
+    assert!(report.written);
+    assert_eq!(fixture.config_json()["multiuser"]["enabled"], true);
+    let store =
+        deep_obsidian_control::ControlStore::open(fixture.base.join("control.sqlite")).unwrap();
+    assert!(store.enabled().unwrap());
+    assert_eq!(store.list_users().unwrap().len(), 1);
+    assert_eq!(store.list_users().unwrap()[0].name, "paul");
+    assert_eq!(
+        store.grants("paul").unwrap()[0].role,
+        deep_obsidian_control::Role::Owner
+    );
+    assert!(!std::fs::read_to_string(&fixture.config_path)
+        .unwrap()
+        .contains("$argon2"));
+    let _ = std::fs::remove_dir_all(&fixture.base);
+}
+
+#[tokio::test]
+async fn multiuser_setup_cancellation_and_dry_run_create_no_accounts() {
+    for (label, dry, confirm) in [("cancel", false, "n"), ("dry", true, "")] {
+        let fixture = Fixture::new(&format!("multiuser-{label}"));
+        let vault = fixture.base.join("Vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let options = fixture.options();
+        let mut io = fixture.io(
+            vec![
+                "1",
+                vault.to_str().unwrap(),
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "y",
+                "paul",
+                "4",
+                "n",
+                confirm,
+            ],
+            Vec::new(),
+        );
+        let result = run_with_io(&request(&options, dry), &mut io).await;
+        assert_eq!(result.is_ok(), dry);
+        assert!(!fixture.config_path.exists());
+        assert!(!fixture.base.join("control.sqlite").exists());
+        let _ = std::fs::remove_dir_all(&fixture.base);
+    }
 }

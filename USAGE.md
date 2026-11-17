@@ -1,7 +1,8 @@
 # Using deep-obsidian-mcp
 
-This guide takes you from a fresh install to a running server your agent can
-use. If you haven't installed it yet, start with [INSTALL.md](./INSTALL.md).
+This guide covers first setup, agent connections and running the service.
+Install first using [INSTALL.md](./INSTALL.md). For day-to-day management and
+command-specific help, use the [CLI guide](docs/cli.md).
 
 1. [Set up your vault](#1-set-up-your-vault)
 2. [Connect your agent](#2-connect-your-agent)
@@ -12,6 +13,18 @@ For embeddings, authentication, and tuning, see
 [CONFIGURATION.md](./CONFIGURATION.md). For the full list of tools your agent
 gets, see [docs/mcp-reference.md](./docs/mcp-reference.md).
 
+## Already have a backend?
+
+```sh
+deep-obsidian-cli link
+deep-obsidian-cli doctor
+deep-obsidian-cli mounts list
+```
+
+Linking chooses a running Docker backend or known local configuration. For
+remote hosts, Docker contexts, explicit targets and local overrides, see
+[Choose a backend](docs/cli.md#choose-a-backend).
+
 ## 1. Set up your vault
 
 `setup-service` writes a config file describing your vault and options. Run the
@@ -21,28 +34,14 @@ interactive wizard for a first install:
 deep-obsidian-cli setup-service --wizard
 ```
 
-It walks six screens, in this order:
+Choose the storage, optional embeddings, transport and authentication, then
+review the proposed configuration before saving. You can also register local
+agent clients, install skills and enable vault snippets. Multiuser activation
+asks for explicit users and vault roles; see [Multiuser](docs/multiuser.md).
 
-1. **Where your notes live.** A local folder (the recommended answer, and the
-   default), or — experimental — a remote LiveSync/CouchDB vault or a shared
-   Algolia index as the vault *root*. A missing folder is created if you say so.
-2. **Any further vaults**, each mounted under a subfolder of the first. See
-   [CONFIGURATION.md](./CONFIGURATION.md#multiple-vaults-mounts).
-3. **Embeddings.** Off by default; without them search stays lexical. The Ollama
-   preset fills in a local endpoint and model.
-4. **Transport.** stdio (the default — your MCP client launches the server on
-   demand) or HTTP, which asks for a port and can generate a bearer token.
-5. **The extras** — the same `--mcp`, `--skills` and `--vault-snippets` installs
-   the flags below do.
-6. **A recap.** It prints the config it is about to write, with credentials shown
-   only as [references](./CONFIGURATION.md#secrets-are-references-never-values),
-   and asks once before writing. Then it runs the local `doctor` checks and lists
-   your next steps.
-
-Every question takes a default, so Enter all the way through is a valid answer,
-and a re-run prefills from the config you already have rather than starting over.
-Stopping part-way (`Ctrl-D`, a closed pipe) writes nothing and removes any
-credential the run had already stored.
+Enter accepts a default. Cancelling before confirmation leaves the existing
+configuration and identities unchanged. The [configuration reference](CONFIGURATION.md#the-setup-wizard)
+explains storage validation and credential handling.
 
 The wizard does **not** edit a config that already declares a mount table — it
 points you at `mounts add` / `mounts list` / `mounts remove`, which change a table
@@ -54,13 +53,9 @@ Or pass the choices directly (good for scripts):
 deep-obsidian-cli setup-service --vault ~/Vault --mcp --skills --vault-snippets
 ```
 
-- `--mcp` — register the server with local agents (Codex in `~/.codex/config.toml`, and Claude Code via `claude mcp add` when the CLI is present).
-- `--skills` — install packaged agent skills into `~/.codex/skills` and `~/.claude/skills`.
-- `--vault-snippets` — install Obsidian CSS snippets into your vault and enable them.
-- `--auth` / `--no-auth` — enable or disable HTTP bearer auth (see [CONFIGURATION.md](./CONFIGURATION.md#authentication)). The wizard asks instead, on its transport screen.
-- `--transport stdio|http` — without it, the flag-driven command writes an HTTP config, which is what the packaged service wants.
-- `--dry-run` — preview every change without writing. Safe with `--wizard` too: it stores no credential and contacts no remote.
-- `--overwrite` — replace existing config, MCP entries, skills, or snippets.
+Run `deep-obsidian-cli setup-service --help` for setup options, and add
+`--dry-run` to preview changes. `--mcp`, `--skills` and `--vault-snippets`
+install their respective local client integrations.
 
 The config is written to `~/.config/deep-obsidian-mcp/config.json` by default
 (override with `--config <path>`). Settings resolve in this order: **CLI flag →
@@ -130,7 +125,8 @@ deep-obsidian-cli secrets check # does every stored credential still resolve? (n
 ```
 
 `secrets check` is also how you rotate one: it names the `secrets set` command for any
-reference it reports as `MISSING`. See
+reference it reports as `MISSING`. For a lost bearer token, see
+[Token recovery](docs/authentication.md#recover-a-lost-bearer-token). For replacement, see
 [CONFIGURATION.md § Rotating a stored secret](./CONFIGURATION.md#rotating-a-stored-secret).
 
 Health endpoints (no auth required):

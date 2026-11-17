@@ -32,158 +32,6 @@ use crate::config::{ResolvedRuntimeConfig, ResolvedSource, ResolvedSources};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INDEX_SQLITE_FILENAME: &str = "index.sqlite";
 const CONFIG_PRECEDENCE: [&str; 4] = ["cli", "config", "env", "default"];
-const HELP_TEXT: &str = "\
-Usage:
-  deep-obsidian-cli <command> [--config <path>]
-  deep-obsidian-cli link [--container <name>] [--context <name>] [--local-config <path>]
-  deep-obsidian-cli link --status
-  deep-obsidian-cli unlink
-  deep-obsidian-cli setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--auth|--no-auth] [--dry-run]
-  deep-obsidian-cli setup-service --wizard [--config <path>] [--dry-run]
-  deep-obsidian-cli doctor [--config <path>] [--json] [--probe-remote]
-  deep-obsidian-cli print-config [--config <path>]
-  deep-obsidian-cli probe [--config <path>] [--json]
-  deep-obsidian-cli couchdb export --mount <id> --out <dir> [--config <path>] [--json]
-  deep-obsidian-cli couchdb restore --mount <id> --from <dir> [--dry-run] [--force] [--json]
-  deep-obsidian-cli algolia seed --mount <id> [--from <folder>] [--dry-run] [--move] [--json]
-  deep-obsidian-cli algolia dump --mount <id> --out <dir> [--json]
-  deep-obsidian-cli algolia restore --mount <id> --from <dir> [--dry-run] [--force] [--json]
-  deep-obsidian-cli algolia status --mount <id> [--json]
-  deep-obsidian-cli algolia retract --mount <id> --path <note> [--yes] [--json]
-  deep-obsidian-cli algolia key --mount <id> [--parent-key-ref <ref>] [--prefix <folder>] [--json]
-  deep-obsidian-cli mounts add filesystem [--id <id>] [--mount-at <prefix>] [--vault-path <dir>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
-  deep-obsidian-cli mounts add couchdb [--id <id>] [--mount-at <prefix>] [--url <origin>] [--database <db>] [--username <user>] [--password-stdin] [--writable] [--e2ee] [--sidecar-path <file>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
-  deep-obsidian-cli mounts add algolia [--id <id>] [--mount-at <prefix>] [--app-id <id>] [--index-name <index>] [--base-url <url>] [--api-key-stdin] [--writable] [--participant-id <who>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
-  deep-obsidian-cli mounts list [--json]
-  deep-obsidian-cli mounts remove --id <id> [--purge-index] [--yes] [--json]
-  deep-obsidian-cli secrets set --mount <id> [--field password|e2ee-passphrase|api-key] [--stdin] [--dry-run] [--json]
-  deep-obsidian-cli secrets set --target auth-token|embedding-api-key [--stdin] [--dry-run] [--json]
-  deep-obsidian-cli secrets check [--json]
-
-Commands:
-  setup-service  Validate service config and optionally install MCP client entries, skills, or vault snippets.
-  doctor         Diagnose config, vault access, dependencies, and health.
-  print-config   Print the normalized persisted config.
-  probe          Probe the configured HTTP health and MCP endpoints.
-  couchdb        Snapshot (export) and restore a CouchDB (Self-hosted LiveSync) mount.
-  algolia        Seed, dump, restore, inspect and scope an Algolia-backed shared corpus.
-  mounts         Build and inspect the config's mount table (add / list / remove).
-  secrets        Rotate the value behind a stored reference, and check every one resolves.
-  help           Show this help.
-  version        Print the current version.
-
-setup-service --wizard is the FIRST-INIT flow: it asks where your notes live (a local
-folder, or -- experimental -- a remote LiveSync/CouchDB vault or a shared Algolia index
-as the vault ROOT), offers to mount further vaults under subfolders, then asks about
-embeddings, transport (stdio by default; HTTP asks for a port and can generate a bearer
-token), and the --mcp/--skills/--vault-snippets installs. It ends by printing the
-resolved config with secrets shown only as references, asking once before writing it,
-and reporting the local doctor checks plus next steps. Every question can be answered
-with Enter to take the default, and prefills come from the config file that is already
-there, so a re-run is an edit. An interrupted run (^D, a closed pipe) writes nothing and
-removes any credential it had stored. It does NOT edit a config that already declares a
-mount table -- use the mounts family for that -- and it does not tune retention,
-recallWeight or cache.
-
-mounts is the checkable way to build a mount table, which setup-service refuses to
-rewrite. Every write goes through the same config loader the server uses, so this
-command cannot produce a config the server would then refuse to load; run
-`deep-obsidian-cli mounts add --help` for the per-kind flags.
-
-mounts add is GUIDED when flags are missing: on a terminal it asks the same per-kind
-questions the wizard asks, treating the flags you did give as answers already supplied,
-so `mounts add couchdb --url https://couch.example` prompts only for the rest. With no
-terminal -- a script, a pipe, --yes, or --password-stdin/--api-key-stdin, which have
-already claimed stdin for the credential -- a missing required flag is an error naming
-every one of them at once, never a prompt that would hang.
-
-mounts add converts a legacy vaultPath-only config to an explicit root mount first
-(id `vault`, mountAt \"\", the same path -- it resolves identically), then appends. A
-couchdb or algolia mount, or a second mount of any kind, needs an experimental flag:
-the command names the flag, says what it turns on, and asks -- it never enables one
-silently. --yes answers every prompt for scripting.
-
-A credential is never a flag VALUE (that would put it in `ps` output and shell
-history): the couchdb password and the algolia API key are prompted MASKED, or read
-from stdin with --password-stdin / --api-key-stdin. Only the reference to the stored
-secret lands in the config file.
-
-mounts add then PROBES the new mount before writing -- a directory read, a sidecar
-handshake, or one index read -- and on failure writes nothing, removing the credential
-it had just stored so no orphan is left behind. --keep-anyway writes the mount anyway
-and warns that doctor --probe-remote will report it degraded. A content-changing write
-leaves the previous file at config.json.bak, and unknown keys are preserved.
-
-mounts remove UNMOUNTS: nothing is ever deleted from a couchdb or algolia backing
-store. The local index stays unless --purge-index, and the stored credential is always
-kept and named, because a reference can be shared by more than one mount. Removing the
-root while other mounts exist is refused (they resolve beneath it), and so is removing
-the last mount -- a config needs a root mount, so edit the file directly to start over.
-
-secrets set ROTATES: it replaces the value one stored reference points at and never
-modifies the config file. The reference it writes to is the one the config actually
-CONTAINS -- read out of the file, hand-written custom ids included -- so a rotation
-cannot leave the config pointing at a value nobody updated. The reference's own store is
-therefore preserved (an osKeyring ref stays in the keyring, an encryptedFile ref stays
-in the file): rotation is not migration, and if that store cannot be written to, the
-command reports it and changes nothing rather than falling back to the other one and
-orphaning the reference. --field defaults by backend kind (couchdb -> password,
-algolia -> api-key); e2ee-passphrase must be named explicitly. The new value is never a
-flag value: it is prompted MASKED, or read from the first line of stdin with --stdin.
-Adding a secret a mount does not have yet -- an e2ee passphrase, a first bearer token --
-is a config change, so it is refused here and the message names the command that does it.
-
-secrets check prints one line per reference the config holds -- every mount credential,
-the bearer token, the embedding keys -- saying whether the store answers for it and, if
-not, what would rotate it. It never prints a value, and it exits non-zero when any
-reference is MISSING. It reports the STORE, not the effective value: an environment
-variable such as DEEP_OBSIDIAN_AUTH_TOKEN shadows a reference at runtime and is not
-consulted here.
-
-doctor prints one block of checks per declared mount. The local ones always run and
-contact nothing: a filesystem mount's directory, and for a couchdb mount whether the
-LiveSync sidecar bundle was located and whether a Node >= 20 is present. --probe-remote
-additionally contacts each couchdb and algolia mount READ-ONLY -- one handshake or one
-getSettings, no data method -- which is opt-in because it needs credentials and network.
-A remote-backed mount that cannot be reached is a warn, never a fail: those mounts are
-experimental and non-root, so the vault root keeps serving without them.
-
-setup-service does NOT rewrite a config that declares a mount table, with or without
---overwrite, and refuses an auth change on one. Use the `mounts` family for the table
-(see below) and edit the file directly for anything else; --mcp, --skills and
---vault-snippets still work. A content-changing write leaves the previous file at
-config.json.bak. Without --transport the config it writes is HTTP, which is what the
-packaged service wants; an explicit --transport is honoured (the wizard uses this to
-write a stdio config).
-
-couchdb export writes every entry of one mount to a directory, plus a manifest.json
-recording each entry's revision, content hash and storage kind. Two exports of an
-unchanged vault are byte-identical, so `diff -r` (or the reported tree hash) verifies
-a round trip.
-
-couchdb restore writes such a directory back through the same revision-guarded write
-path the MCP tools use. It creates missing entries, skips identical ones, and REFUSES
-entries whose remote content differs unless --force is given -- so the default cannot
-discard an edit made after the export. --dry-run reports exactly what a real run would
-do and works on a read-only mount.
-
-algolia seed imports a local folder into the mount's index ONCE. It defaults to the
-folder the mount shadows (<vaultPath>/<mountAt>), creates and updates only, and never
-deletes a note from the index to match the source. --move deletes each local original
-only after re-reading the index and confirming it holds those exact bytes.
-
-algolia dump writes every note to a directory plus a deterministic manifest.json; two
-dumps of an unchanged corpus are byte-identical. algolia restore writes such a tree
-back through the guarded write path: creates, skips identical, and REFUSES notes whose
-index content differs unless --force -- and even then nothing is destroyed, the current
-version moves to history. Non-.md files are refused outright: the corpus stores Markdown
-only, and no flag lifts that.
-
-algolia retract permanently deletes a note AND its whole history. It is the one
-destructive operation here, it prompts unless --yes, and it is deliberately not an MCP
-tool. algolia key derives a scoped read-only secured key for a teammate; it REFUSES a
-write-capable parent key, because a secured key inherits its parent's ACLs while its
-filter restriction constrains search only.";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -361,24 +209,22 @@ pub struct ServeReport {
 
 pub async fn run() -> Result<()> {
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
-    let raw_args = match crate::link::dispatch(&raw_args)? {
-        crate::link::Dispatch::Continue(args) => args,
-        crate::link::Dispatch::Exit(code) => { if code != 0 { std::process::exit(code); } return Ok(()); }
-    };
-    // `--help` prints the hand-written summary for every command EXCEPT `mounts`, whose
-    // help falls through to clap's derive.
-    //
-    // Why the exception rather than a rewrite: the `mounts` family is three subcommands
-    // with three kinds and about twenty flags between them, and restating that in
-    // `HELP_TEXT` would be a second surface to keep in sync — the kind of duplication that
-    // is wrong within a release of being added. Every other command keeps the summary it
-    // has always printed, so `doctor --help` is unchanged.
-    let (normalized_args, is_mounts_family) = normalize_cli_args_detailed(&raw_args)?;
-    let wants_help = raw_args.iter().any(|arg| arg == "--help" || arg == "-h");
-    if wants_help && !is_mounts_family {
-        println!("{HELP_TEXT}");
+    if let Some(status) = crate::help::print_if_requested(&raw_args)? {
+        if status != 0 {
+            std::process::exit(status);
+        }
         return Ok(());
     }
+    let raw_args = match crate::link::dispatch(&raw_args)? {
+        crate::link::Dispatch::Continue(args) => args,
+        crate::link::Dispatch::Exit(code) => {
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
+    };
+    let (normalized_args, _) = normalize_cli_args_detailed(&raw_args)?;
     if raw_args.len() == 1 && matches!(raw_args[0].as_str(), "--version" | "-v") {
         println!("{VERSION}");
         return Ok(());
@@ -394,8 +240,12 @@ pub async fn run() -> Result<()> {
     }
 
     match cli.command.unwrap_or(Command::Help) {
+        Command::Users { command } => {
+            let resolved = crate::config::resolve_runtime_config(&cli.options)?;
+            crate::users_cmd::run(command, &resolved.service, dry_run, json).await
+        }
         Command::Help => {
-            println!("{HELP_TEXT}");
+            crate::help::print_root()?;
             Ok(())
         }
         Command::Version => {
@@ -807,6 +657,7 @@ fn is_known_command(token: &str) -> bool {
             | "algolia"
             | "mounts"
             | "secrets"
+            | "users"
             | "help"
             | "version"
     )
@@ -899,9 +750,9 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
 
 /// The normalized argv, plus whether the COMMAND is the `mounts` family.
 ///
-/// The flag exists for the `--help` gate in [`run`], and it comes from here rather than
+/// The flag records whether normalization entered the mounts family, and it comes from here rather than
 /// from a search of argv for the word `mounts` because a VALUE can be that word too:
-/// `algolia status --mount mounts --help` must still print `HELP_TEXT`. This scan already
+/// `algolia status --mount mounts --help` must still select Algolia help. This scan already
 /// distinguishes a command from a flag's value — it has to, to decide what becomes
 /// `--vault` — so answering the question here costs one `bool` and duplicates nothing.
 pub(crate) fn normalize_cli_args_detailed(raw_args: &[String]) -> Result<(Vec<String>, bool)> {
@@ -930,6 +781,10 @@ pub(crate) fn normalize_cli_args_detailed(raw_args: &[String]) -> Result<(Vec<St
 
     while index < raw_args.len() {
         let token = &raw_args[index];
+        if token == "users" {
+            normalized.extend(raw_args[index..].iter().cloned());
+            return Ok((normalized, false));
+        }
         if !in_mounts_family && token == "--vault-path" {
             saw_vault_flag = true;
             let (replacement, next_index) =
@@ -2897,6 +2752,18 @@ async fn probe_health(client: &Client, url: &str) -> HealthProbeReport {
     }
 }
 
+fn check_mcp_http_status(status: reqwest::StatusCode) -> Result<()> {
+    if !status.is_success() {
+        let hint = match status {
+            reqwest::StatusCode::UNAUTHORIZED => "; check the MCP bearer token",
+            reqwest::StatusCode::FORBIDDEN => "; check MCP permissions and allowed origins",
+            _ => "",
+        };
+        return Err(anyhow!("MCP endpoint returned HTTP {status}{hint}"));
+    }
+    Ok(())
+}
+
 async fn post_json_rpc(client: &Client, url: &str, payload: Value) -> Result<Value> {
     let response = client
         .post(url)
@@ -2904,20 +2771,21 @@ async fn post_json_rpc(client: &Client, url: &str, payload: Value) -> Result<Val
         .send()
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
-    response
-        .json::<Value>()
-        .await
-        .map_err(|error| anyhow!(error.to_string()))
+    let status = response.status();
+    check_mcp_http_status(status)?;
+    response.json::<Value>().await.map_err(|_| {
+        anyhow!("MCP endpoint returned HTTP {status}, but its response was not valid JSON")
+    })
 }
 
 async fn post_json_rpc_notification(client: &Client, url: &str, payload: Value) -> Result<()> {
-    client
+    let response = client
         .post(url)
         .json(&payload)
         .send()
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
-    Ok(())
+    check_mcp_http_status(response.status())
 }
 
 fn json_rpc_result(value: Value, label: &str) -> Result<Value> {
@@ -4733,10 +4601,10 @@ mod tests {
         assert!(!normalized.iter().any(|token| token == "--vault"));
     }
 
-    /// The `mounts`-family flag the `--help` gate reads is about the COMMAND, not about the
+    /// The `mounts`-family flag normalization records is about the COMMAND, not about the
     /// word appearing anywhere in argv.
     ///
-    /// `algolia status --mount mounts --help` must still print `HELP_TEXT`: `mounts` is a
+    /// `algolia status --mount mounts --help` must still select Algolia help: `mounts` is a
     /// flag VALUE there. A gate that searched argv for the token would have flipped, and the
     /// user would have got clap's top-level help for a command that has none.
     #[test]

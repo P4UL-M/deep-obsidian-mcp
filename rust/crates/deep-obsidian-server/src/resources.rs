@@ -162,6 +162,9 @@ async fn all_logical_note_paths(state: &AppState) -> Result<Vec<String>, String>
             .map_err(|error| format!("mount '{}' cannot be listed: {error}", mount.id))?;
         paths.extend(notes.iter().map(|note| mount.to_logical(note)));
     }
+    if state.access.is_some() {
+        paths.retain(|path| state.visible_path(path));
+    }
     paths.sort_unstable();
     // Two mounts cannot own the same logical path (longest-prefix routing gives it to
     // exactly one), so this only ever collapses a duplicate WITHIN one mount's answer.
@@ -171,6 +174,9 @@ async fn all_logical_note_paths(state: &AppState) -> Result<Vec<String>, String>
 }
 
 pub async fn list_resources(state: &AppState) -> Result<ResourceListResult, String> {
+    state
+        .check_tool("resources/list", &serde_json::json!({}))
+        .map_err(|e| e.to_string())?;
     let note_paths = all_logical_note_paths(state).await?;
     let note_count = note_paths.len();
     let listed_count = note_count.min(NOTE_RESOURCE_LIST_LIMIT);
@@ -319,6 +325,25 @@ async fn read_note_text(
 }
 
 pub async fn read_resource(state: &AppState, uri: &str) -> Result<ResourceReadResult, String> {
+    state
+        .check_tool("resources/read", &serde_json::json!({}))
+        .map_err(|e| e.to_string())?;
+    if uri == VAULT_INFO_URI && state.access.is_some() {
+        return Ok(ResourceReadResult {
+            contents: vec![ResourceContents {
+                uri: uri.into(),
+                mime_type: "application/json".into(),
+                text: state.user_vault_info().to_string(),
+            }],
+        });
+    }
+    if state.access.is_some() {
+        if let Some(path) = parse_uri_query(uri).get("path") {
+            state
+                .check_path(path, deep_obsidian_control::Action::Read)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     if uri == VAULT_INFO_URI {
         // The ROOT mount's index, or the honest no-local-index refusal — see
         // `tools::root_index`. An algolia-rooted vault has no root index and this

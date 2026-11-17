@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use serde::{Deserialize, Serialize};
 
 const FORWARDED: &str = "DEEP_OBSIDIAN_CLI_FORWARDED";
@@ -18,6 +18,20 @@ const CONTAINER_SCRIPT: &str = r#"set -eu
 config=${DO_CONFIG_PATH:-${DO_STATE_DIR:-/var/lib/deep-obsidian-mcp}/config.json}
 mounted=${DO_MOUNTED_CONFIG:-/etc/deep-obsidian/config.json}
 if [ -f "$mounted" ]; then config=$mounted; fi
+# docker exec does not inherit exports made by the service entrypoint. Read the
+# same secret inside the container; never put its value in Docker arguments.
+token_file=${DO_SECRETS_DIR:-/run/secrets}/auth_token
+if [ -f "$token_file" ]; then
+    if [ ! -r "$token_file" ]; then
+        printf '%s\n' 'cannot read the container bearer-token secret' >&2
+        exit 1
+    fi
+    token=$(head -n 1 "$token_file")
+    if [ -n "$(printf '%s' "$token" | tr -d '[:space:]')" ]; then
+        export DEEP_OBSIDIAN_AUTH_TOKEN="$token"
+    fi
+    unset token
+fi
 exec deep-obsidian-cli --config "$config" "$@"
 "#;
 
@@ -66,6 +80,11 @@ struct LinkOptions {
     /// Emit routing metadata as JSON; never includes backend secrets.
     #[arg(long)]
     json: bool,
+}
+
+/// Share the actual link flags with the local help tree.
+pub(crate) fn help_command() -> clap::Command {
+    LinkOptions::command().name("link")
 }
 
 struct Output {
@@ -707,9 +726,11 @@ mod tests {
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "deep-obsidian-link-{}-{}",
+                "deep-obsidian-link-{}-{}-{}",
                 std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -838,6 +859,82 @@ mod tests {
         assert!(forward.contains(&CONTAINER_SCRIPT.to_owned()));
         assert_eq!(&forward[forward.len() - args.len()..], args);
         assert!(!CONTAINER_SCRIPT.contains("space ;"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_forwarding_loads_the_service_secret_without_exposing_it_in_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = Temp::new();
+        let secrets = temp.0.join("secrets with spaces");
+        fs::create_dir(&secrets).unwrap();
+        let mounted = temp.0.join("mounted config.json");
+        fs::write(&mounted, "{}").unwrap();
+        let stub = temp.0.join("deep-obsidian-cli");
+        fs::write(
+            &stub,
+            "#!/bin/sh\n[ \"${DEEP_OBSIDIAN_AUTH_TOKEN:-}\" = \"$EXPECTED_TOKEN\" ] || exit 42\nprintf '%s\\n' \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let secret = "fixture-bearer-not-a-real-secret";
+        // Match the entrypoint: a nonempty secret file wins over an inherited
+        // environment value; empty/absent files leave that environment alone.
+        for (file, inherited, expected) in [
+            (
+                Some(format!("{secret}\nignored second line\n")),
+                Some("stale"),
+                secret,
+            ),
+            (Some(" \n".to_owned()), Some("fallback"), "fallback"),
+            (None, Some("fallback"), "fallback"),
+            (None, None, ""),
+        ] {
+            let token_file = secrets.join("auth_token");
+            if let Some(contents) = file {
+                fs::write(&token_file, contents).unwrap();
+            } else if token_file.exists() {
+                fs::remove_file(&token_file).unwrap();
+            }
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    CONTAINER_SCRIPT,
+                    "deep-obsidian-cli",
+                    "probe",
+                    "--json",
+                ])
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", temp.0.display()))
+                .env("DO_CONFIG_PATH", temp.config())
+                .env("DO_MOUNTED_CONFIG", &mounted)
+                .env("DO_SECRETS_DIR", &secrets)
+                .env("EXPECTED_TOKEN", expected);
+            if let Some(token) = inherited {
+                command.env("DEEP_OBSIDIAN_AUTH_TOKEN", token);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                stdout.lines().collect::<Vec<_>>(),
+                vec!["--config", mounted.to_str().unwrap(), "probe", "--json"]
+            );
+            assert!(!stdout.contains(secret));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        }
+        assert!(
+            !forward_args("watson", "deep-one", &strings(&["probe"]), false)
+                .iter()
+                .any(|argument| argument.contains(secret))
+        );
     }
     #[test]
     fn explicit_selection_saves_context_and_stable_container_name() {
