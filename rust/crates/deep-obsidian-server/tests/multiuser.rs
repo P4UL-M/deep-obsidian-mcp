@@ -640,3 +640,35 @@ async fn owners_manage_only_their_own_vault_and_transfer_before_leaving() {
             .contains("sharedword")
     );
 }
+
+#[tokio::test]
+async fn folders_only_listing_does_not_disclose_a_denied_mount() {
+    let f = Fixture::new(Role::Reader).await;
+    let response = tool(
+        &f.as_paul(),
+        "list_children",
+        json!({"path":"","foldersOnly":true}),
+    )
+    .await;
+    let data = structured(&response);
+    assert!(
+        !data["folders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "Laura"),
+        "{response}"
+    );
+    assert!(
+        data["folders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "Shared"),
+        "{response}"
+    );
+    assert_eq!(
+        data["count"].as_u64().unwrap() as usize,
+        data["folders"].as_array().unwrap().len()
+    );
+}
