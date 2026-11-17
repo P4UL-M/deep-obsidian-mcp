@@ -499,6 +499,7 @@ readiness reports it as such",
 
     let endpoints = build_service_endpoints(&config);
     let state = state.with_auth(auth_state);
+    state.start_mount_background();
     let control = crate::control::start(&state).map_err(io::Error::other)?;
     let live_state = state.clone();
 
@@ -542,7 +543,6 @@ readiness reports it as such",
     });
     // Every mount is refreshed and watched. A non-root mount that fails is logged
     // and left degraded rather than taking the service down with it.
-    live_state.start_mount_background();
 
     Ok(ServiceBootstrapContext {
         config,

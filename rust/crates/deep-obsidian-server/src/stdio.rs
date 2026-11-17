@@ -108,8 +108,8 @@ pub async fn run_stdio_service(config: ResolvedServiceConfig) -> io::Result<()> 
     let state =
         crate::multiuser::attach(AppState::with_backends(config.clone(), runtimes, &backends))
             .map_err(io::Error::other)?;
-    let _control = crate::control::start(&state).map_err(io::Error::other)?;
     state.start_mount_background();
+    let _control = crate::control::start(&state).map_err(io::Error::other)?;
     let state = if state.multiuser_enabled() {
         let username = std::env::var("DEEP_OBSIDIAN_USERNAME").map_err(|_| {
             io::Error::other(

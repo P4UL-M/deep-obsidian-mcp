@@ -47,6 +47,7 @@ fn lock(config: &ResolvedServiceConfig) -> Result<File> {
 }
 
 pub fn start(state: &AppState) -> Result<ControlGuard> {
+    state.control.as_ref().context("control store missing")?;
     let file = lock(&state.config)?;
     #[cfg(unix)]
     {
