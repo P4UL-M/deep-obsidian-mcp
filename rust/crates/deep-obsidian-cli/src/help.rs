@@ -180,6 +180,18 @@ fn style(command: Command, parents: &[String]) -> Command {
                     .help_heading("Service settings")
                     .display_order(100 + SETTINGS.iter().position(|key| *key == id).unwrap());
             }
+            arg = match id.as_str() {
+                "config" | "vault_path" | "local_config" | "sidecar_path" => arg.value_name("PATH"),
+                "index_dir" => arg.value_name("DIR"),
+                "probe_timeout_ms"
+                | "timeout_ms"
+                | "reindex_debounce_ms"
+                | "reindex_interval_ms" => arg.value_name("MS"),
+                "embedding_provider" => arg.value_name("PROVIDER"),
+                "embedding_model" => arg.value_name("MODEL"),
+                "embedding_base_url" => arg.value_name("URL"),
+                _ => arg,
+            };
             match id.as_str() {
                 "help" => arg
                     .action(ArgAction::HelpShort)
@@ -188,12 +200,8 @@ fn style(command: Command, parents: &[String]) -> Command {
                 "local" => arg.help("Use local configuration instead of the saved link"),
                 "json" => arg.help("Print machine-readable JSON"),
                 "dry_run" => arg.help("Preview changes without writing"),
-                "password_stdin" => {
-                    arg.help("Read the password from stdin; otherwise prompted masked")
-                }
-                "api_key_stdin" => {
-                    arg.help("Read the API key from stdin; otherwise prompted masked")
-                }
+                "password_stdin" => arg.help("Password from stdin; otherwise prompted masked"),
+                "api_key_stdin" => arg.help("API key from stdin; otherwise prompted masked"),
                 _ => arg,
             }
         });

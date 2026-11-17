@@ -1397,7 +1397,7 @@ fn cli_argv_never_enables_an_experimental_flag_without_an_answer() {
 }
 
 /// `mounts --help` and each nested command expose their own flags, and
-/// every other command keeps the summary it has always printed.
+/// diagnostic help stays specific to its own command.
 #[test]
 fn cli_argv_mounts_and_doctor_help_stay_command_specific() {
     let mounts_help = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))

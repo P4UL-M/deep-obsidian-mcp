@@ -26,17 +26,13 @@ Start with the guide for the task you are doing. CLI help stays short; use
 
 ## Reference
 
+- [OAuth protocol](oauth.md) — consent, client authorization and refresh behavior.
+
 - [demo.md](./demo.md) — `scripts/demo-multi-backend.sh`: a one-command, runnable tour of the multi-backend architecture (filesystem + CouchDB + Algolia under one namespace).
 - [mcp-reference.md](./mcp-reference.md) — MCP tools, resources, and prompts.
 - [architecture.md](./architecture.md) — indexing model, semantic backends, roadmap.
 - [algolia-mounts.md](./algolia-mounts.md) — the experimental shared Algolia corpus: design, versioning, CLI, security, limits.
 - [agent-workflows.md](./agent-workflows.md) — agent workflow patterns.
-
-## Service & packaging reference
-
-- [homebrew-service.md](./homebrew-service.md) — full Homebrew service model and troubleshooting.
-- [debian-package.md](./debian-package.md) — Debian/Ubuntu `.deb` and APT repository details.
-- [docker.md](./docker.md) — the container image and `docker-compose.example.yml`: env matrix, config precedence, the ephemeral-secret model, the CouchDB pairing flow.
 
 ## Maintainer / internal
 
@@ -45,8 +41,5 @@ Start with the guide for the task you are doing. CLI help stays short; use
 - [retrieval-eval.md](./retrieval-eval.md) — retrieval evaluation harness.
 - [release-checklist.md](./release-checklist.md) — release steps, and where the version lives.
 - [stack-merge-procedure.md](./stack-merge-procedure.md) — landing a long linear PR stack on `main` before a tag.
-- [migration-and-rollback.md](./migration-and-rollback.md) — moving a folder onto a remote backend, and getting back off it.
 - [homebrew-gap-todo.md](./homebrew-gap-todo.md) — outstanding release-artifact gaps.
 - [FIX_EMBEDDING_CONTEXT_CRASH.md](./FIX_EMBEDDING_CONTEXT_CRASH.md) — incident note.
-
-- [OAuth protocol](oauth.md) — consent, client authorization and refresh behavior.

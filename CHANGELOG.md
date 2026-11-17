@@ -2,6 +2,61 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## v0.2.0-alpha.10 — 2026-11-17
+
+### Added
+
+- Optional application users with private/shared vault memberships on one backend.
+  Reader, editor and owner grants apply to entire mounts and intersect with
+  backend capabilities. OAuth and stdio requests use the current user's grants
+  across search, resources, metadata, reads, writes and uploads.
+- `deep-obsidian-cli users` manages accounts, vault roles, default destinations
+  and generated-password rotation. The enablement wizard collects explicit
+  assignments and ownership before confirmation. Password rotation revokes the
+  user's existing authorizations; vault owners can manage their own memberships.
+- Private `control.sqlite` persists Argon2 password verifiers, grants, credential
+  generations and audit metadata. Live operator changes use a restricted local
+  Unix control socket; offline changes take the same exclusive state lock.
+- Independent OAuth authorization revocation at `/revoke`, plus user-bound
+  upload tokens with current-permission checks at consumption and while streaming.
+- Task-based [CLI](docs/cli.md) and [authentication](docs/authentication.md) guides,
+  including Docker contexts, local overrides, token recovery and rotation.
+
+### Changed
+
+- CLI help is a concise overview. `<command> --help` and `help <command>` show
+  command-specific options; nested help works without Docker, configuration or
+  a reachable backend. Misspelled commands/options return errors even when help
+  is requested. Detailed operation guidance lives in the documentation.
+- Documentation separates first setup, routine management, authentication,
+  multiuser operation and the configuration reference.
+- Docker-linked CLI calls load the service's bearer secret inside the container,
+  without putting its value in process arguments. HTTP probes report MCP/auth
+  errors instead of claiming success after an unsuccessful response.
+
+### Compatibility
+
+- Multiuser is opt-in. Classic access remains the default with no username.
+  Enabling requires at least one user and valid vault ownership; HTTP multiuser
+  requires OAuth. Existing CouchDB/LiveSync accounts and database provisioning
+  remain unchanged.
+- Disabling multiuser deletes all application accounts, grants and sessions,
+  invalidates their authorizations and restores classic access to all configured
+  mounts. Vault data and backend accounts remain intact.
+- Back up `control.sqlite` and its persisted `multiuser-mode.json` alongside the
+  service configuration. Config, control state and indexes must be outside served
+  filesystem vaults; multiuser rejects overlapping physical vault roots.
+- Live native management is supported on Linux/macOS. Windows can manage an
+  offline backend or link to a Linux Docker container.
+
+### Validation
+
+- Regression coverage includes private/shared isolation, owner transfer, live
+  grant changes, password/session revocation, user-bound uploads, wizard
+  cancellation, classic restoration, concise offline help and strict typo errors.
+- Release checks include Rust workspace tests, OAuth browser consent, sidecar
+  tests, Docker amd64/arm64 smoke tests, and Debian/APT package installation.
+
 ## v0.2.0-alpha.9 — 2026-11-17
 
 ### Changed
