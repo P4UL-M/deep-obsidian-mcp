@@ -337,3 +337,338 @@ async fn real_http_oauth_discovery_consent_mcp_and_binary_upload() {
         StatusCode::OK
     );
 }
+
+async fn cli_json(server: &Server, args: &[&str]) -> Value {
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
+        .args([
+            "--config",
+            server.directory.join("config.json").to_str().unwrap(),
+            "--json",
+        ])
+        .args(args)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+async fn user_tokens(server: &Server, name: &str, password: &str) -> (String, Value) {
+    let registered: Value = server
+        .client
+        .post(format!("{}/register", server.base))
+        .json(&json!({"redirect_uris":[REDIRECT]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let client = registered["client_id"].as_str().unwrap().to_owned();
+    let response = server
+        .client
+        .get(format!("{}/authorize", server.base))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", client.as_str()),
+            ("redirect_uri", REDIRECT),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let cookie = response.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let page = response.text().await.unwrap();
+    assert!(page.contains("name=\"username\""));
+    let nonce = page
+        .split("name=\"request_id\" value=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let response = server
+        .client
+        .post(format!("{}/authorize", server.base))
+        .header(header::ORIGIN, &server.base)
+        .header(header::COOKIE, cookie)
+        .form(&[
+            ("request_id", nonce),
+            ("decision", "allow"),
+            ("username", name),
+            ("password", password),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let code = location
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .unwrap()
+        .1
+        .to_string();
+    let tokens: Value = server
+        .client
+        .post(format!("{}/token", server.base))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client.as_str()),
+            ("redirect_uri", REDIRECT),
+            ("code", code.as_str()),
+            ("code_verifier", VERIFIER),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(tokens["access_token"].is_string(), "{tokens}");
+    (client, tokens)
+}
+
+#[tokio::test]
+async fn multiuser_cli_activation_oauth_rotation_revocation_and_classic_transition() {
+    let server = Server::start(true).await;
+    std::fs::write(
+        server.directory.join("vault/note.md"),
+        "# Shared note\nhello",
+    )
+    .unwrap();
+    let plan = server.directory.join("plan.json");
+    std::fs::write(&plan,json!([
+        {"name":"owner","grants":[{"mount_id":"vault","role":"owner"}],"default_mount":"vault"},
+        {"name":"reader","grants":[{"mount_id":"vault","role":"reader"}],"default_mount":"vault"}
+    ]).to_string()).unwrap();
+    let created = cli_json(
+        &server,
+        &["users", "enable", "--plan", plan.to_str().unwrap(), "--yes"],
+    )
+    .await;
+    let password = created["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["user"]["name"] == "reader")
+        .unwrap()["password"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        server
+            .mcp(Some(SECRET), "initialize", json!({}))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let health: Value = server
+        .client
+        .get(format!("{}/healthz", server.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(health.get("mounts").is_none() && health.get("vaultPath").is_none());
+    let (client, tokens) = user_tokens(&server, "reader", password).await;
+    let access = tokens["access_token"].as_str().unwrap();
+    let response: Value = server
+        .mcp(
+            Some(access),
+            "tools/call",
+            json!({"name":"read_file","arguments":{"path":"note.md"}}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(response["result"]["structuredContent"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("hello"));
+    let response: Value = server
+        .mcp(
+            Some(access),
+            "tools/call",
+            json!({"name":"upsert_note","arguments":{"path":"denied.md","content":"blocked"}}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(response.get("error").is_some());
+    cli_json(&server, &["users", "revoke", "reader", "--mount", "vault"]).await;
+    let response: Value = server
+        .mcp(
+            Some(access),
+            "tools/call",
+            json!({"name":"read_file","arguments":{"path":"note.md"}}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(response.get("error").is_some());
+    cli_json(
+        &server,
+        &[
+            "users", "grant", "reader", "--mount", "vault", "--role", "reader",
+        ],
+    )
+    .await;
+    // Upload tokens remain bound to their issuing user, even when another
+    // authorized user can write the same shared mount. Consumption checks the
+    // current role again after the token was minted.
+    let owner_password = created["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["user"]["name"] == "owner")
+        .unwrap()["password"]
+        .as_str()
+        .unwrap();
+    let (_, owner_tokens) = user_tokens(&server, "owner", owner_password).await;
+    let owner_access = owner_tokens["access_token"].as_str().unwrap();
+    cli_json(
+        &server,
+        &[
+            "users", "grant", "reader", "--mount", "vault", "--role", "editor",
+        ],
+    )
+    .await;
+    let mint = |path: &str| json!({"name":"request_vault_upload","arguments":{"path":path,"maxBytes":1024}});
+    let minted: Value = server
+        .mcp(
+            Some(owner_access),
+            "tools/call",
+            mint("Attachments/owned.bin"),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let url = minted["result"]["structuredContent"]["uploadUrl"]
+        .as_str()
+        .unwrap();
+    let wrong_user = server
+        .client
+        .put(url)
+        .bearer_auth(access)
+        .body("wrong user")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_user.status(), StatusCode::FORBIDDEN);
+    let uploaded = server
+        .client
+        .put(url)
+        .bearer_auth(owner_access)
+        .body("owner bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read(server.directory.join("vault/Attachments/owned.bin")).unwrap(),
+        b"owner bytes"
+    );
+    let minted: Value = server
+        .mcp(
+            Some(owner_access),
+            "tools/call",
+            mint("Attachments/revoked.bin"),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let url = minted["result"]["structuredContent"]["uploadUrl"]
+        .as_str()
+        .unwrap();
+    cli_json(
+        &server,
+        &[
+            "users", "grant", "reader", "--mount", "vault", "--role", "owner",
+        ],
+    )
+    .await;
+    cli_json(
+        &server,
+        &[
+            "users", "grant", "owner", "--mount", "vault", "--role", "reader",
+        ],
+    )
+    .await;
+    let revoked = server
+        .client
+        .put(url)
+        .bearer_auth(owner_access)
+        .body("revoked bytes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+    assert!(!server
+        .directory
+        .join("vault/Attachments/revoked.bin")
+        .exists());
+    let rotated = cli_json(&server, &["users", "rotate-password", "reader"]).await;
+    assert_ne!(rotated["password"], password);
+    assert_eq!(
+        server
+            .mcp(Some(access), "initialize", json!({}))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = server
+        .client
+        .post(format!("{}/token", server.base))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client.as_str()),
+            ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let (_, new_tokens) =
+        user_tokens(&server, "reader", rotated["password"].as_str().unwrap()).await;
+    cli_json(&server, &["users", "disable", "--yes"]).await;
+    assert_eq!(
+        server
+            .mcp(
+                Some(new_tokens["access_token"].as_str().unwrap()),
+                "initialize",
+                json!({})
+            )
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        server
+            .mcp(Some(SECRET), "initialize", json!({}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        std::fs::read_to_string(server.directory.join("vault/note.md"))
+            .unwrap()
+            .contains("hello")
+    );
+}

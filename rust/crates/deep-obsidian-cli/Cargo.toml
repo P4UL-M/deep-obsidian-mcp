@@ -24,6 +24,7 @@ clap.workspace = true
 deep-obsidian-algolia = { path = "../deep-obsidian-algolia" }
 deep-obsidian-backend = { path = "../deep-obsidian-backend" }
 deep-obsidian-config = { path = "../deep-obsidian-config" }
+deep-obsidian-control = { path = "../deep-obsidian-control" }
 deep-obsidian-core = { path = "../deep-obsidian-core" }
 deep-obsidian-server = { path = "../deep-obsidian-server" }
 deep-obsidian-types = { path = "../deep-obsidian-types" }

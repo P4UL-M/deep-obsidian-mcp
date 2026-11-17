@@ -848,3 +848,7 @@ within a single index.
 Omit `auth.oauth` to keep legacy bearer authentication. Add `auth.oauth` to enable
 Authorization Code + PKCE alongside the existing bearer token. See [OAuth setup](docs/oauth.md)
 for configuration, discovery, registration and restart behavior.
+
+## Optional application users
+
+Use `deep-obsidian-cli users enable --wizard` to opt into multiuser. Users and grants live in the backend state directory, separately from mount definitions and the CLI link profile. See [multiuser configuration, state and backups](docs/multiuser.md). Disabling through `users disable` deletes application identities and restores classic access to all mounts.

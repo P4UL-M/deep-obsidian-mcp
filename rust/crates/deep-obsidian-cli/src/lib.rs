@@ -8,6 +8,7 @@ pub mod mounts_cmd;
 pub mod secrets_cmd;
 pub mod service_entry;
 pub mod wizard;
+pub mod users_cmd;
 
 pub use cli::{
     Cli, Command, SecretField, SecretTarget, SecretsCommand, ServiceOptions, StdioMode,

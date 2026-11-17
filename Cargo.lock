@@ -664,6 +664,7 @@ dependencies = [
  "deep-obsidian-algolia",
  "deep-obsidian-backend",
  "deep-obsidian-config",
+ "deep-obsidian-control",
  "deep-obsidian-core",
  "deep-obsidian-server",
  "deep-obsidian-types",

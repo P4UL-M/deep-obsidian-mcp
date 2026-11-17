@@ -114,3 +114,7 @@ More reference and maintainer notes are indexed in [docs/](./docs/README.md).
 ## License
 
 MIT.
+
+### Multiuser and backend linking
+
+The optional [multiuser workflow](docs/multiuser.md) gives users private and shared vaults on one backend. Use `deep-obsidian-cli link` to select a Docker or local backend, then `deep-obsidian-cli users enable --wizard` to assign users and vault roles. `deep-obsidian-mcp` remains the service executable.

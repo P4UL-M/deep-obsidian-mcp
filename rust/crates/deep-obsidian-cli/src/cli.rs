@@ -103,6 +103,11 @@ pub struct ServiceOptions {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
+    /// Manage application users and vault grants.
+    Users {
+        #[command(subcommand)]
+        command: crate::users_cmd::UsersCommand,
+    },
     Serve,
     SetupService {
         #[arg(long)]

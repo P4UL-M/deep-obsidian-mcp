@@ -38,6 +38,8 @@ Usage:
   deep-obsidian-cli link [--container <name>] [--context <name>] [--local-config <path>]
   deep-obsidian-cli link --status
   deep-obsidian-cli unlink
+  deep-obsidian-cli users enable --wizard [--config <path>]
+  deep-obsidian-cli users <status|list|add|show|grant|revoke|default|rotate-password|remove|disable> [--help]
   deep-obsidian-cli setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--auth|--no-auth] [--dry-run]
   deep-obsidian-cli setup-service --wizard [--config <path>] [--dry-run]
   deep-obsidian-cli doctor [--config <path>] [--json] [--probe-remote]
@@ -363,7 +365,12 @@ pub async fn run() -> Result<()> {
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
     let raw_args = match crate::link::dispatch(&raw_args)? {
         crate::link::Dispatch::Continue(args) => args,
-        crate::link::Dispatch::Exit(code) => { if code != 0 { std::process::exit(code); } return Ok(()); }
+        crate::link::Dispatch::Exit(code) => {
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
     };
     // `--help` prints the hand-written summary for every command EXCEPT `mounts`, whose
     // help falls through to clap's derive.
@@ -375,7 +382,7 @@ pub async fn run() -> Result<()> {
     // has always printed, so `doctor --help` is unchanged.
     let (normalized_args, is_mounts_family) = normalize_cli_args_detailed(&raw_args)?;
     let wants_help = raw_args.iter().any(|arg| arg == "--help" || arg == "-h");
-    if wants_help && !is_mounts_family {
+    if wants_help && !is_mounts_family && !raw_args.iter().any(|arg| arg == "users") {
         println!("{HELP_TEXT}");
         return Ok(());
     }
@@ -394,6 +401,10 @@ pub async fn run() -> Result<()> {
     }
 
     match cli.command.unwrap_or(Command::Help) {
+        Command::Users { command } => {
+            let resolved = crate::config::resolve_runtime_config(&cli.options)?;
+            crate::users_cmd::run(command, &resolved.service, dry_run, json).await
+        }
         Command::Help => {
             println!("{HELP_TEXT}");
             Ok(())
@@ -807,6 +818,7 @@ fn is_known_command(token: &str) -> bool {
             | "algolia"
             | "mounts"
             | "secrets"
+            | "users"
             | "help"
             | "version"
     )
@@ -930,6 +942,10 @@ pub(crate) fn normalize_cli_args_detailed(raw_args: &[String]) -> Result<(Vec<St
 
     while index < raw_args.len() {
         let token = &raw_args[index];
+        if token == "users" {
+            normalized.extend(raw_args[index..].iter().cloned());
+            return Ok((normalized, false));
+        }
         if !in_mounts_family && token == "--vault-path" {
             saw_vault_flag = true;
             let (replacement, next_index) =
