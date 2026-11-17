@@ -250,7 +250,7 @@ fn require_couchdb<'backend>(
     backend.as_couchdb().ok_or_else(|| {
         anyhow!(
             "mount {mount_id:?} could not be initialized as a CouchDB vault (a missing \
-                 secret, or a missing sidecar bundle). Run `deep-obsidian-mcp doctor` for the \
+                 secret, or a missing sidecar bundle). Run `deep-obsidian-cli doctor` for the \
                  specific reason."
         )
     })

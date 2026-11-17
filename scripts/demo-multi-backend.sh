@@ -64,6 +64,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$REPO/target/debug/deep-obsidian-mcp"
+CLI_BIN="$REPO/target/debug/deep-obsidian-cli"
 MOCK_ALGOLIA_BIN="$REPO/target/debug/examples/mock_algolia"
 SIDECAR_DIR="$REPO/sidecar/livesync-sidecar"
 SIDECAR_BUNDLE="$SIDECAR_DIR/dist/sidecar.mjs"
@@ -179,7 +180,7 @@ else
   note "--no-build: using whatever is already in target/ and dist/"
 fi
 
-for artefact in "$BIN" "$MOCK_ALGOLIA_BIN" "$SIDECAR_BUNDLE"; do
+for artefact in "$BIN" "$CLI_BIN" "$MOCK_ALGOLIA_BIN" "$SIDECAR_BUNDLE"; do
   [[ -s "$artefact" ]] || die "missing build artefact: $artefact"
 done
 pass "binary, mock-Algolia example and sidecar bundle are present"
@@ -429,7 +430,7 @@ note "so nothing here depends on a timer firing."
 
 say "print-config: what the service will actually run"
 cmd "deep-obsidian-mcp --config <sandbox>/config.json print-config"
-PRINTED="$("$BIN" --config "$CONFIG" print-config)"
+PRINTED="$("$CLI_BIN" --config "$CONFIG" print-config)"
 printf '%s\n' "$PRINTED" | show
 assert_contains "print-config keeps the references" '"kind": "encryptedFile"' "$PRINTED"
 assert_not_contains "no CouchDB password value in print-config" "$COUCH_PASSWORD" "$PRINTED"
@@ -439,7 +440,7 @@ note "an identity function precisely because a persisted config has nothing secr
 
 say "doctor: local checks plus a read-only probe of both remotes"
 cmd "deep-obsidian-mcp --config <sandbox>/config.json doctor --probe-remote"
-DOCTOR_JSON="$("$BIN" --config "$CONFIG" doctor --json --probe-remote 2>/dev/null)"
+DOCTOR_JSON="$("$CLI_BIN" --config "$CONFIG" doctor --json --probe-remote 2>/dev/null)"
 printf '%s\n' "$DOCTOR_JSON" | pick 'd.checks.filter(c => c.name.startsWith("mount.")).map(c => `[${c.status}] ${c.name}: ${c.message}`).join("\n")'
 echo
 COUCH_PROBE="$(printf '%s\n' "$DOCTOR_JSON" | pick 'd.checks.find(c => c.name === "mount.team.remote").message')"
@@ -673,8 +674,8 @@ banner "HONEST DEGRADATION" \
   "Observed semantics are scripted here -- including what recovery really costs."
 
 say "First, an operator snapshot of the shared corpus (this is also step 10's tool)"
-cmd "deep-obsidian-mcp algolia dump --mount wiki --out <sandbox>/snapshots/wiki"
-"$BIN" --config "$CONFIG" algolia dump --mount wiki --out "$WORK/snapshots/wiki"
+cmd "deep-obsidian-cli algolia dump --mount wiki --out <sandbox>/snapshots/wiki"
+"$CLI_BIN" --config "$CONFIG" algolia dump --mount wiki --out "$WORK/snapshots/wiki"
 
 say "Now kill the Algolia mock"
 cmd "kill $ALGOLIA_PID"
@@ -720,8 +721,8 @@ note "so the next search is clean. But candidateCount is 0 -- and that is the ho
 note "part. This mock keeps its corpus in memory, so killing the process destroyed the"
 note "index too. A real Algolia outage would not; here the corpus has to come back from"
 note "the snapshot taken above, which is exactly what an operator would do:"
-cmd "deep-obsidian-mcp algolia restore --mount wiki --from <sandbox>/snapshots/wiki"
-"$BIN" --config "$CONFIG" algolia restore --mount wiki --from "$WORK/snapshots/wiki"
+cmd "deep-obsidian-cli algolia restore --mount wiki --from <sandbox>/snapshots/wiki"
+"$CLI_BIN" --config "$CONFIG" algolia restore --mount wiki --from "$WORK/snapshots/wiki"
 RESTORED="$(mcp hybrid_search '{"query":"federation","limit":10}')"
 printf '%s\n' "$RESTORED" | pick 'JSON.stringify({degraded: d.result.structuredContent.degraded, count: d.result.structuredContent.count, matches: d.result.structuredContent.matches.map(m => ({path: m.path, mountId: m.mountId}))}, null, 2)' | show
 echo
@@ -834,7 +835,7 @@ banner "OPS" \
 
 say "doctor, with the mount lines and the per-mount checks"
 cmd "deep-obsidian-mcp --config <sandbox>/config.json doctor --probe-remote"
-DOCTOR_TEXT="$("$BIN" --config "$CONFIG" doctor --probe-remote 2>&1)"
+DOCTOR_TEXT="$("$CLI_BIN" --config "$CONFIG" doctor --probe-remote 2>&1)"
 printf '%s\n' "$DOCTOR_TEXT" | grep -E '^(mount |\[(ok|warn|fail|skip)\] mount)' || true
 assert_contains "doctor lists the couchdb mount" "mount team at /Team (couchdb)" "$DOCTOR_TEXT"
 assert_contains "doctor lists the algolia mount" "mount wiki at /Wiki (algolia)" "$DOCTOR_TEXT"
@@ -851,7 +852,7 @@ echo
 
 say "couchdb export --mount team: the LiveSync vault as a directory tree"
 cmd "deep-obsidian-mcp --config <sandbox>/config.json couchdb export --mount team --out <sandbox>/export/team"
-"$BIN" --config "$CONFIG" couchdb export --mount team --out "$WORK/export/team"
+"$CLI_BIN" --config "$CONFIG" couchdb export --mount team --out "$WORK/export/team"
 echo
 find "$WORK/export/team" -type f | sed "s|$WORK/export/team|  team|" | sort
 say "and its manifest"
@@ -864,7 +865,7 @@ assert_contains "so is the fixture's binary attachment" "logo.png" \
 
 say "algolia dump --mount wiki: the shared corpus as a directory tree"
 cmd "deep-obsidian-mcp --config <sandbox>/config.json algolia dump --mount wiki --out <sandbox>/export/wiki"
-"$BIN" --config "$CONFIG" algolia dump --mount wiki --out "$WORK/export/wiki"
+"$CLI_BIN" --config "$CONFIG" algolia dump --mount wiki --out "$WORK/export/wiki"
 echo
 find "$WORK/export/wiki" -type f | sed "s|$WORK/export/wiki|  wiki|" | sort
 pick 'JSON.stringify({version: d.version, mount: d.mount, entries: d.entries.length, sample: d.entries.slice(0, 2)}, null, 2)' < "$WORK/export/wiki/manifest.json" | show

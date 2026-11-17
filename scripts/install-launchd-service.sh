@@ -78,7 +78,6 @@ mkdir -p "${LAUNCH_AGENTS_DIR}" "${LOG_DIR}"
 typeset -a program_arguments
 program_arguments=(
   "    <string>${SERVER_BIN}</string>"
-  "    <string>serve</string>"
   "    <string>--packaged</string>"
   "    <string>--transport</string>"
   "    <string>http</string>"

@@ -143,7 +143,7 @@ async fn real_cli_preserves_secret_references_overrides_and_mcp_auth() {
         let config_text = config.to_string();
         std::fs::write(&path, &config_text).unwrap();
         if let Some(key) = stored_key {
-            let mut store = tokio::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"));
+            let mut store = tokio::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"));
             let mut child = store
                 .args([
                     "--config",

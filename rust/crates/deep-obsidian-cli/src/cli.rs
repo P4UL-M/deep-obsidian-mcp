@@ -17,7 +17,7 @@ pub enum StdioMode {
 
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "deep-obsidian-mcp",
+    name = "deep-obsidian-cli",
     version,
     about = "Rust prototype CLI for deep-obsidian-mcp",
     disable_help_subcommand = true,
@@ -31,7 +31,7 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Args, Default)]
 pub struct ServiceOptions {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
@@ -323,7 +323,7 @@ pub enum MountsCommand {
 /// "ask me nothing" — the missing flags are reported together in one clap-style error, so
 /// a script never hangs on a prompt it cannot answer. Marking them `required` in clap
 /// would take that decision away from the code that knows whether a prompt is possible.
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 pub struct MountsAddCommon {
     /// Stable identifier for the mount: `[a-z0-9][a-z0-9-]*`.
     ///

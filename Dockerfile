@@ -75,6 +75,7 @@ COPY rust/crates/deep-obsidian-types/Cargo.toml ./rust/crates/deep-obsidian-type
 RUN set -eux; \
     for crate in rust/crates/*/; do mkdir -p "$crate/src"; : > "$crate/src/lib.rs"; done; \
     printf 'fn main() {}\n' > rust/crates/deep-obsidian-cli/src/main.rs; \
+    printf 'fn main() {}\n' > rust/crates/deep-obsidian-cli/src/service_main.rs; \
     cargo build --release --locked -p deep-obsidian-cli
 
 # The real sources. Every `.rs` is touched afterwards because cargo's freshness
@@ -88,7 +89,8 @@ COPY assets ./assets
 RUN set -eux; \
     find rust -name '*.rs' -exec touch {} +; \
     cargo build --release --locked -p deep-obsidian-cli; \
-    ./target/release/deep-obsidian-mcp version | grep -Eq '^[0-9]+\.[0-9]+'; \
+    ./target/release/deep-obsidian-cli version | grep -Eq '^[0-9]+\.[0-9]+'; \
+    ./target/release/deep-obsidian-mcp --version | grep -Eq '[0-9]+\.[0-9]+'; \
     ldd ./target/release/deep-obsidian-mcp
 
 # ---------------------------------------------------------------------------
@@ -148,6 +150,7 @@ RUN set -eux; \
         --create-home --shell /usr/sbin/nologin deepobsidian
 
 COPY --from=rust-builder /src/target/release/deep-obsidian-mcp /opt/deep-obsidian-mcp/bin/deep-obsidian-mcp
+COPY --from=rust-builder /src/target/release/deep-obsidian-cli /opt/deep-obsidian-mcp/bin/deep-obsidian-cli
 COPY --from=sidecar-builder /sidecar/dist/sidecar.mjs \
      /opt/deep-obsidian-mcp/share/deep-obsidian-mcp/sidecar/livesync-sidecar/dist/sidecar.mjs
 # The same packaged data the .deb installs under /usr/share/deep-obsidian-mcp, so

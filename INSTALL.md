@@ -77,10 +77,10 @@ Requires a [Rust toolchain](https://rustup.rs) and `ripgrep` on your `PATH`.
 ```bash
 git clone https://github.com/P4UL-M/deep-obsidian-mcp.git
 cd deep-obsidian-mcp
-cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp
+cargo build --release -p deep-obsidian-cli --bins
 ```
 
-The binary is at `target/release/deep-obsidian-mcp`. The `bin/deep-obsidian-mcp`
+The server is at `target/release/deep-obsidian-mcp` and its management client at `target/release/deep-obsidian-cli`. The `bin/deep-obsidian-mcp`
 wrapper finds the release (or debug) build automatically, so you can run either:
 
 ```bash
@@ -140,7 +140,7 @@ export DEEP_OBSIDIAN_NODE=/path/to/node     # only if `node` is not on the servi
 Verify — this contacts no CouchDB and needs no credentials:
 
 ```bash
-deep-obsidian-mcp doctor
+deep-obsidian-cli doctor
 ```
 
 It prints, per couchdb mount, whether the bundle was located and whether Node satisfies

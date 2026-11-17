@@ -234,24 +234,24 @@ Every command takes `--mount <id>`, and every one is secret-free in its output.
 ```bash
 # Import a local folder into the corpus, once. Defaults to the folder the mount
 # shadows (<vaultPath>/<mountAt>) — which is what a migration wants.
-deep-obsidian-mcp algolia seed --mount team-wiki --dry-run
-deep-obsidian-mcp algolia seed --mount team-wiki
-deep-obsidian-mcp algolia seed --mount team-wiki --from ~/Notes/wiki --move
+deep-obsidian-cli algolia seed --mount team-wiki --dry-run
+deep-obsidian-cli algolia seed --mount team-wiki
+deep-obsidian-cli algolia seed --mount team-wiki --from ~/Notes/wiki --move
 
 # The backup / exit strategy. Deterministic: two dumps of an unchanged corpus are
 # byte-identical, so `diff -r` verifies a round trip.
-deep-obsidian-mcp algolia dump --mount team-wiki --out ~/Backups/team-wiki
-deep-obsidian-mcp algolia restore --mount team-wiki --from ~/Backups/team-wiki --dry-run
-deep-obsidian-mcp algolia restore --mount team-wiki --from ~/Backups/team-wiki --force
+deep-obsidian-cli algolia dump --mount team-wiki --out ~/Backups/team-wiki
+deep-obsidian-cli algolia restore --mount team-wiki --from ~/Backups/team-wiki --dry-run
+deep-obsidian-cli algolia restore --mount team-wiki --from ~/Backups/team-wiki --force
 
 # Reachability, provisioning, note and version counts, divergence, retention.
-deep-obsidian-mcp algolia status --mount team-wiki
+deep-obsidian-cli algolia status --mount team-wiki
 
 # The ONE destructive operation. Prompts unless --yes. Never an MCP tool.
-deep-obsidian-mcp algolia retract --mount team-wiki --path _Wiki/Decisions/Mistake.md
+deep-obsidian-cli algolia retract --mount team-wiki --path _Wiki/Decisions/Mistake.md
 
 # A scoped read-only key for a teammate.
-deep-obsidian-mcp algolia key --mount team-wiki \
+deep-obsidian-cli algolia key --mount team-wiki \
   --parent-key-ref env:SEARCH_ONLY_KEY --prefix _Wiki
 ```
 

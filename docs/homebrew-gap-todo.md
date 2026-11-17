@@ -49,4 +49,4 @@ This document tracks what is still missing before `deep-obsidian-mcp` can be tre
 
 ## Exit Condition
 
-This gap list is complete when a user can install the formula from the tap, run `deep-obsidian-mcp setup-service --vault ~/Vault`, start it with `brew services`, and validate it with `doctor` and `probe` without touching the source checkout.
+This gap list is complete when a user can install the formula from the tap, run `deep-obsidian-cli setup-service --vault ~/Vault`, start it with `brew services`, and validate it with `doctor` and `probe` without touching the source checkout.

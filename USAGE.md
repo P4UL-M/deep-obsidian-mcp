@@ -18,7 +18,7 @@ gets, see [docs/mcp-reference.md](./docs/mcp-reference.md).
 interactive wizard for a first install:
 
 ```bash
-deep-obsidian-mcp setup-service --wizard
+deep-obsidian-cli setup-service --wizard
 ```
 
 It walks six screens, in this order:
@@ -51,7 +51,7 @@ without regenerating the rest of the file.
 Or pass the choices directly (good for scripts):
 
 ```bash
-deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
+deep-obsidian-cli setup-service --vault ~/Vault --mcp --skills --vault-snippets
 ```
 
 - `--mcp` — register the server with local agents (Codex in `~/.codex/config.toml`, and Claude Code via `claude mcp add` when the CLI is present).
@@ -122,11 +122,11 @@ packaged path — see [docs/homebrew-service.md](./docs/homebrew-service.md).
 ## 4. Check it's working & troubleshoot
 
 ```bash
-deep-obsidian-mcp doctor        # diagnose config, vault access, index, dependencies
-deep-obsidian-mcp probe         # exercise the HTTP health and MCP endpoints
-deep-obsidian-mcp print-config  # show the resolved configuration (secrets redacted)
-deep-obsidian-mcp mounts list   # what is mounted where (experimental multi-backend vaults)
-deep-obsidian-mcp secrets check # does every stored credential still resolve? (no value printed)
+deep-obsidian-cli doctor        # diagnose config, vault access, index, dependencies
+deep-obsidian-cli probe         # exercise the HTTP health and MCP endpoints
+deep-obsidian-cli print-config  # show the resolved configuration (secrets redacted)
+deep-obsidian-cli mounts list   # what is mounted where (experimental multi-backend vaults)
+deep-obsidian-cli secrets check # does every stored credential still resolve? (no value printed)
 ```
 
 `secrets check` is also how you rotate one: it names the `secrets set` command for any

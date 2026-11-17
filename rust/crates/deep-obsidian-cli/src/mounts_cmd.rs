@@ -628,7 +628,7 @@ fn base_mount_table(
         }
         bail!(
             "{} declares neither `vaultPath` nor `mounts`, so there is no vault to add a mount \
-             beside. Run `deep-obsidian-mcp setup-service --vault <path>` first.",
+             beside. Run `deep-obsidian-cli setup-service --vault <path>` first.",
             config_path.display()
         );
     };
@@ -1341,7 +1341,7 @@ pub async fn add_with_resolver(
     let existing = load_config_file(config_path)?.ok_or_else(|| {
         anyhow!(
             "no config file at {}: `mounts add` edits an existing config rather than inventing \
-             one. Run `deep-obsidian-mcp setup-service --vault <path>` first, then add mounts \
+             one. Run `deep-obsidian-cli setup-service --vault <path>` first, then add mounts \
              to it.",
             config_path.display()
         )
@@ -1464,7 +1464,7 @@ pub async fn add_with_resolver(
 pub fn list(config_path: &Path) -> Result<MountsListReport> {
     let existing = load_config_file(config_path)?.ok_or_else(|| {
         anyhow!(
-            "no config file at {}. Run `deep-obsidian-mcp setup-service --vault <path>` to \
+            "no config file at {}. Run `deep-obsidian-cli setup-service --vault <path>` to \
              create one.",
             config_path.display()
         )

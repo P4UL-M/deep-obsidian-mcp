@@ -46,7 +46,6 @@ fi
 
 typeset -a args
 args=(
-  "serve"
   "--packaged"
   "--transport" "http"
   "--host" "${HOST}"

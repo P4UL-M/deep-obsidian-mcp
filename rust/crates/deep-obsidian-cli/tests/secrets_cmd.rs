@@ -848,7 +848,7 @@ fn check_reports_every_reference_and_flags_the_missing_ones() {
     );
     // A missing reference is followed by the way to fix it...
     assert!(
-        text.contains("rotate with: deep-obsidian-mcp secrets set --mount wiki --field api-key"),
+        text.contains("rotate with: deep-obsidian-cli secrets set --mount wiki --field api-key"),
         "{text}"
     );
     // ... and the environment-override caveat is always present, because without it a
@@ -978,7 +978,7 @@ fn run(
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .env("XDG_CONFIG_HOME", xdg)
         .arg("--config")
         .arg(config_path)
@@ -1254,13 +1254,13 @@ fn cli_argv_reports_the_refusals() {
 /// guards that exception from spreading by accident.
 #[test]
 fn cli_argv_secrets_help_is_the_hand_written_summary() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .args(["secrets", "--help"])
         .output()
         .expect("run --help");
     let text = String::from_utf8_lossy(&output.stdout).to_string();
     assert!(
-        text.starts_with("Usage:\n  deep-obsidian-mcp [serve]"),
+        text.starts_with("Usage:\n  deep-obsidian-cli <command>"),
         "{text}"
     );
     assert!(

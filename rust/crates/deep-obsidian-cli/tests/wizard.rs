@@ -1173,7 +1173,7 @@ fn a_fully_flagged_add_asks_nothing_and_needs_no_terminal() {
 fn cli_argv_reaches_the_wizard_and_a_closed_stdin_writes_nothing() {
     let base = temp_dir("argv-wizard");
     let config_path = base.join("config.json");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .arg("--config")
         .arg(&config_path)
         .args(["setup-service", "--wizard"])
@@ -1241,7 +1241,7 @@ fn cli_argv_completes_a_local_install_and_prints_its_report_once() {
     .join("\n")
         + "\n";
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .arg("--config")
         .arg(&config_path)
         // An explicit index dir: without one the packaged default would put this test's index
@@ -1325,7 +1325,7 @@ fn cli_argv_reports_missing_mount_flags_instead_of_hanging() {
     )
     .expect("seed config");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-mcp"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_deep-obsidian-cli"))
         .arg("--config")
         .arg(&config_path)
         .args(["mounts", "add", "couchdb", "--url", "https://couch.example"])

@@ -1,5 +1,8 @@
 # Running deep-obsidian-mcp in Docker
 
+The image installs two real executables: `deep-obsidian-mcp` is the long-running
+server (PID 1); `deep-obsidian-cli` handles configuration and management.
+
 The container is a long-lived HTTP MCP server: bearer-authenticated, non-root, with
 its index on a volume and its credentials nowhere. It is the deployment shape for a
 CouchDB-backed vault in particular — the Obsidian LiveSync database that your
@@ -108,7 +111,7 @@ a secret (secrets are files — see [below](#secrets-are-ephemeral)).
    loader's own message), injects secrets into the references it declares, and
    serves it. Nothing is derived, and `/var/lib/deep-obsidian-mcp/config.json` is
    not created. This is the path for a config you built with
-   `deep-obsidian-mcp setup-service --wizard` on your laptop, and the only path for
+   `deep-obsidian-cli setup-service --wizard` on your laptop, and the only path for
    a multi-mount table.
 2. **Otherwise the environment derives a config, once**, into
    `/var/lib/deep-obsidian-mcp/config.json`. That file is on the volume, so every
@@ -339,7 +342,7 @@ Three stages, one runtime:
 
 | Stage | Base | Produces |
 | --- | --- | --- |
-| `rust-builder` | `rust:1-bookworm` | `deep-obsidian-mcp`, `--release`, deps cooked in a cached layer before sources |
+| `rust-builder` | `rust:1-bookworm` | `deep-obsidian-mcp` and `deep-obsidian-cli`, `--release`, deps cooked in a cached layer before sources |
 | `sidecar-builder` | `node:20-slim` | `sidecar/livesync-sidecar/dist/sidecar.mjs` via `npm ci && npm run build` |
 | `runtime` | `node:20-slim` | the binary, the bundle, `ripgrep`, `curl`, the packaged skills/snippets/assets |
 

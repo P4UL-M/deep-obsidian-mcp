@@ -34,31 +34,33 @@ const INDEX_SQLITE_FILENAME: &str = "index.sqlite";
 const CONFIG_PRECEDENCE: [&str; 4] = ["cli", "config", "env", "default"];
 const HELP_TEXT: &str = "\
 Usage:
-  deep-obsidian-mcp [serve] [--config <path>] [--vault <path>] [--transport stdio|http] [--packaged]
-  deep-obsidian-mcp setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--auth|--no-auth] [--dry-run]
-  deep-obsidian-mcp setup-service --wizard [--config <path>] [--dry-run]
-  deep-obsidian-mcp doctor [--config <path>] [--json] [--probe-remote]
-  deep-obsidian-mcp print-config [--config <path>]
-  deep-obsidian-mcp probe [--config <path>] [--json]
-  deep-obsidian-mcp couchdb export --mount <id> --out <dir> [--config <path>] [--json]
-  deep-obsidian-mcp couchdb restore --mount <id> --from <dir> [--dry-run] [--force] [--json]
-  deep-obsidian-mcp algolia seed --mount <id> [--from <folder>] [--dry-run] [--move] [--json]
-  deep-obsidian-mcp algolia dump --mount <id> --out <dir> [--json]
-  deep-obsidian-mcp algolia restore --mount <id> --from <dir> [--dry-run] [--force] [--json]
-  deep-obsidian-mcp algolia status --mount <id> [--json]
-  deep-obsidian-mcp algolia retract --mount <id> --path <note> [--yes] [--json]
-  deep-obsidian-mcp algolia key --mount <id> [--parent-key-ref <ref>] [--prefix <folder>] [--json]
-  deep-obsidian-mcp mounts add filesystem [--id <id>] [--mount-at <prefix>] [--vault-path <dir>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
-  deep-obsidian-mcp mounts add couchdb [--id <id>] [--mount-at <prefix>] [--url <origin>] [--database <db>] [--username <user>] [--password-stdin] [--writable] [--e2ee] [--sidecar-path <file>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
-  deep-obsidian-mcp mounts add algolia [--id <id>] [--mount-at <prefix>] [--app-id <id>] [--index-name <index>] [--base-url <url>] [--api-key-stdin] [--writable] [--participant-id <who>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
-  deep-obsidian-mcp mounts list [--json]
-  deep-obsidian-mcp mounts remove --id <id> [--purge-index] [--yes] [--json]
-  deep-obsidian-mcp secrets set --mount <id> [--field password|e2ee-passphrase|api-key] [--stdin] [--dry-run] [--json]
-  deep-obsidian-mcp secrets set --target auth-token|embedding-api-key [--stdin] [--dry-run] [--json]
-  deep-obsidian-mcp secrets check [--json]
+  deep-obsidian-cli <command> [--config <path>]
+  deep-obsidian-cli link [--container <name>] [--context <name>] [--local-config <path>]
+  deep-obsidian-cli link --status
+  deep-obsidian-cli unlink
+  deep-obsidian-cli setup-service --vault <path> [--config <path>] [--mcp] [--skills] [--vault-snippets] [--auth|--no-auth] [--dry-run]
+  deep-obsidian-cli setup-service --wizard [--config <path>] [--dry-run]
+  deep-obsidian-cli doctor [--config <path>] [--json] [--probe-remote]
+  deep-obsidian-cli print-config [--config <path>]
+  deep-obsidian-cli probe [--config <path>] [--json]
+  deep-obsidian-cli couchdb export --mount <id> --out <dir> [--config <path>] [--json]
+  deep-obsidian-cli couchdb restore --mount <id> --from <dir> [--dry-run] [--force] [--json]
+  deep-obsidian-cli algolia seed --mount <id> [--from <folder>] [--dry-run] [--move] [--json]
+  deep-obsidian-cli algolia dump --mount <id> --out <dir> [--json]
+  deep-obsidian-cli algolia restore --mount <id> --from <dir> [--dry-run] [--force] [--json]
+  deep-obsidian-cli algolia status --mount <id> [--json]
+  deep-obsidian-cli algolia retract --mount <id> --path <note> [--yes] [--json]
+  deep-obsidian-cli algolia key --mount <id> [--parent-key-ref <ref>] [--prefix <folder>] [--json]
+  deep-obsidian-cli mounts add filesystem [--id <id>] [--mount-at <prefix>] [--vault-path <dir>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
+  deep-obsidian-cli mounts add couchdb [--id <id>] [--mount-at <prefix>] [--url <origin>] [--database <db>] [--username <user>] [--password-stdin] [--writable] [--e2ee] [--sidecar-path <file>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
+  deep-obsidian-cli mounts add algolia [--id <id>] [--mount-at <prefix>] [--app-id <id>] [--index-name <index>] [--base-url <url>] [--api-key-stdin] [--writable] [--participant-id <who>] [--index-dir <dir>] [--keep-anyway] [--yes] [--json]
+  deep-obsidian-cli mounts list [--json]
+  deep-obsidian-cli mounts remove --id <id> [--purge-index] [--yes] [--json]
+  deep-obsidian-cli secrets set --mount <id> [--field password|e2ee-passphrase|api-key] [--stdin] [--dry-run] [--json]
+  deep-obsidian-cli secrets set --target auth-token|embedding-api-key [--stdin] [--dry-run] [--json]
+  deep-obsidian-cli secrets check [--json]
 
 Commands:
-  serve          Start the MCP server using resolved config.
   setup-service  Validate service config and optionally install MCP client entries, skills, or vault snippets.
   doctor         Diagnose config, vault access, dependencies, and health.
   print-config   Print the normalized persisted config.
@@ -86,7 +88,7 @@ recallWeight or cache.
 mounts is the checkable way to build a mount table, which setup-service refuses to
 rewrite. Every write goes through the same config loader the server uses, so this
 command cannot produce a config the server would then refuse to load; run
-`deep-obsidian-mcp mounts add --help` for the per-kind flags.
+`deep-obsidian-cli mounts add --help` for the per-kind flags.
 
 mounts add is GUIDED when flags are missing: on a terminal it asks the same per-kind
 questions the wizard asks, treating the flags you did give as answers already supplied,
@@ -359,6 +361,10 @@ pub struct ServeReport {
 
 pub async fn run() -> Result<()> {
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
+    let raw_args = match crate::link::dispatch(&raw_args)? {
+        crate::link::Dispatch::Continue(args) => args,
+        crate::link::Dispatch::Exit(code) => { if code != 0 { std::process::exit(code); } return Ok(()); }
+    };
     // `--help` prints the hand-written summary for every command EXCEPT `mounts`, whose
     // help falls through to clap's derive.
     //
@@ -378,7 +384,7 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let cli = Cli::parse_from(iter::once("deep-obsidian-mcp".to_string()).chain(normalized_args));
+    let cli = Cli::parse_from(iter::once("deep-obsidian-cli".to_string()).chain(normalized_args));
     let json = cli.options.json && !cli.options.no_json;
     let dry_run = cli.options.dry_run && !cli.options.no_dry_run;
 
@@ -387,7 +393,7 @@ pub async fn run() -> Result<()> {
         std::env::set_var("DEEP_OBSIDIAN_ALLOW_INSECURE", "1");
     }
 
-    match cli.command.unwrap_or(Command::Serve) {
+    match cli.command.unwrap_or(Command::Help) {
         Command::Help => {
             println!("{HELP_TEXT}");
             Ok(())
@@ -396,11 +402,9 @@ pub async fn run() -> Result<()> {
             println!("{VERSION}");
             Ok(())
         }
-        Command::Serve => {
-            let resolved = crate::config::resolve_runtime_config(&cli.options)?;
-            serve(&resolved).await?;
-            Ok(())
-        }
+        Command::Serve => Err(anyhow!(
+            "deep-obsidian-cli manages a backend; run deep-obsidian-mcp to serve MCP requests"
+        )),
         Command::SetupService {
             overwrite,
             wizard,
@@ -729,7 +733,7 @@ fn normalize_optional_bool_flag(
     }
 
     if let Some(value) = args.get(index + 1) {
-        if !value.starts_with('-') {
+        if !value.starts_with('-') && !is_known_command(value) {
             return Ok((
                 if parse_boolean_like(value, true) {
                     positive.to_string()
@@ -900,7 +904,7 @@ fn normalize_cli_args(raw_args: &[String]) -> Result<Vec<String>> {
 /// `algolia status --mount mounts --help` must still print `HELP_TEXT`. This scan already
 /// distinguishes a command from a flag's value — it has to, to decide what becomes
 /// `--vault` — so answering the question here costs one `bool` and duplicates nothing.
-fn normalize_cli_args_detailed(raw_args: &[String]) -> Result<(Vec<String>, bool)> {
+pub(crate) fn normalize_cli_args_detailed(raw_args: &[String]) -> Result<(Vec<String>, bool)> {
     let mut normalized = Vec::with_capacity(raw_args.len() + 2);
     let mut index = 0;
     let mut pending_vault_path: Option<String> = None;
@@ -1230,7 +1234,7 @@ pub fn setup_service(request: &SetupServiceRequest<'_>) -> Result<SetupServiceRe
     if declared_mounts {
         vault_access_messages.push(format!(
             "mounts config detected ({} mounts): leaving {} untouched. setup-service does not \
-             rewrite a declared mount table — use `deep-obsidian-mcp mounts add` / `mounts \
+             rewrite a declared mount table — use `deep-obsidian-cli mounts add` / `mounts \
              remove` to change it, which validates the whole table before writing, or edit the \
              file directly for the per-mount settings those commands do not expose.",
             service.mounts.len(),
@@ -1291,7 +1295,7 @@ pub fn setup_service(request: &SetupServiceRequest<'_>) -> Result<SetupServiceRe
         anyhow::bail!(
             "setup-service cannot change auth on a config that declares a mount table: it does \
              not rewrite such a file, so the token would be stored with nothing referencing it. \
-             Edit the `auth` section of {} by hand — `deep-obsidian-mcp print-config` shows the \
+             Edit the `auth` section of {} by hand — `deep-obsidian-cli print-config` shows the \
              current shape — and put the token in the OS keyring or the encrypted secrets file \
              at {} under the id the `tokenRef` names.",
             config_path.display(),
@@ -1387,8 +1391,8 @@ pub fn setup_service(request: &SetupServiceRequest<'_>) -> Result<SetupServiceRe
         // that this command cannot reproduce faithfully.
         final_messages.push(format!(
             "config not written: {} declares a mount table, which setup-service does not \
-             rewrite (--overwrite does not apply). Use `deep-obsidian-mcp mounts add` / \
-             `mounts remove` to change the table; `deep-obsidian-mcp print-config` shows what \
+             rewrite (--overwrite does not apply). Use `deep-obsidian-cli mounts add` / \
+             `mounts remove` to change the table; `deep-obsidian-cli print-config` shows what \
              this build reads from the file.",
             config_path.display()
         ));
@@ -1558,9 +1562,9 @@ pub(crate) fn refuse_wizard_on_a_mounts_config(
     Err(anyhow!(
         "the setup wizard cannot edit {}: it declares a mount table, and setup-service does not \
          rewrite one (a mount table is the one thing in this file it cannot reproduce \
-         faithfully). Use `deep-obsidian-mcp mounts add` / `mounts list` / `mounts remove` for \
+         faithfully). Use `deep-obsidian-cli mounts add` / `mounts list` / `mounts remove` for \
          the table — they validate it through the same loader the server uses — and \
-         `deep-obsidian-mcp print-config` for what this build reads from the file. The \
+         `deep-obsidian-cli print-config` for what this build reads from the file. The \
          non-config installers still work: `setup-service --mcp --skills --vault-snippets`.",
         config_path.display()
     ))
@@ -2733,7 +2737,7 @@ fn macos_vault_access_guidance(vault_path: &Path, privacy_opened: bool) -> Strin
         let _ = writeln!(&mut message, "  {}", candidate.display());
     }
     let _ = writeln!(&mut message, "  brew services restart deep-obsidian-mcp");
-    let _ = write!(&mut message, "  deep-obsidian-mcp doctor");
+    let _ = write!(&mut message, "  deep-obsidian-cli doctor");
     message
 }
 

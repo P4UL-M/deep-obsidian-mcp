@@ -120,6 +120,7 @@ else
   fail "deep-obsidian-mcp version printed '$VERSION_OUT'"
 fi
 check "deep-obsidian-mcp on PATH" run_in_image 'command -v deep-obsidian-mcp'
+check "deep-obsidian-cli on PATH" run_in_image 'command -v deep-obsidian-cli'
 check "ripgrep (rg) on PATH" run_in_image 'command -v rg'
 check "node on PATH (the couchdb sidecar runtime)" run_in_image 'command -v node'
 check "curl on PATH (the HEALTHCHECK's only dependency)" run_in_image 'command -v curl'
@@ -358,7 +359,7 @@ HEALTH_CODE=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/he
 
 # The index must not land inside the vault: a vault can be a read-only bind mount,
 # and an in-vault index is a directory an Obsidian client would sync.
-CONF_DUMP=$(docker exec "$C1" deep-obsidian-mcp --config /var/lib/deep-obsidian-mcp/config.json print-config 2>&1)
+CONF_DUMP=$(docker exec "$C1" deep-obsidian-cli --config /var/lib/deep-obsidian-mcp/config.json print-config 2>&1)
 if printf '%s\n' "$CONF_DUMP" | grep -e '/var/lib/deep-obsidian-mcp/index' >/dev/null; then
   pass "indexDir resolves onto the volume (/var/lib/deep-obsidian-mcp/index)"
 else
@@ -461,7 +462,7 @@ docker run -d --name "$C3" \
   "$IMAGE" >/dev/null
 if wait_for_health "$C3"; then
   pass "server is up from the mounted config (DO_ROOT_KIND=couchdb was ignored)"
-  MOUNTED_DUMP=$(docker exec "$C3" deep-obsidian-mcp --config /etc/deep-obsidian/config.json print-config 2>&1)
+  MOUNTED_DUMP=$(docker exec "$C3" deep-obsidian-cli --config /etc/deep-obsidian/config.json print-config 2>&1)
   printf '%s\n' "$MOUNTED_DUMP" | grep -e mountedroot >/dev/null \
     && pass "the mounted config's mount id ('mountedroot') is what resolves" \
     || { fail "the mounted config's mount id is not what resolved"; printf '%s\n' "$MOUNTED_DUMP" | head -30; }

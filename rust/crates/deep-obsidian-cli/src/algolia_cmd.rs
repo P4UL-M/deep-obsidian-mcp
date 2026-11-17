@@ -137,7 +137,7 @@ fn require_algolia<'backend>(
     backend.as_algolia().ok_or_else(|| {
         anyhow!(
             "mount {mount_id:?} could not be initialized as an Algolia vault (most likely its \
-             `apiKeyRef` secret is not stored). Run `deep-obsidian-mcp doctor` for the specific \
+             `apiKeyRef` secret is not stored). Run `deep-obsidian-cli doctor` for the specific \
              reason."
         )
     })

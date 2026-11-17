@@ -79,7 +79,8 @@ is_true() {
     esac
 }
 
-BIN=/opt/deep-obsidian-mcp/bin/deep-obsidian-mcp
+SERVER_BIN=/opt/deep-obsidian-mcp/bin/deep-obsidian-mcp
+CLI_BIN=/opt/deep-obsidian-mcp/bin/deep-obsidian-cli
 
 : "${DO_STATE_DIR:=/var/lib/deep-obsidian-mcp}"
 : "${DO_CONFIG_PATH:=$DO_STATE_DIR/config.json}"
@@ -115,7 +116,7 @@ SECRETS_STORE="$XDG_CONFIG_HOME/deep-obsidian-mcp/secrets.json"
 # Every CLI invocation goes through here so none can forget `--config` and silently
 # read the (empty, ephemeral) default path under $XDG_CONFIG_HOME instead.
 CONFIG=""
-cli() { "$BIN" --config "$CONFIG" "$@"; }
+cli() { "$CLI_BIN" --config "$CONFIG" "$@"; }
 
 # ---------------------------------------------------------------------------
 # 1. Pick the config
@@ -379,8 +380,8 @@ cli secrets check >&2 || log "WARNING: 'secrets check' reported a missing or unr
 # 5. Anything other than `serve` runs and exits
 # ---------------------------------------------------------------------------
 if [ "$#" -gt 0 ] && [ "$1" != serve ]; then
-    log "running: deep-obsidian-mcp $*"
-    exec "$BIN" --config "$CONFIG" "$@"
+    log "running management command through deep-obsidian-cli"
+    exec "$CLI_BIN" --config "$CONFIG" "$@"
 fi
 
 # ---------------------------------------------------------------------------
@@ -417,11 +418,10 @@ fi
 # handles SIGTERM by stopping its sidecar children before exiting, which a shell
 # wrapper swallowing the signal would turn into a 10-second SIGKILL on every
 # `docker stop`.
-log "starting: deep-obsidian-mcp serve --transport http --host $DO_HTTP_HOST --port $DO_HTTP_PORT"
-exec "$BIN" \
+log "starting: deep-obsidian-mcp --transport http --host $DO_HTTP_HOST --port $DO_HTTP_PORT"
+exec "$SERVER_BIN" \
     --config "$CONFIG" \
     --transport http \
     --host "$DO_HTTP_HOST" \
     --port "$DO_HTTP_PORT" \
-    ${INSECURE_FLAG:+$INSECURE_FLAG} \
-    serve
+    ${INSECURE_FLAG:+$INSECURE_FLAG}

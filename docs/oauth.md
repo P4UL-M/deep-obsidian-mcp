@@ -7,7 +7,7 @@ challenge when OAuth is absent. Health and readiness remain unauthenticated.
 
 ## Enable legacy + OAuth
 
-Run `deep-obsidian-mcp setup-service --wizard`, choose HTTP, enable authentication,
+Run `deep-obsidian-cli setup-service --wizard`, choose HTTP, enable authentication,
 then choose **Legacy bearer + OAuth (MCP / ChatGPT)** and enter the public HTTPS
 origin. The wizard preserves existing token references and defaults to the current
 mode when editing an existing setup. Choosing stdio preserves the HTTP auth config.

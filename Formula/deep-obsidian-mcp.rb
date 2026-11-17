@@ -47,7 +47,7 @@ class DeepObsidianMcp < Formula
   def caveats
     <<~EOS
       Configure the service before starting it:
-        deep-obsidian-mcp setup-service --vault ~/Vault --mcp --skills --vault-snippets
+        deep-obsidian-cli setup-service --vault ~/Vault --mcp --skills --vault-snippets
 
       On macOS, setup-service performs an interactive vault access preflight.
       If your vault is under Documents, Desktop, Downloads, or iCloud Drive, approve the
@@ -56,7 +56,7 @@ class DeepObsidianMcp < Formula
 
       Then start and validate:
         brew services start P4UL-M/tap/deep-obsidian-mcp
-        deep-obsidian-mcp doctor
+        deep-obsidian-cli doctor
         curl -fsS http://127.0.0.1:4100/readyz
 
       Homebrew services run in packaged mode, so default indexes live outside the vault under:
@@ -77,7 +77,7 @@ class DeepObsidianMcp < Formula
 
       EXPERIMENTAL multi-backend mounts (couchdb, algolia) are opt-in per mount and are
       configured by editing config.json by hand — setup-service deliberately does not
-      rewrite a mount table. `deep-obsidian-mcp print-config` shows what this build reads.
+      rewrite a mount table. `deep-obsidian-cli print-config` shows what this build reads.
 
       A couchdb (Self-hosted LiveSync) mount additionally needs the LiveSync sidecar
       bundle, which this formula now INSTALLS from the release, at the path the binary
@@ -97,14 +97,14 @@ class DeepObsidianMcp < Formula
       per mount with "sidecarPath" in config.json, or globally:
         export DEEP_OBSIDIAN_LIVESYNC_SIDECAR=/path/to/dist/sidecar.mjs
 
-      `deep-obsidian-mcp doctor` reports, per mount, whether the bundle and a suitable
+      `deep-obsidian-cli doctor` reports, per mount, whether the bundle and a suitable
       Node were found. Every other mount kind — including the default filesystem vault —
       needs no Node at all.
     EOS
   end
 
   service do
-    run [opt_bin/"deep-obsidian-mcp", "serve", "--packaged", "--transport", "http"]
+    run [opt_bin/"deep-obsidian-mcp", "--packaged", "--transport", "http"]
     keep_alive true
     environment_variables DEEP_OBSIDIAN_PACKAGED: "1"
     log_path var/"log/deep-obsidian-mcp/output.log"
@@ -112,7 +112,8 @@ class DeepObsidianMcp < Formula
   end
 
   test do
-    assert_match "Usage:", shell_output("#{bin}/deep-obsidian-mcp help")
+    assert_match "Usage:", shell_output("#{bin}/deep-obsidian-cli help")
+    assert_match "Deep Obsidian MCP server", shell_output("#{bin}/deep-obsidian-mcp --help")
     assert_equal version.to_s, shell_output("#{bin}/deep-obsidian-mcp version").strip
     # The sidecar bundle, at the exact path the binary's exe-relative probe derives. A
     # `couchdb` mount is the only thing that reads it, so a resource that silently

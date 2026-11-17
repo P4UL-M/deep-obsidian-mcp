@@ -417,8 +417,8 @@ Expected fixture root for CLI and integration tests:
 Preferred verification commands:
 
 - `cargo test --workspace`
-- `cargo run -p deep-obsidian-cli --bin deep-obsidian-mcp -- doctor --vault tests/fixtures/vault`
-- `cargo run -p deep-obsidian-cli --bin deep-obsidian-mcp -- print-config --vault tests/fixtures/vault`
+- `cargo run -p deep-obsidian-cli --bin deep-obsidian-cli -- doctor --vault tests/fixtures/vault`
+- `cargo run -p deep-obsidian-cli --bin deep-obsidian-cli -- print-config --vault tests/fixtures/vault`
 - `cargo build --release -p deep-obsidian-cli --bin deep-obsidian-mcp`
 - `codesign --force --sign - --timestamp=none target/release/deep-obsidian-mcp`
 - `codesign --verify --verbose=2 target/release/deep-obsidian-mcp`
