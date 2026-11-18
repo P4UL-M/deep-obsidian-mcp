@@ -80,7 +80,7 @@ fn requested(args: &[String]) -> Option<clap::Error> {
     }
 }
 
-fn command() -> Command {
+pub(crate) fn command() -> Command {
     let mut root = crate::cli::Cli::command()
         .subcommand(crate::link::help_command())
         .subcommand(Command::new("unlink").about("Clear the saved backend link"))
@@ -139,6 +139,7 @@ fn style(command: Command, parents: &[String]) -> Command {
             "print-config",
             "couchdb",
             "algolia",
+            "completions",
             "help",
             "version",
         ]
@@ -163,11 +164,14 @@ fn style(command: Command, parents: &[String]) -> Command {
             } else {
                 match id.as_str() {
                     "no_json" | "no_dry_run" => false,
-                    "json" => family.is_some_and(|f| !matches!(f, "unlink" | "help" | "version")),
+                    "json" => family.is_some_and(|f| {
+                        !matches!(f, "unlink" | "completions" | "help" | "version")
+                    }),
                     "dry_run" => writing,
-                    "config" | "local" => {
-                        !matches!(family, Some("link" | "unlink" | "help" | "version"))
-                    }
+                    "config" | "local" => !matches!(
+                        family,
+                        Some("link" | "unlink" | "completions" | "help" | "version")
+                    ),
                     _ => true,
                 }
             };
@@ -209,6 +213,7 @@ fn style(command: Command, parents: &[String]) -> Command {
         [] => command.after_help(format!("Start here:\n  deep-obsidian-cli setup-service --wizard\n  deep-obsidian-cli link\n\nCommand help: deep-obsidian-cli <command> --help\nRun the service: deep-obsidian-mcp --help\nGuide: {DOCS}")),
         ["setup-service"] => command.after_help("Start with: deep-obsidian-cli setup-service --wizard\nUse mounts to change an existing mount table. Preview with --dry-run."),
         ["link"] => command.after_help("Examples:\n  deep-obsidian-cli link\n  deep-obsidian-cli link --context watson\n  deep-obsidian-cli link --local-config /path/config.json\n\nDiscovery uses one Docker context and known local configs; it does not scan the network."),
+        ["completions"] => command.after_help("Examples:\n  source <(deep-obsidian-cli completions bash)\n  deep-obsidian-cli completions zsh > _deep-obsidian-cli\n\nGeneration runs locally without contacting the linked backend.\nInstallation for each shell: docs/cli.md#shell-completion"),
         ["doctor"] => command.after_help("Local checks run by default. Add --probe-remote to check remote mounts read-only.\nUse probe to test the HTTP health and MCP endpoints."),
         ["secrets"] => command.after_help("Use check to identify each secret's store; set replaces a stored value.\nBearer-token recovery and Docker secret files: docs/cli.md#recover-a-lost-bearer-token"),
         ["secrets", "set"] => command.after_help("Examples:\n  deep-obsidian-cli secrets set --target auth-token\n  deep-obsidian-cli secrets set --mount team\n\nThe replacement is prompted masked, or read with --stdin. Rotation keeps the existing\nstore and reference; it does not change configuration or migrate credentials."),

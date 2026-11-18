@@ -1,6 +1,7 @@
 pub mod algolia_cmd;
 pub mod cli;
 pub mod commands;
+mod completions;
 pub mod config;
 pub mod couchdb_transfer;
 mod help;

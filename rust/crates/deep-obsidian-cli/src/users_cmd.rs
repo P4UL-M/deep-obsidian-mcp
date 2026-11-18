@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use clap::Subcommand;
+use clap::{builder::TypedValueParser, Subcommand};
 use deep_obsidian_control::{Grant, InitialUser, Role};
 use deep_obsidian_types::{MountConfig, ResolvedServiceConfig};
 use serde_json::{json, Value};
@@ -31,7 +31,7 @@ pub enum UsersCommand {
         #[arg(long)]
         mount: String,
         /// Vault role: reader, editor or owner.
-        #[arg(long, value_parser=parse_role)]
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["reader", "editor", "owner"]).try_map(|value: String| parse_role(&value)))]
         role: Role,
     },
     /// Remove access to a mount.

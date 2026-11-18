@@ -2,6 +2,17 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## Unreleased
+
+### Added
+
+- `deep-obsidian-cli completions <shell>` generates Bash, Zsh, Fish,
+  PowerShell and Elvish autocomplete scripts from the CLI command definitions.
+  Completion covers commands, nested options and fixed values, including user
+  roles, without contacting a linked backend. Homebrew and Debian packages
+  install Bash, Zsh and Fish completions automatically; the CLI guide documents
+  activation and source installations.
+
 ## v0.2.0-alpha.11 — 2026-11-17
 
 ### Fixed

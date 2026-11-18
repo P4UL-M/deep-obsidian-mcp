@@ -43,6 +43,9 @@ check "obsidian-snippets installed" test -d /usr/share/deep-obsidian-mcp/obsidia
 check "assets installed" test -d /usr/share/deep-obsidian-mcp/assets
 check "systemd user unit installed" test -f /usr/lib/systemd/user/deep-obsidian-mcp.service
 check "livesync sidecar bundle installed" test -s "$SIDECAR_BUNDLE"
+check "Bash completion installed" test -s /usr/share/bash-completion/completions/deep-obsidian-cli
+check "Zsh completion installed" test -s /usr/share/zsh/vendor-completions/_deep-obsidian-cli
+check "Fish completion installed" test -s /usr/share/fish/vendor_completions.d/deep-obsidian-cli.fish
 
 step "systemd unit sanity"
 if command -v systemd-analyze >/dev/null 2>&1; then
