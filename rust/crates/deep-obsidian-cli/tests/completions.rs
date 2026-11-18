@@ -186,7 +186,7 @@ fn zsh_completion_loads_and_registers() {
     let file = f.0.join("_deep-obsidian-cli");
     std::fs::write(&file, generated.stdout).unwrap();
     let output = Command::new("zsh")
-        .args(["-f", "-c", r#"autoload -Uz compinit; compinit -D; source "$1"; [[ ${_comps[deep-obsidian-cli]} == _deep-obsidian-cli ]]"#, "completion-test"])
+        .args(["-f", "-c", r#"autoload -Uz compinit; compinit -i -D; source "$1"; [[ ${_comps[deep-obsidian-cli]} == _deep-obsidian-cli ]]"#, "completion-test"])
         .arg(file).output().unwrap();
     assert!(output.status.success(), "{output:?}");
 }
