@@ -28,6 +28,8 @@ class DeepObsidianMcp < Formula
 
   def install
     system "cargo", "install", *std_cargo_args(path: "rust/crates/deep-obsidian-cli")
+    generate_completions_from_executable(bin/"deep-obsidian-cli", "completions",
+                                        shells: [:bash, :zsh, :fish])
     pkgshare.install "assets"
     pkgshare.install "skills"
     pkgshare.install "obsidian-snippets"
@@ -113,6 +115,9 @@ class DeepObsidianMcp < Formula
 
   test do
     assert_match "Usage:", shell_output("#{bin}/deep-obsidian-cli help")
+    assert_path_exists bash_completion/"deep-obsidian-cli"
+    assert_path_exists zsh_completion/"_deep-obsidian-cli"
+    assert_path_exists fish_completion/"deep-obsidian-cli.fish"
     assert_match "Deep Obsidian MCP server", shell_output("#{bin}/deep-obsidian-mcp --help")
     assert_equal version.to_s, shell_output("#{bin}/deep-obsidian-mcp version").strip
     # The sidecar bundle, at the exact path the binary's exe-relative probe derives. A

@@ -240,6 +240,7 @@ pub async fn run() -> Result<()> {
     }
 
     match cli.command.unwrap_or(Command::Help) {
+        Command::Completions { shell } => crate::completions::print(shell),
         Command::Users { command } => {
             let resolved = crate::config::resolve_runtime_config(&cli.options)?;
             crate::users_cmd::run(command, &resolved.service, dry_run, json).await
@@ -781,7 +782,7 @@ pub(crate) fn normalize_cli_args_detailed(raw_args: &[String]) -> Result<(Vec<St
 
     while index < raw_args.len() {
         let token = &raw_args[index];
-        if token == "users" {
+        if matches!(token.as_str(), "users" | "completions") {
             normalized.extend(raw_args[index..].iter().cloned());
             return Ok((normalized, false));
         }

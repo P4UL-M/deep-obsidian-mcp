@@ -21,6 +21,7 @@ path = "src/service_main.rs"
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["wrap_help"] }
+clap_complete.workspace = true
 deep-obsidian-algolia = { path = "../deep-obsidian-algolia" }
 deep-obsidian-backend = { path = "../deep-obsidian-backend" }
 deep-obsidian-config = { path = "../deep-obsidian-config" }
@@ -66,6 +67,9 @@ unit, then configure it with `deep-obsidian-cli setup-service`."""
 assets = [
     ["target/release/deep-obsidian-mcp", "usr/bin/", "755"],
     ["target/release/deep-obsidian-cli", "usr/bin/", "755"],
+    ["../../../target/completions/deep-obsidian-cli.bash", "usr/share/bash-completion/completions/deep-obsidian-cli", "644"],
+    ["../../../target/completions/_deep-obsidian-cli", "usr/share/zsh/vendor-completions/_deep-obsidian-cli", "644"],
+    ["../../../target/completions/deep-obsidian-cli.fish", "usr/share/fish/vendor_completions.d/deep-obsidian-cli.fish", "644"],
     ["../../../skills/**/*", "usr/share/deep-obsidian-mcp/skills/", "644"],
     ["../../../obsidian-snippets/**/*", "usr/share/deep-obsidian-mcp/obsidian-snippets/", "644"],
     ["../../../assets/**/*", "usr/share/deep-obsidian-mcp/assets/", "644"],

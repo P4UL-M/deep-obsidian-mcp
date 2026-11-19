@@ -125,6 +125,12 @@ pub struct ServiceOptions {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
+    /// Generate a shell completion script on stdout.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Manage application users and vault grants.
     Users {
         #[command(subcommand)]

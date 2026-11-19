@@ -75,6 +75,13 @@ fi
 # Build the release binary first so cargo-deb packages an optimized build.
 cargo build --release -p deep-obsidian-cli --bins
 
+# Generate from the binary being packaged so completions track its command tree.
+mkdir -p target/completions
+CLI_BIN="${CARGO_TARGET_DIR:-target}/release/deep-obsidian-cli"
+"$CLI_BIN" completions bash > target/completions/deep-obsidian-cli.bash
+"$CLI_BIN" completions zsh > target/completions/_deep-obsidian-cli
+"$CLI_BIN" completions fish > target/completions/deep-obsidian-cli.fish
+
 ARGS=(deb -p deep-obsidian-cli --no-build)
 if [[ -n "$DEB_VERSION" ]]; then
   ARGS+=(--deb-version "$DEB_VERSION")

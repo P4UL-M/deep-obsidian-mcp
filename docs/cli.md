@@ -30,6 +30,70 @@ command or option returns an error, including when `--help` is present.
 | Export or restore a LiveSync mount | `couchdb` | [Migration and rollback](migration-and-rollback.md) |
 | Seed, snapshot or manage an Algolia corpus | `algolia` | [Algolia](algolia-mounts.md) |
 | Inspect installed CLI version | `version` | Version of the local CLI executable |
+| Enable shell autocomplete | `completions SHELL` | [Shell completion](#shell-completion) |
+
+## Shell completion
+
+`deep-obsidian-cli completions SHELL` prints a completion script for `bash`,
+`zsh`, `fish`, `powershell` or `elvish`. It completes commands, nested commands,
+options and fixed choices (for example `users grant --role`). Generation runs
+locally without loading backend configuration or contacting Docker. Mount IDs,
+usernames and Docker contexts are not fetched for completion.
+
+Homebrew and Debian packages install Bash, Zsh and Fish completion files in their
+standard locations. Restart the shell after installing. Bash needs its
+`bash-completion` integration enabled; Zsh needs `compinit`.
+
+For a source installation, enable completion as follows.
+
+**Bash** — put this in `~/.bashrc`:
+
+```bash
+source <(deep-obsidian-cli completions bash)
+```
+
+**Zsh** — generate the file:
+
+```zsh
+mkdir -p ~/.zsh/completions
+deep-obsidian-cli completions zsh > ~/.zsh/completions/_deep-obsidian-cli
+```
+
+Add `fpath=(~/.zsh/completions $fpath)` before your existing `compinit` call in
+`~/.zshrc`, or initialize it with:
+
+```zsh
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit
+compinit
+```
+
+**Fish**:
+
+```fish
+mkdir -p ~/.config/fish/completions
+deep-obsidian-cli completions fish > ~/.config/fish/completions/deep-obsidian-cli.fish
+```
+
+**PowerShell** — add this to `$PROFILE`:
+
+```powershell
+deep-obsidian-cli completions powershell | Out-String | Invoke-Expression
+```
+
+**Elvish** — generate a module and load it from `rc.elv`:
+
+```sh
+mkdir -p ~/.config/elvish/lib
+deep-obsidian-cli completions elvish > ~/.config/elvish/lib/deep-obsidian-cli.elv
+```
+
+```elvish
+use deep-obsidian-cli
+```
+
+Regenerate saved scripts after upgrading a source installation. Packaged
+completion files are regenerated from the release binary during packaging.
 
 ## Choose a backend
 
