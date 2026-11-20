@@ -174,6 +174,7 @@ impl AppState {
             "upsert_note"
                 | "upsert_session_note"
                 | "edit_note"
+                | "rename_note"
                 | "delete_note"
                 | "request_vault_upload"
         ) {
@@ -195,7 +196,7 @@ impl AppState {
                 .iter()
                 .find(|m| m.id == id)
                 .context("access denied")?;
-            for key in ["path", "folder"] {
+            for key in ["path", "folder", "from", "to"] {
                 if let Some(path) = args.get(key).and_then(Value::as_str).map(str::to_owned) {
                     args[key] = json!(mount.to_logical(&path));
                 }
@@ -387,12 +388,13 @@ impl AppState {
             "upsert_note"
                 | "upsert_session_note"
                 | "edit_note"
+                | "rename_note"
                 | "delete_note"
                 | "request_vault_upload"
                 | "request_artifact_upload"
         );
         let action = if write { Action::Write } else { Action::Read };
-        for key in ["path", "scope", "folder", "directory"] {
+        for key in ["path", "scope", "folder", "directory", "from", "to"] {
             if name == "list_children" && args.get(key).and_then(Value::as_str) == Some("") {
                 continue;
             }
@@ -403,7 +405,7 @@ impl AppState {
                 self.check_path(path, action)?;
             }
         }
-        if write && !args.get("path").is_some_and(Value::is_string) {
+        if write && name != "rename_note" && !args.get("path").is_some_and(Value::is_string) {
             // Session-note folder/topic writes must explicitly select an authorized mount.
             let path = args.get("folder").and_then(Value::as_str).unwrap_or("");
             self.check_path(path, Action::Write)?;
@@ -453,6 +455,7 @@ impl VaultBackend for GrantedBackend {
                 Capability::BinaryWrite,
                 Capability::Upload,
                 Capability::SoftDelete,
+                Capability::Rename,
             ] {
                 d.capabilities.remove(&c);
             }

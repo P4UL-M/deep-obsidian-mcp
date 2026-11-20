@@ -540,7 +540,7 @@ const DIFF_CONTEXT_LINES: usize = 3;
 /// Cap on how many inbound-linking notes `rename_note`'s repair pass scans. A cap that
 /// silently hid notes would leave broken links that look fine in their source, so
 /// hitting it is reported in the response (`linkingTruncated`) rather than absorbed.
-const RENAME_LINK_GRAPH_LIMIT: usize = 500;
+const RENAME_LINK_REPAIR_LIMIT: usize = 500;
 
 /// How much a write should say about what it changed.
 ///
@@ -621,12 +621,13 @@ fn note_basename(note_path: &str) -> &str {
 
 /// Rewrite one note's links to a moved note, returning how many changed.
 ///
-/// Guarded on the revision just read, so a concurrent edit to a linking note makes this one
-/// fail rather than clobbering it. The caller retries the rename and only the notes that
-/// failed are touched again.
+/// Carries the revision just read. CouchDB refuses a concurrent edit through CAS;
+/// Algolia retains its normal version-history/divergence semantics. A retry scans
+/// current content and skips links whose spelling is already correct.
 async fn rewrite_links_in_note(
     state: &AppState,
     note_path: &str,
+    reference_path: &str,
     from: &str,
     to: &str,
     old_basename_was_unique: bool,
@@ -637,7 +638,13 @@ async fn rewrite_links_in_note(
         .into_versioned_text()
         .map(|(text, version)| (text, BaseVersion::from_read(version)))
         .map_err(|error| error.to_string())?;
-    let outcome = crate::links::rewrite_wiki_links(&content, from, to, old_basename_was_unique);
+    let outcome = crate::links::rewrite_wiki_links_in_note(
+        &content,
+        reference_path,
+        from,
+        to,
+        old_basename_was_unique,
+    );
     if outcome.rewritten == 0 {
         return Ok(0);
     }
@@ -1092,7 +1099,7 @@ fn insert_capability_tools(definitions: &mut Vec<ToolDefinition>, capabilities: 
     if capabilities.rename {
         definitions.push(ToolDefinition {
             name: "rename_note".to_string(),
-            description: "Move a note to a new vault-relative path and repoint the wikilinks that referenced it. Refuses rather than guessing in the cases where a move changes meaning it was not asked to change: a destination that already holds a note (that would destroy it, which is not what renaming means), a destination whose basename already exists elsewhere in the vault (short `[[Name]]` links in unrelated notes would silently resolve somewhere new), a path reaching a protected Template(s) folder, and a source and destination on different mounts — a rename moves within one mount, it does not copy between providers. Link rewriting is a repair pass over the notes that link here, not part of the move: it is idempotent, so if it is interrupted, re-running the same call recognizes the move already happened, skips it, and finishes the pass (alreadyMoved:true). Only mounts advertising 'rename' in vault_info.mounts[].capabilities; the response's 'atomic' says whether the move itself was one operation, and 'linkingTruncated' says whether the inbound-link scan hit its 500-note cap.".to_string(),
+            description: "Move a markdown note within one writable mount and repair inbound wikilinks, including self-links. Refuses protected Template(s) paths, cross-mount moves, occupied destinations and destination-basename collisions within the owning mount. The move reports atomic; link repair is a separate, revision-aware pass over current backend content and works without a local index. At most 500 notes needing changes are repaired per call; linkingTruncated reports more work. Inspect the destination and resume with the same from/to and expectedHash set to the returned newHash. A missing source is not proof of a completed move: recovery requires a matching hash. Non-atomic moves may leave two identical copies; a hash-verified retry can finish removal without replacing a different destination. Failures and howToRecover describe remaining work.".to_string(),
             annotations: Some(tool_annotations(false, Some(true), Some(true))),
             execution: Some(json!({"taskSupport":"forbidden"})),
             input_schema: object_schema(
@@ -1100,7 +1107,7 @@ fn insert_capability_tools(definitions: &mut Vec<ToolDefinition>, capabilities: 
                     ("from", json!({"type":"string","description":"Current vault-relative markdown path."})),
                     ("to", json!({"type":"string","description":"New vault-relative markdown path. Missing parent folders are created."})),
                     ("rewriteLinks", json!({"type":"boolean","default":true,"description":"Repoint inbound wikilinks after the move. Set false to move the note only and get the list of notes that link to it, to fix yourself."})),
-                    ("expectedHash", json!({"type":"string","description":"Optional hash of the note being moved. If it does not match, nothing moves."})),
+                    ("expectedHash", json!({"type":"string","description":"Optional hash of the note being moved; required to verify resumed moves. For recovery use the prior response's newHash. A mismatch refuses the call."})),
                     ("dryRun", json!({"type":"boolean","default":false,"description":"Report what would move and which notes link here, without changing the vault."})),
                 ],
                 vec!["from", "to"],
@@ -4199,7 +4206,7 @@ pub async fn call_tool(
             }
         }
         if let (Some(access), Some(store)) = (&state.access, &state.control) {
-            let mount = ["path", "folder", "scope"]
+            let mount = ["path", "folder", "scope", "from"]
                 .iter()
                 .find_map(|key| arguments.get(*key).and_then(Value::as_str))
                 .and_then(|path| access.original_router.resolve(path).ok())
@@ -4947,169 +4954,132 @@ async fn call_tool_inner(
                         "rename_note requires a vault-relative .md path; `{label}` is not one."
                     ));
                 }
-            }
-            if from == to {
-                return Err("rename_note was given the same path twice.".to_string());
+                if is_protected_write_path(path) {
+                    return Err(format!("refusing to rename the {label} path {path}: it reaches a protected Template(s) folder."));
+                }
             }
             refuse_incapable_mount(state, "rename_note", &from, Capability::Rename)?;
             refuse_incapable_mount(state, "rename_note", &to, Capability::Rename)?;
-            // A rename is a move within ONE mount: across mounts it would be a read from
-            // one provider and a write to another, which no backend sees as one operation.
-            let from_mount = state
+            let (source, destination) = state
                 .router
-                .resolve(&from)
-                .map_err(|error| error.to_string())?
-                .mount
-                .id
-                .clone();
-            let to_mount = state
-                .router
-                .resolve(&to)
-                .map_err(|error| error.to_string())?
-                .mount
-                .id
-                .clone();
-            if from_mount != to_mount {
-                return Err(format!(
-                    "refusing to rename {from} to {to}: the paths live on different mounts \
-                     ({from_mount:?} and {to_mount:?}), and a rename moves a note within one \
-                     mount rather than copying between providers."
-                ));
-            }
-            // A move that reaches a protected Template(s) folder changes protected content
-            // the same way a write there is refused, so both sides of the move are guarded.
-            for (label, path) in [("from", &from), ("to", &to)] {
-                if is_protected_write_path(path) {
-                    return Err(format!(
-                        "refusing to rename the {label} path {path}: it reaches a protected \
-                         Template(s) folder, whose content changes only when a human edits \
-                         the template."
-                    ));
-                }
+                .resolve_pair("rename", &from, &to)
+                .map_err(|error| error.to_string())?;
+            let mount = source.mount;
+            let from_relative = source.backend_relative_path.clone();
+            let to_relative = destination.backend_relative_path.clone();
+            let from = mount.to_logical(&from_relative);
+            let to = mount.to_logical(&to_relative);
+            if from_relative == to_relative {
+                return Err("rename_note was given the same path twice.".to_string());
             }
             let dry_run = bool_arg(arguments, "dryRun", false);
             let rewrite_links = bool_arg(arguments, "rewriteLinks", true);
             let expected_hash = expected_hash_arg(arguments);
-
-            // One manifest answers every existence question: both refusals below, and
-            // whether this call is a first attempt or a re-run finishing an interrupted
-            // repair pass.
-            let notes = backend_call(state, BackendRequest::walk_markdown())
-                .await?
+            // A manifest and its link spellings belong to ONE backend, not the logical
+            // namespace. No local index is required, including on native Algolia mounts.
+            let mut notes = mount
+                .backend
+                .execute(BackendRequest::walk_markdown())
+                .await
+                .map_err(|error| error.to_string())?
                 .into_markdown_files()
                 .map_err(|error| error.to_string())?;
-            let source_exists = notes.iter().any(|note| note == &from);
-            let destination_exists = notes.iter().any(|note| note == &to);
-            // A re-run finds the source gone and the destination in place: the move already
-            // happened, so only the repair pass is left. Skipping the move is what makes
-            // "re-run the same call" a recovery a caller can actually follow, instead of
-            // advice that dies on the destination refusal.
+            notes.retain(|path| {
+                let logical = mount.to_logical(path);
+                state.visible_path(&logical)
+                    && state
+                        .router
+                        .resolve(&logical)
+                        .is_ok_and(|resolved| resolved.mount.id == mount.id)
+            });
+            notes.sort();
+            let source_exists = notes.contains(&from_relative);
+            let destination_exists = notes.contains(&to_relative);
             let already_moved = !source_exists && destination_exists;
-            if !source_exists && !already_moved {
-                return Err(format!(
-                    "cannot rename {from}: no such note in the vault, and {to} does not \
-                     exist either — there is nothing to move and nothing to finish."
-                ));
+            if !source_exists && !destination_exists {
+                return Err(format!("cannot rename {from}: no such note in the vault, and {to} does not exist either — there is nothing to move and nothing to finish."));
             }
-            if source_exists && destination_exists {
-                return Err(format!(
-                    "refusing to rename {from} to {to}: a note already exists there, and \
-                     renaming onto it would destroy it. Pick another path, or remove that note \
-                     first if replacing it is what you meant."
-                ));
+            if already_moved && expected_hash.is_none() {
+                return Err(format!("cannot confirm that {from} was moved to {to}: the source is absent. Inspect the destination and resume with the expectedHash returned by the original rename; an unrelated destination must not receive this note's links."));
             }
-            let mut observed_version = BaseVersion::Unobserved;
-            let destination_basename = note_basename(&to);
-            if source_exists {
-                // Second refusal: a colliding basename would silently change where SHORT
-                // links in unrelated notes resolve, which finishing the move was never asked
-                // to do.
-                if let Some(collision) = notes
-                    .iter()
-                    .find(|note| *note != &from && note_basename(note) == destination_basename)
-                {
-                    return Err(format!(
-                        "refusing to rename {from} to {to}: the basename {destination_basename:?} is \
-                         already used by {collision}. Obsidian resolves a short [[{}]] link by \
-                         basename, so finishing this move would silently change where such links in \
-                         unrelated notes point. Rename to a distinct basename.",
-                        strip_md_extension(destination_basename)
-                    ));
-                }
-                let (existing, base_version) =
-                    backend_call(state, BackendRequest::read_text(&from))
-                        .await?
-                        .into_versioned_text()
-                        .map(|(text, version)| (text, BaseVersion::from_read(version)))
-                        .map_err(|error| error.to_string())?;
-                validate_expected_hash(
-                    expected_hash.as_deref(),
-                    Some(&content_hash(existing.as_bytes())),
-                    &from,
-                )?;
-                observed_version = base_version;
-            }
-            // Whether the OLD basename was unique decides whether short links may be
-            // rewritten: if it was not, `[[Name]]` never unambiguously meant this note. On a
-            // re-run the moved note itself sits at the destination basename, so it is
-            // excluded from the scan the same way the source was.
-            let from_basename = note_basename(&from);
-            let old_basename_was_unique = !notes
-                .iter()
-                .any(|note| note != &from && note != &to && note_basename(note) == from_basename);
-
-            let (scoped, _mount_path) = resolve_recall_path(state, "rename_note", &from)?;
-            let snapshot = scoped
-                .runtime
-                .snapshot()
+            let observed_path = if source_exists { &from } else { &to };
+            let (existing, version) = backend_call(state, BackendRequest::read_text(observed_path))
+                .await?
+                .into_versioned_text()
                 .map_err(|error| error.to_string())?;
-            // The linking set comes from the RAW links each indexed note carries, not from
-            // a resolved graph traversal. After the move, the index may already know the
-            // note under its new path — a traversal FROM the old path then finds nothing,
-            // which is exactly the interrupted-repair state a re-run has to handle. Raw
-            // matching also sees links the resolver can no longer resolve, which a graph
-            // pass silently drops as broken.
-            let from_target = strip_md_extension(&from);
-            let from_base = from_target.rsplit('/').next().unwrap_or(from_target);
-            let link_matches_old_target = |raw: &str| -> bool {
-                // Strip fragment, then alias — a `\|` escaped alias leaves a trailing
-                // backslash on the target part, which is trimmed with it.
-                let target = raw.split('#').next().unwrap_or("");
-                let target = target.split('|').next().unwrap_or("");
-                let target = target.trim().trim_end_matches('\\').trim();
-                if target.is_empty() {
-                    return false;
+            let previous_hash = content_hash(existing.as_bytes());
+            validate_expected_hash(
+                expected_hash.as_deref(),
+                Some(&previous_hash),
+                observed_path,
+            )?;
+            if source_exists && destination_exists {
+                let copied = backend_call(state, BackendRequest::read_text(&to))
+                    .await?
+                    .into_text()
+                    .map_err(|error| error.to_string())?;
+                // A verified, identical pair is the recoverable intermediate state of
+                // a write-then-remove move. Never infer it from existence alone.
+                if expected_hash.is_none() || copied != existing {
+                    return Err(format!("refusing to rename {from} to {to}: a note already exists there, and renaming onto it would destroy it. Pick another path, or reconcile the copies first."));
                 }
-                let normalized = target.strip_suffix(".md").unwrap_or(target);
-                let normalized = normalized.strip_prefix("./").unwrap_or(normalized);
-                normalized == from_target || (old_basename_was_unique && normalized == from_base)
-            };
-            let mut linking: Vec<String> = Vec::new();
+            }
+            let destination_basename = note_basename(&to_relative);
+            if let Some(collision) = notes.iter().find(|note| {
+                *note != &from_relative
+                    && *note != &to_relative
+                    && note_basename(note) == destination_basename
+            }) {
+                return Err(format!("refusing to rename {from} to {to}: the basename {destination_basename:?} is already used by {}. Obsidian resolves a short [[{}]] link by basename, so finishing this move would silently change where such links in unrelated notes point. Rename to a distinct basename.", mount.to_logical(collision), strip_md_extension(destination_basename)));
+            }
+            let old_basename_was_unique = !notes.iter().any(|note| {
+                note != &from_relative
+                    && note != &to_relative
+                    && note_basename(note) == note_basename(&from_relative)
+            });
+            let mut linking = Vec::new();
             let mut linking_truncated = false;
-            for note in &snapshot.index.notes {
-                if note.path == from || note.path == to {
+            for note in &notes {
+                if source_exists && destination_exists && note == &to_relative {
+                    // This verified identical copy will be repaired through the source
+                    // candidate at its destination, using the source's link context.
                     continue;
                 }
-                if note.links.iter().any(|raw| link_matches_old_target(raw)) {
-                    if linking.len() >= RENAME_LINK_GRAPH_LIMIT {
+                let logical = mount.to_logical(note);
+                let content = backend_call(state, BackendRequest::read_text(&logical))
+                    .await?
+                    .into_text()
+                    .map_err(|error| error.to_string())?;
+                let reference_path = if note == &to_relative {
+                    &from_relative
+                } else {
+                    note
+                };
+                if crate::links::rewrite_wiki_links_in_note(
+                    &content,
+                    reference_path,
+                    &from_relative,
+                    &to_relative,
+                    old_basename_was_unique,
+                )
+                .rewritten
+                    > 0
+                {
+                    if linking.len() >= RENAME_LINK_REPAIR_LIMIT {
                         linking_truncated = true;
                         break;
                     }
-                    linking.push(scoped.to_logical(&note.path));
+                    linking.push((logical, reference_path.clone()));
                 }
             }
-
+            let linking_notes: Vec<_> = linking.iter().map(|(path, _)| path.clone()).collect();
             if dry_run {
                 return Ok(json_text_result(json!({
-                    "from": from,
-                    "to": to,
-                    "dryRun": true,
-                    "linkingNotes": linking,
-                    "linkingTruncated": linking_truncated,
-                    "oldBasenameWasUnique": old_basename_was_unique,
+                    "from":from, "to":to, "dryRun":true, "previousHash":previous_hash,
+                    "alreadyMoved":already_moved, "linkingNotes":linking_notes,
+                    "linkingTruncated":linking_truncated, "oldBasenameWasUnique":old_basename_was_unique
                 })));
             }
-
             let atomic = if already_moved {
                 None
             } else {
@@ -5118,7 +5088,7 @@ async fn call_tool_inner(
                     BackendRequest::Mutation(MutationRequest::Rename {
                         from: from.clone(),
                         to: to.clone(),
-                        base_version: observed_version,
+                        base_version: BaseVersion::from_read(version),
                     }),
                 )
                 .await?;
@@ -5127,44 +5097,44 @@ async fn call_tool_inner(
                     BackendResponse::Mutation(MutationResponse::Renamed { atomic: true, .. })
                 ))
             };
-
-            // The repair pass. Each note is its own write, so a failure leaves the rest done
-            // and the response names the ones that were not — re-running the same rename
-            // finishes them, because a rewritten note has no old-path link left to match.
             let mut rewritten = Vec::new();
             let mut failed = Vec::new();
             if rewrite_links {
-                for note in &linking {
-                    match rewrite_links_in_note(state, note, &from, &to, old_basename_was_unique)
-                        .await
+                for (note, reference_path) in &linking {
+                    let note = if note == &from { &to } else { note };
+                    match rewrite_links_in_note(
+                        state,
+                        note,
+                        reference_path,
+                        &from_relative,
+                        &to_relative,
+                        old_basename_was_unique,
+                    )
+                    .await
                     {
                         Ok(0) => {}
-                        Ok(count) => rewritten.push(json!({"path": note, "links": count})),
-                        Err(reason) => failed.push(json!({"path": note, "error": reason})),
+                        Ok(count) => rewritten.push(json!({"path":note, "links":count})),
+                        Err(reason) => failed.push(json!({"path":note,"error":reason})),
                     }
                 }
             }
-
+            let moved_content = backend_call(state, BackendRequest::read_text(&to))
+                .await?
+                .into_text()
+                .map_err(|error| error.to_string())?;
+            let new_hash = content_hash(moved_content.as_bytes());
             let mut payload = json!({
-                "from": from,
-                "to": to,
-                "atomic": atomic,
-                "alreadyMoved": already_moved,
-                "dryRun": false,
-                "resourceUri": note_uri(&to),
-                "wikiLink": note_wiki_link(&to),
-                "linkingNotes": linking,
-                "linkingTruncated": linking_truncated,
-                "rewroteLinksIn": rewritten,
+                "from":from, "to":to, "atomic":atomic, "alreadyMoved":already_moved,
+                "dryRun":false, "previousHash":previous_hash, "newHash":new_hash,
+                "resourceUri":note_uri(&to), "wikiLink":note_wiki_link(&to),
+                "linkingNotes":linking_notes, "linkingTruncated":linking_truncated,
+                "rewroteLinksIn":rewritten
             });
             if !failed.is_empty() {
                 payload["linkRewritesFailed"] = json!(failed);
-                payload["howToRecover"] = json!(
-                    "the move is done and some inbound links still point at the old path. \
-                     Re-run the same rename_note call: it recognizes the move already happened, \
-                     skips straight to the repair pass, and notes already rewritten are left \
-                     alone because none of their links match the old path anymore."
-                );
+            }
+            if !failed.is_empty() || linking_truncated || !rewrite_links {
+                payload["howToRecover"] = json!(format!("The move is complete. Resolve any reported write errors and inspect the destination before resuming. Call rename_note again with the same from/to, rewriteLinks:true and expectedHash {new_hash}. Already repaired links are skipped; repeat while linkingTruncated is true."));
             }
             Ok(json_text_result(payload))
         }

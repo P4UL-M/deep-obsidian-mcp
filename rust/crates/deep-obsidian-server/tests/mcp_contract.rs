@@ -1049,7 +1049,7 @@ async fn rename_note_resumes_an_interrupted_repair_on_a_rerun() {
     let second = tool_call(
         &state,
         "rename_note",
-        json!({"from": "Folder/Child.md", "to": "Folder/Renamed Child.md"}),
+        json!({"from": "Folder/Child.md", "to": "Folder/Renamed Child.md", "expectedHash":first["result"]["structuredContent"]["newHash"]}),
     )
     .await;
     let result = &second["result"]["structuredContent"];
@@ -1142,6 +1142,106 @@ async fn rename_note_reports_when_the_link_scan_hits_its_cap() {
         Some(500),
         "the cap holds the list to 500 entries: {result}"
     );
+}
+
+#[tokio::test]
+async fn rename_note_requires_evidence_before_repairing_a_missing_source() {
+    let fixture = Fixture::new("rename-unrelated-destination");
+    let state = fixture.state().await;
+    let before = fs::read_to_string(fixture.vault_path.join("Root.md")).unwrap();
+    let response = tool_call(
+        &state,
+        "rename_note",
+        json!({
+            "from":"Folder/Child.md", "to":"Root.md", "expectedHash":"fnv1a64:wrong"
+        }),
+    )
+    .await;
+    assert!(response.get("error").is_some(), "{response}");
+    fs::remove_file(fixture.vault_path.join("Folder/Child.md")).unwrap();
+    for expected in [None, Some("fnv1a64:wrong")] {
+        let response = tool_call(
+            &state,
+            "rename_note",
+            json!({
+                "from":"Folder/Child.md", "to":"Root.md", "expectedHash":expected
+            }),
+        )
+        .await;
+        assert!(response.get("error").is_some(), "{response}");
+        assert_eq!(
+            fs::read_to_string(fixture.vault_path.join("Root.md")).unwrap(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn rename_note_repairs_fresh_links_and_the_moved_notes_self_links() {
+    let fixture = Fixture::new("rename-fresh-links");
+    let state = fixture.state().await;
+    fs::write(fixture.vault_path.join("Fresh.md"), "[[Folder/Child]]\n").unwrap();
+    fs::write(
+        fixture.vault_path.join("Folder/Child.md"),
+        "# Child\n[[Folder/Child#Self]] [[./Sibling]]\n",
+    )
+    .unwrap();
+    let response = tool_call(
+        &state,
+        "rename_note",
+        json!({
+            "from":"Folder/Child.md", "to":"Elsewhere/Moved.md"
+        }),
+    )
+    .await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        fs::read_to_string(fixture.vault_path.join("Fresh.md")).unwrap(),
+        "[[Elsewhere/Moved]]\n"
+    );
+    assert!(
+        fs::read_to_string(fixture.vault_path.join("Elsewhere/Moved.md"))
+            .unwrap()
+            .contains("[[Elsewhere/Moved#Self]] [[Folder/Sibling]]")
+    );
+}
+
+#[tokio::test]
+async fn rename_note_repeated_repairs_make_progress_without_an_index_refresh() {
+    let fixture = Fixture::new("rename-progress");
+    for i in 0..501 {
+        fs::write(
+            fixture.vault_path.join(format!("Linker{i:03}.md")),
+            "[[Folder/Child]]\n",
+        )
+        .unwrap();
+    }
+    let state = fixture.state().await;
+    let first = tool_call(
+        &state,
+        "rename_note",
+        json!({"from":"Folder/Child.md", "to":"Folder/Moved.md"}),
+    )
+    .await;
+    let first = &first["result"]["structuredContent"];
+    assert_eq!(first["linkingTruncated"], true, "{first}");
+    let second = tool_call(
+        &state,
+        "rename_note",
+        json!({
+            "from":"Folder/Child.md", "to":"Folder/Moved.md", "expectedHash":first["newHash"]
+        }),
+    )
+    .await;
+    let second = &second["result"]["structuredContent"];
+    assert_eq!(second["alreadyMoved"], true, "{second}");
+    assert_eq!(second["linkingTruncated"], false, "{second}");
+    for i in 0..501 {
+        assert_eq!(
+            fs::read_to_string(fixture.vault_path.join(format!("Linker{i:03}.md"))).unwrap(),
+            "[[Folder/Moved]]\n"
+        );
+    }
 }
 
 #[tokio::test]

@@ -10,7 +10,7 @@
 //! point at the old target, and a note it already rewrote has none left, so re-running is a
 //! no-op there while a note it never reached still gets fixed. The failure mode is "some
 //! links still point at the old path", which is visible (they are broken links) and
-//! repaired by running the same rename again.
+//! repaired by resuming the rename with the destination hash returned by the prior call.
 //!
 //! # Forms that have to be handled
 //!
@@ -39,7 +39,15 @@ pub struct RewriteOutcome {
 
 /// Strip a trailing `.md`, matching how a wikilink target is written.
 fn link_target(note_path: &str) -> &str {
-    note_path.strip_suffix(".md").unwrap_or(note_path)
+    if note_path.len() >= 3
+        && note_path
+            .get(note_path.len() - 3..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".md"))
+    {
+        &note_path[..note_path.len() - 3]
+    } else {
+        note_path
+    }
 }
 
 fn basename(target: &str) -> &str {
@@ -52,18 +60,16 @@ fn basename(target: &str) -> &str {
 /// writes an alias inside a table cell, and which one was used has to be preserved on the
 /// way out.
 fn split_link(inner: &str) -> (String, Option<String>, Option<(bool, String)>) {
-    let (target_and_fragment, alias) = match inner.find("\\|") {
-        Some(index) => (
-            &inner[..index],
-            Some((true, inner[index + 2..].to_string())),
-        ),
-        None => match inner.find('|') {
-            Some(index) => (
-                &inner[..index],
-                Some((false, inner[index + 1..].to_string())),
-            ),
-            None => (inner, None),
-        },
+    let (target_and_fragment, alias) = match inner.find('|') {
+        Some(index) => {
+            let escaped = inner[..index].ends_with('\\');
+            let end = index - usize::from(escaped);
+            (
+                &inner[..end],
+                Some((escaped, inner[index + 1..].to_string())),
+            )
+        }
+        None => (inner, None),
     };
     match target_and_fragment.find('#') {
         Some(index) => (
@@ -86,6 +92,18 @@ pub fn rewrite_wiki_links(
     to_path: &str,
     old_basename_was_unique: bool,
 ) -> RewriteOutcome {
+    rewrite_wiki_links_in_note(content, "", from_path, to_path, old_basename_was_unique)
+}
+
+/// Interpret explicit relative targets against the linking note's folder, within its
+/// backend's namespace. The logical mount prefix must never become a stored wikilink.
+pub fn rewrite_wiki_links_in_note(
+    content: &str,
+    note_path: &str,
+    from_path: &str,
+    to_path: &str,
+    old_basename_was_unique: bool,
+) -> RewriteOutcome {
     let from_target = link_target(from_path);
     let to_target = link_target(to_path);
     let from_base = basename(from_target);
@@ -103,37 +121,68 @@ pub fn rewrite_wiki_links(
 
         let (target, fragment, alias) = split_link(inner);
         let trimmed = target.trim();
-        // Two written forms of the same target must not survive the pass as broken links
-        // that look fine in their source: Obsidian accepts the `.md` suffix inside the
-        // brackets, and a leading `./` is the note-relative spelling of the same target.
-        // Both normalize to the canonical target before matching; `../` is deliberately
-        // NOT normalized, because resolving it needs the linking note's own folder and a
-        // wrong guess would repoint a link that never meant this note.
-        let normalized = trimmed.strip_suffix(".md").unwrap_or(trimmed);
-        let normalized = normalized.strip_prefix("./").unwrap_or(normalized);
-        let matches_full = normalized == from_target;
-        let matches_base = old_basename_was_unique && normalized == from_base;
+        let normalized = link_target(trimmed);
+        let relative = normalized.starts_with("./") || normalized.starts_with("../");
+        let resolved = if relative {
+            let mut parts: Vec<_> = note_path
+                .rsplit_once('/')
+                .map(|(dir, _)| dir.split('/').collect())
+                .unwrap_or_default();
+            let mut valid = true;
+            for part in normalized.split('/') {
+                match part {
+                    "." | "" => {}
+                    ".." => {
+                        if parts.pop().is_none() {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    part => parts.push(part),
+                }
+            }
+            valid.then(|| parts.join("/"))
+        } else {
+            Some(normalized.to_string())
+        };
+        let matches_full = resolved.as_deref() == Some(from_target);
+        let matches_base = !relative && old_basename_was_unique && normalized == from_base;
+        let moved_relative_link = relative
+            && resolved.is_some()
+            && note_path == from_path
+            && from_path.rsplit_once('/').map(|(folder, _)| folder)
+                != to_path.rsplit_once('/').map(|(folder, _)| folder);
 
-        if (matches_full || matches_base) && !inner.contains('[') && !inner.contains(']') {
+        if (matches_full || matches_base || moved_relative_link)
+            && !inner.contains('[')
+            && !inner.contains(']')
+        {
             // A link written in the short form stays short when the new basename is still
             // usable that way; otherwise it has to become a full path or it would resolve
             // somewhere else, or nowhere.
-            let replacement_target = if matches_base && !matches_full {
+            let replacement_target = if moved_relative_link && !matches_full {
+                // The note changed folders, but the target of its outgoing relative
+                // link did not. Store its prior mount-relative target explicitly.
+                resolved.as_deref().expect("a resolved relative target")
+            } else if matches_base && !matches_full {
                 basename(to_target)
             } else {
                 to_target
             };
-            out.push_str("[[");
-            out.push_str(replacement_target);
+            let mut replacement = String::from("[[");
+            replacement.push_str(replacement_target);
             if let Some(fragment) = &fragment {
-                out.push_str(fragment);
+                replacement.push_str(fragment);
             }
             if let Some((escaped, alias)) = &alias {
-                out.push_str(if *escaped { "\\|" } else { "|" });
-                out.push_str(alias);
+                replacement.push_str(if *escaped { "\\|" } else { "|" });
+                replacement.push_str(alias);
             }
-            out.push_str("]]");
-            rewritten += 1;
+            replacement.push_str("]]");
+            if replacement != rest[start..start + 2 + length + 2] {
+                rewritten += 1;
+            }
+            out.push_str(&replacement);
         } else {
             out.push_str("[[");
             out.push_str(inner);
@@ -156,6 +205,63 @@ mod tests {
 
     fn rewrite(content: &str) -> RewriteOutcome {
         rewrite_wiki_links(content, "Old/Note.md", "New/Renamed.md", true)
+    }
+
+    #[test]
+    fn relative_links_use_the_linking_notes_folder() {
+        let out = rewrite_wiki_links_in_note(
+            "[[./Note#H]] [[../Other]]",
+            "Old/Ref.md",
+            "Old/Note.md",
+            "New/Moved.md",
+            true,
+        );
+        assert_eq!(out.content, "[[New/Moved#H]] [[../Other]]");
+        let unrelated = rewrite_wiki_links_in_note(
+            "[[./Old/Note]]",
+            "Folder/Ref.md",
+            "Old/Note.md",
+            "New/Moved.md",
+            true,
+        );
+        assert_eq!(unrelated.rewritten, 0);
+        let parent = rewrite_wiki_links_in_note(
+            "[[../Old/Note]]",
+            "Folder/Ref.md",
+            "Old/Note.md",
+            "New/Moved.md",
+            true,
+        );
+        assert_eq!(parent.content, "[[New/Moved]]");
+    }
+
+    #[test]
+    fn unchanged_short_links_do_not_consume_a_repair_batch() {
+        let out = rewrite_wiki_links("[[Note]]", "Old/Note.md", "New/Note.md", true);
+        assert_eq!(out.content, "[[Note]]");
+        assert_eq!(out.rewritten, 0);
+    }
+
+    #[test]
+    fn moving_the_linking_note_preserves_its_outgoing_relative_targets() {
+        let out = rewrite_wiki_links_in_note(
+            "[[./Other#H|alias]] [[../Root]] [[./Note#Self]]",
+            "Old/Note.md",
+            "Old/Note.md",
+            "New/Moved.md",
+            true,
+        );
+        assert_eq!(
+            out.content,
+            "[[Old/Other#H|alias]] [[Root]] [[New/Moved#Self]]"
+        );
+        assert_eq!(out.rewritten, 3);
+    }
+
+    #[test]
+    fn the_first_pipe_separates_an_alias_even_when_its_text_contains_an_escape() {
+        let out = rewrite("[[Old/Note|alias\\|extra]]");
+        assert_eq!(out.content, "[[New/Renamed|alias\\|extra]]");
     }
 
     #[test]
@@ -247,8 +353,11 @@ mod tests {
 
     #[test]
     fn an_unrelated_link_is_untouched() {
-        let out = rewrite("see [[Other/Thing]] and [[Old/NoteButLonger]]");
-        assert_eq!(out.content, "see [[Other/Thing]] and [[Old/NoteButLonger]]");
+        let out = rewrite("see [[Other/Thing]] and [[Old/NoteButLonger]] and [[💡]]");
+        assert_eq!(
+            out.content,
+            "see [[Other/Thing]] and [[Old/NoteButLonger]] and [[💡]]"
+        );
         assert_eq!(out.rewritten, 0);
     }
 

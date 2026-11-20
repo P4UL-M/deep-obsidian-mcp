@@ -409,10 +409,12 @@ async fn archive_version(
 pub async fn soft_delete_note(
     backend: &AlgoliaVaultBackend,
     remote_path: &str,
+    base_version: &BaseVersion,
 ) -> Result<SoftDeleteOutcome, BackendError> {
     let head = fetch_head(backend, remote_path)
         .await?
         .ok_or_else(|| super::note_not_found(remote_path))?;
+    crate::validate_observed_version(remote_path, base_version, Some(&head.version_id))?;
     if head.deleted {
         return Ok(SoftDeleteOutcome {
             version_id: head.version_id,

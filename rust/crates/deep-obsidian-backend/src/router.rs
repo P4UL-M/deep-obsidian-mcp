@@ -626,13 +626,14 @@ impl VaultRouter {
                     }))
                     .await?)
             }
-            MutationRequest::SoftDelete { path } => {
+            MutationRequest::SoftDelete { path, base_version } => {
                 let resolved = self.resolve(&path)?;
                 Ok(resolved
                     .mount
                     .backend
-                    .execute(BackendRequest::soft_delete(
+                    .execute(BackendRequest::soft_delete_guarded(
                         resolved.backend_relative_path.clone(),
+                        base_version,
                     ))
                     .await?)
             }

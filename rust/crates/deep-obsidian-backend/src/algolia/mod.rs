@@ -509,7 +509,11 @@ impl AlgoliaVaultBackend {
     /// Gated on `writable` like every other mutation, and on the markdown-only rule
     /// before that — a caller asking to delete an attachment must be told the mount never
     /// held one, not that the delete failed.
-    async fn soft_delete(&self, path: &str) -> Result<MutationResponse, BackendError> {
+    async fn soft_delete(
+        &self,
+        path: &str,
+        base_version: BaseVersion,
+    ) -> Result<MutationResponse, BackendError> {
         self.ensure_writable()?;
         ensure_vault_relative(path)?;
         if !reads::is_markdown_path(path) {
@@ -517,7 +521,7 @@ impl AlgoliaVaultBackend {
                 ALGOLIA_NO_BINARY_MESSAGE.to_string(),
             ));
         }
-        let outcome = versioning::soft_delete_note(self, path).await?;
+        let outcome = versioning::soft_delete_note(self, path, &base_version).await?;
         Ok(MutationResponse::SoftDeleted {
             version_id: outcome.version_id,
             already_deleted: outcome.already_deleted,
@@ -560,7 +564,7 @@ impl VaultBackend for AlgoliaVaultBackend {
     ///   listing versions and reading one back are reads, and a participant who may read
     ///   the corpus may read its history. Gating it on `writable` would hide the recovery
     ///   path from exactly the mounts most likely to need it.
-    /// * `SoftDelete` — only when `writable`. This is the ONE capability `writable`
+    /// * `SoftDelete` — only when `writable`. Together with `Rename`, these are the capabilities `writable`
     ///   gates, and it must be gated: a delete is a write, and the server registers the
     ///   `delete_note` tool from this capability, so advertising it on a read-only mount
     ///   would put a tool on the surface that could only ever refuse.
@@ -603,15 +607,18 @@ impl VaultBackend for AlgoliaVaultBackend {
                 .map(BackendResponse::Mutation),
             // An Algolia record is addressed by its own object id, so a path change is a
             // re-index plus a delete — two operations, not a move. Same reasoning as the
-            // couchdb mount: no atomicity, so no `Capability::Rename`.
-            BackendRequest::Mutation(MutationRequest::Rename { from, to, .. }) => {
-                crate::rename_by_write_then_remove(self, &from, &to)
-                    .await
-                    .map(BackendResponse::Mutation)
-            }
-            BackendRequest::Mutation(MutationRequest::SoftDelete { path }) => {
-                self.soft_delete(&path).await.map(BackendResponse::Mutation)
-            }
+            // couchdb mount: it reports atomic:false and can leave a resumable copy.
+            BackendRequest::Mutation(MutationRequest::Rename {
+                from,
+                to,
+                base_version,
+            }) => crate::rename_by_write_then_remove(self, &from, &to, base_version)
+                .await
+                .map(BackendResponse::Mutation),
+            BackendRequest::Mutation(MutationRequest::SoftDelete { path, base_version }) => self
+                .soft_delete(&path, base_version)
+                .await
+                .map(BackendResponse::Mutation),
             // Refused for being BINARY rather than for the mount being read-only,
             // even on a read-only mount: `writable` can be turned on, and the reader
             // of this error must not be sent off to do that in the belief it will

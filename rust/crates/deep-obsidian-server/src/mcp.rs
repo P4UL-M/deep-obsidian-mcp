@@ -284,8 +284,8 @@ pub async fn handle_request(
                     tools: {
                         let mut definitions=tools::list_tools(state.rg_available,state.router.is_multi_mount(),tools::CapabilitySet::of(&state.router));
                         if state.access.is_some() { for definition in &mut definitions {
-                            if matches!(definition.name.as_str(),"upsert_note"|"upsert_session_note"|"edit_note"|"delete_note"|"request_vault_upload") {
-                                definition.input_schema["properties"]["mountId"]=json!({"type":"string","description":"Optional permitted mount ID, or default, to interpret path/folder relative to that vault. Omit for logical vault paths."});
+                            if matches!(definition.name.as_str(),"upsert_note"|"upsert_session_note"|"edit_note"|"rename_note"|"delete_note"|"request_vault_upload") {
+                                definition.input_schema["properties"]["mountId"]=json!({"type":"string","description":"Optional permitted mount ID, or default, to interpret path/folder/from/to relative to that vault. Omit for logical vault paths."});
                             }
                         } }
                         if state.access.is_some() { definitions.push(crate::multiuser::membership_definition()); }

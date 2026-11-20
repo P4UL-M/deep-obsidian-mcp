@@ -837,7 +837,11 @@ impl CouchDbVaultBackend {
     /// produces a fresh `deleted: true` revision — and that is precisely why the request is
     /// not made: the new revision would replicate to every device that syncs this vault
     /// and mean nothing that the old one did not.
-    async fn soft_delete(&self, path: &str) -> Result<MutationResponse, BackendError> {
+    async fn soft_delete(
+        &self,
+        path: &str,
+        base_version: BaseVersion,
+    ) -> Result<MutationResponse, BackendError> {
         self.ensure_writable()?;
         // The protected-path rule, and not just `ensure_vault_relative`: `write_text` and
         // `commit_upload` both refuse `Templates/`, and a surface where a template cannot
@@ -846,6 +850,7 @@ impl CouchDbVaultBackend {
         // A missing entry arrives as an IO `NotFound`, which is the taxonomy the tool layer
         // already branches on for a read of a missing note.
         let stat = map_sidecar(self.supervisor.stat(path).await)?;
+        crate::validate_observed_version(path, &base_version, Some(&stat.rev))?;
         if stat.deleted {
             debug!(
                 "delete of {path} was asked of an entry that is already a livesync tombstone at \
@@ -1370,19 +1375,19 @@ impl VaultBackend for CouchDbVaultBackend {
                 .write_text(&path, &content, base_version)
                 .await
                 .map(BackendResponse::Mutation),
-            // Refused rather than emulated. LiveSync has no move: doing it as
-            // write-then-soft-delete is two replications, and a crash between them leaves
-            // the note visible at both paths to every other participant with no way to
-            // tell that from success. `Capability::Rename` is therefore not advertised —
-            // see its doc, which requires atomicity to claim it.
-            BackendRequest::Mutation(MutationRequest::Rename { from, to, .. }) => {
-                crate::rename_by_write_then_remove(self, &from, &to)
-                    .await
-                    .map(BackendResponse::Mutation)
-            }
-            BackendRequest::Mutation(MutationRequest::SoftDelete { path }) => {
-                self.soft_delete(&path).await.map(BackendResponse::Mutation)
-            }
+            // A path-derived LiveSync document id requires a copy followed by a
+            // revision-guarded source removal; the response reports non-atomicity.
+            BackendRequest::Mutation(MutationRequest::Rename {
+                from,
+                to,
+                base_version,
+            }) => crate::rename_by_write_then_remove(self, &from, &to, base_version)
+                .await
+                .map(BackendResponse::Mutation),
+            BackendRequest::Mutation(MutationRequest::SoftDelete { path, base_version }) => self
+                .soft_delete(&path, base_version)
+                .await
+                .map(BackendResponse::Mutation),
             BackendRequest::Mutation(MutationRequest::CommitUploadStream {
                 path,
                 expected_hash,

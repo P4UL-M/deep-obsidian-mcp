@@ -140,7 +140,7 @@ pub enum Capability {
     /// note by construction and "list its history" has no answer — not an empty one.
     VersionHistory,
     /// The backend can move a note from one path to another
-    /// ([`MutationRequest::Rename`]) as one operation.
+    /// ([`MutationRequest::Rename`]); atomicity is reported separately.
     ///
     /// Separate from [`Capability::SoftDelete`] on purpose, and present on backends that
     /// lack it. The distinction is recoverability THROUGH THIS SURFACE: after a rename the
@@ -497,8 +497,11 @@ pub enum MutationRequest {
     /// than merely find it missing, and that its last content is still reachable
     /// through the version history. A backend that cannot promise all three must
     /// refuse rather than approximate it with an unlink — see [`Capability::SoftDelete`].
-    SoftDelete { path: String },
-    /// Move a note, atomically, within one mount.
+    SoftDelete {
+        path: String,
+        base_version: BaseVersion,
+    },
+    /// Move a note within one mount, reporting whether the move was atomic.
     ///
     /// Cross-mount moves are refused before reaching a backend — see
     /// [`VaultRouter::resolve_pair`], whose whole purpose is that guard. `base_version`
@@ -961,8 +964,8 @@ pub struct GrepContextLine {
 /// LiveSync sidecar reaches a document through `path2id`, and an Algolia record's objectID
 /// is `note:{path}`. Refusing on those grounds would be the wrong call twice over. First,
 /// the two-step failure is benign in the way that matters — an interrupted move leaves the
-/// note READABLE at both paths, so nothing is lost, the state is visible, and re-running
-/// the same rename repairs it. Second, `SoftDelete` already accepts exactly this contract
+/// note READABLE at both paths. A retry verifies identical content and the source
+/// observation before finishing removal; changed copies require caller reconciliation. Second, `SoftDelete` already accepts exactly this contract
 /// for itself, so refusing a move for lacking atomicity while shipping a delete that also
 /// lacks it would be inconsistent.
 ///
@@ -979,35 +982,70 @@ pub async fn rename_by_write_then_remove(
     backend: &(impl VaultBackend + ?Sized),
     from: &str,
     to: &str,
+    base_version: BaseVersion,
 ) -> Result<MutationResponse, BackendError> {
-    let replaced_destination = backend.execute(BackendRequest::read_text(to)).await.is_ok();
-
-    let text = backend
+    if from == to {
+        return Err(BackendError::Message(
+            "cannot rename a note onto itself".to_string(),
+        ));
+    }
+    deep_obsidian_core::vault::ensure_writable_vault_relative_path(from)?;
+    deep_obsidian_core::vault::ensure_writable_vault_relative_path(to)?;
+    let (text, version) = backend
         .execute(BackendRequest::read_text(from))
         .await?
-        .into_text()?;
-
+        .into_versioned_text()?;
+    validate_observed_version(from, &base_version, version.as_deref())?;
+    let hash = deep_obsidian_core::content_hash(text.as_bytes());
+    match backend.execute(BackendRequest::read_text(to)).await {
+        Ok(response) => {
+            if response.into_text()? != text {
+                return Err(BackendError::Message(format!("refusing to rename {from} to {to}: the destination already exists with different content")));
+            }
+            // Resume a copy whose destination was written but source removal failed.
+        }
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => {
+            backend
+                .execute(BackendRequest::write_text_full(
+                    to,
+                    &text,
+                    BaseVersion::Absent,
+                    false,
+                ))
+                .await?;
+        }
+        Err(error) => return Err(error),
+    }
     backend
-        .execute(BackendRequest::write_text_full(
-            to.to_string(),
-            text,
-            // The caller refuses an occupied destination, but that check read the manifest
-            // a moment earlier — `Absent` turns "destination was free when I looked" into
-            // a storage-level create-only write, so a note created in between is reported
-            // rather than clobbered. Backends that cannot express it keep their old
-            // semantics, by the contract of `BaseVersion`.
-            BaseVersion::Absent,
-            false,
-        ))
-        .await?;
-    backend
-        .execute(BackendRequest::soft_delete(from.to_string()))
-        .await?;
+        .execute(BackendRequest::soft_delete_guarded(from, BaseVersion::from_read(version)))
+        .await.map_err(|error| BackendError::Message(format!("rename wrote {to}, but could not remove {from}: {error}. Both paths may remain. Inspect both copies; if unchanged, retry rename_note with expectedHash {hash}.")))?;
 
     Ok(MutationResponse::Renamed {
-        replaced_destination,
+        replaced_destination: false,
         atomic: false,
     })
+}
+
+/// A rename's source must still be the revision that was observed/copied. Storage
+/// without revisions retains its existing Unobserved semantics.
+pub(crate) fn validate_observed_version(
+    path: &str,
+    expected: &BaseVersion,
+    found: Option<&str>,
+) -> Result<(), BackendError> {
+    match expected {
+        BaseVersion::Version(version) if found != Some(version.as_str()) => {
+            Err(BackendError::VersionConflict {
+                path: path.to_string(),
+                expected: version.clone(),
+                found: found.unwrap_or("absent").to_string(),
+            })
+        }
+        BaseVersion::Absent => Err(BackendError::Message(format!(
+            "cannot remove {path}: the source was expected to be absent"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 #[async_trait::async_trait]
@@ -1323,7 +1361,14 @@ impl BackendRequest {
 
     /// Remove a note observably and recoverably.
     pub fn soft_delete(path: impl Into<String>) -> Self {
-        BackendRequest::Mutation(MutationRequest::SoftDelete { path: path.into() })
+        Self::soft_delete_guarded(path, BaseVersion::Unobserved)
+    }
+
+    pub fn soft_delete_guarded(path: impl Into<String>, base_version: BaseVersion) -> Self {
+        BackendRequest::Mutation(MutationRequest::SoftDelete {
+            path: path.into(),
+            base_version,
+        })
     }
 
     /// A ranked search served by the backend itself, from the most relevant hit.
