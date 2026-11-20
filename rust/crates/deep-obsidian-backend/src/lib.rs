@@ -991,7 +991,12 @@ pub async fn rename_by_write_then_remove(
         .execute(BackendRequest::write_text_full(
             to.to_string(),
             text,
-            BaseVersion::Unobserved,
+            // The caller refuses an occupied destination, but that check read the manifest
+            // a moment earlier — `Absent` turns "destination was free when I looked" into
+            // a storage-level create-only write, so a note created in between is reported
+            // rather than clobbered. Backends that cannot express it keep their old
+            // semantics, by the contract of `BaseVersion`.
+            BaseVersion::Absent,
             false,
         ))
         .await?;

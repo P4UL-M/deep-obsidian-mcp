@@ -271,7 +271,10 @@ impl AppState {
     /// Scope BEFORE any candidate retrieval, resource enumeration or metadata rendering.
     pub fn for_principal(&self, principal: Principal) -> Result<Self> {
         let current = self.current();
-        let store = current.control.as_ref().context("multiuser is unavailable")?;
+        let store = current
+            .control
+            .as_ref()
+            .context("multiuser is unavailable")?;
         if !store.principal_valid(&principal)? || !store.enabled()? {
             bail!("access denied");
         }

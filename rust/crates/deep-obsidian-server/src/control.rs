@@ -101,10 +101,17 @@ pub fn start(state: &AppState) -> Result<ControlGuard> {
                         let _serial = gate.lock().await;
                         match serde_json::from_str::<Value>(&line) {
                             Ok(request) if request["operation"] == "mounts.reload" => {
-                                match tokio::time::timeout(std::time::Duration::from_secs(25), crate::reload::apply(&state)).await {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(25),
+                                    crate::reload::apply(&state),
+                                )
+                                .await
+                                {
                                     Ok(Ok(result)) => json!({"ok":true,"result":result}),
                                     Ok(Err(error)) => json!({"ok":false,"error":error.to_string()}),
-                                    Err(_) => json!({"ok":false,"error":"mount reload timed out; previous live mounts were retained"}),
+                                    Err(_) => {
+                                        json!({"ok":false,"error":"mount reload timed out; previous live mounts were retained"})
+                                    }
                                 }
                             }
                             Ok(request) => {
@@ -162,7 +169,10 @@ pub fn start(state: &AppState) -> Result<ControlGuard> {
 }
 
 /// CLI sends changes to a live server, or locks an offline config for initial setup.
-pub async fn try_call_running(config: &ResolvedServiceConfig, request: Value) -> Result<Option<Value>> {
+pub async fn try_call_running(
+    config: &ResolvedServiceConfig,
+    request: Value,
+) -> Result<Option<Value>> {
     #[cfg(unix)]
     {
         match tokio::net::UnixStream::connect(multiuser::socket_path(config)).await {
@@ -200,7 +210,9 @@ pub async fn try_call_running(config: &ResolvedServiceConfig, request: Value) ->
 }
 
 pub async fn call_local(config: &ResolvedServiceConfig, request: Value) -> Result<Value> {
-    if let Some(result) = try_call_running(config, request.clone()).await? { return Ok(result); }
+    if let Some(result) = try_call_running(config, request.clone()).await? {
+        return Ok(result);
+    }
     let _lock = lock(config)?;
     let store = ControlStore::open(multiuser::database_path(config))?;
     execute(config, &store, request)

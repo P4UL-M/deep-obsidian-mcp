@@ -36,12 +36,30 @@ All notable changes to deep-obsidian-mcp are documented here.
     short `[[Name]]` link by basename, so completing the move would silently
     change where such links in UNRELATED notes point
 
+  Two more refusals guard meaning the same way: a source or destination
+  reaching a protected Template(s) folder (a move there changes protected
+  content just as a write would, and a move out removes it), and a source and
+  destination on different mounts — a rename moves a note within one mount,
+  it does not copy between providers.
+
   Link rewriting is a repair pass, not part of the move: N inbound links are N
   writes and nothing makes them one transaction. It is idempotent — a note already
   rewritten has no old-path link left to match — so an interrupted pass is
   finished by re-running the same call, and the response names the notes it could
-  not rewrite. Each rewrite is guarded on the revision just read, so a concurrent
-  edit to a linking note fails that note rather than clobbering it. Five link
+  not rewrite. A re-run recognizes that the move already happened
+  (`alreadyMoved: true`), skips it, and runs only the repair pass, so the
+  recovery advice is one a caller can actually follow. The linking set is
+  matched against each note's RAW links rather than a resolved graph, so links
+  the resolver can no longer resolve (the exact state after a move) are still
+  found and repaired; `.md`-suffixed and `./`-prefixed spellings normalize to
+  the same target, while a `../` link is left alone because resolving it needs
+  the linking note's own folder. Each rewrite is guarded on the revision just
+  read, so a concurrent edit to a linking note fails that note rather than
+  clobbering it. The inbound-link scan is capped at 500 notes; hitting the cap
+  is reported as `linkingTruncated: true` instead of silently leaving the rest
+  broken. The composed (non-atomic) move writes its destination as a
+  create-only write, so a note created at the destination between the
+  occupancy check and the write is reported rather than clobbered. Five link
   forms are handled: `[[path]]`, `[[path|alias]]`, `[[path#heading]]`, the
   shortest-path `[[basename]]`, and any of them behind a `!` embed —
   `[[path\|alias]]` included, since the escaped pipe is the only way to write an

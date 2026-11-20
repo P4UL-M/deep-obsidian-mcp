@@ -103,8 +103,16 @@ pub fn rewrite_wiki_links(
 
         let (target, fragment, alias) = split_link(inner);
         let trimmed = target.trim();
-        let matches_full = trimmed == from_target;
-        let matches_base = old_basename_was_unique && trimmed == from_base;
+        // Two written forms of the same target must not survive the pass as broken links
+        // that look fine in their source: Obsidian accepts the `.md` suffix inside the
+        // brackets, and a leading `./` is the note-relative spelling of the same target.
+        // Both normalize to the canonical target before matching; `../` is deliberately
+        // NOT normalized, because resolving it needs the linking note's own folder and a
+        // wrong guess would repoint a link that never meant this note.
+        let normalized = trimmed.strip_suffix(".md").unwrap_or(trimmed);
+        let normalized = normalized.strip_prefix("./").unwrap_or(normalized);
+        let matches_full = normalized == from_target;
+        let matches_base = old_basename_was_unique && normalized == from_base;
 
         if (matches_full || matches_base) && !inner.contains('[') && !inner.contains(']') {
             // A link written in the short form stays short when the new basename is still
@@ -171,6 +179,34 @@ mod tests {
     fn an_escaped_pipe_stays_escaped() {
         let out = rewrite("| col | [[Old/Note\\|Old]] |");
         assert_eq!(out.content, "| col | [[New/Renamed\\|Old]] |");
+    }
+
+    /// Obsidian accepts the `.md` suffix inside the brackets. Leaving such a link
+    /// unrewritten would be a broken link that looks fine in its source.
+    #[test]
+    fn an_md_suffixed_link_is_rewritten() {
+        let out = rewrite("see [[Old/Note.md]] here");
+        assert_eq!(out.content, "see [[New/Renamed]] here");
+        assert_eq!(out.rewritten, 1);
+    }
+
+    /// A leading `./` is the note-relative spelling of the same target and must be
+    /// repointed too.
+    #[test]
+    fn a_dot_slash_relative_link_is_rewritten() {
+        let out = rewrite("see [[./Old/Note]] here");
+        assert_eq!(out.content, "see [[New/Renamed]] here");
+        assert_eq!(out.rewritten, 1);
+    }
+
+    /// Normalization must not overreach: another note's `.md` link is untouched, and a
+    /// `../` link is left alone because resolving it needs the linking note's own folder —
+    /// a wrong guess would repoint a link that never meant this note.
+    #[test]
+    fn unrelated_and_parent_relative_links_are_untouched() {
+        let out = rewrite("see [[Unrelated.md]] and [[../Old/Note]]");
+        assert_eq!(out.content, "see [[Unrelated.md]] and [[../Old/Note]]");
+        assert_eq!(out.rewritten, 0);
     }
 
     #[test]

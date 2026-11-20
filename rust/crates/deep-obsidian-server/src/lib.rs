@@ -1,7 +1,7 @@
 pub mod auth;
 pub mod bootstrap;
-pub mod couchdb_source;
 pub mod control;
+pub mod couchdb_source;
 pub mod edits;
 pub mod federation;
 pub mod health;
@@ -12,8 +12,8 @@ pub mod multiuser;
 pub mod oauth;
 pub mod prompts;
 pub mod protocol;
-pub mod resources;
 pub mod reload;
+pub mod resources;
 pub mod runtime;
 pub mod stdio;
 pub mod tools;

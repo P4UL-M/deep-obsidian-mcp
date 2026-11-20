@@ -1021,6 +1021,129 @@ async fn rename_note_refuses_a_destination_whose_basename_collides() {
     );
 }
 
+/// The documented recovery must actually be followable: after a move whose repair pass
+/// was interrupted (simulated here by `rewriteLinks:false`), a re-run of the SAME call
+/// recognizes the move already happened, skips it, and finishes the pass — instead of
+/// dying on the destination-occupied refusal like the old advice did.
+#[tokio::test]
+async fn rename_note_resumes_an_interrupted_repair_on_a_rerun() {
+    let fixture = Fixture::new("rename-resume");
+    let state = fixture.state().await;
+
+    let first = tool_call(
+        &state,
+        "rename_note",
+        json!({
+            "from": "Folder/Child.md",
+            "to": "Folder/Renamed Child.md",
+            "rewriteLinks": false
+        }),
+    )
+    .await;
+    assert_eq!(
+        first["result"]["structuredContent"]["atomic"],
+        json!(true),
+        "{first}"
+    );
+
+    let second = tool_call(
+        &state,
+        "rename_note",
+        json!({"from": "Folder/Child.md", "to": "Folder/Renamed Child.md"}),
+    )
+    .await;
+    let result = &second["result"]["structuredContent"];
+    assert_eq!(
+        result["alreadyMoved"],
+        json!(true),
+        "the re-run must recognize the move: {second}"
+    );
+    assert!(
+        result["rewroteLinksIn"]
+            .as_array()
+            .expect("rewroteLinksIn")
+            .iter()
+            .any(|entry| entry["path"] == json!("Root.md")),
+        "the interrupted repair finishes on the re-run: {second}"
+    );
+    let root = std::fs::read_to_string(fixture.vault_path.join("Root.md")).expect("read root");
+    assert!(root.contains("[[Folder/Renamed Child]]"), "{root}");
+    assert!(!root.contains("[[Folder/Child]]"), "{root}");
+}
+
+/// A move that reaches a protected Template(s) folder changes protected content the same
+/// way a write there is refused, so both sides of the move are guarded.
+#[tokio::test]
+async fn rename_note_refuses_to_touch_a_protected_templates_path() {
+    let fixture = Fixture::new("rename-templates");
+    fs::create_dir_all(fixture.vault_path.join("Templates")).expect("create Templates");
+    fs::write(fixture.vault_path.join("Templates/Daily.md"), "# Daily\n").expect("write template");
+    let state = fixture.state().await;
+
+    let into = tool_call(
+        &state,
+        "rename_note",
+        json!({"from": "Folder/Child.md", "to": "Templates/Child.md"}),
+    )
+    .await;
+    let message = into["error"]["message"].as_str().expect("an error");
+    assert!(message.contains("Template"), "{message}");
+    assert!(
+        fixture.vault_path.join("Folder/Child.md").exists(),
+        "a refused rename must not move anything"
+    );
+
+    let out_of = tool_call(
+        &state,
+        "rename_note",
+        json!({"from": "Templates/Daily.md", "to": "Folder/Daily.md"}),
+    )
+    .await;
+    let message = out_of["error"]["message"].as_str().expect("an error");
+    assert!(message.contains("Template"), "{message}");
+    assert!(
+        fixture.vault_path.join("Templates/Daily.md").exists(),
+        "a refused rename must not move anything"
+    );
+}
+
+/// Hitting the inbound-link scan's cap is REPORTED, not absorbed: a silently truncated
+/// pass would leave broken links that look fine in their source.
+#[tokio::test]
+async fn rename_note_reports_when_the_link_scan_hits_its_cap() {
+    let fixture = Fixture::new("rename-truncated");
+    for i in 0..501 {
+        fs::write(
+            fixture.vault_path.join(format!("Linker{i:03}.md")),
+            format!("# Linker {i}\n\n[[Folder/Child]]\n"),
+        )
+        .expect("write linker note");
+    }
+    let state = fixture.state().await;
+
+    let response = tool_call(
+        &state,
+        "rename_note",
+        json!({
+            "from": "Folder/Child.md",
+            "to": "Folder/Moved.md",
+            "dryRun": true
+        }),
+    )
+    .await;
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(
+        result["linkingTruncated"],
+        json!(true),
+        "501 linking notes exceed the 500-note scan cap: {result}"
+    );
+    assert_eq!(
+        result["linkingNotes"].as_array().map(Vec::len),
+        Some(500),
+        "the cap holds the list to 500 entries: {result}"
+    );
+}
+
 #[tokio::test]
 async fn request_vault_upload_is_frozen() {
     let fixture = Fixture::new("upload");
