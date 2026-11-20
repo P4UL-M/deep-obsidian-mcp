@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::edits::{apply_edits, AppliedEdit, EditSpec};
-use crate::locks::MutationLockGuard;
+use crate::locks::{MutationLockGuard, MUTATION_LOCK_KEY_SEPARATOR};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use deep_obsidian_backend::{
@@ -676,28 +676,8 @@ fn normalize_score_order(left: f64, right: f64, left_path: &str, right_path: &st
 /// callers spelling the same note differently — or reaching it through a scoped
 /// principal router — serialize against the same mutex, while a remapped mount
 /// gets its own.
-/// Field separator inside a mutation-lock key. A unit separator: it cannot
-/// appear in a vault-relative path, so storage identity and path never blur.
-const MUTATION_LOCK_KEY_SEPARATOR: char = '\u{1f}';
-
 fn mutation_lock_key(state: &AppState, path: &str) -> Result<String, String> {
-    let resolved = state.router.resolve(path).map_err(|error| error.to_string())?;
-    let mut normalized = resolved
-        .backend_relative_path
-        .trim_start_matches("./")
-        .to_string();
-    while normalized.starts_with('/') {
-        normalized.remove(0);
-    }
-    while normalized.ends_with('/') {
-        normalized.pop();
-    }
-    Ok(format!(
-        "{}{}{}",
-        resolved.mount.backend.storage_id(),
-        MUTATION_LOCK_KEY_SEPARATOR,
-        normalized
-    ))
+    crate::locks::note_lock_key(&state.router, path)
 }
 
 /// Acquire the per-note mutation lock for one path.

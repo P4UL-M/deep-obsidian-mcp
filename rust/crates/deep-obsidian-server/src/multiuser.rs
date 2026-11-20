@@ -487,9 +487,8 @@ impl VaultBackend for GrantedBackend {
         }
         let request = match request {
             BackendRequest::Mutation(
-                deep_obsidian_backend::MutationRequest::CommitUploadStream {
+                deep_obsidian_backend::MutationRequest::StageUploadStream {
                     path,
-                    expected_hash,
                     max_bytes,
                     chunks,
                 },
@@ -508,9 +507,8 @@ impl VaultBackend for GrantedBackend {
                     chunks.next()
                 });
                 BackendRequest::Mutation(
-                    deep_obsidian_backend::MutationRequest::CommitUploadStream {
+                    deep_obsidian_backend::MutationRequest::StageUploadStream {
                         path,
-                        expected_hash,
                         max_bytes,
                         chunks: deep_obsidian_backend::UploadChunks::new(guarded),
                     },

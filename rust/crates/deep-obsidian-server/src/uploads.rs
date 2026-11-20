@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use deep_obsidian_backend::{
-    BackendError, BackendRequest, MutationRequest, UploadChunks, VaultBackend,
+    BackendError, BackendRequest, MutationRequest, MutationResponse, UploadChunks, VaultBackend,
 };
 
 /// Maximum bytes a single upload may carry (100 MiB).
@@ -271,30 +271,57 @@ pub struct CommitOutcome {
     pub hash: String,
 }
 
-/// Land an upload's bytes at its bound destination, through the backend.
-///
-/// The staging file, the incremental hash, the byte budget, the optimistic-concurrency
-/// re-read and the atomic swap all live inside the backend: "write a sibling temp file
-/// then rename" is a filesystem mechanic, not a vault contract. This function is the
-/// thin adapter that keeps [`CommitError`] — and therefore every HTTP status code and
-/// message the upload endpoint returns — exactly as it was.
+/// Stage an upload's bytes through the backend, WITHOUT touching the
+/// destination. Runs concurrently with the request-body pump; the per-note
+/// mutation lock is deliberately NOT held here — this phase can take as long as
+/// the network transfer does.
 ///
 /// Takes owned arguments so the caller can drive it as a concurrent task while it
-/// pumps the request body into `chunks`.
-pub async fn commit_stream_via_backend(
+/// pumps the request body into `chunks`. Returns the backend's opaque staging
+/// handle for [`commit_staged_via_backend`].
+pub async fn stage_stream_via_backend(
     backend: Arc<dyn VaultBackend>,
     dest_path: String,
-    expected_hash: Option<String>,
     max_bytes: usize,
     chunks: UploadChunks,
+) -> Result<String, CommitError> {
+    let staged = backend
+        .execute(BackendRequest::Mutation(
+            MutationRequest::StageUploadStream {
+                path: dest_path,
+                max_bytes,
+                chunks,
+            },
+        ))
+        .await
+        .map_err(CommitError::from)?;
+    let deep_obsidian_backend::BackendResponse::Mutation(MutationResponse::UploadStaged {
+        handle,
+    }) = staged
+    else {
+        return Err(CommitError::Io(
+            "backend returned a non-staging response to a staging request".to_string(),
+        ));
+    };
+    Ok(handle)
+}
+
+/// Commit a staged upload: re-read the destination, verify `expected_hash`
+/// against it as it is NOW, and swap the staged bytes in. The caller holds the
+/// destination's per-note mutation lock across this call and this call only —
+/// the read/check/write critical section the whole feature exists to protect.
+pub async fn commit_staged_via_backend(
+    backend: Arc<dyn VaultBackend>,
+    dest_path: String,
+    handle: String,
+    expected_hash: Option<String>,
 ) -> Result<CommitOutcome, CommitError> {
     let outcome = backend
         .execute(BackendRequest::Mutation(
-            MutationRequest::CommitUploadStream {
+            MutationRequest::CommitStagedUpload {
                 path: dest_path,
+                handle,
                 expected_hash,
-                max_bytes,
-                chunks,
             },
         ))
         .await
@@ -400,8 +427,23 @@ mod tests {
 
     /// The adapter between the backend and [`CommitError`] is what decides the
     /// upload endpoint's HTTP status codes, and for a conflict it also decides the
-    /// 409 body. These go through `commit_stream_via_backend` — the exact path
+    /// 409 body. These go through the staged pair — the exact path
     /// `upload_handler` drives — so a dropped or reordered field would fail here.
+    /// Stage then commit through both adapters, preserving the old single-call
+    /// test ergonomics while covering the split the endpoint actually drives.
+    async fn stage_and_commit_via_backend(
+        backend: Arc<dyn VaultBackend>,
+        dest_path: impl Into<String>,
+        expected_hash: Option<String>,
+        max_bytes: usize,
+        chunks: UploadChunks,
+    ) -> Result<CommitOutcome, CommitError> {
+        let dest_path = dest_path.into();
+        let handle =
+            stage_stream_via_backend(backend.clone(), dest_path.clone(), max_bytes, chunks).await?;
+        commit_staged_via_backend(backend, dest_path, handle, expected_hash).await
+    }
+
     #[tokio::test]
     async fn backend_failures_map_to_the_commit_error_taxonomy() {
         use deep_obsidian_backend::FilesystemVaultBackend;
@@ -416,7 +458,7 @@ mod tests {
         let backend = || -> Arc<dyn VaultBackend> { Arc::new(FilesystemVaultBackend::new(&dir)) };
 
         // Stale expected hash -> 409, carrying both hashes verbatim.
-        let error = commit_stream_via_backend(
+        let error = stage_and_commit_via_backend(
             backend(),
             "doc.bin".to_string(),
             Some("fnv1a64:0000000000000000".to_string()),
@@ -437,7 +479,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("doc.bin")).unwrap(), b"current");
 
         // Over the byte budget -> 413.
-        let error = commit_stream_via_backend(
+        let error = stage_and_commit_via_backend(
             backend(),
             "big.bin".to_string(),
             None,
@@ -451,7 +493,7 @@ mod tests {
         assert!(!dir.join("big.bin").exists());
 
         // Traversal -> the escape arm, which the endpoint reports as 403.
-        let error = commit_stream_via_backend(
+        let error = stage_and_commit_via_backend(
             backend(),
             "../escaped.bin".to_string(),
             None,
@@ -464,7 +506,7 @@ mod tests {
         assert_eq!(error.to_string(), "destination escapes the vault root");
 
         // A successful commit still reports the canonical hash and byte count.
-        let outcome = commit_stream_via_backend(
+        let outcome = stage_and_commit_via_backend(
             backend(),
             "fresh.bin".to_string(),
             None,

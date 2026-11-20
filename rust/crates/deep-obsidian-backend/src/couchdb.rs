@@ -33,7 +33,7 @@
 //!   experimental read-only state and the exact setting that changes it rather than
 //!   reporting a generic capability error.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -319,6 +319,11 @@ struct CachedManifest {
 /// supervisor was configured `read-write`.
 pub struct CouchDbVaultBackend {
     supervisor: Arc<SidecarSupervisor>,
+    /// Bytes staged by [`MutationRequest::StageUploadStream`], keyed by an
+    /// opaque handle, waiting for the matching commit. The buffer lives here —
+    /// not on the wire — so the server's per-note lock is held only across the
+    /// commit, never across the network transfer.
+    staged_uploads: std::sync::Mutex<HashMap<String, Vec<u8>>>,
     manifest: std::sync::Mutex<Option<CachedManifest>>,
     /// What each recently-touched path's content hashed to, at which revision.
     /// See [`HashCache`] and [`Self::read_text_conditionally`].
@@ -354,6 +359,7 @@ impl CouchDbVaultBackend {
             supervisor,
             manifest: std::sync::Mutex::new(None),
             hashes: std::sync::Mutex::new(HashCache::default()),
+            staged_uploads: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -910,30 +916,52 @@ impl CouchDbVaultBackend {
         }
     }
 
-    /// `CommitUploadStream`: collect the body, verify `expected_hash`, write binary.
+    /// `StageUploadStream`: collect the body into a backend-held buffer. Nothing
+    /// touches the destination, so the caller's per-note lock is not needed yet.
     ///
-    /// The filesystem backend's staging file and atomic rename have no analogue here
-    /// and need none: the sidecar's write is already all-or-nothing at the entry root
-    /// (chunks first, root last), so there is nothing to stage. What IS shared is the
-    /// contract: `max_bytes` enforced *during* collection so an oversize body never
-    /// reaches the remote, `expected_hash` verified against the destination as it is
-    /// at commit time, and the canonical content hash reported back.
-    async fn commit_upload(
+    /// `max_bytes` is enforced *during* collection so an oversize body never
+    /// reaches this process's memory budget. The commit half verifies
+    /// `expected_hash` against the destination as it is at commit time and
+    /// writes under the destination's revision guard.
+    async fn stage_upload(
         &self,
-        path: &str,
-        expected_hash: Option<&str>,
         max_bytes: usize,
         chunks: crate::UploadChunks,
     ) -> Result<MutationResponse, BackendError> {
-        self.ensure_writable()?;
-        ensure_writable_path(path)?;
-
         // The chunk iterator is fed by the caller's async body pump, so pulling it on
         // a reactor thread would deadlock against that pump — the same reason the
         // filesystem backend spawns here.
         let collected = tokio::task::spawn_blocking(move || collect_upload(max_bytes, chunks))
             .await
             .map_err(|error| BackendError::Message(error.to_string()))??;
+        let handle = crate::filesystem::staging_token();
+        self.staged_uploads
+            .lock()
+            .map_err(|_| BackendError::Message("staging registry poisoned".to_string()))?
+            .insert(handle.clone(), collected.bytes);
+        Ok(MutationResponse::UploadStaged { handle })
+    }
+
+    /// `CommitStagedUpload`: verify `expected_hash`, write the staged bytes.
+    async fn commit_staged_upload(
+        &self,
+        path: &str,
+        handle: &str,
+        expected_hash: Option<&str>,
+    ) -> Result<MutationResponse, BackendError> {
+        self.ensure_writable()?;
+        ensure_writable_path(path)?;
+        let bytes = self
+            .staged_uploads
+            .lock()
+            .map_err(|_| BackendError::Message("staging registry poisoned".to_string()))?
+            .remove(handle)
+            .ok_or_else(|| {
+                BackendError::Message(
+                    "unknown or expired staging handle: the staged upload was already                      committed or the server restarted"
+                        .to_string(),
+                )
+            })?;
 
         // One read serves both the precondition and the guard: re-reading for the
         // revision separately would open a second window between them.
@@ -959,15 +987,15 @@ impl CouchDbVaultBackend {
         let result = self
             .guarded_write(
                 path,
-                WritePayload::Base64(encode_base64(&collected.bytes)),
+                WritePayload::Base64(encode_base64(&bytes)),
                 guard,
-                &collected.bytes,
+                &bytes,
             )
             .await?;
         Ok(MutationResponse::UploadCommitted {
             created: result.created,
-            bytes_written: collected.bytes.len(),
-            hash: collected.hash,
+            bytes_written: bytes.len(),
+            hash: deep_obsidian_core::content_hash(&bytes),
         })
     }
 
@@ -1392,13 +1420,20 @@ impl VaultBackend for CouchDbVaultBackend {
                 .soft_delete(&path, base_version)
                 .await
                 .map(BackendResponse::Mutation),
-            BackendRequest::Mutation(MutationRequest::CommitUploadStream {
-                path,
-                expected_hash,
+            BackendRequest::Mutation(MutationRequest::StageUploadStream {
                 max_bytes,
                 chunks,
+                ..
             }) => self
-                .commit_upload(&path, expected_hash.as_deref(), max_bytes, chunks)
+                .stage_upload(max_bytes, chunks)
+                .await
+                .map(BackendResponse::Mutation),
+            BackendRequest::Mutation(MutationRequest::CommitStagedUpload {
+                path,
+                handle,
+                expected_hash,
+            }) => self
+                .commit_staged_upload(&path, &handle, expected_hash.as_deref())
                 .await
                 .map(BackendResponse::Mutation),
             BackendRequest::Recall(RecallRequest::Grep {

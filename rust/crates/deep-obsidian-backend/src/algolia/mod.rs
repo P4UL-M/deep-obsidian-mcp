@@ -627,7 +627,7 @@ impl VaultBackend for AlgoliaVaultBackend {
             // even on a read-only mount: `writable` can be turned on, and the reader
             // of this error must not be sent off to do that in the belief it will
             // help. Nothing makes an Algolia index hold an attachment.
-            BackendRequest::Mutation(MutationRequest::CommitUploadStream { chunks, .. }) => {
+            BackendRequest::Mutation(MutationRequest::StageUploadStream { chunks, .. }) => {
                 // The body is dropped without being pulled. The caller's pump sees the
                 // failure through the response, and reading a body only to discard it
                 // would make a refusal cost the whole upload.
@@ -636,6 +636,9 @@ impl VaultBackend for AlgoliaVaultBackend {
                     ALGOLIA_NO_BINARY_MESSAGE.to_string(),
                 ))
             }
+            BackendRequest::Mutation(MutationRequest::CommitStagedUpload { .. }) => Err(
+                BackendError::Unsupported(ALGOLIA_NO_BINARY_MESSAGE.to_string()),
+            ),
             // Housekeeping, and a no-op: documented as best-effort and never-failing,
             // and there is no staging area here to sweep — a note's records are pushed
             // chunks-first, head-last, so a killed process leaves records that the
@@ -1274,9 +1277,8 @@ mod tests {
 
         let error = backend
             .execute(BackendRequest::Mutation(
-                MutationRequest::CommitUploadStream {
+                MutationRequest::StageUploadStream {
                     path: "Assets/logo.png".to_string(),
-                    expected_hash: None,
                     max_bytes: 16,
                     chunks: crate::UploadChunks::new(std::iter::once(Ok(b"bytes".to_vec()))),
                 },

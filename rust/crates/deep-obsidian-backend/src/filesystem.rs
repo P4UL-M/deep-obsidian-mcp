@@ -344,20 +344,32 @@ impl VaultBackend for FilesystemVaultBackend {
             // The upload commit pulls a synchronous chunk iterator that is fed by
             // the caller's async body pump, so it must not run on a reactor thread:
             // blocking there would deadlock against the pump.
-            BackendRequest::Mutation(MutationRequest::CommitUploadStream {
+            BackendRequest::Mutation(MutationRequest::StageUploadStream {
                 path,
-                expected_hash,
                 max_bytes,
                 chunks,
             }) => {
                 let vault_path = self.vault_path.clone();
                 tokio::task::spawn_blocking(move || {
-                    commit_upload_stream(
+                    stage_upload_stream(&vault_path, &path, max_bytes, chunks.into_inner())
+                        .map(|handle| MutationResponse::UploadStaged { handle })
+                })
+                .await
+                .map_err(|error| BackendError::Message(error.to_string()))?
+                .map(BackendResponse::Mutation)
+            }
+            BackendRequest::Mutation(MutationRequest::CommitStagedUpload {
+                path,
+                handle,
+                expected_hash,
+            }) => {
+                let vault_path = self.vault_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    commit_staged_upload(
                         &vault_path,
                         &path,
+                        &handle,
                         expected_hash.as_deref(),
-                        max_bytes,
-                        chunks.into_inner(),
                     )
                     .map(|outcome| MutationResponse::UploadCommitted {
                         created: outcome.created,
@@ -480,19 +492,16 @@ fn resolve_guarded_destination(
 /// destination at commit; a mismatch aborts with [`BackendError::HashConflict`].
 ///
 /// On any failure the staging file is removed and the destination is left untouched.
-fn commit_upload_stream(
+fn stage_upload_stream(
     vault_path: &Path,
     dest_path: &str,
-    expected_hash: Option<&str>,
     max_bytes: usize,
     mut chunks: Box<dyn Iterator<Item = Result<Vec<u8>, String>> + Send>,
-) -> Result<CommitOutcome, BackendError> {
+) -> Result<String, BackendError> {
     let absolute = resolve_guarded_destination(vault_path, dest_path)?;
     let parent = absolute
         .parent()
         .ok_or_else(|| BackendError::Message("destination has no parent directory".to_string()))?;
-
-    let created = !absolute.exists();
 
     let temp_path = parent.join(format!("{TEMP_PREFIX}{}.tmp", staging_token()));
     let mut temp_file = match std::fs::File::create(&temp_path) {
@@ -525,18 +534,72 @@ fn commit_upload_stream(
     }
     drop(temp_file);
 
-    // Optimistic concurrency: re-read the destination at commit if requested.
+    // The handle is the staging file's NAME only: the commit re-resolves it
+    // against the destination's own directory, so a handle can never name a
+    // file outside this vault, and a handle is committed only with the path it
+    // was staged for (the caller passes both back together, and the commit
+    // re-derives the directory from the destination).
+    Ok(
+        temp_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| BackendError::Message("staging file name is not UTF-8".to_string()))?
+            .to_string(),
+    )
+}
+
+fn commit_staged_upload(
+    vault_path: &Path,
+    dest_path: &str,
+    handle: &str,
+    expected_hash: Option<&str>,
+) -> Result<CommitOutcome, BackendError> {
+    // A handle is a bare staging file name minted by `stage_upload_stream`.
+    // Anything else — a path, a traversal, a foreign name — is refused before
+    // the filesystem ever sees it.
+    if handle.contains('/') || handle.contains('\\') || !handle.starts_with(TEMP_PREFIX) || !handle.ends_with(".tmp") {
+        return Err(BackendError::Message(
+            "invalid staging handle: not a staging file this backend minted".to_string(),
+        ));
+    }
+    let absolute = resolve_guarded_destination(vault_path, dest_path)?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| BackendError::Message("destination has no parent directory".to_string()))?;
+    let staged_path = parent.join(handle);
+    if !staged_path.is_file() {
+        return Err(BackendError::Message(
+            "staged upload is gone: the staging file was already committed or swept".to_string(),
+        ));
+    }
+
+    let created = !absolute.exists();
+
+    // Hash the staged bytes streaming — the file is already on disk, so the
+    // commit never buffers the whole body in RAM.
+    let staged = std::fs::File::open(&staged_path).map_err(BackendError::io)?;
+    let mut reader = std::io::BufReader::new(staged);
+    let mut hasher = ContentHasher::new();
+    let mut bytes_written: usize = 0;
+    loop {
+        let chunk = read_chunk(&mut reader)?;
+        if chunk.is_empty() {
+            break;
+        }
+        bytes_written = bytes_written.saturating_add(chunk.len());
+        hasher.update(&chunk);
+    }
+
+    // Optimistic concurrency: re-read the destination at commit, under the
+    // caller's per-note lock.
     if let Some(expected) = expected_hash {
         let current_hash = match std::fs::read(&absolute) {
             Ok(bytes) => Some(deep_obsidian_core::content_hash(&bytes)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(BackendError::io(error));
-            }
+            Err(error) => return Err(BackendError::io(error)),
         };
         if current_hash.as_deref() != Some(expected) {
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = std::fs::remove_file(&staged_path);
             return Err(BackendError::HashConflict {
                 expected: expected.to_string(),
                 found: current_hash.unwrap_or_else(|| "null".to_string()),
@@ -545,16 +608,28 @@ fn commit_upload_stream(
     }
 
     let hash = hasher.finish();
-    if let Err(error) = std::fs::rename(&temp_path, &absolute) {
-        let _ = std::fs::remove_file(&temp_path);
+    if let Err(error) = std::fs::rename(&staged_path, &absolute) {
+        let _ = std::fs::remove_file(&staged_path);
         return Err(BackendError::io(error));
     }
 
     Ok(CommitOutcome {
         created,
-        bytes_written: total,
+        bytes_written,
         hash,
     })
+}
+
+/// Read one bounded chunk from a staged file (kept at the same granularity the
+/// stream pump used, so hashing behavior matches byte for byte).
+fn read_chunk(
+    reader: &mut std::io::BufReader<std::fs::File>,
+) -> Result<Vec<u8>, BackendError> {
+    use std::io::Read;
+    let mut chunk = Vec::with_capacity(64 * 1024);
+    let mut take = reader.take(64 * 1024);
+    take.read_to_end(&mut chunk).map_err(BackendError::io)?;
+    Ok(chunk)
 }
 
 /// Generate a 256-bit random staging-file discriminator as lowercase hex.
@@ -562,7 +637,7 @@ fn commit_upload_stream(
 /// Unpredictable by design: the staging file is created inside the vault, so a
 /// guessable name would let a local attacker pre-plant a symlink at that path and
 /// redirect the write.
-fn staging_token() -> String {
+pub(crate) fn staging_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -723,12 +798,25 @@ mod tests {
         );
     }
 
+    /// One-shot stage+commit through the split API, preserving the old
+    /// single-call test ergonomics while covering both halves.
+    fn stage_and_commit(
+        dir: &Path,
+        path: &str,
+        expected_hash: Option<&str>,
+        max_bytes: usize,
+        chunks: Box<dyn Iterator<Item = Result<Vec<u8>, String>> + Send>,
+    ) -> Result<CommitOutcome, BackendError> {
+        let handle = stage_upload_stream(dir, path, max_bytes, chunks)?;
+        commit_staged_upload(dir, path, &handle, expected_hash)
+    }
+
     #[test]
     fn commit_writes_file_and_reports_created() {
         let dir = temp_dir("backend-commit");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let outcome = commit_upload_stream(
+        let outcome = stage_and_commit(
             &dir,
             "sub/out.bin",
             None,
@@ -748,7 +836,7 @@ mod tests {
         );
 
         // A second commit over the same path reports `created = false`.
-        let outcome = commit_upload_stream(
+        let outcome = stage_and_commit(
             &dir,
             "sub/out.bin",
             None,
@@ -766,7 +854,7 @@ mod tests {
         let dir = temp_dir("backend-oversize");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let error = commit_upload_stream(
+        let error = stage_and_commit(
             &dir,
             "big.bin",
             None,
@@ -794,7 +882,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("doc.bin"), b"current").unwrap();
 
-        let error = commit_upload_stream(
+        let error = stage_and_commit(
             &dir,
             "doc.bin",
             Some("fnv1a64:0000000000000000"),
@@ -821,7 +909,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("doc.bin"), b"current").unwrap();
 
-        let outcome = commit_upload_stream(
+        let outcome = stage_and_commit(
             &dir,
             "doc.bin",
             Some(&deep_obsidian_core::content_hash(b"current")),
@@ -845,7 +933,7 @@ mod tests {
         let link = vault.join("link");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
 
-        let error = commit_upload_stream(
+        let error = stage_and_commit(
             &vault,
             "link/escaped.bin",
             None,

@@ -209,7 +209,10 @@ impl VaultBackend for InMemoryVaultBackend {
             BackendRequest::Mutation(MutationRequest::SoftDelete { .. }) => Err(
                 BackendError::Unsupported(IN_MEMORY_UNSUPPORTED_MESSAGE.to_string()),
             ),
-            BackendRequest::Mutation(MutationRequest::CommitUploadStream { .. }) => Err(
+            BackendRequest::Mutation(MutationRequest::StageUploadStream { .. }) => Err(
+                BackendError::Unsupported("this backend does not support uploads".to_string()),
+            ),
+            BackendRequest::Mutation(MutationRequest::CommitStagedUpload { .. }) => Err(
                 BackendError::Unsupported("this backend does not support uploads".to_string()),
             ),
             BackendRequest::Manifest(ManifestRequest::WalkMarkdown) => {

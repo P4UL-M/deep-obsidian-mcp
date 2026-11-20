@@ -2250,7 +2250,7 @@ async fn a_dry_run_on_a_couchdb_mount_never_writes() {
 /// and then `read_artifact` has to serve the bytes back from the same logical path the
 /// token was bound to.
 ///
-/// Driven through the upload store and `commit_stream_via_backend`, which is the exact
+/// Driven through the upload store and the staged commit adapter, which is the exact
 /// path `upload_handler` drives; the HTTP layer itself is not reachable from this harness
 /// and adds no couchdb-specific behaviour.
 #[tokio::test]
@@ -2300,12 +2300,19 @@ async fn an_upload_round_trips_through_the_mcp_surface_on_a_couchdb_mount() {
         .resolve(&pending.dest_path)
         .expect("resolve")
         .backend_relative_path;
-    let outcome = deep_obsidian_server::uploads::commit_stream_via_backend(
-        backend,
-        relative,
-        pending.expected_hash.clone(),
+    let staged_handle = deep_obsidian_server::uploads::stage_stream_via_backend(
+        backend.clone(),
+        relative.clone(),
         pending.max_bytes,
         deep_obsidian_backend::UploadChunks::new(std::iter::once(Ok(bytes.clone()))),
+    )
+    .await
+    .expect("the stage must accept the bytes");
+    let outcome = deep_obsidian_server::uploads::commit_staged_via_backend(
+        backend,
+        relative,
+        staged_handle,
+        pending.expected_hash.clone(),
     )
     .await
     .expect("the commit must land on a writable couchdb mount");

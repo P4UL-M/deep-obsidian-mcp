@@ -263,7 +263,7 @@ pub(crate) async fn upload_handler(
     principal: Option<axum::Extension<deep_obsidian_control::Principal>>,
     body: Body,
 ) -> impl IntoResponse {
-    use crate::uploads::{commit_stream_via_backend, ClaimError, CommitError};
+    use crate::uploads::{commit_staged_via_backend, stage_stream_via_backend, ClaimError, CommitError};
     let state = state.current();
     let principal = principal.map(|p| p.0);
     if !state.uploads.owner_matches(&token, principal.as_ref()) {
@@ -297,9 +297,11 @@ pub(crate) async fn upload_handler(
         state.uploads.release(&token);
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     }
-    // Bridge the async body stream into the backend's bounded commit, which pulls
-    // the chunks synchronously on its own blocking thread. The lock is NOT held
-    // during streaming, and the commit runs concurrently with the pump below.
+    // Bridge the async body stream into the backend's bounded staging, which
+    // pulls the chunks synchronously on its own blocking thread. Staging holds
+    // NO note lock: it runs concurrently with the pump below and can take as
+    // long as the network transfer does. The lock is acquired afterwards,
+    // around the commit alone — the read/hash-check/swap critical section.
     let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(4);
     // Route to the mount owning the destination. The commit needs an owned handle
     // it can hold across the stream, so it takes the backend rather than issuing a
@@ -321,10 +323,9 @@ pub(crate) async fn upload_handler(
     let expected_hash = pending.expected_hash.clone();
     let max_bytes = pending.max_bytes;
 
-    let commit = tokio::spawn(commit_stream_via_backend(
-        backend,
-        dest_path,
-        expected_hash,
+    let stage = tokio::spawn(stage_stream_via_backend(
+        backend.clone(),
+        dest_path.clone(),
         max_bytes,
         deep_obsidian_backend::UploadChunks::new(chunk_rx.into_iter()),
     ));
@@ -348,16 +349,59 @@ pub(crate) async fn upload_handler(
     }
     drop(chunk_tx);
 
-    let outcome = match commit.await {
-        Ok(result) => result,
+    let staged_handle = match stage.await {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(error)) => {
+            state.uploads.release(&token);
+            if let Some(stream_error) = stream_error {
+                warn!("upload stream error: {stream_error}");
+            }
+            return match error {
+                CommitError::TooLarge => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "upload exceeds maximum allowed size",
+                )
+                    .into_response(),
+                CommitError::EscapesVault => {
+                    (StatusCode::FORBIDDEN, "invalid upload token").into_response()
+                }
+                CommitError::Io(message) => {
+                    warn!("upload staging error: {message}");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "upload failed").into_response()
+                }
+                CommitError::HashConflict { .. } => {
+                    (StatusCode::CONFLICT, error.to_string()).into_response()
+                }
+            };
+        }
         Err(join_error) => {
             state.uploads.release(&token);
-            warn!("upload commit task failed: {join_error}");
+            warn!("upload staging task failed: {join_error}");
             return (StatusCode::INTERNAL_SERVER_ERROR, "upload failed").into_response();
         }
     };
 
-    match outcome {
+    // The commit is the only part that touches the destination: hold the
+    // destination's per-note mutation lock across it and nothing else, so a
+    // concurrent edit_note/upsert/rename on the same note serializes against
+    // this swap instead of interleaving with it.
+    let lock_key = match crate::locks::note_lock_key(&state.router, &pending.dest_path) {
+        Ok(key) => key,
+        Err(message) => {
+            state.uploads.release(&token);
+            warn!("upload destination unroutable at commit: {message}");
+            return (StatusCode::FORBIDDEN, "invalid upload token").into_response();
+        }
+    };
+    let lock_guard = state.mutation_locks.acquire(lock_key).await;
+    // The commit is the ONLY storage-touching step, and it holds the note's
+    // lock: a concurrent edit_note/upsert/rename on the same note serializes
+    // against this read/hash-check/swap instead of interleaving with it.
+    let commit_response =
+        commit_staged_via_backend(backend, dest_path, staged_handle, expected_hash).await;
+    drop(lock_guard);
+
+    match commit_response {
         Ok(outcome) => {
             // Only a successful commit consumes the token.
             state.uploads.consume(&token);

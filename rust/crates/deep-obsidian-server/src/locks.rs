@@ -24,6 +24,10 @@ use std::sync::{Arc, Mutex};
 /// One registry per server, shared across every `AppState` clone, every
 /// principal-scoped router and every live-mount reload generation that points
 /// at the same storage.
+/// Field separator inside a mutation-lock key. A unit separator: it cannot
+/// appear in a vault-relative path, so storage identity and path never blur.
+pub(crate) const MUTATION_LOCK_KEY_SEPARATOR: char = '\u{1f}';
+
 #[derive(Debug, Default)]
 pub struct MutationLockRegistry {
     map: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -88,6 +92,34 @@ impl Drop for MutationLockGuard {
         self.guard = None;
         self.registry.release(&self.key);
     }
+}
+
+/// The per-note mutation lock key for one logical path: stable storage identity
+/// (backend coordinates, never secrets) plus the backend-relative path, so two
+/// callers spelling the same note differently — or reaching it through a scoped
+/// principal router — serialize against the same mutex, while a remapped mount
+/// gets its own.
+pub fn note_lock_key(
+    router: &deep_obsidian_backend::VaultRouter,
+    path: &str,
+) -> Result<String, String> {
+    let resolved = router.resolve(path).map_err(|error| error.to_string())?;
+    let mut normalized = resolved
+        .backend_relative_path
+        .trim_start_matches("./")
+        .to_string();
+    while normalized.starts_with('/') {
+        normalized.remove(0);
+    }
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    Ok(format!(
+        "{}{}{}",
+        resolved.mount.backend.storage_id(),
+        MUTATION_LOCK_KEY_SEPARATOR,
+        normalized
+    ))
 }
 
 /// Acquire several note locks in deterministic key order.

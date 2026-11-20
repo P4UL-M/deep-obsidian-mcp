@@ -812,9 +812,8 @@ async fn uploads_are_refused_without_the_capability() {
         let error = subject
             .backend
             .execute(BackendRequest::Mutation(
-                MutationRequest::CommitUploadStream {
+                MutationRequest::StageUploadStream {
                     path: "Uploads/file.bin".to_string(),
-                    expected_hash: None,
                     max_bytes: 16,
                     chunks: crate::UploadChunks::new(std::iter::once(Ok(b"data".to_vec()))),
                 },

@@ -521,13 +521,26 @@ pub enum MutationRequest {
     /// backend would implement the same request with a multipart session and a
     /// commit call.
     ///
-    /// `chunks` is pulled synchronously on a blocking thread; `max_bytes` is
-    /// enforced *during* streaming so an oversize body never lands.
-    CommitUploadStream {
+    /// Stage an upload's bytes without touching the destination: the bytes land
+    /// in backend-held staging (a temp file next to the destination on
+    /// filesystem; an in-memory buffer on CouchDB) and the response carries an
+    /// opaque handle. `chunks` is pulled synchronously on a blocking thread;
+    /// `max_bytes` is enforced *during* streaming so an oversize body never
+    /// lands. The split exists so the server can hold its per-note mutation
+    /// lock across ONLY the commit phase — never across the network transfer.
+    StageUploadStream {
         path: String,
-        expected_hash: Option<String>,
         max_bytes: usize,
         chunks: UploadChunks,
+    },
+    /// Commit a previously staged upload: re-read the destination, verify
+    /// `expected_hash` against it as it is NOW, and swap the staged bytes in.
+    /// The handle is the one `StageUploadStream` returned; using it for a
+    /// different destination is refused.
+    CommitStagedUpload {
+        path: String,
+        handle: String,
+        expected_hash: Option<String>,
     },
     /// Best-effort removal of staging artifacts orphaned by a killed process.
     /// Never fails: housekeeping, not a contract.
@@ -781,6 +794,9 @@ pub enum MutationResponse {
         /// paths. That state is readable and re-running the same rename repairs it, but a
         /// caller that believed the move was atomic would not think to check.
         atomic: bool,
+    },
+    UploadStaged {
+        handle: String,
     },
     UploadCommitted {
         created: bool,
@@ -1290,7 +1306,15 @@ impl BackendResponse {
         }
     }
 
-    /// Outcome of a [`MutationRequest::CommitUploadStream`].
+    /// The handle from a [`MutationRequest::StageUploadStream`].
+    pub fn into_upload_staged(self) -> Result<String, BackendError> {
+        match self {
+            BackendResponse::Mutation(MutationResponse::UploadStaged { handle }) => Ok(handle),
+            other => Err(mismatch("stage-upload-stream", &other)),
+        }
+    }
+
+    /// Outcome of a [`MutationRequest::CommitStagedUpload`].
     pub fn into_upload_outcome(self) -> Result<UploadOutcome, BackendError> {
         match self {
             BackendResponse::Mutation(MutationResponse::UploadCommitted {
