@@ -17,14 +17,16 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 - An `edit_note` hash conflict no longer returns two opaque hashes. The server
   re-runs the caller's edits against the note as it now stands and answers the
-  only question a conflicted caller has: anchors still hold — retry the same
-  call with the returned hash, with a diff of what the retry would change; an
+  only question a conflicted caller has: edits still apply — inspect a preview
+  before deciding whether to retry with the returned hash, since a heading's
+  body or an occurrence target may have changed concurrently; an
   anchor is gone — re-read and re-derive, with the underlying failure reason
   forwarded; an anchor became ambiguous through a concurrent duplication — do
   not retry, it would edit an unknown copy; or the concurrent write already
   produced the intended result — nothing to retry. The retry advice appears
-  only where a retry can work, and the conflict diff is bounded with an
-  explicit truncation notice instead of being able to flood the caller.
+  only where a retry can work. Both preview diffs and failure diagnostics,
+  including ambiguity candidate lists, are bounded with an explicit truncation
+  notice instead of being able to flood the caller.
 
 ## v0.2.0-alpha.11 — 2026-11-17
 
