@@ -185,6 +185,7 @@ pub fn default_participant_id() -> String {
 /// `writable`.
 pub struct AlgoliaVaultBackend {
     client: AlgoliaClient,
+    storage_identity: String,
     index_name: String,
     history_index: String,
     writable: bool,
@@ -245,6 +246,17 @@ impl AlgoliaVaultBackend {
             credentials.base_url.as_deref(),
         );
         let history_index = history_index_name(&credentials.index_name);
+        let endpoint = credentials
+            .base_url
+            .as_deref()
+            .map(|url| url.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| {
+                format!("https://{}.algolia.net", credentials.app_id.to_lowercase())
+            });
+        let storage_identity = format!(
+            "algolia:{:?}",
+            (endpoint, &credentials.app_id, &credentials.index_name)
+        );
         let cache = cache::NoteCache::open(
             cache_dir(index_dir, &credentials.index_name),
             options.cache_max_bytes.unwrap_or(DEFAULT_CACHE_MAX_BYTES),
@@ -253,6 +265,7 @@ impl AlgoliaVaultBackend {
         .map_err(BackendError::io)?;
         Ok(Self {
             client,
+            storage_identity,
             index_name: credentials.index_name,
             history_index,
             writable: options.writable,
@@ -544,7 +557,7 @@ impl AlgoliaVaultBackend {
 #[async_trait::async_trait]
 impl VaultBackend for AlgoliaVaultBackend {
     fn storage_id(&self) -> String {
-        format!("algolia:{}", self.index_name)
+        self.storage_identity.clone()
     }
 
     /// # Capability rationale
@@ -1105,6 +1118,46 @@ fn ensure_writable_path(path: &str) -> Result<(), BackendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutation_identity_distinguishes_applications_and_effective_endpoints() {
+        let root =
+            std::env::temp_dir().join(format!("dob-algolia-identity-{}", std::process::id()));
+        let connect = |app: &str, endpoint: Option<&str>, cache: &str| {
+            AlgoliaVaultBackend::connect(
+                AlgoliaCredentials {
+                    app_id: app.into(),
+                    index_name: "notes".into(),
+                    api_key: SecretString::new("secret".into()),
+                    base_url: endpoint.map(str::to_string),
+                },
+                AlgoliaOptions::default(),
+                &root.join(cache),
+            )
+            .unwrap()
+        };
+        let a = connect("APP_A", None, "a");
+        let alias = connect("APP_A", Some("https://app_a.algolia.net/"), "alias");
+        let b = connect("APP_B", None, "b");
+        let endpoint = connect("APP_A", Some("http://127.0.0.1:1"), "endpoint");
+        assert_eq!(
+            a.mutation_key("Doc.md").unwrap(),
+            alias.mutation_key("Doc.md").unwrap()
+        );
+        assert_ne!(
+            a.mutation_key("Doc.md").unwrap(),
+            b.mutation_key("Doc.md").unwrap()
+        );
+        assert_ne!(
+            a.mutation_key("Doc.md").unwrap(),
+            endpoint.mutation_key("Doc.md").unwrap()
+        );
+        assert_ne!(
+            a.mutation_key("Doc.md").unwrap(),
+            a.mutation_key("doc.md").unwrap()
+        );
+        assert!(!a.storage_id().contains("secret"));
+    }
 
     fn backend(writable: bool) -> AlgoliaVaultBackend {
         static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

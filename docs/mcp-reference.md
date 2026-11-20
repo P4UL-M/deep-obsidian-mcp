@@ -118,6 +118,35 @@ A remote mount that is **read-only** refuses it too, and says so differently: th
 can soft-delete, but the mount did not set `"writable": true`. The refusal names that setting
 rather than claiming the removal would be a local unlink.
 
+### Concurrent mutations
+
+Within one server process, mutations to the same stored note acquire a shared
+mutex before reading its authoritative content. The mutex covers the
+`expectedHash` check, edit derivation and completion of the storage write. A
+queued request reads the result of the preceding mutation: an old hash conflicts,
+while an unguarded patch applies to the latest content. Blind upserts still
+replace content intentionally.
+
+Locks are shared across users and live mount reloads. Filesystem keys resolve
+lexical path aliases, in-vault symlinks and aliases of the vault root; missing
+create targets use their existing ancestor. Case-insensitive macOS volumes also
+fold case and Unicode normalization. Remote paths retain their case, and remote
+storage identities distinguish server/application/index coordinates.
+
+Rename acquires both endpoint keys in a consistent order, then releases them
+before repairing links one note at a time. The move and backlink batch are not a
+vault-wide transaction. Upload bodies are staged without a note lock; only the
+current-content check and final commit hold it. Cancelling the HTTP request
+does not unlock an already running commit. Abandoned staging receipts discard
+their temporary file or memory buffer, and failed/cancelled requests release
+their upload claim for retry; a completed commit consumes it.
+
+These locks coordinate this process's mutations. Reads and writers in Obsidian,
+sync clients, other MCP processes or remote clients retain their existing
+behavior. Keep `expectedHash` and backend revision/CAS guards. Ordinary filesystem
+writes still use their existing write mechanics; this adds no cross-process
+atomicity guarantee.
+
 ### Payload fields appear only when they are true
 
 An incomplete answer must say so; a complete one must not carry the apparatus for saying so.

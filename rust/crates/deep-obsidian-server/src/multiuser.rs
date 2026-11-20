@@ -451,6 +451,10 @@ impl VaultBackend for GrantedBackend {
         self.inner.storage_id()
     }
 
+    fn mutation_key(&self, path: &str) -> std::result::Result<String, BackendError> {
+        self.inner.mutation_key(path)
+    }
+
     fn descriptor(&self) -> BackendDescriptor {
         let mut d = self.inner.descriptor();
         if !self

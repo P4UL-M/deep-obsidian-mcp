@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::edits::{apply_edits, AppliedEdit, EditSpec};
-use crate::locks::{MutationLockGuard, MUTATION_LOCK_KEY_SEPARATOR};
+use crate::locks::MutationLockGuard;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use deep_obsidian_backend::{
@@ -676,14 +676,9 @@ fn normalize_score_order(left: f64, right: f64, left_path: &str, right_path: &st
 /// callers spelling the same note differently — or reaching it through a scoped
 /// principal router — serialize against the same mutex, while a remapped mount
 /// gets its own.
-fn mutation_lock_key(state: &AppState, path: &str) -> Result<String, String> {
-    crate::locks::note_lock_key(&state.router, path)
-}
-
 /// Acquire the per-note mutation lock for one path.
 async fn lock_note_mutation(state: &AppState, path: &str) -> Result<MutationLockGuard, String> {
-    let key = mutation_lock_key(state, path)?;
-    Ok(state.mutation_locks.acquire(key).await)
+    crate::locks::lock_note(&state.mutation_locks, &state.router, path).await
 }
 
 /// Run the final storage mutation while STILL holding `guard`, in a spawned task
@@ -5020,24 +5015,9 @@ async fn call_tool_inner(
             // authoritative state is read: two opposite-direction renames each
             // need both keys, and taking them in the same order is what makes
             // the overlap resolve instead of deadlock.
-            let mutation_guards = crate::locks::sorted_mutation_locks(
-                &state.mutation_locks,
-                vec![
-                    format!(
-                        "{}{}{}",
-                        mount.backend.storage_id(),
-                        MUTATION_LOCK_KEY_SEPARATOR,
-                        from_relative
-                    ),
-                    format!(
-                        "{}{}{}",
-                        mount.backend.storage_id(),
-                        MUTATION_LOCK_KEY_SEPARATOR,
-                        to_relative
-                    ),
-                ],
-            )
-            .await;
+            let mutation_guards =
+                crate::locks::lock_note_pair(&state.mutation_locks, &state.router, &from, &to)
+                    .await?;
             let dry_run = bool_arg(arguments, "dryRun", false);
             let rewrite_links = bool_arg(arguments, "rewriteLinks", true);
             let expected_hash = expected_hash_arg(arguments);

@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use deep_obsidian_backend::{
-    BackendError, BackendRequest, MutationRequest, MutationResponse, UploadChunks, VaultBackend,
+    BackendError, BackendRequest, MutationRequest, MutationResponse, StagedUpload, UploadChunks,
+    VaultBackend,
 };
 
 /// Maximum bytes a single upload may carry (100 MiB).
@@ -70,7 +71,36 @@ pub struct UploadStore {
     owners: Arc<Mutex<HashMap<String, (String, u64)>>>,
 }
 
+/// Release an abandoned request's claim, or consume it after the commit lands.
+/// The commit task owns this once storage work starts.
+pub struct UploadClaim {
+    store: UploadStore,
+    token: String,
+}
+
+impl UploadClaim {
+    pub fn consume(self) {
+        self.store.consume(&self.token);
+    }
+}
+
+impl Drop for UploadClaim {
+    fn drop(&mut self) {
+        self.store.release(&self.token);
+    }
+}
+
 impl UploadStore {
+    pub fn claim_owned(&self, token: &str) -> Result<(PendingUpload, UploadClaim), ClaimError> {
+        let pending = self.claim(token)?;
+        Ok((
+            pending,
+            UploadClaim {
+                store: self.clone(),
+                token: token.to_string(),
+            },
+        ))
+    }
     pub fn bind_owner(&self, token: &str, principal: &deep_obsidian_control::Principal) {
         // Mint purges expired tokens. Keep owner bindings bounded by that same
         // outstanding-token set, without holding both locks simultaneously.
@@ -284,7 +314,7 @@ pub async fn stage_stream_via_backend(
     dest_path: String,
     max_bytes: usize,
     chunks: UploadChunks,
-) -> Result<String, CommitError> {
+) -> Result<StagedUpload, CommitError> {
     let staged = backend
         .execute(BackendRequest::Mutation(
             MutationRequest::StageUploadStream {
@@ -312,7 +342,7 @@ pub async fn stage_stream_via_backend(
 pub async fn commit_staged_via_backend(
     backend: Arc<dyn VaultBackend>,
     dest_path: String,
-    handle: String,
+    handle: StagedUpload,
     expected_hash: Option<String>,
 ) -> Result<CommitOutcome, CommitError> {
     let outcome = backend

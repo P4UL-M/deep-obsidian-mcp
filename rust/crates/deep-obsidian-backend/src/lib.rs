@@ -539,7 +539,7 @@ pub enum MutationRequest {
     /// different destination is refused.
     CommitStagedUpload {
         path: String,
-        handle: String,
+        handle: StagedUpload,
         expected_hash: Option<String>,
     },
     /// Best-effort removal of staging artifacts orphaned by a killed process.
@@ -552,6 +552,60 @@ pub enum MutationRequest {
 /// Boxed rather than generic so [`MutationRequest`] stays a plain data enum that an
 /// object-safe `execute` can accept.
 pub struct UploadChunks(Box<dyn Iterator<Item = Result<Vec<u8>, String>> + Send>);
+
+/// Owned staging receipt. Dropping the final owner discards the local staging
+/// artifact, including on cancellation, authorization failure or an unused task
+/// result. Cleanup never writes the destination.
+#[derive(Clone)]
+pub struct StagedUpload(std::sync::Arc<StagedUploadInner>);
+
+struct StagedUploadInner {
+    handle: String,
+    destination: String,
+    cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl StagedUpload {
+    pub fn new(
+        handle: String,
+        destination: String,
+        cleanup: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self(std::sync::Arc::new(StagedUploadInner {
+            handle,
+            destination,
+            cleanup: Some(Box::new(cleanup)),
+        }))
+    }
+
+    pub fn handle(&self) -> &str {
+        &self.0.handle
+    }
+    pub fn destination(&self) -> &str {
+        &self.0.destination
+    }
+}
+
+impl Drop for StagedUploadInner {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+impl std::fmt::Debug for StagedUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("StagedUpload").field(&self.0.handle).finish()
+    }
+}
+
+impl PartialEq for StagedUpload {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for StagedUpload {}
 
 impl UploadChunks {
     pub fn new<I>(chunks: I) -> Self
@@ -796,7 +850,7 @@ pub enum MutationResponse {
         atomic: bool,
     },
     UploadStaged {
-        handle: String,
+        handle: StagedUpload,
     },
     UploadCommitted {
         created: bool,
@@ -1088,6 +1142,14 @@ pub trait VaultBackend: Send + Sync {
         format!("anon:{:p}", self as *const Self)
     }
 
+    /// Identity of one stored note. Backends with filesystem aliases override
+    /// this; remote paths keep their storage spelling and case. Length-prefixing
+    /// the storage component prevents separator characters from colliding.
+    fn mutation_key(&self, path: &str) -> Result<String, BackendError> {
+        let storage = self.storage_id();
+        Ok(format!("{}:{}{}", storage.len(), storage, path))
+    }
+
     /// Subscribe to change notifications.
     ///
     /// `after` resumes from a previously minted cursor when the backend supports
@@ -1307,7 +1369,7 @@ impl BackendResponse {
     }
 
     /// The handle from a [`MutationRequest::StageUploadStream`].
-    pub fn into_upload_staged(self) -> Result<String, BackendError> {
+    pub fn into_upload_staged(self) -> Result<StagedUpload, BackendError> {
         match self {
             BackendResponse::Mutation(MutationResponse::UploadStaged { handle }) => Ok(handle),
             other => Err(mismatch("stage-upload-stream", &other)),

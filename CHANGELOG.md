@@ -19,6 +19,13 @@ All notable changes to deep-obsidian-mcp are documented here.
   blocks another writer. The guarantee is per-process by design: readers,
   Obsidian/sync/external writers keep their existing behavior, and
   `expectedHash`/backend CAS checks remain necessary.
+  Filesystem lock keys resolve lexical, symlink and vault-root aliases, including
+  missing create targets and case-insensitive macOS volumes; renames use the same
+  keys as edits and uploads. Upload commits retain their lock after request
+  cancellation until storage work finishes, and owned staging receipts discard
+  abandoned files/buffers. Read-only CouchDB mounts refuse staging before reading
+  the body. Cancelled lock waiters are reclaimed, and Algolia lock identities
+  distinguish applications and endpoints.
 
 - `deep-obsidian-cli completions <shell>` generates Bash, Zsh, Fish,
   PowerShell and Elvish autocomplete scripts from the CLI command definitions.

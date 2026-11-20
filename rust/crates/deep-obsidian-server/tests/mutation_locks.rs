@@ -354,6 +354,7 @@ async fn opposite_direction_renames_do_not_deadlock() {
 #[tokio::test]
 async fn rename_releases_its_locks_before_repairing_links() {
     let fixture = Fixture::new("rename-repair");
+    std::fs::write(fixture.vault_path.join("Doc.md"), "# Doc\n\n[[Doc]]\n").unwrap();
     let state = Arc::new(fixture.state().await);
 
     let response = tool_call(
@@ -367,6 +368,50 @@ async fn rename_releases_its_locks_before_repairing_links() {
         "rename must succeed: {response}"
     );
     assert_eq!(live_locks(&state), 0, "no lock leaks after the rename");
+    assert!(fixture.read("Moved.md").contains("[[Moved]]"));
+}
+
+#[tokio::test]
+async fn rename_and_edit_aliases_wait_for_the_same_held_note_lock() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    for rename in [false, true] {
+        let fixture = Fixture::new(if rename { "rename-alias" } else { "edit-alias" });
+        let state = fixture.state().await;
+        let held_path = if rename { "Moved.md" } else { "Doc.md" };
+        let guard = state
+            .mutation_locks
+            .acquire(deep_obsidian_server::locks::note_lock_key(&state.router, held_path).unwrap())
+            .await;
+        let (name, args) = if rename {
+            (
+                "rename_note",
+                json!({"from":"Doc.md","to":"./Moved.md","rewriteLinks":false}),
+            )
+        } else {
+            (
+                "edit_note",
+                json!({"path":"Folder/../Doc.md","edits":[{"old":"body","new":"patched"}]}),
+            )
+        };
+        let mut operation = Box::pin(tool_call(&state, name, args));
+        assert!(matches!(
+            operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        assert_eq!(
+            live_locks(&state),
+            if rename { 2 } else { 1 },
+            "the alias must wait on the existing key"
+        );
+        assert_eq!(fixture.read("Doc.md"), "# Doc\n\nbody\n");
+        drop(guard);
+        let response = operation.await;
+        assert!(response.get("result").is_some(), "{response}");
+        assert_eq!(live_locks(&state), 0);
+    }
 }
 
 /// The lock key folds path spellings the backend treats as the same note:

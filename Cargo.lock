@@ -649,6 +649,7 @@ name = "deep-obsidian-backend"
 version = "0.2.0-alpha.11"
 dependencies = [
  "async-trait",
+ "core-foundation-sys",
  "deep-obsidian-algolia",
  "deep-obsidian-core",
  "deep-obsidian-index",

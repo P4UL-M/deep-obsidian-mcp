@@ -24,13 +24,15 @@ use std::sync::{Arc, Mutex};
 /// One registry per server, shared across every `AppState` clone, every
 /// principal-scoped router and every live-mount reload generation that points
 /// at the same storage.
-/// Field separator inside a mutation-lock key. A unit separator: it cannot
-/// appear in a vault-relative path, so storage identity and path never blur.
-pub(crate) const MUTATION_LOCK_KEY_SEPARATOR: char = '\u{1f}';
-
 #[derive(Debug, Default)]
 pub struct MutationLockRegistry {
-    map: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    map: Mutex<HashMap<String, LockEntry>>,
+}
+
+#[derive(Debug, Default)]
+struct LockEntry {
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    users: usize,
 }
 
 /// Held for the duration of one note's critical section. Release — and return
@@ -55,14 +57,19 @@ impl MutationLockRegistry {
     pub async fn acquire(self: &Arc<Self>, key: String) -> MutationLockGuard {
         let mutex = {
             let mut map = self.map.lock().expect("mutation lock registry poisoned");
-            map.entry(key.clone()).or_default().clone()
+            let entry = map.entry(key.clone()).or_default();
+            entry.users += 1;
+            entry.mutex.clone()
         };
-        let guard = mutex.clone().lock_owned().await;
-        MutationLockGuard {
+        // Register cleanup BEFORE waiting: cancellation can happen after the
+        // previous holder releases but before this waiter is polled again.
+        let mut guard = MutationLockGuard {
             registry: self.clone(),
             key,
-            guard: Some(guard),
-        }
+            guard: None,
+        };
+        guard.guard = Some(mutex.lock_owned().await);
+        guard
     }
 
     /// Number of keys currently holding a live entry — locked or lingering.
@@ -76,11 +83,11 @@ impl MutationLockRegistry {
 
     fn release(&self, key: &str) {
         let mut map = self.map.lock().expect("mutation lock registry poisoned");
-        // Reclaim only when nothing else references the mutex: a concurrent
-        // acquirer cloning the Arc under this map lock would bump the count and
-        // keep the entry alive, so a used mutex is never removed.
-        if let Some(entry) = map.get(key) {
-            if Arc::strong_count(entry) == 1 {
+        // Counts include queued acquisitions, whose cleanup guard also runs
+        // when their future is cancelled. Arc counts cannot track that lifetime.
+        if let Some(entry) = map.get_mut(key) {
+            entry.users -= 1;
+            if entry.users == 0 {
                 map.remove(key);
             }
         }
@@ -89,9 +96,7 @@ impl MutationLockRegistry {
 
 impl Drop for MutationLockGuard {
     fn drop(&mut self) {
-        // Release the mutex BEFORE reclaiming the entry: during `drop`, the
-        // struct's own fields are still alive, so the guard's Arc reference
-        // would defeat the strong-count check if it were dropped afterwards.
+        // Unlock before making the key available for a fresh registry entry.
         self.guard = None;
         self.registry.release(&self.key);
     }
@@ -107,22 +112,42 @@ pub fn note_lock_key(
     path: &str,
 ) -> Result<String, String> {
     let resolved = router.resolve(path).map_err(|error| error.to_string())?;
-    let mut normalized = resolved
-        .backend_relative_path
-        .trim_start_matches("./")
-        .to_string();
-    while normalized.starts_with('/') {
-        normalized.remove(0);
+    resolved
+        .mount
+        .backend
+        .mutation_key(&resolved.backend_relative_path)
+        .map_err(|error| error.to_string())
+}
+
+/// Recheck identity after waiting: another mutation may have created a file or
+/// moved a symlink while this request was queued.
+pub async fn lock_note(
+    registry: &Arc<MutationLockRegistry>,
+    router: &deep_obsidian_backend::VaultRouter,
+    path: &str,
+) -> Result<MutationLockGuard, String> {
+    loop {
+        let key = note_lock_key(router, path)?;
+        let guard = registry.acquire(key.clone()).await;
+        if note_lock_key(router, path)? == key {
+            return Ok(guard);
+        }
     }
-    while normalized.ends_with('/') {
-        normalized.pop();
+}
+
+pub async fn lock_note_pair(
+    registry: &Arc<MutationLockRegistry>,
+    router: &deep_obsidian_backend::VaultRouter,
+    from: &str,
+    to: &str,
+) -> Result<Vec<MutationLockGuard>, String> {
+    loop {
+        let keys = vec![note_lock_key(router, from)?, note_lock_key(router, to)?];
+        let guards = sorted_mutation_locks(registry, keys.clone()).await;
+        if keys == vec![note_lock_key(router, from)?, note_lock_key(router, to)?] {
+            return Ok(guards);
+        }
     }
-    Ok(format!(
-        "{}{}{}",
-        resolved.mount.backend.storage_id(),
-        MUTATION_LOCK_KEY_SEPARATOR,
-        normalized
-    ))
 }
 
 /// Acquire several note locks in deterministic key order.
@@ -147,6 +172,48 @@ pub async fn sorted_mutation_locks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_waiter_is_reclaimed_before_or_after_holder_release() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        for release_first in [false, true] {
+            let registry = MutationLockRegistry::shared();
+            let holder = registry.acquire("note".into()).await;
+            let mut waiter = Box::pin(registry.acquire("note".into()));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+            if release_first {
+                drop(holder);
+                drop(waiter);
+            } else {
+                drop(waiter);
+                assert_eq!(registry.live_keys(), 1);
+                drop(holder);
+            }
+            assert_eq!(registry.live_keys(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_partial_pair_releases_the_first_lock() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let registry = MutationLockRegistry::shared();
+        let b = registry.acquire("b".into()).await;
+        let mut pair = Box::pin(sorted_mutation_locks(
+            &registry,
+            vec!["b".into(), "a".into()],
+        ));
+        assert!(matches!(
+            pair.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        drop(pair);
+        assert_eq!(registry.live_keys(), 1);
+        drop(b);
+        assert_eq!(registry.live_keys(), 0);
+    }
 
     /// Deterministic on the current-thread test runtime: every step is
     /// synchronized through channels, never through sleeps or yield counts.
