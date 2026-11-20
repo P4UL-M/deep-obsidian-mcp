@@ -4,6 +4,8 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 ## Unreleased
 
+## v0.2.0-alpha.12 — 2026-11-20
+
 ### Added
 
 - Mutations to the SAME stored note are now serialized within one server

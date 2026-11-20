@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-algolia"
-version = "0.2.0-alpha.11"
+version = "0.2.0-alpha.12"
 dependencies = [
  "axum",
  "base64",
@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-backend"
-version = "0.2.0-alpha.11"
+version = "0.2.0-alpha.12"
 dependencies = [
  "async-trait",
  "core-foundation-sys",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-cli"
-version = "0.2.0-alpha.11"
+version = "0.2.0-alpha.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-config"
-version = "0.2.0-alpha.11"
+version = "0.2.0-alpha.12"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-control"
-version = "0.2.0-alpha.11"
+version = "0.2.0-alpha.12"
 dependencies = [
  "anyhow",
  "argon2",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-core"
-version = "0.2.0-alpha.11"
+version = "0.2.0-alpha.12"
 dependencies = [
  "anyhow",
  "thiserror",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-index"
-version = "0.2.0-alpha.11"
+version = "0.2.0-alpha.12"
 dependencies = [
  "anyhow",
  "base64",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-server"
-version = "0.2.0-alpha.11"
+version = "0.2.0-alpha.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "deep-obsidian-types"
-version = "0.2.0-alpha.11"
+version = "0.2.0-alpha.12"
 dependencies = [
  "serde",
  "serde_json",
