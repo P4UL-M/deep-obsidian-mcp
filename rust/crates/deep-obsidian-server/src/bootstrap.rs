@@ -29,6 +29,10 @@ use crate::mounts::MountBackends;
 use crate::protocol::JsonRpcRequest;
 use crate::runtime::MountRuntimes;
 
+#[cfg(test)]
+#[path = "concurrency_tests.rs"]
+mod concurrency_tests;
+
 /// Environment variable carrying a literal bearer token. When set and non-empty
 /// it enables authentication and overrides any configured `token_ref` — useful
 /// for containers, tunnels, and headless hosts where the OS keyring is absent.
