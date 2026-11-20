@@ -295,9 +295,8 @@ pub async fn stage_stream_via_backend(
         ))
         .await
         .map_err(CommitError::from)?;
-    let deep_obsidian_backend::BackendResponse::Mutation(MutationResponse::UploadStaged {
-        handle,
-    }) = staged
+    let deep_obsidian_backend::BackendResponse::Mutation(MutationResponse::UploadStaged { handle }) =
+        staged
     else {
         return Err(CommitError::Io(
             "backend returned a non-staging response to a staging request".to_string(),

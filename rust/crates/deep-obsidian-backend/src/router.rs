@@ -637,7 +637,11 @@ impl VaultRouter {
                     ))
                     .await?)
             }
-            MutationRequest::StageUploadStream { path, max_bytes, chunks } => {
+            MutationRequest::StageUploadStream {
+                path,
+                max_bytes,
+                chunks,
+            } => {
                 let resolved = self.resolve(&path)?;
                 let backend = resolved.mount.backend.clone();
                 let routed_path = resolved.backend_relative_path.clone();

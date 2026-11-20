@@ -68,7 +68,10 @@ impl MutationLockRegistry {
     /// Number of keys currently holding a live entry — locked or lingering.
     /// Exposed for tests and diagnostics, not part of any contract.
     pub fn live_keys(&self) -> usize {
-        self.map.lock().expect("mutation lock registry poisoned").len()
+        self.map
+            .lock()
+            .expect("mutation lock registry poisoned")
+            .len()
     }
 
     fn release(&self, key: &str) {

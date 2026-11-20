@@ -263,7 +263,9 @@ pub(crate) async fn upload_handler(
     principal: Option<axum::Extension<deep_obsidian_control::Principal>>,
     body: Body,
 ) -> impl IntoResponse {
-    use crate::uploads::{commit_staged_via_backend, stage_stream_via_backend, ClaimError, CommitError};
+    use crate::uploads::{
+        commit_staged_via_backend, stage_stream_via_backend, ClaimError, CommitError,
+    };
     let state = state.current();
     let principal = principal.map(|p| p.0);
     if !state.uploads.owner_matches(&token, principal.as_ref()) {

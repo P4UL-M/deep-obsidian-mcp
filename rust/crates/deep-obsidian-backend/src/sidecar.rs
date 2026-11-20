@@ -1588,7 +1588,10 @@ impl SidecarSupervisor {
     /// which CouchDB server and database this sidecar talks to. Deliberately
     /// excludes credentials — never a secret.
     pub fn storage_identity(&self) -> String {
-        format!("{}#{}", self.config.credentials.url, self.config.credentials.database)
+        format!(
+            "{}#{}",
+            self.config.credentials.url, self.config.credentials.database
+        )
     }
 
     pub fn change_epoch(&self) -> u64 {

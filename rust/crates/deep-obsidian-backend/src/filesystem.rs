@@ -365,17 +365,13 @@ impl VaultBackend for FilesystemVaultBackend {
             }) => {
                 let vault_path = self.vault_path.clone();
                 tokio::task::spawn_blocking(move || {
-                    commit_staged_upload(
-                        &vault_path,
-                        &path,
-                        &handle,
-                        expected_hash.as_deref(),
+                    commit_staged_upload(&vault_path, &path, &handle, expected_hash.as_deref()).map(
+                        |outcome| MutationResponse::UploadCommitted {
+                            created: outcome.created,
+                            bytes_written: outcome.bytes_written,
+                            hash: outcome.hash,
+                        },
                     )
-                    .map(|outcome| MutationResponse::UploadCommitted {
-                        created: outcome.created,
-                        bytes_written: outcome.bytes_written,
-                        hash: outcome.hash,
-                    })
                 })
                 .await
                 .map_err(|error| BackendError::Message(error.to_string()))?
@@ -539,13 +535,11 @@ fn stage_upload_stream(
     // file outside this vault, and a handle is committed only with the path it
     // was staged for (the caller passes both back together, and the commit
     // re-derives the directory from the destination).
-    Ok(
-        temp_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| BackendError::Message("staging file name is not UTF-8".to_string()))?
-            .to_string(),
-    )
+    Ok(temp_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| BackendError::Message("staging file name is not UTF-8".to_string()))?
+        .to_string())
 }
 
 fn commit_staged_upload(
@@ -557,7 +551,11 @@ fn commit_staged_upload(
     // A handle is a bare staging file name minted by `stage_upload_stream`.
     // Anything else — a path, a traversal, a foreign name — is refused before
     // the filesystem ever sees it.
-    if handle.contains('/') || handle.contains('\\') || !handle.starts_with(TEMP_PREFIX) || !handle.ends_with(".tmp") {
+    if handle.contains('/')
+        || handle.contains('\\')
+        || !handle.starts_with(TEMP_PREFIX)
+        || !handle.ends_with(".tmp")
+    {
         return Err(BackendError::Message(
             "invalid staging handle: not a staging file this backend minted".to_string(),
         ));
@@ -622,9 +620,7 @@ fn commit_staged_upload(
 
 /// Read one bounded chunk from a staged file (kept at the same granularity the
 /// stream pump used, so hashing behavior matches byte for byte).
-fn read_chunk(
-    reader: &mut std::io::BufReader<std::fs::File>,
-) -> Result<Vec<u8>, BackendError> {
+fn read_chunk(reader: &mut std::io::BufReader<std::fs::File>) -> Result<Vec<u8>, BackendError> {
     use std::io::Read;
     let mut chunk = Vec::with_capacity(64 * 1024);
     let mut take = reader.take(64 * 1024);
