@@ -2807,6 +2807,63 @@ fn an_algolia_mount_requires_the_algolia_vaults_flag_and_may_be_the_root() {
 /// Reads, writes, listings and outlines all work on an algolia mount, through the
 /// public JSON-RPC surface, in the LOGICAL namespace.
 #[tokio::test]
+async fn rename_note_scopes_links_and_basename_collisions_to_its_mount() {
+    let fixture = Fixture::new("rename-mount-paths");
+    fs::create_dir_all(fixture.team_vault.join("Folder")).unwrap();
+    fs::write(fixture.team_vault.join("Folder/Old.md"), "# Old\n").unwrap();
+    fs::write(
+        fixture.team_vault.join("Ref.md"),
+        "[[Folder/Old]] and [[Old]]\n",
+    )
+    .unwrap();
+    fs::write(fixture.root_vault.join("New.md"), "# Unrelated root note\n").unwrap();
+    let state = fixture.state().await;
+    let response = tool_call(
+        &state,
+        "rename_note",
+        json!({
+            "from":"Team/Folder/Old.md", "to":"Team/Folder/New.md"
+        }),
+    )
+    .await;
+    let result = structured(&response);
+    assert_eq!(result["to"], "Team/Folder/New.md");
+    assert_eq!(
+        fs::read_to_string(fixture.team_vault.join("Ref.md")).unwrap(),
+        "[[Folder/New]] and [[New]]\n"
+    );
+}
+
+#[tokio::test]
+async fn rename_note_works_on_an_algolia_mount_without_a_local_index() {
+    let fixture = AlgoliaFixture::new("rename-algolia").await;
+    let state = fixture.state_writable(true).await;
+    for (path, content) in [("Old.md", "# Old\n"), ("Ref.md", "[[Old]]\n")] {
+        structured(
+            &tool_call(
+                &state,
+                "upsert_note",
+                json!({"path":format!("_Shared/{path}"),"content":content}),
+            )
+            .await,
+        );
+    }
+    let response = tool_call(
+        &state,
+        "rename_note",
+        json!({"from":"_Shared/Old.md","to":"_Shared/New.md"}),
+    )
+    .await;
+    let result = structured(&response);
+    assert_eq!(result["atomic"], false, "{result}");
+    let read = tool_call(&state, "read_file", json!({"path":"_Shared/Ref.md"})).await;
+    assert!(structured(&read)["text"]
+        .as_str()
+        .unwrap()
+        .contains("[[New]]"));
+}
+
+#[tokio::test]
 async fn an_algolia_mount_serves_reads_writes_listings_and_outlines() {
     let fixture = AlgoliaFixture::new("algolia-crud").await;
     let state = fixture.state_writable(true).await;
@@ -3325,15 +3382,16 @@ async fn vault_info_describes_the_algolia_mount_and_never_calls_it_degraded() {
     assert_eq!(shared["backendKind"], json!("algolia"));
     assert_eq!(shared["mountAt"], json!("_Shared"));
     // Capabilities are the backend's own, and they are honest: a bounded grep, its own
-    // ranked recall, a version history, a soft delete (this mount is writable) — and
-    // nothing binary. The ORDER is the `Capability` enum's declaration order, which is
-    // what reaches a client, so this pins it too.
+    // ranked recall, a version history, and — because this mount is writable — a soft
+    // delete and a rename. Nothing binary. The ORDER is the `Capability` enum's
+    // declaration order, which is what reaches a client, so this pins it too.
     assert_eq!(
         shared["capabilities"],
         json!([
             "grep-search",
             "native-recall",
             "version-history",
+            "rename",
             "soft-delete"
         ])
     );

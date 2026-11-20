@@ -239,6 +239,47 @@ async fn private_reads_and_resource_reads_are_scoped_to_the_caller() {
 }
 
 #[tokio::test]
+async fn rename_note_cannot_reach_an_ungranted_shadowed_mount() {
+    let f = Fixture::new(Role::Reader).await;
+    let paul = f.as_paul();
+    let result = tool(
+        &paul,
+        "rename_note",
+        json!({"from":"Laura/Shadow.md","to":"Leaked.md"}),
+    )
+    .await;
+    denied(&result);
+    assert!(!f.base.join("paul/Leaked.md").exists());
+    assert!(f.base.join("paul/Laura/Shadow.md").exists());
+    denied(
+        &tool(
+            &paul,
+            "rename_note",
+            json!({"from":"PaulSecret.md","to":"Laura/Hidden.md"}),
+        )
+        .await,
+    );
+    assert!(f.base.join("paul/PaulSecret.md").exists());
+}
+
+#[tokio::test]
+async fn an_editor_can_rename_relative_to_an_explicit_mount() {
+    let f = Fixture::new(Role::Editor).await;
+    let laura = f.as_laura();
+    let response = tool(
+        &laura,
+        "rename_note",
+        json!({"mountId":"shared","from":"Other.md","to":"Renamed.md"}),
+    )
+    .await;
+    assert_eq!(structured(&response)["to"], "Shared/Renamed.md");
+    assert!(f.base.join("shared/Renamed.md").exists());
+    assert!(fs::read_to_string(f.base.join("shared/Welcome.md"))
+        .unwrap()
+        .contains("[[Renamed]]"));
+}
+
+#[tokio::test]
 async fn shared_reader_can_read_but_cannot_mutate_or_upload() {
     let f = Fixture::new(Role::Reader).await;
     let laura = f.as_laura();
@@ -258,6 +299,14 @@ async fn shared_reader_can_read_but_cannot_mutate_or_upload() {
             json!({"path":"Shared/Welcome.md","edits":[{"old":"sharedword","new":"changed"}]}),
         ),
         ("delete_note", json!({"path":"Shared/Welcome.md"})),
+        (
+            "rename_note",
+            json!({"from":"Shared/Welcome.md","to":"Shared/Denied.md","dryRun":true}),
+        ),
+        (
+            "rename_note",
+            json!({"from":"Shared/Welcome.md","to":"Shared/Denied.md"}),
+        ),
         ("request_vault_upload", json!({"path":"Shared/image.png"})),
         (
             "upsert_session_note",
@@ -267,6 +316,14 @@ async fn shared_reader_can_read_but_cannot_mutate_or_upload() {
         denied(&tool(&laura, name, args).await);
     }
     assert!(!f.base.join("shared/Denied.md").exists());
+    assert!(!laura
+        .router
+        .resolve("Shared/Welcome.md")
+        .unwrap()
+        .mount
+        .backend
+        .descriptor()
+        .supports(deep_obsidian_backend::Capability::Rename));
     assert!(fs::read_to_string(f.base.join("shared/Welcome.md"))
         .unwrap()
         .contains("sharedword"));

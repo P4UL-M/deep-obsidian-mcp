@@ -654,6 +654,77 @@ async fn write_capabilities_follow_the_mounts_mode() {
 /// Also the proof that the revision a read hands out is the one a write accepts — if
 /// the two disagreed, this would fail with a conflict rather than succeed.
 #[tokio::test]
+async fn rename_and_source_removal_refuse_a_stale_couchdb_revision() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+    let (_, version) = read_versioned(&backend, "Beta.md").await;
+    let version = version.unwrap();
+    let winner = "a concurrent source update\n";
+    backend
+        .execute(BackendRequest::write_text("Beta.md", winner))
+        .await
+        .unwrap();
+    let error = backend
+        .execute(BackendRequest::soft_delete_guarded(
+            "Beta.md",
+            BaseVersion::Version(version.clone()),
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, BackendError::VersionConflict { .. }));
+    let error = backend
+        .execute(BackendRequest::Mutation(MutationRequest::Rename {
+            from: "Beta.md".into(),
+            to: "Moved.md".into(),
+            base_version: BaseVersion::Version(version),
+        }))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, BackendError::VersionConflict { .. }));
+    assert_eq!(read_versioned(&backend, "Beta.md").await.0, winner);
+    assert!(backend
+        .execute(BackendRequest::read_text("Moved.md"))
+        .await
+        .is_err());
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn couchdb_rename_finishes_a_verified_pair_of_identical_copies() {
+    require_prerequisites!();
+    let couch = MockCouch::start_writable("small");
+    let (supervisor, backend) = writable_backend(&couch);
+    let (text, version) = read_versioned(&backend, "Beta.md").await;
+    backend
+        .execute(BackendRequest::write_text_guarded(
+            "Moved.md",
+            &text,
+            BaseVersion::Absent,
+        ))
+        .await
+        .unwrap();
+    backend
+        .execute(BackendRequest::Mutation(MutationRequest::Rename {
+            from: "Beta.md".into(),
+            to: "Moved.md".into(),
+            base_version: BaseVersion::from_read(version),
+        }))
+        .await
+        .unwrap();
+    let listed = backend
+        .execute(BackendRequest::walk_markdown())
+        .await
+        .unwrap()
+        .into_markdown_files()
+        .unwrap();
+    assert!(!listed.contains(&"Beta.md".to_string()));
+    assert!(listed.contains(&"Moved.md".to_string()));
+    assert_eq!(read_versioned(&backend, "Moved.md").await.0, text);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_write_guarded_by_the_revision_a_read_returned_lands() {
     require_prerequisites!();
     let couch = MockCouch::start_writable("small");

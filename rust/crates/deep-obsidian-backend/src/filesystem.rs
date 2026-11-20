@@ -204,6 +204,36 @@ impl FilesystemVaultBackend {
         })
     }
 
+    /// Move a note with `fs::rename`, which is atomic within one filesystem.
+    ///
+    /// Both paths go through `ensure_inside_vault` — the destination too, or a rename would
+    /// be a way to write outside the vault that no other mutation offers. Missing parent
+    /// directories are created for the destination, matching `write_text_file`, so moving a
+    /// note into a new folder does not need a separate step.
+    ///
+    /// Occupancy is enforced by the move itself, not a check-then-rename window.
+    fn rename(&self, from: &str, to: &str) -> Result<MutationResponse, BackendError> {
+        vault::ensure_writable_vault_relative_path(from)?;
+        vault::ensure_writable_vault_relative_path(to)?;
+        let source = vault::ensure_inside_vault(&self.vault_path, from)?;
+        let destination = vault::ensure_inside_vault(&self.vault_path, to)?;
+        if !source.exists() {
+            return Err(BackendError::Message(format!(
+                "cannot rename {from}: no such note in the vault"
+            )));
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| BackendError::Message(vault::describe_io_error(parent, &error)))?;
+        }
+        let atomic = rename_without_replacement(&source, &destination)
+            .map_err(|error| BackendError::Message(vault::describe_io_error(&source, &error)))?;
+        Ok(MutationResponse::Renamed {
+            replaced_destination: false,
+            atomic,
+        })
+    }
+
     async fn recall(&self, request: RecallRequest) -> Result<RecallResponse, BackendError> {
         match request {
             RecallRequest::Grep {
@@ -287,6 +317,13 @@ impl VaultBackend for FilesystemVaultBackend {
             Capability::BinaryWrite,
             Capability::Upload,
             Capability::Watch,
+            // Advertised even though `SoftDelete` is not, and the difference is
+            // recoverability through this surface rather than squeamishness about writes:
+            // the content stays fully readable at the new path and renaming back restores
+            // the original state exactly. Deletion leaves nothing to read and nothing to
+            // undo — see `FILESYSTEM_SOFT_DELETE_UNSUPPORTED_MESSAGE`. This is also the one
+            // backend whose move is a single operation, so it reports `atomic: true`.
+            Capability::Rename,
         ];
         if self.ripgrep_available {
             capabilities.push(Capability::GrepSearch);
@@ -341,6 +378,9 @@ impl VaultBackend for FilesystemVaultBackend {
             BackendRequest::Mutation(MutationRequest::SoftDelete { .. }) => Err(
                 BackendError::Unsupported(FILESYSTEM_SOFT_DELETE_UNSUPPORTED_MESSAGE.to_string()),
             ),
+            BackendRequest::Mutation(MutationRequest::Rename { from, to, .. }) => {
+                self.rename(&from, &to).map(BackendResponse::Mutation)
+            }
             BackendRequest::Mutation(MutationRequest::SweepOrphanStagingFiles) => {
                 sweep_orphan_temp_files_at(&self.vault_path, std::time::SystemTime::now());
                 Ok(BackendResponse::Mutation(MutationResponse::Swept))
@@ -590,6 +630,57 @@ fn sweep_dir(dir: &Path, now: std::time::SystemTime, depth: usize) {
     }
 }
 
+/// Linux and macOS expose an exclusive rename. Other platforms use an exclusive
+/// hard-link creation followed by unlink, reporting that fallback as non-atomic.
+fn rename_without_replacement(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        // SAFETY: the CString buffers are NUL-terminated and live for the call.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            Ok(true)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        std::fs::hard_link(source, destination)?;
+        std::fs::remove_file(source).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "created {} but could not remove {}: {error}; both paths may remain",
+                    destination.display(),
+                    source.display()
+                ),
+            )
+        })?;
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +700,24 @@ mod tests {
     }
 
     // -- upload commit ------------------------------------------------------
+
+    #[test]
+    fn rename_refuses_a_destination_created_after_the_callers_check() {
+        let dir = temp_dir("rename-occupied");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Old.md"), "original").unwrap();
+        std::fs::write(dir.join("New.md"), "concurrent destination").unwrap();
+        let backend = FilesystemVaultBackend::new(&dir);
+        assert!(backend.rename("Old.md", "New.md").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Old.md")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("New.md")).unwrap(),
+            "concurrent destination"
+        );
+    }
 
     #[test]
     fn commit_writes_file_and_reports_created() {

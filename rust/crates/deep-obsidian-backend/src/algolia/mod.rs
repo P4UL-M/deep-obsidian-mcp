@@ -509,7 +509,11 @@ impl AlgoliaVaultBackend {
     /// Gated on `writable` like every other mutation, and on the markdown-only rule
     /// before that — a caller asking to delete an attachment must be told the mount never
     /// held one, not that the delete failed.
-    async fn soft_delete(&self, path: &str) -> Result<MutationResponse, BackendError> {
+    async fn soft_delete(
+        &self,
+        path: &str,
+        base_version: BaseVersion,
+    ) -> Result<MutationResponse, BackendError> {
         self.ensure_writable()?;
         ensure_vault_relative(path)?;
         if !reads::is_markdown_path(path) {
@@ -517,7 +521,7 @@ impl AlgoliaVaultBackend {
                 ALGOLIA_NO_BINARY_MESSAGE.to_string(),
             ));
         }
-        let outcome = versioning::soft_delete_note(self, path).await?;
+        let outcome = versioning::soft_delete_note(self, path, &base_version).await?;
         Ok(MutationResponse::SoftDeleted {
             version_id: outcome.version_id,
             already_deleted: outcome.already_deleted,
@@ -560,7 +564,7 @@ impl VaultBackend for AlgoliaVaultBackend {
     ///   listing versions and reading one back are reads, and a participant who may read
     ///   the corpus may read its history. Gating it on `writable` would hide the recovery
     ///   path from exactly the mounts most likely to need it.
-    /// * `SoftDelete` — only when `writable`. This is the ONE capability `writable`
+    /// * `SoftDelete` — only when `writable`. Together with `Rename`, these are the capabilities `writable`
     ///   gates, and it must be gated: a delete is a write, and the server registers the
     ///   `delete_note` tool from this capability, so advertising it on a read-only mount
     ///   would put a tool on the surface that could only ever refuse.
@@ -576,6 +580,10 @@ impl VaultBackend for AlgoliaVaultBackend {
         ];
         if self.writable {
             capabilities.push(Capability::SoftDelete);
+            // Two steps, not one — an objectID is `note:{path}`, so the move is a re-index
+            // plus a delete. Advertised anyway and reported `atomic: false`; see
+            // `rename_by_write_then_remove`.
+            capabilities.push(Capability::Rename);
         }
         BackendDescriptor::new(BackendKind::Algolia, capabilities)
     }
@@ -597,9 +605,20 @@ impl VaultBackend for AlgoliaVaultBackend {
                 .write_text(&path, &content, base_version, resolve_divergence)
                 .await
                 .map(BackendResponse::Mutation),
-            BackendRequest::Mutation(MutationRequest::SoftDelete { path }) => {
-                self.soft_delete(&path).await.map(BackendResponse::Mutation)
-            }
+            // An Algolia record is addressed by its own object id, so a path change is a
+            // re-index plus a delete — two operations, not a move. Same reasoning as the
+            // couchdb mount: it reports atomic:false and can leave a resumable copy.
+            BackendRequest::Mutation(MutationRequest::Rename {
+                from,
+                to,
+                base_version,
+            }) => crate::rename_by_write_then_remove(self, &from, &to, base_version)
+                .await
+                .map(BackendResponse::Mutation),
+            BackendRequest::Mutation(MutationRequest::SoftDelete { path, base_version }) => self
+                .soft_delete(&path, base_version)
+                .await
+                .map(BackendResponse::Mutation),
             // Refused for being BINARY rather than for the mount being read-only,
             // even on a read-only mount: `writable` can be turned on, and the reader
             // of this error must not be sent off to do that in the belief it will
@@ -1152,27 +1171,35 @@ mod tests {
         }
     }
 
-    /// `writable` gates EXACTLY one capability, and it has to be that one: the server
-    /// registers `delete_note` from `SoftDelete`, so advertising it on a read-only mount
+    /// `writable` gates exactly the MUTATING capabilities, and the set is closed: the
+    /// server registers a tool per capability, so advertising one on a read-only mount
     /// would put a tool on the surface whose every call is refused. Reading the history
     /// stays available, because recovering content is a read.
     #[test]
-    fn only_soft_delete_is_gated_on_writable() {
+    fn writable_gates_exactly_the_mutating_capabilities() {
         let read_only = backend(false).descriptor();
         let writable = backend(true).descriptor();
-        assert!(!read_only.supports(Capability::SoftDelete));
-        assert!(writable.supports(Capability::SoftDelete));
+        for mutating in [Capability::SoftDelete, Capability::Rename] {
+            assert!(!read_only.supports(mutating), "{read_only:?}");
+            assert!(writable.supports(mutating), "{writable:?}");
+        }
         assert!(
             read_only.supports(Capability::VersionHistory)
                 && read_only.supports(Capability::NativeRecall),
             "reads do not depend on `writable`: {read_only:?}"
         );
-        let difference: Vec<Capability> = writable
+        let mut difference: Vec<Capability> = writable
             .capabilities
             .difference(&read_only.capabilities)
             .copied()
             .collect();
-        assert_eq!(difference, vec![Capability::SoftDelete]);
+        difference.sort_by_key(|capability| format!("{capability:?}"));
+        assert_eq!(
+            difference,
+            vec![Capability::Rename, Capability::SoftDelete],
+            "the gated set is closed: a new mutating capability must be added here \
+             deliberately, not discovered later"
+        );
     }
 
     /// A read-only mount refuses a DELETE by naming the setting, exactly as it refuses a

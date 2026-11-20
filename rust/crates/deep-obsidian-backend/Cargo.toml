@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc.workspace = true
 async-trait.workspace = true
 # The typed Algolia REST client the algolia backend speaks through. Acyclic: the
 # algolia crate depends on nothing in this workspace.

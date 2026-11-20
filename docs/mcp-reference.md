@@ -38,7 +38,7 @@ ever refuse is not advertised.**
    tools that rank (`hybrid_search`, `load_knowledge`, `search_artifacts`). It adds no tool
    and removes none; a single-mount vault's list is unchanged.
 3. **mount capabilities** — a mount declares what its storage can do
-   (`vault_info.mounts[].capabilities`), and these four tools appear only when at least one
+   (`vault_info.mounts[].capabilities`), and these five tools appear only when at least one
    mount has the capability they need:
 
 | Tool | Needs | What it does |
@@ -47,6 +47,33 @@ ever refuse is not advertised.**
 | `read_version` | `version-history` | Read one specific, possibly superseded version, reassembled from the mount's history. Take the `versionId` from `note_history`. |
 | `resolve_divergence` | `version-history` | Return a diverged note's current head, the version it overtook, and their common ancestor, so **you** can three-way merge them. The server never merges: a wrong automatic merge produces plausible text and is nearly undetectable. Write the result with `upsert_note` and `resolveDivergence: true` to clear the mark. |
 | `delete_note` | `soft-delete` | Soft-delete a note whose removal is observable to other participants and recoverable: it leaves listings and search, and the payload's `howToRecover` says how to undo it **on that mount**. Recovery differs per backend — see the table below. |
+| `rename_note` | `rename` | Move a note within one writable mount and repair its inbound wikilinks. Both paths require write permission; protected paths, cross-mount moves and basename collisions within that mount are refused. |
+
+#### Rename recovery
+
+`rename_note` reads current backend content to find links, including on mounts
+without a local index. Paths stored inside wikilinks are mount-relative; explicit
+`./` and `../` targets are resolved using the linking note's folder. Self-links,
+fragments, aliases (including escaped table aliases) and embeds are repaired.
+When the moved note changes folders, its outgoing relative wikilinks retain
+their original targets.
+
+The move reports `atomic`; the link repair pass is separate and changes at most
+500 notes per call. `linkingTruncated` signals remaining work and
+`linkRewritesFailed` names individual write failures. Inspect the destination,
+resolve reported errors, then resume with the same `from`/`to` and
+`expectedHash` set to the returned `newHash`. A missing source requires that hash;
+an arbitrary existing destination is never accepted as proof of a prior move.
+A hash-verified pair of identical copies left by a non-atomic remote move can
+also finish source removal. `dryRun` reports the observed `previousHash` and
+candidate linking notes without writing.
+
+Linux and macOS use exclusive filesystem rename operations. Other platforms
+use exclusive hard-link creation followed by source removal and report
+`atomic:false`. Remote backends copy first, then remove the source with its
+copied revision. CouchDB can enforce that revision through compare-and-swap;
+Algolia has no CAS and retains its existing version-history/divergence model.
+Do not treat `atomic:false` as a transactional move across paths or link repairs.
 
 `version-history` also adds the `resolveDivergence` argument to `upsert_note`.
 
@@ -75,7 +102,7 @@ Deleting an already-deleted note is a successful no-op with `alreadyDeleted: tru
 CouchDB mount it reports the revision the tombstone already had — a repeated delete
 replicates nothing.
 
-None of the four takes a `scope`. Each takes a `path`, so the mount is determined by
+The four history/delete tools take no `scope`; each takes a `path`, so the mount is determined by
 longest-prefix match exactly as it is for `read_file` — a `scope` would be a second,
 redundant way to say the same thing, and a way for the two to disagree.
 

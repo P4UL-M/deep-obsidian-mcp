@@ -162,7 +162,7 @@ fn is_protected_template_segment(segment: &str) -> bool {
     segment.eq_ignore_ascii_case("template") || segment.eq_ignore_ascii_case("templates")
 }
 
-fn ensure_writable_vault_relative_path(relative_path: &str) -> Result<(), VaultError> {
+pub fn ensure_writable_vault_relative_path(relative_path: &str) -> Result<(), VaultError> {
     let normalized = normalize_vault_relative_path(relative_path)?;
     if Path::new(&normalized)
         .components()

@@ -27,6 +27,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+libc = "0.2"
 anyhow = "1"
 argon2 = "0.5"
 async-trait = "0.1"

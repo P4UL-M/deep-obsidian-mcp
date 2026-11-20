@@ -13,6 +13,22 @@ All notable changes to deep-obsidian-mcp are documented here.
   install Bash, Zsh and Fish completions automatically; the CLI guide documents
   activation and source installations.
 
+- `rename_note` moves a markdown note within one writable mount and repairs
+  inbound wikilinks, including self-links, aliases, embeds, fragments and explicit
+  relative paths; outgoing relative wikilinks retain their targets across folders.
+  Discovery reads current backend content, so it also works on
+  Algolia mounts without a local index. Collision checks and stored wiki targets
+  stay within the owning mount; application-user permissions cover both paths.
+  Protected Template(s) paths, cross-mount moves and conflicting destinations are
+  refused. Linux/macOS filesystem moves exclusively create the destination;
+  remote moves copy first and guard source removal with the copied revision.
+  The response reports atomicity, failed repairs and batches beyond 500 changed
+  notes. Inspect the destination and resume with its returned newHash as
+  expectedHash; recovery verifies the destination instead of inferring success
+  from its existence. Identical copies left by an interrupted remote move can
+  also be resumed with a matching hash. Algolia retains its version-history
+  concurrency semantics rather than providing compare-and-swap.
+
 ### Fixed
 
 - An `edit_note` hash conflict no longer returns two opaque hashes. The server
@@ -396,6 +412,7 @@ All notable changes to deep-obsidian-mcp are documented here.
   replaced by five wrong ones reads as `+5 -5`). The binary upload commit path is
   excluded: it is a raw `PUT` with no MCP arguments, and line counts mean nothing
   for bytes.
+
 
 - **Multi-backend vaults (experimental, off by default).** A vault can now be
   composed of several **mounts**, each grafting other storage onto a folder of

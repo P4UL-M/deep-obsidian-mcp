@@ -654,6 +654,7 @@ dependencies = [
  "deep-obsidian-index",
  "futures-util",
  "globset",
+ "libc",
  "notify",
  "rand 0.8.6",
  "regex",
