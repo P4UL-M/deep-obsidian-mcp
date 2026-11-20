@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::edits::{apply_edits, AppliedEdit, EditSpec};
+use crate::locks::MutationLockGuard;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use deep_obsidian_backend::{
@@ -632,6 +633,11 @@ async fn rewrite_links_in_note(
     to: &str,
     old_basename_was_unique: bool,
 ) -> Result<usize, String> {
+    // One repaired note, one lock: re-read INSIDE the critical section and derive
+    // the replacement from that content, so a note edited between the rename's
+    // discovery pass and this repair is patched against its latest state, never
+    // against a stale read.
+    let mutation_guard = lock_note_mutation(state, note_path).await?;
     let (content, base_version) = backend_call(state, BackendRequest::read_text(note_path))
         .await
         .map_err(|error| error.to_string())?
@@ -648,8 +654,9 @@ async fn rewrite_links_in_note(
     if outcome.rewritten == 0 {
         return Ok(0);
     }
-    backend_call(
+    write_under_lock(
         state,
+        mutation_guard,
         BackendRequest::write_text_full(note_path, &outcome.content, base_version, false),
     )
     .await
@@ -662,6 +669,37 @@ fn normalize_score_order(left: f64, right: f64, left_path: &str, right_path: &st
         .partial_cmp(&left)
         .unwrap_or(Ordering::Equal)
         .then_with(|| left_path.cmp(right_path))
+}
+
+/// The per-note mutation lock key for one logical path: stable storage identity
+/// (backend coordinates, never secrets) plus the backend-relative path, so two
+/// callers spelling the same note differently — or reaching it through a scoped
+/// principal router — serialize against the same mutex, while a remapped mount
+/// gets its own.
+/// Acquire the per-note mutation lock for one path.
+async fn lock_note_mutation(state: &AppState, path: &str) -> Result<MutationLockGuard, String> {
+    crate::locks::lock_note(&state.mutation_locks, &state.router, path).await
+}
+
+/// Run the final storage mutation while STILL holding `guard`, in a spawned task
+/// awaited to completion. If this request is cancelled at an await point, the
+/// spawned task is detached rather than aborted — tokio does not abort on a
+/// dropped `JoinHandle` — so the lock is released only when the backend work has
+/// actually finished, never under an in-flight write.
+async fn write_under_lock(
+    state: &AppState,
+    guard: MutationLockGuard,
+    request: BackendRequest,
+) -> Result<BackendResponse, String> {
+    let router = state.router.clone();
+    tokio::spawn(async move {
+        let outcome = router.execute(request).await;
+        drop(guard);
+        outcome
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 fn strip_md_extension(note_path: &str) -> &str {
@@ -3837,7 +3875,8 @@ async fn delete_note_payload(state: &AppState, path: &str) -> Result<Value, Stri
     // descriptor is a pure function of its configuration — but reading it first also means
     // a failure here cannot leave a caller with a tombstone and no guidance.
     let has_history = mount_supports(state, path, Capability::VersionHistory);
-    let outcome = backend_call(state, BackendRequest::soft_delete(path))
+    let mutation_guard = lock_note_mutation(state, path).await?;
+    let outcome = write_under_lock(state, mutation_guard, BackendRequest::soft_delete(path))
         .await?
         .into_soft_delete()
         .map_err(|error| error.to_string())?;
@@ -4972,6 +5011,13 @@ async fn call_tool_inner(
             if from_relative == to_relative {
                 return Err("rename_note was given the same path twice.".to_string());
             }
+            // Both ends of the move, in deterministic key order, before ANY
+            // authoritative state is read: two opposite-direction renames each
+            // need both keys, and taking them in the same order is what makes
+            // the overlap resolve instead of deadlock.
+            let mutation_guards =
+                crate::locks::lock_note_pair(&state.mutation_locks, &state.router, &from, &to)
+                    .await?;
             let dry_run = bool_arg(arguments, "dryRun", false);
             let rewrite_links = bool_arg(arguments, "rewriteLinks", true);
             let expected_hash = expected_hash_arg(arguments);
@@ -5081,17 +5127,34 @@ async fn call_tool_inner(
                 })));
             }
             let atomic = if already_moved {
+                // The move already happened: release both ends now, because the
+                // repair pass below locks each repaired note — including the
+                // moved note itself, for its self-links — and holding the
+                // destination lock through that would deadlock against it.
+                drop(mutation_guards);
                 None
             } else {
-                let renamed = backend_call(
-                    state,
-                    BackendRequest::Mutation(MutationRequest::Rename {
-                        from: from.clone(),
-                        to: to.clone(),
-                        base_version: BaseVersion::from_read(version),
-                    }),
-                )
-                .await?;
+                let router = state.router.clone();
+                let task_from = from.clone();
+                let task_to = to.clone();
+                let base_version = BaseVersion::from_read(version);
+                let renamed = tokio::spawn(async move {
+                    let outcome = router
+                        .execute(BackendRequest::Mutation(MutationRequest::Rename {
+                            from: task_from,
+                            to: task_to,
+                            base_version,
+                        }))
+                        .await;
+                    // Both ends released only once the move has landed; a
+                    // cancelled request detaches this task rather than
+                    // releasing the locks under an in-flight move.
+                    drop(mutation_guards);
+                    outcome
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
                 Some(matches!(
                     renamed,
                     BackendResponse::Mutation(MutationResponse::Renamed { atomic: true, .. })
@@ -5485,6 +5548,7 @@ async fn call_tool_inner(
             // A read failure still means "no existing note" here, exactly as before,
             // so a first write creates. What is new is that the read also yields the
             // precondition the write will carry; see `backend_read_note_for_write`.
+            let mutation_guard = lock_note_mutation(state, &path).await?;
             let prior = backend_read_note_for_write(state, &path).await;
             let existing = prior.existing;
             let previous_hash = existing
@@ -5505,8 +5569,9 @@ async fn call_tool_inner(
             // The dry run returns above without ever reaching the write, so no
             // backend — and therefore no remote — is touched by one.
             if !dry_run {
-                backend_call(
+                write_under_lock(
                     state,
+                    mutation_guard,
                     BackendRequest::write_text_full(
                         &path,
                         &final_content,
@@ -5550,6 +5615,7 @@ async fn call_tool_inner(
             let specs = parse_edit_specs(arguments)?;
             // Like `update_note_section` and unlike the upserts, this REQUIRES an existing
             // note: there is nothing to address in a note that is not there.
+            let mutation_guard = lock_note_mutation(state, &path).await?;
             let (existing, base_version) = backend_call(state, BackendRequest::read_text(&path))
                 .await?
                 .into_versioned_text()
@@ -5570,8 +5636,9 @@ async fn call_tool_inner(
             let (final_content, applied) = apply_edits(&existing, &specs)?;
             let new_hash = content_hash(final_content.as_bytes());
             if !dry_run {
-                backend_call(
+                write_under_lock(
                     state,
+                    mutation_guard,
                     BackendRequest::write_text_guarded(&path, &final_content, base_version),
                 )
                 .await?;
@@ -5665,6 +5732,7 @@ async fn call_tool_inner(
                     folder.as_deref().unwrap_or("Knowledge Capture"),
                 )
             });
+            let mutation_guard = lock_note_mutation(state, &target_path).await?;
             let prior = backend_read_note_for_write(state, &target_path).await;
             let existing = prior.existing;
             let previous_hash = existing
@@ -5680,8 +5748,9 @@ async fn call_tool_inner(
             let new_hash = content_hash(final_content.as_bytes());
             let created = existing.is_none();
             if !dry_run {
-                backend_call(
+                write_under_lock(
                     state,
+                    mutation_guard,
                     BackendRequest::write_text_guarded(
                         &target_path,
                         &final_content,
@@ -6980,6 +7049,7 @@ mod tests {
                 vault_path.join("definitely-missing-rg"),
             ));
         let state = AppState {
+            mutation_locks: crate::locks::MutationLockRegistry::shared(),
             live: std::sync::Arc::default(),
             router: std::sync::Arc::new(deep_obsidian_backend::VaultRouter::single(
                 "vault",

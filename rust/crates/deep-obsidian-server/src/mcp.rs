@@ -43,6 +43,11 @@ pub struct AppState {
     /// own vault path now reaches the index crate through that mount's
     /// [`RuntimeState`] instead (see [`MountRuntimes`]).
     pub router: Arc<VaultRouter>,
+    /// Per-note mutation locks, shared by every clone of this state (principal
+    /// scopes included) and carried across live-mount reloads, so two requests
+    /// reaching the same stored note serialize no matter which route they came
+    /// in by. See [`crate::locks`].
+    pub mutation_locks: Arc<crate::locks::MutationLockRegistry>,
     /// The ROOT mount's backend, unrouted.
     ///
     /// A convenience handle for the two callers that are about the root vault
@@ -137,6 +142,7 @@ impl AppState {
             runtimes,
             auth: Arc::new(AuthState::disabled()),
             router: Arc::new(router),
+            mutation_locks: crate::locks::MutationLockRegistry::shared(),
             backend,
             rg_available,
             uploads: UploadStore::new(),

@@ -6,6 +6,7 @@ pub mod edits;
 pub mod federation;
 pub mod health;
 pub mod links;
+pub mod locks;
 pub mod mcp;
 pub mod mounts;
 pub mod multiuser;

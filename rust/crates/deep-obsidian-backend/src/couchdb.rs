@@ -33,7 +33,7 @@
 //!   experimental read-only state and the exact setting that changes it rather than
 //!   reporting a generic capability error.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -319,6 +319,11 @@ struct CachedManifest {
 /// supervisor was configured `read-write`.
 pub struct CouchDbVaultBackend {
     supervisor: Arc<SidecarSupervisor>,
+    /// Bytes staged by [`MutationRequest::StageUploadStream`], keyed by an
+    /// opaque handle, waiting for the matching commit. The buffer lives here —
+    /// not on the wire — so the server's per-note lock is held only across the
+    /// commit, never across the network transfer.
+    staged_uploads: Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
     manifest: std::sync::Mutex<Option<CachedManifest>>,
     /// What each recently-touched path's content hashed to, at which revision.
     /// See [`HashCache`] and [`Self::read_text_conditionally`].
@@ -354,6 +359,7 @@ impl CouchDbVaultBackend {
             supervisor,
             manifest: std::sync::Mutex::new(None),
             hashes: std::sync::Mutex::new(HashCache::default()),
+            staged_uploads: Arc::default(),
         }
     }
 
@@ -910,30 +916,69 @@ impl CouchDbVaultBackend {
         }
     }
 
-    /// `CommitUploadStream`: collect the body, verify `expected_hash`, write binary.
+    /// `StageUploadStream`: collect the body into a backend-held buffer. Nothing
+    /// touches the destination, so the caller's per-note lock is not needed yet.
     ///
-    /// The filesystem backend's staging file and atomic rename have no analogue here
-    /// and need none: the sidecar's write is already all-or-nothing at the entry root
-    /// (chunks first, root last), so there is nothing to stage. What IS shared is the
-    /// contract: `max_bytes` enforced *during* collection so an oversize body never
-    /// reaches the remote, `expected_hash` verified against the destination as it is
-    /// at commit time, and the canonical content hash reported back.
-    async fn commit_upload(
+    /// `max_bytes` is enforced *during* collection so an oversize body never
+    /// reaches this process's memory budget. The commit half verifies
+    /// `expected_hash` against the destination as it is at commit time and
+    /// writes under the destination's revision guard.
+    async fn stage_upload(
         &self,
         path: &str,
-        expected_hash: Option<&str>,
         max_bytes: usize,
         chunks: crate::UploadChunks,
     ) -> Result<MutationResponse, BackendError> {
         self.ensure_writable()?;
         ensure_writable_path(path)?;
-
         // The chunk iterator is fed by the caller's async body pump, so pulling it on
         // a reactor thread would deadlock against that pump — the same reason the
         // filesystem backend spawns here.
         let collected = tokio::task::spawn_blocking(move || collect_upload(max_bytes, chunks))
             .await
             .map_err(|error| BackendError::Message(error.to_string()))??;
+        let handle = crate::filesystem::staging_token();
+        self.staged_uploads
+            .lock()
+            .map_err(|_| BackendError::Message("staging registry poisoned".to_string()))?
+            .insert(handle.clone(), collected.bytes);
+        let uploads = self.staged_uploads.clone();
+        let cleanup_handle = handle.clone();
+        Ok(MutationResponse::UploadStaged {
+            handle: crate::StagedUpload::new(handle, path.to_string(), move || {
+                uploads
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&cleanup_handle);
+            }),
+        })
+    }
+
+    /// `CommitStagedUpload`: verify `expected_hash`, write the staged bytes.
+    async fn commit_staged_upload(
+        &self,
+        path: &str,
+        staged: crate::StagedUpload,
+        expected_hash: Option<&str>,
+    ) -> Result<MutationResponse, BackendError> {
+        self.ensure_writable()?;
+        ensure_writable_path(path)?;
+        if staged.destination() != path {
+            return Err(BackendError::Message(
+                "staged upload destination mismatch".to_string(),
+            ));
+        }
+        let bytes = self
+            .staged_uploads
+            .lock()
+            .map_err(|_| BackendError::Message("staging registry poisoned".to_string()))?
+            .remove(staged.handle())
+            .ok_or_else(|| {
+                BackendError::Message(
+                    "unknown or expired staging handle: the staged upload was already                      committed or the server restarted"
+                        .to_string(),
+                )
+            })?;
 
         // One read serves both the precondition and the guard: re-reading for the
         // revision separately would open a second window between them.
@@ -959,15 +1004,15 @@ impl CouchDbVaultBackend {
         let result = self
             .guarded_write(
                 path,
-                WritePayload::Base64(encode_base64(&collected.bytes)),
+                WritePayload::Base64(encode_base64(&bytes)),
                 guard,
-                &collected.bytes,
+                &bytes,
             )
             .await?;
         Ok(MutationResponse::UploadCommitted {
             created: result.created,
-            bytes_written: collected.bytes.len(),
-            hash: collected.hash,
+            bytes_written: bytes.len(),
+            hash: deep_obsidian_core::content_hash(&bytes),
         })
     }
 
@@ -1300,6 +1345,10 @@ impl CouchDbVaultBackend {
 
 #[async_trait::async_trait]
 impl VaultBackend for CouchDbVaultBackend {
+    fn storage_id(&self) -> String {
+        format!("couchdb:{}", self.supervisor.storage_identity())
+    }
+
     /// # Capability rationale
     ///
     /// * `GrepSearch` — served by [`Self::grep`], an imitation of ripgrep over note
@@ -1354,11 +1403,9 @@ impl VaultBackend for CouchDbVaultBackend {
             BackendRequest::Content(request) => {
                 self.content(request).await.map(BackendResponse::Content)
             }
-            // Housekeeping, and a no-op in BOTH modes: it is documented as
-            // best-effort and never-failing, and there is no staging area here to
-            // sweep — the sidecar's write is all-or-nothing at the entry root, so no
-            // partial artifact ever exists for a killed process to leave behind.
-            // Failing it would make a caller's cleanup pass report a spurious error.
+            // In-memory staging is owned by receipts: abandoned results and
+            // denied/cancelled commits discard it on drop; process exit frees
+            // it outright. There are no persistent orphan files to sweep.
             BackendRequest::Mutation(MutationRequest::SweepOrphanStagingFiles) => {
                 Ok(BackendResponse::Mutation(crate::MutationResponse::Swept))
             }
@@ -1388,13 +1435,20 @@ impl VaultBackend for CouchDbVaultBackend {
                 .soft_delete(&path, base_version)
                 .await
                 .map(BackendResponse::Mutation),
-            BackendRequest::Mutation(MutationRequest::CommitUploadStream {
+            BackendRequest::Mutation(MutationRequest::StageUploadStream {
                 path,
-                expected_hash,
                 max_bytes,
                 chunks,
             }) => self
-                .commit_upload(&path, expected_hash.as_deref(), max_bytes, chunks)
+                .stage_upload(&path, max_bytes, chunks)
+                .await
+                .map(BackendResponse::Mutation),
+            BackendRequest::Mutation(MutationRequest::CommitStagedUpload {
+                path,
+                handle,
+                expected_hash,
+            }) => self
+                .commit_staged_upload(&path, handle, expected_hash.as_deref())
                 .await
                 .map(BackendResponse::Mutation),
             BackendRequest::Recall(RecallRequest::Grep {
@@ -1465,7 +1519,6 @@ struct ExistingEntry {
 /// A fully collected upload body.
 struct CollectedUpload {
     bytes: Vec<u8>,
-    hash: String,
 }
 
 /// The largest upload this backend has actually been exercised with, end to end.
@@ -1499,13 +1552,11 @@ fn collect_upload(
     chunks: crate::UploadChunks,
 ) -> Result<CollectedUpload, BackendError> {
     let mut bytes: Vec<u8> = Vec::new();
-    let mut hasher = deep_obsidian_core::ContentHasher::new();
     for chunk in chunks.into_inner() {
         let chunk = chunk.map_err(BackendError::Message)?;
         if bytes.len().saturating_add(chunk.len()) > max_bytes {
             return Err(BackendError::PayloadTooLarge);
         }
-        hasher.update(&chunk);
         bytes.extend_from_slice(&chunk);
     }
     if bytes.len() > UPLOAD_COLLECT_ADVISORY_BYTES {
@@ -1517,10 +1568,7 @@ fn collect_upload(
             UPLOAD_COLLECT_ADVISORY_BYTES
         );
     }
-    Ok(CollectedUpload {
-        hash: hasher.finish(),
-        bytes,
-    })
+    Ok(CollectedUpload { bytes })
 }
 
 /// The compare-and-swap precondition a caller's observation implies.
@@ -1871,6 +1919,80 @@ fn path_is_filtered(path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::sidecar::EntryKind;
+
+    fn staging_backend(writable: bool) -> CouchDbVaultBackend {
+        let supervisor = SidecarSupervisor::new(crate::SidecarConfig {
+            launch: crate::sidecar::SidecarLaunch {
+                node: "unused-node".into(),
+                bundle: "unused-bundle".into(),
+            },
+            credentials: crate::SidecarCredentials {
+                url: "http://127.0.0.1:1".into(),
+                database: "test".into(),
+                username: "test".into(),
+                password: secrecy::SecretString::new("test".into()),
+                e2ee_passphrase: None,
+                e2ee_obfuscate_passphrase: None,
+            },
+            mode: if writable {
+                crate::SidecarMode::ReadWrite
+            } else {
+                crate::SidecarMode::ReadOnly
+            },
+            options: None,
+            request_timeout: Duration::from_secs(1),
+            restart_backoff_base: Duration::from_millis(1),
+        });
+        CouchDbVaultBackend::from_supervisor(supervisor)
+    }
+
+    #[tokio::test]
+    async fn staging_refuses_read_only_and_protected_paths_before_pulling_the_body() {
+        for (writable, path) in [
+            (false, "out.bin"),
+            (true, "Templates/out.bin"),
+            (true, "../out.bin"),
+        ] {
+            let backend = staging_backend(writable);
+            let chunks = crate::UploadChunks::new(std::iter::from_fn(|| {
+                panic!("an invalid staging request must not pull the body")
+            }));
+            assert!(backend.stage_upload(path, 32, chunks).await.is_err());
+            assert!(backend.staged_uploads.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_or_denied_staging_receipts_release_their_buffers() {
+        let mut backend = staging_backend(true);
+        let chunks = || crate::UploadChunks::new(std::iter::once(Ok(vec![1; 1024])));
+        let receipt = match backend
+            .stage_upload("out.bin", 1024, chunks())
+            .await
+            .unwrap()
+        {
+            MutationResponse::UploadStaged { handle } => handle,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(backend.staged_uploads.lock().unwrap().len(), 1);
+        drop(receipt);
+        assert!(backend.staged_uploads.lock().unwrap().is_empty());
+
+        let receipt = match backend
+            .stage_upload("out.bin", 1024, chunks())
+            .await
+            .unwrap()
+        {
+            MutationResponse::UploadStaged { handle } => handle,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        backend.writable = false;
+        assert!(backend
+            .commit_staged_upload("out.bin", receipt, None)
+            .await
+            .is_err());
+        assert!(backend.staged_uploads.lock().unwrap().is_empty());
+    }
 
     fn entry(path: &str, kind: EntryKind, deleted: bool) -> ManifestEntry {
         ManifestEntry {

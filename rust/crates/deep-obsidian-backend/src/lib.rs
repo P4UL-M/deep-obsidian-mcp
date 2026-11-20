@@ -521,13 +521,26 @@ pub enum MutationRequest {
     /// backend would implement the same request with a multipart session and a
     /// commit call.
     ///
-    /// `chunks` is pulled synchronously on a blocking thread; `max_bytes` is
-    /// enforced *during* streaming so an oversize body never lands.
-    CommitUploadStream {
+    /// Stage an upload's bytes without touching the destination: the bytes land
+    /// in backend-held staging (a temp file next to the destination on
+    /// filesystem; an in-memory buffer on CouchDB) and the response carries an
+    /// opaque handle. `chunks` is pulled synchronously on a blocking thread;
+    /// `max_bytes` is enforced *during* streaming so an oversize body never
+    /// lands. The split exists so the server can hold its per-note mutation
+    /// lock across ONLY the commit phase — never across the network transfer.
+    StageUploadStream {
         path: String,
-        expected_hash: Option<String>,
         max_bytes: usize,
         chunks: UploadChunks,
+    },
+    /// Commit a previously staged upload: re-read the destination, verify
+    /// `expected_hash` against it as it is NOW, and swap the staged bytes in.
+    /// The handle is the one `StageUploadStream` returned; using it for a
+    /// different destination is refused.
+    CommitStagedUpload {
+        path: String,
+        handle: StagedUpload,
+        expected_hash: Option<String>,
     },
     /// Best-effort removal of staging artifacts orphaned by a killed process.
     /// Never fails: housekeeping, not a contract.
@@ -539,6 +552,60 @@ pub enum MutationRequest {
 /// Boxed rather than generic so [`MutationRequest`] stays a plain data enum that an
 /// object-safe `execute` can accept.
 pub struct UploadChunks(Box<dyn Iterator<Item = Result<Vec<u8>, String>> + Send>);
+
+/// Owned staging receipt. Dropping the final owner discards the local staging
+/// artifact, including on cancellation, authorization failure or an unused task
+/// result. Cleanup never writes the destination.
+#[derive(Clone)]
+pub struct StagedUpload(std::sync::Arc<StagedUploadInner>);
+
+struct StagedUploadInner {
+    handle: String,
+    destination: String,
+    cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl StagedUpload {
+    pub fn new(
+        handle: String,
+        destination: String,
+        cleanup: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self(std::sync::Arc::new(StagedUploadInner {
+            handle,
+            destination,
+            cleanup: Some(Box::new(cleanup)),
+        }))
+    }
+
+    pub fn handle(&self) -> &str {
+        &self.0.handle
+    }
+    pub fn destination(&self) -> &str {
+        &self.0.destination
+    }
+}
+
+impl Drop for StagedUploadInner {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+impl std::fmt::Debug for StagedUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("StagedUpload").field(&self.0.handle).finish()
+    }
+}
+
+impl PartialEq for StagedUpload {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for StagedUpload {}
 
 impl UploadChunks {
     pub fn new<I>(chunks: I) -> Self
@@ -781,6 +848,9 @@ pub enum MutationResponse {
         /// paths. That state is readable and re-running the same rename repairs it, but a
         /// caller that believed the move was atomic would not think to check.
         atomic: bool,
+    },
+    UploadStaged {
+        handle: StagedUpload,
     },
     UploadCommitted {
         created: bool,
@@ -1060,6 +1130,26 @@ pub trait VaultBackend: Send + Sync {
     /// helpers, and treat a family mismatch as a bug rather than a runtime condition.
     async fn execute(&self, request: BackendRequest) -> Result<BackendResponse, BackendError>;
 
+    /// Stable identity of the storage this backend serves, for server-side
+    /// per-note mutation locking. Two backends serving the SAME storage must
+    /// return the same string (so a scoped authorizing wrapper and its inner
+    /// backend agree, and a reload generation matches its predecessor); two
+    /// backends serving DIFFERENT storage must not (so a remapped mount gets
+    /// its own locks). The default is pointer identity, which satisfies both
+    /// for in-memory and test backends; real backends override with their
+    /// storage coordinates. The string must never contain secrets.
+    fn storage_id(&self) -> String {
+        format!("anon:{:p}", self as *const Self)
+    }
+
+    /// Identity of one stored note. Backends with filesystem aliases override
+    /// this; remote paths keep their storage spelling and case. Length-prefixing
+    /// the storage component prevents separator characters from colliding.
+    fn mutation_key(&self, path: &str) -> Result<String, BackendError> {
+        let storage = self.storage_id();
+        Ok(format!("{}:{}{}", storage.len(), storage, path))
+    }
+
     /// Subscribe to change notifications.
     ///
     /// `after` resumes from a previously minted cursor when the backend supports
@@ -1278,7 +1368,15 @@ impl BackendResponse {
         }
     }
 
-    /// Outcome of a [`MutationRequest::CommitUploadStream`].
+    /// The handle from a [`MutationRequest::StageUploadStream`].
+    pub fn into_upload_staged(self) -> Result<StagedUpload, BackendError> {
+        match self {
+            BackendResponse::Mutation(MutationResponse::UploadStaged { handle }) => Ok(handle),
+            other => Err(mismatch("stage-upload-stream", &other)),
+        }
+    }
+
+    /// Outcome of a [`MutationRequest::CommitStagedUpload`].
     pub fn into_upload_outcome(self) -> Result<UploadOutcome, BackendError> {
         match self {
             BackendResponse::Mutation(MutationResponse::UploadCommitted {

@@ -1584,6 +1584,16 @@ impl SidecarSupervisor {
     /// unreported, which is the one failure mode this counter exists to prevent. The
     /// price of reading it early is a needless re-collection when a change happens to
     /// land during one, and that is the correct direction to be wrong in.
+    /// Stable storage identity for server-side per-note mutation locking:
+    /// which CouchDB server and database this sidecar talks to. Deliberately
+    /// excludes credentials — never a secret.
+    pub fn storage_identity(&self) -> String {
+        format!(
+            "{}#{}",
+            self.config.credentials.url, self.config.credentials.database
+        )
+    }
+
     pub fn change_epoch(&self) -> u64 {
         self.change_epoch.load(Ordering::SeqCst)
     }

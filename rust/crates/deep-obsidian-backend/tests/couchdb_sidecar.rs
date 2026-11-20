@@ -513,9 +513,8 @@ async fn writes_are_refused_with_the_experimental_read_only_message_but_grep_is_
 
     let upload = backend
         .execute(BackendRequest::Mutation(
-            MutationRequest::CommitUploadStream {
+            MutationRequest::StageUploadStream {
                 path: "New.png".to_string(),
-                expected_hash: None,
                 max_bytes: 16,
                 chunks: deep_obsidian_backend::UploadChunks::new(std::iter::empty()),
             },
@@ -1453,11 +1452,10 @@ async fn an_upload_round_trips_binary_bytes() {
     // Deliberately not a multiple of 3, so the base64 padding path is exercised, and
     // deliberately containing bytes no UTF-8 decoder would survive.
     let bytes: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe, 0x01, 0x02];
-    let outcome = backend
+    let staged = backend
         .execute(BackendRequest::Mutation(
-            MutationRequest::CommitUploadStream {
+            MutationRequest::StageUploadStream {
                 path: "assets/uploaded.png".to_string(),
-                expected_hash: None,
                 max_bytes: 1024,
                 // Two chunks, so the collector's concatenation is exercised rather
                 // than a single-buffer shortcut.
@@ -1467,7 +1465,19 @@ async fn an_upload_round_trips_binary_bytes() {
             },
         ))
         .await
-        .expect("an upload to a writable mount must land")
+        .expect("an upload to a writable mount must stage")
+        .into_upload_staged()
+        .expect("staging outcome");
+    let outcome = backend
+        .execute(BackendRequest::Mutation(
+            MutationRequest::CommitStagedUpload {
+                path: "assets/uploaded.png".to_string(),
+                handle: staged,
+                expected_hash: None,
+            },
+        ))
+        .await
+        .expect("a staged upload to a writable mount must land")
         .into_upload_outcome()
         .expect("upload outcome");
     assert!(outcome.created);
@@ -1521,11 +1531,10 @@ async fn a_multi_megabyte_upload_round_trips() {
         })
         .collect();
 
-    let outcome = backend
+    let staged = backend
         .execute(BackendRequest::Mutation(
-            MutationRequest::CommitUploadStream {
+            MutationRequest::StageUploadStream {
                 path: "assets/large.bin".to_string(),
-                expected_hash: None,
                 max_bytes: deep_obsidian_backend::UPLOAD_COLLECT_ADVISORY_BYTES,
                 // Streamed in 64 KiB chunks, as a real HTTP body pump would deliver it.
                 chunks: deep_obsidian_backend::UploadChunks::new(
@@ -1535,6 +1544,18 @@ async fn a_multi_megabyte_upload_round_trips() {
                         .collect::<Vec<_>>()
                         .into_iter(),
                 ),
+            },
+        ))
+        .await
+        .expect("a multi-megabyte upload must stage")
+        .into_upload_staged()
+        .expect("staging outcome");
+    let outcome = backend
+        .execute(BackendRequest::Mutation(
+            MutationRequest::CommitStagedUpload {
+                path: "assets/large.bin".to_string(),
+                handle: staged,
+                expected_hash: None,
             },
         ))
         .await
@@ -1579,15 +1600,26 @@ async fn an_upload_with_a_stale_expected_hash_conflicts_with_the_frozen_wording(
         .into_bytes()
         .expect("bytes");
 
-    let error = backend
+    let staged = backend
         .execute(BackendRequest::Mutation(
-            MutationRequest::CommitUploadStream {
+            MutationRequest::StageUploadStream {
                 path: "assets/logo.png".to_string(),
-                expected_hash: Some("fnv1a64:0000000000000000".to_string()),
                 max_bytes: 1024,
                 chunks: deep_obsidian_backend::UploadChunks::new(std::iter::once(Ok(
                     b"replacement".to_vec(),
                 ))),
+            },
+        ))
+        .await
+        .expect("staging succeeds even when the commit will conflict")
+        .into_upload_staged()
+        .expect("staging outcome");
+    let error = backend
+        .execute(BackendRequest::Mutation(
+            MutationRequest::CommitStagedUpload {
+                path: "assets/logo.png".to_string(),
+                handle: staged,
+                expected_hash: Some("fnv1a64:0000000000000000".to_string()),
             },
         ))
         .await
@@ -1623,9 +1655,8 @@ async fn an_oversize_upload_is_refused_before_the_remote_is_touched() {
 
     let error = backend
         .execute(BackendRequest::Mutation(
-            MutationRequest::CommitUploadStream {
+            MutationRequest::StageUploadStream {
                 path: "assets/too-big.bin".to_string(),
-                expected_hash: None,
                 max_bytes: 4,
                 chunks: deep_obsidian_backend::UploadChunks::new(std::iter::once(Ok(
                     b"12345".to_vec()

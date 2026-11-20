@@ -444,6 +444,17 @@ struct GrantedBackend {
 }
 #[async_trait]
 impl VaultBackend for GrantedBackend {
+    fn storage_id(&self) -> String {
+        // The wrapper serves the SAME storage as its inner backend: a scoped
+        // principal and the principal-free state must agree on which note a
+        // mutation lock names.
+        self.inner.storage_id()
+    }
+
+    fn mutation_key(&self, path: &str) -> std::result::Result<String, BackendError> {
+        self.inner.mutation_key(path)
+    }
+
     fn descriptor(&self) -> BackendDescriptor {
         let mut d = self.inner.descriptor();
         if !self
@@ -480,9 +491,8 @@ impl VaultBackend for GrantedBackend {
         }
         let request = match request {
             BackendRequest::Mutation(
-                deep_obsidian_backend::MutationRequest::CommitUploadStream {
+                deep_obsidian_backend::MutationRequest::StageUploadStream {
                     path,
-                    expected_hash,
                     max_bytes,
                     chunks,
                 },
@@ -501,9 +511,8 @@ impl VaultBackend for GrantedBackend {
                     chunks.next()
                 });
                 BackendRequest::Mutation(
-                    deep_obsidian_backend::MutationRequest::CommitUploadStream {
+                    deep_obsidian_backend::MutationRequest::StageUploadStream {
                         path,
-                        expected_hash,
                         max_bytes,
                         chunks: deep_obsidian_backend::UploadChunks::new(guarded),
                     },

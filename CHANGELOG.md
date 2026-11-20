@@ -6,6 +6,27 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 ### Added
 
+- Mutations to the SAME stored note are now serialized within one server
+  process: the per-note lock is acquired before the authoritative read and held
+  through `expectedHash` validation, content derivation and completion of the
+  storage write, so two overlapping requests can no longer both derive from the
+  same pre-write state — the second read waits, then sees the first's result.
+  Different notes stay concurrent, keys are stable across users, mount aliases
+  and live reloads, and rename takes both ends in a deterministic order before
+  its per-note backlink repair. Upload commits share the same lock: the body is
+  staged without holding it (`CommitUploadStream` split into
+  `StageUploadStream` + `CommitStagedUpload`), so the network transfer never
+  blocks another writer. The guarantee is per-process by design: readers,
+  Obsidian/sync/external writers keep their existing behavior, and
+  `expectedHash`/backend CAS checks remain necessary.
+  Filesystem lock keys resolve lexical, symlink and vault-root aliases, including
+  missing create targets and case-insensitive macOS volumes; renames use the same
+  keys as edits and uploads. Upload commits retain their lock after request
+  cancellation until storage work finishes, and owned staging receipts discard
+  abandoned files/buffers. Read-only CouchDB mounts refuse staging before reading
+  the body. Cancelled lock waiters are reclaimed, and Algolia lock identities
+  distinguish applications and endpoints.
+
 - `deep-obsidian-cli completions <shell>` generates Bash, Zsh, Fish,
   PowerShell and Elvish autocomplete scripts from the CLI command definitions.
   Completion covers commands, nested options and fixed values, including user

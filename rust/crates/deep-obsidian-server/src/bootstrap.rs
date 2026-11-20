@@ -29,6 +29,10 @@ use crate::mounts::MountBackends;
 use crate::protocol::JsonRpcRequest;
 use crate::runtime::MountRuntimes;
 
+#[cfg(test)]
+#[path = "concurrency_tests.rs"]
+mod concurrency_tests;
+
 /// Environment variable carrying a literal bearer token. When set and non-empty
 /// it enables authentication and overrides any configured `token_ref` — useful
 /// for containers, tunnels, and headless hosts where the OS keyring is absent.
@@ -263,7 +267,9 @@ pub(crate) async fn upload_handler(
     principal: Option<axum::Extension<deep_obsidian_control::Principal>>,
     body: Body,
 ) -> impl IntoResponse {
-    use crate::uploads::{commit_stream_via_backend, ClaimError, CommitError};
+    use crate::uploads::{
+        commit_staged_via_backend, stage_stream_via_backend, ClaimError, CommitError,
+    };
     let state = state.current();
     let principal = principal.map(|p| p.0);
     if !state.uploads.owner_matches(&token, principal.as_ref()) {
@@ -280,8 +286,8 @@ pub(crate) async fn upload_handler(
 
     // Atomically claim the token (or reject). Generic errors only: never leak
     // whether a vault path exists.
-    let pending = match state.uploads.claim(&token) {
-        Ok(pending) => pending,
+    let (pending, claim) = match state.uploads.claim_owned(&token) {
+        Ok(claimed) => claimed,
         Err(ClaimError::Expired) => {
             return (StatusCode::GONE, "upload token expired").into_response();
         }
@@ -294,12 +300,13 @@ pub(crate) async fn upload_handler(
         .check_path(&pending.dest_path, deep_obsidian_control::Action::Write)
         .is_err()
     {
-        state.uploads.release(&token);
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     }
-    // Bridge the async body stream into the backend's bounded commit, which pulls
-    // the chunks synchronously on its own blocking thread. The lock is NOT held
-    // during streaming, and the commit runs concurrently with the pump below.
+    // Bridge the async body stream into the backend's bounded staging, which
+    // pulls the chunks synchronously on its own blocking thread. Staging holds
+    // NO note lock: it runs concurrently with the pump below and can take as
+    // long as the network transfer does. The lock is acquired afterwards,
+    // around the commit alone — the read/hash-check/swap critical section.
     let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(4);
     // Route to the mount owning the destination. The commit needs an owned handle
     // it can hold across the stream, so it takes the backend rather than issuing a
@@ -314,17 +321,15 @@ pub(crate) async fn upload_handler(
         // through the router), so this is unreachable. Report it as an invalid
         // token rather than leaking anything about the mount table.
         Err(_) => {
-            state.uploads.release(&token);
             return (StatusCode::FORBIDDEN, "invalid upload token").into_response();
         }
     };
     let expected_hash = pending.expected_hash.clone();
     let max_bytes = pending.max_bytes;
 
-    let commit = tokio::spawn(commit_stream_via_backend(
-        backend,
-        dest_path,
-        expected_hash,
+    let stage = tokio::spawn(stage_stream_via_backend(
+        backend.clone(),
+        dest_path.clone(),
         max_bytes,
         deep_obsidian_backend::UploadChunks::new(chunk_rx.into_iter()),
     ));
@@ -348,34 +353,82 @@ pub(crate) async fn upload_handler(
     }
     drop(chunk_tx);
 
-    let outcome = match commit.await {
-        Ok(result) => result,
+    let staged_handle = match stage.await {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(error)) => {
+            if let Some(stream_error) = stream_error {
+                warn!("upload stream error: {stream_error}");
+            }
+            return match error {
+                CommitError::TooLarge => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "upload exceeds maximum allowed size",
+                )
+                    .into_response(),
+                CommitError::EscapesVault => {
+                    (StatusCode::FORBIDDEN, "invalid upload token").into_response()
+                }
+                CommitError::Io(message) => {
+                    warn!("upload staging error: {message}");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "upload failed").into_response()
+                }
+                CommitError::HashConflict { .. } => {
+                    (StatusCode::CONFLICT, error.to_string()).into_response()
+                }
+            };
+        }
         Err(join_error) => {
-            state.uploads.release(&token);
-            warn!("upload commit task failed: {join_error}");
+            warn!("upload staging task failed: {join_error}");
             return (StatusCode::INTERNAL_SERVER_ERROR, "upload failed").into_response();
         }
     };
 
-    match outcome {
-        Ok(outcome) => {
-            // Only a successful commit consumes the token.
-            state.uploads.consume(&token);
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "action": if outcome.created { "created" } else { "updated" },
-                    "path": pending.dest_path,
-                    "bytesWritten": outcome.bytes_written,
-                    "hash": outcome.hash,
-                })),
-            )
-                .into_response()
+    // The commit is the only part that touches the destination: hold the
+    // destination's per-note mutation lock across it and nothing else, so a
+    // concurrent edit_note/upsert/rename on the same note serializes against
+    // this swap instead of interleaving with it.
+    let lock_guard =
+        match crate::locks::lock_note(&state.mutation_locks, &state.router, &pending.dest_path)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(message) => {
+                warn!("upload destination unroutable at commit: {message}");
+                return (StatusCode::FORBIDDEN, "invalid upload token").into_response();
+            }
+        };
+    // Keep both the lock and token claim in the task that actually commits.
+    // Dropping the request's JoinHandle detaches this work instead of unlocking
+    // while a blocking filesystem operation or remote call is still running.
+    let commit_response = match tokio::spawn(async move {
+        let result =
+            commit_staged_via_backend(backend, dest_path, staged_handle, expected_hash).await;
+        if result.is_ok() {
+            claim.consume();
         }
+        drop(lock_guard);
+        result
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(CommitError::Io(error.to_string())),
+    };
+
+    match commit_response {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(json!({
+                "action": if outcome.created { "created" } else { "updated" },
+                "path": pending.dest_path,
+                "bytesWritten": outcome.bytes_written,
+                "hash": outcome.hash,
+            })),
+        )
+            .into_response(),
         Err(error) => {
             // Failed upload keeps the token alive until TTL so a transient
             // curl failure can retry.
-            state.uploads.release(&token);
             if let Some(stream_error) = stream_error {
                 warn!("upload stream error: {stream_error}");
             }
@@ -572,6 +625,209 @@ mod tests {
 
     // Serializes the env-var mutations below; these globals are process-wide.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct GatedUploadBackend {
+        inner: std::sync::Arc<deep_obsidian_backend::FilesystemVaultBackend>,
+        staged: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        committing: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl deep_obsidian_backend::VaultBackend for GatedUploadBackend {
+        fn descriptor(&self) -> deep_obsidian_backend::BackendDescriptor {
+            self.inner.descriptor()
+        }
+        fn storage_id(&self) -> String {
+            self.inner.storage_id()
+        }
+        fn mutation_key(&self, path: &str) -> Result<String, deep_obsidian_backend::BackendError> {
+            self.inner.mutation_key(path)
+        }
+        fn changes(
+            &self,
+            after: Option<deep_obsidian_backend::OpaqueCursor>,
+        ) -> deep_obsidian_backend::ChangeStream {
+            self.inner.changes(after)
+        }
+        async fn execute(
+            &self,
+            request: deep_obsidian_backend::BackendRequest,
+        ) -> Result<deep_obsidian_backend::BackendResponse, deep_obsidian_backend::BackendError>
+        {
+            use deep_obsidian_backend::{BackendError, BackendRequest, MutationRequest};
+            match &request {
+                BackendRequest::Mutation(MutationRequest::StageUploadStream { .. }) => {
+                    let result = self.inner.execute(request).await;
+                    if let Some(tx) = self.staged.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    result
+                }
+                BackendRequest::Mutation(MutationRequest::CommitStagedUpload { .. }) => {
+                    let started = self.committing.lock().unwrap().take().unwrap();
+                    let release = self.release.lock().unwrap().take().unwrap();
+                    let inner = self.inner.clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = started.send(());
+                        release
+                            .recv()
+                            .map_err(|error| BackendError::Message(error.to_string()))?;
+                        runtime.block_on(inner.execute(request))
+                    })
+                    .await
+                    .map_err(|error| BackendError::Message(error.to_string()))?
+                }
+                _ => self.inner.execute(request).await,
+            }
+        }
+    }
+
+    struct UploadFixture {
+        state: AppState,
+        token: String,
+        root: PathBuf,
+        staged: tokio::sync::oneshot::Receiver<()>,
+        committing: tokio::sync::oneshot::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    fn upload_fixture() -> UploadFixture {
+        use deep_obsidian_backend::{FilesystemVaultBackend, VaultRouter};
+        use std::sync::Arc;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dob-upload-cancel-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join("vault")).unwrap();
+        std::fs::write(root.join("vault/Doc.md"), "# Doc\n\noriginal\n").unwrap();
+        let mut config = config_with("127.0.0.1", false);
+        config.vault_path = Some(root.join("vault"));
+        config.index_dir = root.join("index");
+        config.auto_reindex.enabled = false;
+        let backends = MountBackends::build(&config);
+        let runtimes = crate::runtime::MountRuntimes::new(&config, &backends);
+        let mut state = AppState::with_backends(config, runtimes, &backends);
+        let (stage_tx, staged) = tokio::sync::oneshot::channel();
+        let (commit_tx, committing) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let backend = Arc::new(GatedUploadBackend {
+            inner: Arc::new(FilesystemVaultBackend::new(root.join("vault"))),
+            staged: Mutex::new(Some(stage_tx)),
+            committing: Mutex::new(Some(commit_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        state.router = Arc::new(VaultRouter::single("vault", backend.clone()));
+        state.backend = backend;
+        let token = state
+            .uploads
+            .mint(crate::uploads::PendingUpload {
+                dest_path: "Doc.md".into(),
+                expected_hash: None,
+                max_bytes: 1024,
+                expires_at: std::time::SystemTime::now() + crate::uploads::TOKEN_TTL,
+                in_flight: false,
+            })
+            .unwrap();
+        UploadFixture {
+            state,
+            token,
+            root,
+            staged,
+            committing,
+            release,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_upload_waiting_for_a_note_discards_staging_and_releases_its_claim() {
+        let fixture = upload_fixture();
+        let state = fixture.state.clone();
+        let guard = crate::locks::lock_note(&state.mutation_locks, &state.router, "Doc.md")
+            .await
+            .unwrap();
+        let token = fixture.token.clone();
+        let task_state = state.clone();
+        let upload = tokio::spawn(async move {
+            upload_handler(
+                State(task_state),
+                AxumPath(token),
+                None,
+                Body::from("# Doc\n\nuploaded\n"),
+            )
+            .await
+            .into_response()
+        });
+        fixture.staged.await.unwrap();
+        upload.abort();
+        let _ = upload.await;
+        assert!(
+            state.uploads.claim(&fixture.token).is_ok(),
+            "the token must be retryable"
+        );
+        state.uploads.release(&fixture.token);
+        let staging_count = std::fs::read_dir(fixture.root.join("vault"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".upload-"))
+            .count();
+        assert_eq!(staging_count, 0);
+        drop(guard);
+        assert_eq!(state.mutation_locks.live_keys(), 0);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_upload_keeps_the_note_locked_until_its_blocking_commit_finishes() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let fixture = upload_fixture();
+        let state = fixture.state.clone();
+        let token = fixture.token.clone();
+        let task_state = state.clone();
+        let upload = tokio::spawn(async move {
+            upload_handler(
+                State(task_state),
+                AxumPath(token),
+                None,
+                Body::from("# Doc\n\nuploaded\n"),
+            )
+            .await
+            .into_response()
+        });
+        fixture.committing.await.unwrap();
+        upload.abort();
+        let _ = upload.await;
+        assert!(matches!(
+            state.uploads.claim(&fixture.token),
+            Err(crate::uploads::ClaimError::InFlight)
+        ));
+        let request = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"edit_note","arguments":{"path":"./Doc.md","edits":[{"old":"uploaded","new":"patched"}]}}
+        })).unwrap();
+        let mut edit = Box::pin(crate::mcp::handle_request(state.clone(), request));
+        assert!(matches!(
+            edit.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        fixture.release.send(()).unwrap();
+        let response = edit.await.unwrap().unwrap();
+        assert!(response.get("result").is_some(), "{response}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("vault/Doc.md")).unwrap(),
+            "# Doc\n\npatched\n"
+        );
+        assert!(matches!(
+            state.uploads.claim(&fixture.token),
+            Err(crate::uploads::ClaimError::Unknown)
+        ));
+        assert_eq!(state.mutation_locks.live_keys(), 0);
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
 
     fn config_with(host: &str, auth_enabled: bool) -> ResolvedServiceConfig {
         ResolvedServiceConfig {

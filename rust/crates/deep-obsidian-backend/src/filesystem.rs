@@ -20,7 +20,7 @@ use crate::{
     BackendDescriptor, BackendError, BackendKind, BackendRequest, BackendResponse, Capability,
     ChildListing, ContentRequest, ContentResponse, GrepOutcome, HealthRequest, HealthResponse,
     ManifestRequest, ManifestResponse, MutationRequest, MutationResponse, OpaqueCursor,
-    RecallRequest, RecallResponse, VaultBackend,
+    RecallRequest, RecallResponse, StagedUpload, VaultBackend,
 };
 
 /// Refusal for a ranked search asked of a filesystem mount.
@@ -311,6 +311,20 @@ impl FilesystemVaultBackend {
 
 #[async_trait::async_trait]
 impl VaultBackend for FilesystemVaultBackend {
+    fn storage_id(&self) -> String {
+        format!(
+            "fs:{:?}",
+            self.vault_path
+                .canonicalize()
+                .unwrap_or_else(|_| self.vault_path.clone())
+        )
+    }
+
+    fn mutation_key(&self, path: &str) -> Result<String, BackendError> {
+        let absolute = vault::ensure_inside_vault(&self.vault_path, path)?;
+        Ok(format!("fs:{:?}", canonical_note_path(&absolute)?))
+    }
+
     fn descriptor(&self) -> BackendDescriptor {
         let mut capabilities = vec![
             Capability::BinaryRead,
@@ -340,26 +354,34 @@ impl VaultBackend for FilesystemVaultBackend {
             // The upload commit pulls a synchronous chunk iterator that is fed by
             // the caller's async body pump, so it must not run on a reactor thread:
             // blocking there would deadlock against the pump.
-            BackendRequest::Mutation(MutationRequest::CommitUploadStream {
+            BackendRequest::Mutation(MutationRequest::StageUploadStream {
                 path,
-                expected_hash,
                 max_bytes,
                 chunks,
             }) => {
                 let vault_path = self.vault_path.clone();
                 tokio::task::spawn_blocking(move || {
-                    commit_upload_stream(
-                        &vault_path,
-                        &path,
-                        expected_hash.as_deref(),
-                        max_bytes,
-                        chunks.into_inner(),
+                    stage_upload_stream(&vault_path, &path, max_bytes, chunks.into_inner())
+                        .map(|handle| MutationResponse::UploadStaged { handle })
+                })
+                .await
+                .map_err(|error| BackendError::Message(error.to_string()))?
+                .map(BackendResponse::Mutation)
+            }
+            BackendRequest::Mutation(MutationRequest::CommitStagedUpload {
+                path,
+                handle,
+                expected_hash,
+            }) => {
+                let vault_path = self.vault_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    commit_staged_upload(&vault_path, &path, handle, expected_hash.as_deref()).map(
+                        |outcome| MutationResponse::UploadCommitted {
+                            created: outcome.created,
+                            bytes_written: outcome.bytes_written,
+                            hash: outcome.hash,
+                        },
                     )
-                    .map(|outcome| MutationResponse::UploadCommitted {
-                        created: outcome.created,
-                        bytes_written: outcome.bytes_written,
-                        hash: outcome.hash,
-                    })
                 })
                 .await
                 .map_err(|error| BackendError::Message(error.to_string()))?
@@ -444,6 +466,96 @@ struct CommitOutcome {
     hash: String,
 }
 
+/// Canonicalize the deepest existing ancestor and retain missing components for
+/// create targets. This unifies lexical aliases, vault-root aliases and in-vault
+/// symlinks without creating a file as part of lock acquisition.
+fn canonical_note_path(path: &Path) -> Result<PathBuf, BackendError> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    let mut canonical = loop {
+        match ancestor.canonicalize() {
+            Ok(canonical) => break canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor
+                    .file_name()
+                    .ok_or_else(|| BackendError::io(error))?;
+                missing.push(name.to_owned());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    BackendError::Message("note has no existing filesystem ancestor".to_string())
+                })?;
+            }
+            Err(error) => return Err(BackendError::io(error)),
+        }
+    };
+    let insensitive = filesystem_case_insensitive(&canonical);
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    if insensitive {
+        canonical = fold_filesystem_case(&canonical)?;
+    }
+    Ok(canonical)
+}
+
+#[cfg(target_os = "macos")]
+fn filesystem_case_insensitive(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // Query the actual volume, including case-sensitive APFS volumes.
+    unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) == 0 }
+}
+
+#[cfg(windows)]
+fn filesystem_case_insensitive(_path: &Path) -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn fold_filesystem_case(path: &Path) -> Result<PathBuf, BackendError> {
+    use core_foundation_sys::{base::CFRelease, string::*};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let input = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| BackendError::Message(error.to_string()))?;
+    // Both Unicode case and composed/decomposed spellings may name the same
+    // missing file. Fold the whole canonical path before constructing its key.
+    unsafe {
+        let text = CFStringCreateMutable(std::ptr::null(), 0);
+        if text.is_null() {
+            return Err(BackendError::Message(
+                "cannot allocate filesystem lock key".into(),
+            ));
+        }
+        CFStringAppendCString(text, input.as_ptr(), kCFStringEncodingUTF8);
+        CFStringFold(text, kCFCompareCaseInsensitive, std::ptr::null());
+        CFStringNormalize(text, kCFStringNormalizationFormD);
+        let size =
+            CFStringGetMaximumSizeForEncoding(CFStringGetLength(text), kCFStringEncodingUTF8) + 1;
+        let mut bytes = vec![0u8; size as usize];
+        let ok = CFStringGetCString(text, bytes.as_mut_ptr().cast(), size, kCFStringEncodingUTF8);
+        CFRelease(text.cast());
+        if ok == 0 {
+            return Err(BackendError::Message(
+                "cannot encode filesystem lock key".into(),
+            ));
+        }
+        let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+        bytes.truncate(len);
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fold_filesystem_case(path: &Path) -> Result<PathBuf, BackendError> {
+    Ok(PathBuf::from(path.to_string_lossy().to_lowercase()))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn filesystem_case_insensitive(_path: &Path) -> bool {
+    false
+}
+
 /// Compute the absolute destination, ensuring the canonical parent directory stays
 /// within the canonical vault root.
 ///
@@ -476,19 +588,16 @@ fn resolve_guarded_destination(
 /// destination at commit; a mismatch aborts with [`BackendError::HashConflict`].
 ///
 /// On any failure the staging file is removed and the destination is left untouched.
-fn commit_upload_stream(
+fn stage_upload_stream(
     vault_path: &Path,
     dest_path: &str,
-    expected_hash: Option<&str>,
     max_bytes: usize,
     mut chunks: Box<dyn Iterator<Item = Result<Vec<u8>, String>> + Send>,
-) -> Result<CommitOutcome, BackendError> {
+) -> Result<StagedUpload, BackendError> {
     let absolute = resolve_guarded_destination(vault_path, dest_path)?;
     let parent = absolute
         .parent()
         .ok_or_else(|| BackendError::Message("destination has no parent directory".to_string()))?;
-
-    let created = !absolute.exists();
 
     let temp_path = parent.join(format!("{TEMP_PREFIX}{}.tmp", staging_token()));
     let mut temp_file = match std::fs::File::create(&temp_path) {
@@ -521,18 +630,87 @@ fn commit_upload_stream(
     }
     drop(temp_file);
 
-    // Optimistic concurrency: re-read the destination at commit if requested.
+    // The handle is the staging file's NAME only: the commit re-resolves it
+    // against the destination's own directory, so a handle can never name a
+    // file outside this vault, and a handle is committed only with the path it
+    // was staged for (the caller passes both back together, and the commit
+    // re-derives the directory from the destination).
+    let handle = temp_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| BackendError::Message("staging file name is not UTF-8".to_string()))?
+        .to_string();
+    Ok(StagedUpload::new(
+        handle,
+        absolute.to_string_lossy().into_owned(),
+        move || {
+            let _ = std::fs::remove_file(temp_path);
+        },
+    ))
+}
+
+fn commit_staged_upload(
+    vault_path: &Path,
+    dest_path: &str,
+    staged: StagedUpload,
+    expected_hash: Option<&str>,
+) -> Result<CommitOutcome, BackendError> {
+    // A handle is a bare staging file name minted by `stage_upload_stream`.
+    // Anything else — a path, a traversal, a foreign name — is refused before
+    // the filesystem ever sees it.
+    let handle = staged.handle();
+    if handle.contains('/')
+        || handle.contains('\\')
+        || !handle.starts_with(TEMP_PREFIX)
+        || !handle.ends_with(".tmp")
+    {
+        return Err(BackendError::Message(
+            "invalid staging handle: not a staging file this backend minted".to_string(),
+        ));
+    }
+    let absolute = resolve_guarded_destination(vault_path, dest_path)?;
+    if staged.destination() != absolute.to_string_lossy() {
+        return Err(BackendError::Message(
+            "staged upload destination mismatch".to_string(),
+        ));
+    }
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| BackendError::Message("destination has no parent directory".to_string()))?;
+    let staged_path = parent.join(handle);
+    if !staged_path.is_file() {
+        return Err(BackendError::Message(
+            "staged upload is gone: the staging file was already committed or swept".to_string(),
+        ));
+    }
+
+    let created = !absolute.exists();
+
+    // Hash the staged bytes streaming — the file is already on disk, so the
+    // commit never buffers the whole body in RAM.
+    let staged_file = std::fs::File::open(&staged_path).map_err(BackendError::io)?;
+    let mut reader = std::io::BufReader::new(staged_file);
+    let mut hasher = ContentHasher::new();
+    let mut bytes_written: usize = 0;
+    loop {
+        let chunk = read_chunk(&mut reader)?;
+        if chunk.is_empty() {
+            break;
+        }
+        bytes_written = bytes_written.saturating_add(chunk.len());
+        hasher.update(&chunk);
+    }
+
+    // Optimistic concurrency: re-read the destination at commit, under the
+    // caller's per-note lock.
     if let Some(expected) = expected_hash {
         let current_hash = match std::fs::read(&absolute) {
             Ok(bytes) => Some(deep_obsidian_core::content_hash(&bytes)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(BackendError::io(error));
-            }
+            Err(error) => return Err(BackendError::io(error)),
         };
         if current_hash.as_deref() != Some(expected) {
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = std::fs::remove_file(&staged_path);
             return Err(BackendError::HashConflict {
                 expected: expected.to_string(),
                 found: current_hash.unwrap_or_else(|| "null".to_string()),
@@ -541,16 +719,26 @@ fn commit_upload_stream(
     }
 
     let hash = hasher.finish();
-    if let Err(error) = std::fs::rename(&temp_path, &absolute) {
-        let _ = std::fs::remove_file(&temp_path);
+    if let Err(error) = std::fs::rename(&staged_path, &absolute) {
+        let _ = std::fs::remove_file(&staged_path);
         return Err(BackendError::io(error));
     }
 
     Ok(CommitOutcome {
         created,
-        bytes_written: total,
+        bytes_written,
         hash,
     })
+}
+
+/// Read one bounded chunk from a staged file (kept at the same granularity the
+/// stream pump used, so hashing behavior matches byte for byte).
+fn read_chunk(reader: &mut std::io::BufReader<std::fs::File>) -> Result<Vec<u8>, BackendError> {
+    use std::io::Read;
+    let mut chunk = Vec::with_capacity(64 * 1024);
+    let mut take = reader.take(64 * 1024);
+    take.read_to_end(&mut chunk).map_err(BackendError::io)?;
+    Ok(chunk)
 }
 
 /// Generate a 256-bit random staging-file discriminator as lowercase hex.
@@ -558,7 +746,7 @@ fn commit_upload_stream(
 /// Unpredictable by design: the staging file is created inside the vault, so a
 /// guessable name would let a local attacker pre-plant a symlink at that path and
 /// redirect the write.
-fn staging_token() -> String {
+pub(crate) fn staging_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -684,6 +872,95 @@ fn rename_without_replacement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutation_keys_canonicalize_existing_and_missing_note_aliases() {
+        let dir = temp_dir("mutation-alias");
+        std::fs::create_dir_all(dir.join("Folder")).unwrap();
+        std::fs::write(dir.join("Doc.md"), "body").unwrap();
+        let backend = FilesystemVaultBackend::new(&dir);
+        for (a, b) in [
+            ("Doc.md", "./Doc.md"),
+            ("Doc.md", "Folder/../Doc.md"),
+            ("Folder/New.md", "Folder/./New.md"),
+            ("New/Child.md", "Folder/../New/Child.md"),
+        ] {
+            assert_eq!(
+                backend.mutation_key(a).unwrap(),
+                backend.mutation_key(b).unwrap()
+            );
+        }
+        if filesystem_case_insensitive(&dir) {
+            assert_eq!(
+                backend.mutation_key("Doc.md").unwrap(),
+                backend.mutation_key("DOC.md").unwrap()
+            );
+            assert_eq!(
+                backend.mutation_key("New/Child.md").unwrap(),
+                backend.mutation_key("NEW/CHILD.MD").unwrap()
+            );
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                backend.mutation_key("New/Caf\u{e9}.md").unwrap(),
+                backend.mutation_key("NEW/CAFE\u{301}.MD").unwrap()
+            );
+        } else {
+            assert_ne!(
+                backend.mutation_key("Doc.md").unwrap(),
+                backend.mutation_key("doc.md").unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_keys_unify_symlinks_and_overlapping_vault_roots() {
+        let dir = temp_dir("mutation-symlink");
+        std::fs::create_dir_all(dir.join("Folder")).unwrap();
+        std::fs::write(dir.join("Folder/Doc.md"), "body").unwrap();
+        std::os::unix::fs::symlink(dir.join("Folder"), dir.join("Alias")).unwrap();
+        let root_alias = dir.with_extension("link");
+        std::os::unix::fs::symlink(&dir, &root_alias).unwrap();
+        let backend = FilesystemVaultBackend::new(&dir);
+        let alias = FilesystemVaultBackend::new(&root_alias);
+        let nested = FilesystemVaultBackend::new(dir.join("Folder"));
+        assert_eq!(backend.storage_id(), alias.storage_id());
+        for leaf in ["Doc.md", "New.md"] {
+            let key = backend.mutation_key(&format!("Folder/{leaf}")).unwrap();
+            assert_eq!(key, backend.mutation_key(&format!("Alias/{leaf}")).unwrap());
+            assert_eq!(key, alias.mutation_key(&format!("Folder/{leaf}")).unwrap());
+            assert_eq!(key, nested.mutation_key(leaf).unwrap());
+        }
+        std::fs::remove_file(root_alias).unwrap();
+    }
+
+    #[test]
+    fn abandoned_or_rejected_staging_receipts_remove_the_file() {
+        let dir = temp_dir("staging-cleanup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stage = || {
+            stage_upload_stream(
+                &dir,
+                "out.bin",
+                32,
+                Box::new(std::iter::once(Ok(b"bytes".to_vec()))),
+            )
+            .unwrap()
+        };
+        let receipt = stage();
+        let path = dir.join(receipt.handle());
+        let copy = receipt.clone();
+        drop(receipt);
+        assert!(path.exists());
+        drop(copy);
+        assert!(!path.exists());
+
+        let receipt = stage();
+        let path = dir.join(receipt.handle());
+        assert!(commit_staged_upload(&dir, "other.bin", receipt, None).is_err());
+        assert!(!path.exists());
+        assert!(!dir.join("other.bin").exists());
+    }
     use crate::UploadChunks;
     use std::time::{Duration, SystemTime};
 
@@ -719,12 +996,25 @@ mod tests {
         );
     }
 
+    /// One-shot stage+commit through the split API, preserving the old
+    /// single-call test ergonomics while covering both halves.
+    fn stage_and_commit(
+        dir: &Path,
+        path: &str,
+        expected_hash: Option<&str>,
+        max_bytes: usize,
+        chunks: Box<dyn Iterator<Item = Result<Vec<u8>, String>> + Send>,
+    ) -> Result<CommitOutcome, BackendError> {
+        let handle = stage_upload_stream(dir, path, max_bytes, chunks)?;
+        commit_staged_upload(dir, path, handle, expected_hash)
+    }
+
     #[test]
     fn commit_writes_file_and_reports_created() {
         let dir = temp_dir("backend-commit");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let outcome = commit_upload_stream(
+        let outcome = stage_and_commit(
             &dir,
             "sub/out.bin",
             None,
@@ -744,7 +1034,7 @@ mod tests {
         );
 
         // A second commit over the same path reports `created = false`.
-        let outcome = commit_upload_stream(
+        let outcome = stage_and_commit(
             &dir,
             "sub/out.bin",
             None,
@@ -762,7 +1052,7 @@ mod tests {
         let dir = temp_dir("backend-oversize");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let error = commit_upload_stream(
+        let error = stage_and_commit(
             &dir,
             "big.bin",
             None,
@@ -790,7 +1080,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("doc.bin"), b"current").unwrap();
 
-        let error = commit_upload_stream(
+        let error = stage_and_commit(
             &dir,
             "doc.bin",
             Some("fnv1a64:0000000000000000"),
@@ -817,7 +1107,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("doc.bin"), b"current").unwrap();
 
-        let outcome = commit_upload_stream(
+        let outcome = stage_and_commit(
             &dir,
             "doc.bin",
             Some(&deep_obsidian_core::content_hash(b"current")),
@@ -841,7 +1131,7 @@ mod tests {
         let link = vault.join("link");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
 
-        let error = commit_upload_stream(
+        let error = stage_and_commit(
             &vault,
             "link/escaped.bin",
             None,

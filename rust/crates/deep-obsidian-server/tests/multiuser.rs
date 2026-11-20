@@ -18,6 +18,9 @@ use serde_json::{json, Value};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[path = "support/mutation_gate.rs"]
+mod mutation_gate;
+
 struct Fixture {
     base: PathBuf,
     state: AppState,
@@ -364,6 +367,84 @@ async fn shared_editor_writes_use_only_the_selected_mount() {
         .unwrap()
         .contains("Laura default"));
     assert!(!f.base.join("paul/Default.md").exists());
+}
+
+#[tokio::test]
+async fn independent_scoped_users_share_the_same_note_lock_across_path_spellings() {
+    use deep_obsidian_backend::{BackendRequest, Mount, VaultRouter};
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+    let mut f = Fixture::new(Role::Editor).await;
+    let inner = f
+        .state
+        .router
+        .resolve("Shared/Welcome.md")
+        .unwrap()
+        .mount
+        .backend
+        .clone();
+    let gate = mutation_gate::MutationGate::new(inner);
+    let mounts = f
+        .state
+        .router
+        .mounts()
+        .iter()
+        .map(|m| {
+            Mount::new(
+                m.id.clone(),
+                &m.mount_at,
+                if m.id == "shared" {
+                    gate.clone() as Arc<dyn deep_obsidian_backend::VaultBackend>
+                } else {
+                    m.backend.clone()
+                },
+            )
+        })
+        .collect();
+    f.state.router = Arc::new(VaultRouter::new(mounts).unwrap());
+    let paul = f.as_paul();
+    let laura = f.as_laura();
+    let (entered, release) = gate.arm("Welcome.md");
+    let a = tokio::spawn(async move {
+        tool(
+            &paul,
+            "edit_note",
+            json!({"path":"Shared/Welcome.md","edits":[{"old":"# Shared","new":"# First"}]}),
+        )
+        .await
+    });
+    entered.await.unwrap();
+    let mut b = Box::pin(tool(
+        &laura,
+        "edit_note",
+        json!({"mountId":"shared","path":"Welcome.md","edits":[{"old":"sharedword","new":"second"}]}),
+    ));
+    assert!(matches!(
+        b.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    assert_eq!(
+        gate.reads("Welcome.md"),
+        1,
+        "the second user's authoritative read must wait"
+    );
+    assert_eq!(gate.mutations("Welcome.md"), ["write"]);
+    release.send(()).unwrap();
+    structured(&a.await.unwrap());
+    structured(&b.await);
+    let text = gate
+        .inner
+        .execute(BackendRequest::read_text("Welcome.md"))
+        .await
+        .unwrap()
+        .into_text()
+        .unwrap();
+    assert!(
+        text.contains("# First") && text.contains("second"),
+        "{text}"
+    );
+    assert_eq!(f.state.mutation_locks.live_keys(), 0);
 }
 
 #[tokio::test]

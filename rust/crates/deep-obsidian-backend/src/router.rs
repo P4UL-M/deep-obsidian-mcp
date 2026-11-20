@@ -637,9 +637,8 @@ impl VaultRouter {
                     ))
                     .await?)
             }
-            MutationRequest::CommitUploadStream {
+            MutationRequest::StageUploadStream {
                 path,
-                expected_hash,
                 max_bytes,
                 chunks,
             } => {
@@ -648,11 +647,28 @@ impl VaultRouter {
                 let routed_path = resolved.backend_relative_path.clone();
                 Ok(backend
                     .execute(BackendRequest::Mutation(
-                        MutationRequest::CommitUploadStream {
+                        MutationRequest::StageUploadStream {
                             path: routed_path,
-                            expected_hash,
                             max_bytes,
                             chunks,
+                        },
+                    ))
+                    .await?)
+            }
+            MutationRequest::CommitStagedUpload {
+                path,
+                handle,
+                expected_hash,
+            } => {
+                let resolved = self.resolve(&path)?;
+                let backend = resolved.mount.backend.clone();
+                let routed_path = resolved.backend_relative_path.clone();
+                Ok(backend
+                    .execute(BackendRequest::Mutation(
+                        MutationRequest::CommitStagedUpload {
+                            path: routed_path,
+                            handle,
+                            expected_hash,
                         },
                     ))
                     .await?)
@@ -1444,15 +1460,26 @@ mod tests {
         let vaults = Vaults::new("upload");
         let router = two_mounts(&vaults);
 
-        let outcome = router
+        let handle = router
             .execute(BackendRequest::Mutation(
-                MutationRequest::CommitUploadStream {
+                MutationRequest::StageUploadStream {
                     path: "Team/Assets/logo.bin".to_string(),
-                    expected_hash: None,
                     max_bytes: 1024,
                     chunks: crate::UploadChunks::new(
                         vec![Ok(b"header".to_vec()), Ok(b"-body".to_vec())].into_iter(),
                     ),
+                },
+            ))
+            .await
+            .expect("stage")
+            .into_upload_staged()
+            .expect("staging outcome");
+        let outcome = router
+            .execute(BackendRequest::Mutation(
+                MutationRequest::CommitStagedUpload {
+                    path: "Team/Assets/logo.bin".to_string(),
+                    handle,
+                    expected_hash: None,
                 },
             ))
             .await
@@ -1493,9 +1520,8 @@ mod tests {
 
         let error = router
             .execute(BackendRequest::Mutation(
-                MutationRequest::CommitUploadStream {
+                MutationRequest::StageUploadStream {
                     path: "Elsewhere/logo.bin".to_string(),
-                    expected_hash: None,
                     max_bytes: 1024,
                     chunks: crate::UploadChunks::new(vec![Ok(b"bytes".to_vec())].into_iter()),
                 },
