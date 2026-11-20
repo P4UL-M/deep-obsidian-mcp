@@ -1060,6 +1060,18 @@ pub trait VaultBackend: Send + Sync {
     /// helpers, and treat a family mismatch as a bug rather than a runtime condition.
     async fn execute(&self, request: BackendRequest) -> Result<BackendResponse, BackendError>;
 
+    /// Stable identity of the storage this backend serves, for server-side
+    /// per-note mutation locking. Two backends serving the SAME storage must
+    /// return the same string (so a scoped authorizing wrapper and its inner
+    /// backend agree, and a reload generation matches its predecessor); two
+    /// backends serving DIFFERENT storage must not (so a remapped mount gets
+    /// its own locks). The default is pointer identity, which satisfies both
+    /// for in-memory and test backends; real backends override with their
+    /// storage coordinates. The string must never contain secrets.
+    fn storage_id(&self) -> String {
+        format!("anon:{:p}", self as *const Self)
+    }
+
     /// Subscribe to change notifications.
     ///
     /// `after` resumes from a previously minted cursor when the backend supports

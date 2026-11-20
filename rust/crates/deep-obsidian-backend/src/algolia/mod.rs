@@ -543,6 +543,10 @@ impl AlgoliaVaultBackend {
 
 #[async_trait::async_trait]
 impl VaultBackend for AlgoliaVaultBackend {
+    fn storage_id(&self) -> String {
+        format!("algolia:{}", self.index_name)
+    }
+
     /// # Capability rationale
     ///
     /// * `GrepSearch` — yes, but **candidate-bounded, not exhaustive**. A filesystem

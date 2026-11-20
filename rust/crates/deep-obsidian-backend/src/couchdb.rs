@@ -1300,6 +1300,10 @@ impl CouchDbVaultBackend {
 
 #[async_trait::async_trait]
 impl VaultBackend for CouchDbVaultBackend {
+    fn storage_id(&self) -> String {
+        format!("couchdb:{}", self.supervisor.storage_identity())
+    }
+
     /// # Capability rationale
     ///
     /// * `GrepSearch` — served by [`Self::grep`], an imitation of ripgrep over note

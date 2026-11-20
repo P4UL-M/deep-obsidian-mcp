@@ -311,6 +311,10 @@ impl FilesystemVaultBackend {
 
 #[async_trait::async_trait]
 impl VaultBackend for FilesystemVaultBackend {
+    fn storage_id(&self) -> String {
+        format!("fs:{}", self.vault_path.display())
+    }
+
     fn descriptor(&self) -> BackendDescriptor {
         let mut capabilities = vec![
             Capability::BinaryRead,

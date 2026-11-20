@@ -120,6 +120,7 @@ pub async fn apply(state: &AppState) -> Result<Value> {
     }
     let runtimes = crate::runtime::MountRuntimes::new(&candidate, &backends);
     let mut next = AppState::with_backends(candidate, runtimes, &backends);
+    next.mutation_locks = current.mutation_locks.clone();
     next.auth = current.auth.clone();
     next.control = current.control.clone();
     next.upload_base = current.upload_base.clone();

@@ -444,6 +444,13 @@ struct GrantedBackend {
 }
 #[async_trait]
 impl VaultBackend for GrantedBackend {
+    fn storage_id(&self) -> String {
+        // The wrapper serves the SAME storage as its inner backend: a scoped
+        // principal and the principal-free state must agree on which note a
+        // mutation lock names.
+        self.inner.storage_id()
+    }
+
     fn descriptor(&self) -> BackendDescriptor {
         let mut d = self.inner.descriptor();
         if !self
