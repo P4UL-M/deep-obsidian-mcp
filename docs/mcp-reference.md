@@ -154,7 +154,15 @@ must either declare the argument that fetches them or offer no cursor at all.
   rather than resolved to the first match. Nested subsections survive a section
   edit by default; `includeSubsections:true` opts into replacing the subtree.
   Does not accept `resolveDivergence`: a partial edit never saw the whole note,
-  so it cannot assert that the note reconciles a divergence.
+  so it cannot assert that the note reconciles a divergence. An `expectedHash`
+  conflict is triaged, not just reported: the server re-runs the same edits
+  against the note as it now stands and answers retry-or-re-read — edits
+  still apply (inspect the proposed diff before deciding whether to retry with
+  the returned hash: a heading's body or an occurrence target may have changed),
+  an anchor is gone (re-read and re-derive, failure reason forwarded),
+  an anchor became ambiguous through duplication (do not retry), or the
+  concurrent write already produced the intended result (nothing to retry).
+  Preview diffs and failure diagnostics are bounded with a truncation notice.
 - **Every markdown write reports what it changed.** `upsert_note`, `edit_note`,
   `edit_note` and `upsert_session_note` return `added` and `removed`
   line counts, on applied writes and not only on `dryRun` — the accident worth

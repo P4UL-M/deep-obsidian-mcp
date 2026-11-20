@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::edits::{apply_edits, EditSpec};
+use crate::edits::{apply_edits, AppliedEdit, EditSpec};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use deep_obsidian_backend::{
@@ -361,6 +361,107 @@ fn validate_expected_hash(
         }
     }
     Ok(())
+}
+
+/// Ceiling for either the diff or failure diagnostic in an `edit_note` conflict.
+///
+/// An always-on conflict diff is itself a context hazard: on a 4 000-line note with
+/// `replaceAll`, an unbounded one produced a 316 KB error message. Past this many
+/// characters the detail is cut at a line boundary with an explicit truncation notice.
+/// Ambiguity diagnostics can be just as large because they list every matching line.
+const CONFLICT_DETAIL_MAX_CHARS: usize = 4_000;
+
+/// A hash conflict on `edit_note` that says what to do next instead of naming two
+/// opaque hashes.
+///
+/// At conflict time the server still holds the caller's edits, so it re-runs them
+/// against the current content and answers the only question a conflicted caller has —
+/// retry or re-read — as one of three outcomes:
+///
+/// - the edits still apply: the message gives a bounded preview to inspect before
+///   deciding whether to retry with the current hash. Applicability does not establish
+///   intent: section bodies and ordinal targets may have changed concurrently;
+/// - the edits no longer apply: re-read and re-derive, with the underlying anchor
+///   failure forwarded within the detail budget — and deliberately no retry advice,
+///   because a retry cannot work;
+/// - the edits apply but change nothing: a concurrent write already produced the
+///   intended result, so no retry is needed (one would be a no-op).
+///
+/// A fourth case hides inside the second: a concurrent write that *duplicated* the
+/// anchor text leaves the anchor present but non-unique, which a naive "does the
+/// anchor still exist" check would wave through into editing an unknown copy. The
+/// failure reason is classified, and the ambiguity is named for what it is.
+///
+/// Message-level rather than structured: error responses on this surface carry no
+/// `structuredContent`, and changing that would break `error_taxonomy_is_frozen` and
+/// every error golden.
+fn edit_conflict_message(
+    path: &str,
+    expected_hash: &str,
+    current_hash: &str,
+    current_content: &str,
+    applied: Result<(String, Vec<AppliedEdit>), String>,
+) -> String {
+    let head = format!("hash conflict for {path}: expected {expected_hash}, found {current_hash}.");
+    match applied {
+        Ok((next, _)) if next == current_content => format!(
+            "{head} Applied to the note as it stands now, this call would change nothing — \
+             the concurrent write already produced your intended result, so there is \
+             nothing left to retry."
+        ),
+        Ok((next, _)) => {
+            let diff = bounded_conflict_detail(
+                &unified_line_diff(Some(current_content), &next, DIFF_CONTEXT_LINES),
+                "diff",
+            );
+            format!(
+                "{head} Your edits still apply to the current content. Review the proposed \
+                 diff before retrying: a heading's body or an occurrence target may have \
+                 changed. If these are still the changes you intend, retry this same call \
+                 with expectedHash {current_hash}. Otherwise re-read the affected region \
+                 and re-derive the edits. \
+                 Applied to the note as it stands now, the call would change:\n{diff}"
+            )
+        }
+        Err(reason) if is_ambiguous_anchor_failure(&reason) => {
+            let reason = bounded_conflict_detail(&reason, "edit failure");
+            format!(
+                "{head} An anchor is present but no longer unique, so retrying this call \
+                 would edit an unknown copy. Do not retry; re-read the note and re-derive \
+                 the edits. The edit itself failed with: {reason}"
+            )
+        }
+        Err(reason) => {
+            let reason = bounded_conflict_detail(&reason, "edit failure");
+            format!(
+                "{head} Your edits no longer apply to the note as it stands now — an anchor is \
+                 gone — so re-read the note and re-derive them; retrying cannot work. \
+                 The edit itself failed with: {reason}"
+            )
+        }
+    }
+}
+
+/// True when an `apply_edits` failure says the anchor survived but is no longer unique
+/// (a repeated `old`, or a duplicated heading) rather than vanished.
+fn is_ambiguous_anchor_failure(reason: &str) -> bool {
+    reason.contains("Refusing rather than")
+}
+
+/// Bound every conflict detail, preserving complete lines when possible and naming
+/// what was truncated. Classify the original failure before calling this helper.
+fn bounded_conflict_detail(detail: &str, label: &str) -> String {
+    let mut chars = detail.chars();
+    let head: String = chars.by_ref().take(CONFLICT_DETAIL_MAX_CHARS).collect();
+    if chars.next().is_none() {
+        return head;
+    }
+    let cut = head.rfind('\n').unwrap_or(head.len());
+    format!(
+        "{}\n… {label} truncated at {CONFLICT_DETAIL_MAX_CHARS} characters; re-read the note \
+         for the full picture.",
+        &head[..cut]
+    )
 }
 
 /// Turn the `edits` argument into specs, rejecting shapes the schema alone cannot.
@@ -5193,7 +5294,17 @@ async fn call_tool_inner(
                 .map(|(text, version)| (text, BaseVersion::from_read(version)))
                 .map_err(|error| error.to_string())?;
             let previous_hash = content_hash(existing.as_bytes());
-            validate_expected_hash(expected_hash.as_deref(), Some(&previous_hash), &path)?;
+            if let Some(expected) = expected_hash.as_deref() {
+                if expected != previous_hash {
+                    return Err(edit_conflict_message(
+                        &path,
+                        expected,
+                        &previous_hash,
+                        &existing,
+                        apply_edits(&existing, &specs),
+                    ));
+                }
+            }
             let (final_content, applied) = apply_edits(&existing, &specs)?;
             let new_hash = content_hash(final_content.as_bytes());
             if !dry_run {
@@ -5342,9 +5453,10 @@ async fn call_tool_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        call_tool, clamped_usize_arg, compose_explicit_note_content, content_hash,
-        finalize_session_note_content, json_text_result_from_arguments, merge_with_manual_notes,
-        optional_enum_string_arg, outline_payload, string_arg, TextPayloadOptions,
+        bounded_conflict_detail, call_tool, clamped_usize_arg, compose_explicit_note_content,
+        content_hash, edit_conflict_message, finalize_session_note_content,
+        json_text_result_from_arguments, merge_with_manual_notes, optional_enum_string_arg,
+        outline_payload, string_arg, TextPayloadOptions,
     };
     use crate::mcp::AppState;
     use crate::runtime::MountRuntimes;
@@ -5358,6 +5470,245 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Applicability offers a preview to inspect, not a guarantee of a safe retry.
+    #[test]
+    fn a_hash_conflict_with_intact_anchors_offers_the_retry() {
+        let current = "# Note\n\nunrelated change\n\nthe anchor line\n";
+        let next = "# Note\n\nunrelated change\n\nthe replaced line\n";
+        let message = edit_conflict_message(
+            "Notes/A.md",
+            "fnv1a64:stale",
+            "fnv1a64:current",
+            current,
+            Ok((next.to_string(), vec![])),
+        );
+        assert!(
+            message.contains("retry this same call with expectedHash fnv1a64:current"),
+            "{message}"
+        );
+        assert!(message.contains("-the anchor line"), "{message}");
+        assert!(message.contains("+the replaced line"), "{message}");
+        assert!(message.contains("Review the proposed diff before retrying"));
+        assert!(message.contains("If these are still the changes you intend"));
+        assert!(!message.contains("nothing needs re-reading"));
+    }
+
+    /// Outcome 2: the edits no longer apply. No retry advice — a retry cannot work —
+    /// and the underlying anchor failure is forwarded within the detail budget.
+    #[test]
+    fn a_hash_conflict_with_a_gone_anchor_says_to_re_read() {
+        let message = edit_conflict_message(
+            "Notes/A.md",
+            "fnv1a64:stale",
+            "fnv1a64:current",
+            "# Note\n\nrewritten\n",
+            Err(
+                "edits[0]: `old` was not found in the note. It must match verbatim, \
+                 including indentation and line breaks."
+                    .to_string(),
+            ),
+        );
+        assert!(message.contains("no longer apply"), "{message}");
+        assert!(message.contains("re-read"), "{message}");
+        assert!(message.contains("was not found"), "{message}");
+        assert!(!message.to_lowercase().contains("retry this"), "{message}");
+    }
+
+    /// Outcome 2b — the dangerous one: a concurrent write duplicated the anchor text,
+    /// so the anchor is present but non-unique. A naive "does the anchor still exist"
+    /// check would wave the retry through into editing an unknown copy; the message
+    /// names the duplication and forbids the retry.
+    #[test]
+    fn a_hash_conflict_with_a_duplicated_anchor_forbids_the_retry() {
+        let current = "# Note\n\n## Dup\n\nbody\n\n## Dup\n\nbody\n";
+        let message = edit_conflict_message(
+            "Notes/A.md",
+            "fnv1a64:stale",
+            "fnv1a64:current",
+            current,
+            Err(
+                "edits[0]: the note has 2 headings titled \"Dup\", on lines 3, 6. \
+                 Refusing rather than editing the first one."
+                    .to_string(),
+            ),
+        );
+        assert!(message.contains("no longer unique"), "{message}");
+        assert!(message.contains("unknown copy"), "{message}");
+        assert!(message.contains("Do not retry"), "{message}");
+        assert!(message.contains("headings titled"), "{message}");
+    }
+
+    /// Outcome 3: the concurrent write already produced the intended result — the
+    /// retry would be a no-op, which is stated rather than shown as an empty diff.
+    #[test]
+    fn a_hash_conflict_whose_work_is_already_done_says_so() {
+        let current = "# Note\n\nthe replaced line\n";
+        let message = edit_conflict_message(
+            "Notes/A.md",
+            "fnv1a64:stale",
+            "fnv1a64:current",
+            current,
+            Ok((current.to_string(), vec![])),
+        );
+        assert!(message.contains("would change nothing"), "{message}");
+        assert!(!message.to_lowercase().contains("retry this"), "{message}");
+    }
+
+    /// The always-on conflict diff is bounded: a pathological note must not flood the
+    /// caller's context through an error message (an unbounded one reached 316 KB on a
+    /// 4 000-line note with replaceAll).
+    #[test]
+    fn an_over_long_conflict_diff_is_truncated_with_a_notice() {
+        // Every line changed, so the unified diff itself spans thousands of lines.
+        let huge: String = "x".repeat(20).to_string() + "\n";
+        let huge = huge.repeat(6_000);
+        let next = huge.replace('x', "y");
+        let bounded = bounded_conflict_detail(
+            &super::unified_line_diff(Some(&huge), &next, super::DIFF_CONTEXT_LINES),
+            "diff",
+        );
+        assert!(bounded.chars().count() < super::CONFLICT_DETAIL_MAX_CHARS + 200);
+        assert!(bounded.contains("diff truncated at"), "{bounded}");
+        // The cut is on a line boundary, not mid-line: the truncated body has no
+        // dangling half line before the notice.
+        assert!(bounded.contains("\n… diff truncated at"), "{bounded}");
+    }
+
+    /// End-to-end: a real conflicted `edit_note` against a temporary vault returns the
+    /// triage message with the retry hash, not two opaque hashes.
+    #[tokio::test]
+    async fn a_conflicted_edit_note_returns_the_triage_message() {
+        let vault = temp_dir("edit-note-conflict");
+        fs::create_dir_all(&vault).unwrap();
+        fs::write(
+            vault.join("Conflict.md"),
+            "# Note\n\nsomeone else added a line\n\nthe anchor line\n",
+        )
+        .unwrap();
+        let state = test_state(vault).await;
+        let stale_hash = content_hash(b"# Note\n\nthe anchor line\n");
+        let result = call_tool(
+            &state,
+            "edit_note",
+            &json!({
+                "path": "Conflict.md",
+                "expectedHash": stale_hash,
+                "edits": [{"old": "the anchor line", "new": "the replaced line"}]
+            }),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("expected the conflicted edit_note to fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("hash conflict for Conflict.md"), "{error}");
+        assert!(
+            error.contains("retry this same call with expectedHash"),
+            "{error}"
+        );
+        assert!(error.contains("edits still apply"), "{error}");
+        assert!(error.contains("Review the proposed diff before retrying"));
+    }
+
+    #[test]
+    fn conflict_details_bound_multibyte_text_without_line_breaks() {
+        let exact = "é".repeat(super::CONFLICT_DETAIL_MAX_CHARS);
+        assert_eq!(bounded_conflict_detail(&exact, "edit failure"), exact);
+        let bounded = bounded_conflict_detail(&(exact.clone() + "界"), "edit failure");
+        assert!(bounded.starts_with(&exact));
+        assert!(bounded.contains("edit failure truncated at"));
+        assert!(bounded.chars().count() < super::CONFLICT_DETAIL_MAX_CHARS + 200);
+
+        // Non-ambiguous failures take the same bounded path, even if a caller's
+        // missing heading title is itself oversized.
+        let message = edit_conflict_message(
+            "Notes/A.md",
+            "fnv1a64:stale",
+            "fnv1a64:current",
+            "# Note\n",
+            Err(format!(
+                "edits[0]: no heading titled {exact:?} in the note."
+            )),
+        );
+        assert!(message.contains("edit failure truncated at"));
+        assert!(message.chars().count() < super::CONFLICT_DETAIL_MAX_CHARS + 800);
+    }
+
+    /// The original reproducers still apply, but the tool now requires the caller
+    /// to inspect their destructive or retargeted preview before choosing a retry.
+    #[tokio::test]
+    async fn conflicted_section_and_ordinal_edits_require_preview_review() {
+        let scenarios = [
+            (
+                "section",
+                "# Note\n\n## Plan\n\nfirst draft\n",
+                "# Note\n\n## Plan\n\nfirst draft\nconcurrent decision\n",
+                json!({"heading":"Plan", "content":"revised draft"}),
+                "-concurrent decision",
+            ),
+            (
+                "occurrence",
+                "# Note\n\nA: todo\nB: todo\n",
+                "# Note\n\nZ: todo\nA: todo\nB: todo\n",
+                json!({"old":"todo", "new":"done", "occurrence":2}),
+                "+A: done",
+            ),
+        ];
+        for (name, original, current, edit, preview) in scenarios {
+            let vault = temp_dir(name);
+            fs::write(vault.join("Note.md"), current).unwrap();
+            let state = test_state(vault.clone()).await;
+            let error = call_tool(
+                &state,
+                "edit_note",
+                &json!({
+                    "path":"Note.md",
+                    "expectedHash":content_hash(original.as_bytes()),
+                    "edits":[edit]
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.contains("Review the proposed diff before retrying"),
+                "{error}"
+            );
+            assert!(error.contains("a heading's body or an occurrence target may have changed"));
+            assert!(error.contains("If these are still the changes you intend"));
+            assert!(error.contains(&content_hash(current.as_bytes())));
+            assert!(error.contains(preview), "{error}");
+            assert!(!error.contains("nothing needs re-reading"));
+            assert_eq!(fs::read_to_string(vault.join("Note.md")).unwrap(), current);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_conflicted_edit_with_many_matches_bounds_the_failure_diagnostic() {
+        let vault = temp_dir("conflict-many-matches");
+        let current = "x\n".repeat(10_000);
+        fs::write(vault.join("Note.md"), &current).unwrap();
+        let state = test_state(vault.clone()).await;
+        let error = call_tool(
+            &state,
+            "edit_note",
+            &json!({
+                "path":"Note.md",
+                "expectedHash":content_hash(b"x\n"),
+                "edits":[{"old":"x", "new":"y"}]
+            }),
+        )
+        .await
+        .unwrap_err();
+        // The ambiguity marker in the raw failure comes AFTER its oversized line
+        // list. Classification must therefore happen before truncation.
+        assert!(error.contains("Do not retry"), "{error}");
+        assert!(error.contains("`old` occurs 10000 times, on lines 1, 2, 3"));
+        assert!(error.contains("edit failure truncated at"));
+        assert!(error.contains(&content_hash(current.as_bytes())));
+        assert!(error.chars().count() < super::CONFLICT_DETAIL_MAX_CHARS + 800);
+        assert_eq!(fs::read_to_string(vault.join("Note.md")).unwrap(), current);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
