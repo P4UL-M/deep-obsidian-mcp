@@ -2,7 +2,7 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
-## Unreleased
+## v0.2.0-alpha.13 — 2026-11-21
 
 ### Fixed
 
@@ -17,6 +17,24 @@ All notable changes to deep-obsidian-mcp are documented here.
   and final ranking. Keyword-only searches skip embedding requests; setting both
   weights to zero returns no matches. Native backends that cannot apply custom
   weights are reported explicitly rather than silently using their own ranking.
+
+### Compatibility and validation
+
+- Existing embedding indexes remain usable. A legacy note establishes its chunk
+  reuse identity on its next edit; no schema migration or full rebuild is required.
+- Query vectors are cached in process memory for five minutes, up to 128 entries;
+  service restarts clear the cache. Model instructions and request priorities are
+  unchanged.
+- Both ranking weights set to zero return an empty result even while a local index
+  is loading or unavailable. Scope and access validation still apply.
+- Validated by 1,039 passing workspace tests (seven ignored), retrieval-quality and
+  embedding-call-count regressions, two independent reviews, and Docker/Debian/APT
+  checks on AMD64 and ARM64.
+- CouchDB, Algolia and multi-vault support remain experimental. Algolia sends note
+  content to its configured hosted service. See
+  [migration and rollback](docs/migration-and-rollback.md) for backend migration and
+  configuration/version recovery. Container images require a bearer-token secret,
+  terminate no TLS and may start degraded while CouchDB synchronizes.
 
 ## v0.2.0-alpha.12 — 2026-11-20
 
