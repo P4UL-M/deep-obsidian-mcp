@@ -4920,6 +4920,23 @@ async fn call_tool_inner(
                     ));
                 }
             };
+            // Neither retriever is enabled: target resolution above still enforces the
+            // caller's mount access, but an empty result needs no index snapshot. In
+            // particular it must also succeed while this mount is loading or unavailable.
+            if ranking.semantic_weight <= 0.0 && ranking.bm25_weight <= 0.0 {
+                return Ok(json_text_result_from_arguments(
+                    arguments,
+                    json!({
+                        "query": query,
+                        "rebuilt": false,
+                        "semanticWeight": ranking.semantic_weight,
+                        "bm25Weight": ranking.bm25_weight,
+                        "degraded": false,
+                        "count": 0,
+                        "matches": []
+                    }),
+                ));
+            }
             let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
             let snapshot = scoped.runtime.serving_snapshot()?;
             let index = snapshot.index;
@@ -6256,6 +6273,104 @@ mod tests {
         .await
         .unwrap();
         fs::remove_dir_all(vault).ok();
+    }
+
+    /// No retrieval is requested, so snapshot readiness must not gate the empty answer.
+    /// Exercise both the initial loading state and a refresh failure with no serving index.
+    async fn assert_zero_weights_need_no_local_snapshot(multi_mount: bool) {
+        let vault = temp_dir("zero-weights-no-snapshot");
+        let index_dir = temp_dir("zero-weights-no-snapshot-index");
+        let team = vault.join("team-vault");
+        fs::create_dir_all(&team).unwrap();
+        let mut config = test_config(vault.clone());
+        config.index_dir = index_dir.clone();
+        if multi_mount {
+            config.experimental.multi_vault = true;
+            config.mounts = vec![
+                deep_obsidian_types::MountConfig {
+                    unknown: Default::default(),
+                    id: "vault".to_string(),
+                    mount_at: String::new(),
+                    recall_weight: None,
+                    backend: deep_obsidian_types::MountBackendConfig::Filesystem {
+                        vault_path: vault.clone(),
+                        index_dir: None,
+                    },
+                },
+                deep_obsidian_types::MountConfig {
+                    unknown: Default::default(),
+                    id: "team".to_string(),
+                    mount_at: "Team".to_string(),
+                    recall_weight: None,
+                    backend: deep_obsidian_types::MountBackendConfig::Filesystem {
+                        vault_path: team.clone(),
+                        index_dir: None,
+                    },
+                },
+            ];
+        }
+        let backends = crate::mounts::MountBackends::build(&config);
+        let runtimes = MountRuntimes::new(&config, &backends);
+        let runtime = if multi_mount {
+            runtimes.for_mount("team").unwrap()
+        } else {
+            runtimes.root().unwrap()
+        }
+        .clone();
+        let state = AppState::with_backends(config, runtimes, &backends);
+        let mut arguments = json!({"query":"body", "semanticWeight":0, "bm25Weight":0});
+        if multi_mount {
+            arguments["scope"] = json!("Team");
+        }
+        for unavailable in [false, true] {
+            if unavailable {
+                fs::remove_dir_all(if multi_mount { &team } else { &vault }).unwrap();
+                assert!(runtime.refresh("missing-vault").await.is_err());
+                assert!(runtime.diagnostics().last_error.is_some());
+            }
+            assert!(runtime.snapshot().is_err());
+            let result = call_tool(&state, "hybrid_search", &arguments)
+                .await
+                .unwrap();
+            let payload = &result.structured_content;
+            assert_eq!(payload["query"], "body");
+            assert_eq!(payload["count"], json!(0), "{payload}");
+            assert_eq!(payload["matches"], json!([]), "{payload}");
+            assert_eq!(payload["semanticWeight"], json!(0.0), "{payload}");
+            assert_eq!(payload["bm25Weight"], json!(0.0), "{payload}");
+            assert_eq!(payload["rebuilt"], json!(false), "{payload}");
+            assert_eq!(payload["degraded"], json!(false), "{payload}");
+            assert!(
+                payload.get("semanticBackend").is_none(),
+                "no backend was used: {payload}"
+            );
+            assert!(
+                runtime.snapshot().is_err(),
+                "zero weights must not build the missing index"
+            );
+            assert!(!runtime.diagnostics().refresh_in_flight);
+        }
+        if multi_mount {
+            arguments["scope"] = json!("Unknown");
+            assert!(
+                call_tool(&state, "hybrid_search", &arguments)
+                    .await
+                    .is_err(),
+                "zero weights must still validate mount scope"
+            );
+        }
+        fs::remove_dir_all(vault).ok();
+        fs::remove_dir_all(index_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn zero_weight_single_mount_search_succeeds_without_a_ready_local_index() {
+        assert_zero_weights_need_no_local_snapshot(false).await;
+    }
+
+    #[tokio::test]
+    async fn zero_weight_scoped_search_succeeds_without_a_ready_local_index() {
+        assert_zero_weights_need_no_local_snapshot(true).await;
     }
 
     #[tokio::test]
