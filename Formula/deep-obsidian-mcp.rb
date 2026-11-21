@@ -3,8 +3,8 @@
 class DeepObsidianMcp < Formula
   desc "Filesystem-first MCP server for deep Obsidian vault access"
   homepage "https://github.com/P4UL-M/deep-obsidian-mcp"
-  url "https://github.com/P4UL-M/deep-obsidian-mcp/archive/refs/tags/v0.2.0-alpha.13.tar.gz"
-  sha256 "5afb22c75580681985ed9fbb71603a6f54399132b47074f804dfed3288414b0d"
+  url "https://github.com/P4UL-M/deep-obsidian-mcp/archive/refs/tags/v0.2.0-alpha.14.tar.gz"
+  sha256 "1c3567022191b10796e551b06d4d47bbcc7bf144ae1e3d03015ff16beccb8863"
   license "MIT"
 
   depends_on "rust" => :build
@@ -21,7 +21,7 @@ class DeepObsidianMcp < Formula
   #
   # `using: :nounzip` because the asset is a plain .mjs file, not an archive.
   resource "livesync-sidecar" do
-    url "https://github.com/P4UL-M/deep-obsidian-mcp/releases/download/v0.2.0-alpha.13/livesync-sidecar-0.2.0-alpha.13.mjs",
+    url "https://github.com/P4UL-M/deep-obsidian-mcp/releases/download/v0.2.0-alpha.14/livesync-sidecar-0.2.0-alpha.14.mjs",
         using: :nounzip
     sha256 "f6fbd09ed4f2a10082f55a440d218463c5748e3fb9467dc357bc98a70f2dd0e3"
   end
