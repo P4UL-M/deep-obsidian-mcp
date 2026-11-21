@@ -2,7 +2,7 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
-## Unreleased
+## v0.2.0-alpha.14 — 2026-11-21
 
 ### Added
 
@@ -22,6 +22,18 @@ All notable changes to deep-obsidian-mcp are documented here.
   result; a failed or panicking computation cannot leave followers waiting forever.
 - Artifact query vectors now share the bounded query cache. Scheduling policies do
   not alter vector/cache identity or require an index rebuild.
+
+### Compatibility and validation
+
+- Global embedding admission remains unlimited by default. Existing indexing
+  producer limits and provider quotas still apply. Configure a finite resource
+  capacity explicitly; changing a registered policy requires a service restart.
+- No index rebuild, vector identity change or instruction change is required.
+  Already dispatched requests remain nonpreemptive and external clients are outside
+  this process-local scheduler.
+- Independent review found and verified the correction of a group-only admission
+  bypass. Workspace CI passes 1,060 tests, with eight ignored including the manual
+  contention benchmark. Docker and Debian checks pass on AMD64 and ARM64.
 
 ## v0.2.0-alpha.13 — 2026-11-21
 
