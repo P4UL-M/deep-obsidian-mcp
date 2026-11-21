@@ -868,6 +868,7 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
             query_instruction: config.embedding.query_instruction.clone(),
             max_concurrency: config.embedding.max_concurrency,
             timeout_seconds: config.embedding.timeout_seconds,
+            scheduling: config.embedding.scheduling.clone(),
         }),
         artifact_embedding: if config.artifact_embedding.provider.is_some()
             || config.artifact_embedding.model.is_some()
@@ -875,6 +876,7 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
             || config.artifact_embedding.api_key_ref.is_some()
             || config.artifact_embedding.max_concurrency.is_some()
             || config.artifact_embedding.timeout_seconds.is_some()
+            || config.artifact_embedding.scheduling.is_some()
         {
             Some(EmbeddingConfigInput {
                 provider: config.artifact_embedding.provider.clone(),
@@ -886,6 +888,7 @@ pub fn to_persisted_config(config: &ResolvedServiceConfig) -> PersistedServiceCo
                 query_instruction: config.artifact_embedding.query_instruction.clone(),
                 max_concurrency: config.artifact_embedding.max_concurrency,
                 timeout_seconds: config.artifact_embedding.timeout_seconds,
+                scheduling: config.artifact_embedding.scheduling.clone(),
             })
         } else {
             None
@@ -1116,6 +1119,27 @@ fn normalize_embedding_input(
             "contextTokens must be greater than zero",
         ));
     }
+    if let Some(policy) = &input.scheduling {
+        if policy.max_in_flight == Some(0)
+            || policy.interactive_burst == 0
+            || policy.queue_capacity == 0
+            || policy.interactive_wait_timeout_ms == 0
+            || policy.background_batch_size == 0
+        {
+            return Err(ConfigError::InvalidEmbedding(
+                "scheduling limits must be greater than zero; omit maxInFlight for unlimited",
+            ));
+        }
+        if policy
+            .group
+            .as_ref()
+            .is_some_and(|group| group.trim().is_empty())
+        {
+            return Err(ConfigError::InvalidEmbedding(
+                "scheduling.group must not be empty",
+            ));
+        }
+    }
     let provider = match input.provider {
         Some(EmbeddingProvider::OpenAiCompatible) => Some(EmbeddingProvider::OpenAiCompatible),
         None if input.model.is_some()
@@ -1137,6 +1161,7 @@ fn normalize_embedding_input(
         query_instruction: trim_optional(input.query_instruction),
         max_concurrency: input.max_concurrency,
         timeout_seconds: input.timeout_seconds,
+        scheduling: input.scheduling,
     })
 }
 
@@ -1305,6 +1330,70 @@ mod tests {
         let json = serde_json::to_value(defaults).unwrap();
         assert!(json.get("maxConcurrency").is_none());
         assert!(json.get("timeoutSeconds").is_none());
+    }
+
+    #[test]
+    fn scheduling_round_trips_both_sections_json_and_toml() {
+        for extension in ["json", "toml"] {
+            let root = temp_dir("embedding-scheduling");
+            let path = root.join(format!("config.{extension}"));
+            let policy = serde_json::json!({"group":"shared-gpu", "maxInFlight":2,
+                "interactiveBurst":8, "queueCapacity":32, "interactiveWaitTimeoutMs":1250, "backgroundBatchSize":1});
+            let input: PersistedServiceConfig = serde_json::from_value(serde_json::json!({
+                "vaultPath":root, "embedding":{"scheduling":policy}, "artifactEmbedding":{"scheduling":policy}
+            })).unwrap();
+            let resolved = normalize_persisted_config(input).unwrap();
+            write_config_file(&path, &resolved).unwrap();
+            let loaded =
+                normalize_persisted_config(read_config_file(&path).unwrap().unwrap()).unwrap();
+            for section in [loaded.embedding, loaded.artifact_embedding] {
+                assert_eq!(
+                    serde_json::to_value(section.unwrap().scheduling.unwrap()).unwrap(),
+                    policy
+                );
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        let defaults = super::normalize_embedding_input(None).unwrap();
+        assert!(serde_json::to_value(defaults)
+            .unwrap()
+            .get("scheduling")
+            .is_none());
+        let unlimited: deep_obsidian_types::EmbeddingSchedulingConfig =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(unlimited.max_in_flight, None);
+        assert_eq!(unlimited.interactive_burst, 8);
+    }
+
+    #[test]
+    fn invalid_scheduling_limits_and_typos_fail_closed() {
+        for section in ["embedding", "artifactEmbedding"] {
+            for field in [
+                "maxInFlight",
+                "interactiveBurst",
+                "queueCapacity",
+                "interactiveWaitTimeoutMs",
+                "backgroundBatchSize",
+                "group",
+            ] {
+                let value = if field == "group" {
+                    serde_json::json!("  ")
+                } else {
+                    serde_json::json!(0)
+                };
+                let input: PersistedServiceConfig = serde_json::from_value(serde_json::json!({
+                    "vaultPath":"/tmp/vault", section:{"scheduling":{field:value}}
+                }))
+                .unwrap();
+                assert!(normalize_persisted_config(input).is_err(), "{field}");
+            }
+            assert!(
+                serde_json::from_value::<PersistedServiceConfig>(serde_json::json!({
+                    "vaultPath":"/tmp/vault", section:{"scheduling":{"maxInflight":1}}
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]

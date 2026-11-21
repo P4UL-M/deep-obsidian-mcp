@@ -771,6 +771,7 @@ fn eval_embedding(base_url: &str) -> EmbeddingConfig {
         // Generic (non-qwen3) eval model, so queries stay plain and the rankings match
         // `retrieval_eval`'s.
         query_instruction: None,
+        scheduling: None,
     }
 }
 

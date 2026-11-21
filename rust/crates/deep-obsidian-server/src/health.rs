@@ -559,6 +559,19 @@ pub fn build_runtime_vault_overview_payload(
         "lastSuccessfulArtifactEmbeddingAt".to_string(),
         json!(last_embedding_success(&config.artifact_embedding)),
     );
+    for (name, embedding) in [
+        ("embeddingScheduler", &config.embedding),
+        ("artifactEmbeddingScheduler", &config.artifact_embedding),
+    ] {
+        if let Some(diagnostics) = embedding.base_url.as_deref().and_then(|base| {
+            deep_obsidian_index::embedding_scheduler::diagnostics_for_backend(
+                base,
+                embedding.scheduling.as_ref(),
+            )
+        }) {
+            object.insert(name.to_string(), json!(diagnostics));
+        }
+    }
     object.insert("ready".to_string(), json!(diagnostics.snapshot.is_some()));
     object.insert(
         "indexStatus".to_string(),
@@ -616,6 +629,40 @@ mod tests {
             auth: deep_obsidian_types::AuthConfig::default(),
             config_file_path: None,
         }
+    }
+
+    #[test]
+    fn scheduler_overview_is_optional_read_only_and_shared_with_artifacts() {
+        let mut cfg = test_config();
+        let runtime = crate::runtime::RuntimeState::new(cfg.clone());
+        assert!(build_runtime_vault_overview_payload(&cfg, &runtime)
+            .get("embeddingScheduler")
+            .is_none());
+        let base = "https://health-scheduler-test.invalid/v1";
+        let policy = deep_obsidian_types::EmbeddingSchedulingConfig {
+            max_in_flight: Some(1),
+            ..Default::default()
+        };
+        deep_obsidian_index::embedding_scheduler::register_backend(base, Some(&policy)).unwrap();
+        cfg.embedding.base_url = Some(base.into());
+        cfg.embedding.scheduling = Some(policy);
+        cfg.artifact_embedding.base_url = Some(base.into());
+        let payload = build_runtime_vault_overview_payload(&cfg, &runtime);
+        assert_eq!(
+            payload["embeddingScheduler"],
+            payload["artifactEmbeddingScheduler"]
+        );
+        assert_eq!(payload["embeddingScheduler"]["maxInFlight"], 1);
+        assert_eq!(payload["embeddingScheduler"]["active"], 0);
+        assert_eq!(payload["embeddingScheduler"]["interactive"]["started"], 0);
+        assert_eq!(
+            payload["embeddingScheduler"]["backendId"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(runtime.diagnostics().snapshot.is_none());
     }
 
     #[test]

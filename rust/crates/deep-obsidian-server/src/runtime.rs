@@ -177,6 +177,16 @@ fn index_embedding_config_with_env(
     resolver: &SecretResolver,
     mut env_value: impl FnMut(&str) -> Option<String>,
 ) -> Result<IndexEmbeddingConfig, String> {
+    // Register all shared policies before either indexing path starts work.
+    for embedding in [&config.embedding, &config.artifact_embedding] {
+        if let Some(base) = embedding.base_url.as_deref() {
+            deep_obsidian_index::embedding_scheduler::register_backend(
+                base,
+                embedding.scheduling.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
     let provider = match config.embedding.provider {
         Some(deep_obsidian_types::EmbeddingProvider::OpenAiCompatible) => {
             Some(IndexEmbeddingProvider::OpenAiCompatible)
@@ -224,6 +234,7 @@ key its 'embedding.apiKeyRef' points at; unset the variable to use the configure
             .unwrap_or(deep_obsidian_index::embedding_context::FALLBACK_CONTEXT_TOKENS),
         chars_per_token: DEFAULT_CHARS_PER_TOKEN,
         query_instruction: config.embedding.query_instruction.clone(),
+        scheduling: config.embedding.scheduling.clone(),
     }
     .with_context_tokens(
         config
@@ -236,6 +247,16 @@ key its 'embedding.apiKeyRef' points at; unset the variable to use the configure
 fn index_artifact_embedding_config(
     config: &ResolvedServiceConfig,
 ) -> Result<IndexEmbeddingConfig, String> {
+    // Register all shared policies before either indexing path starts work.
+    for embedding in [&config.embedding, &config.artifact_embedding] {
+        if let Some(base) = embedding.base_url.as_deref() {
+            deep_obsidian_index::embedding_scheduler::register_backend(
+                base,
+                embedding.scheduling.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
     let provider = match config.artifact_embedding.provider {
         Some(deep_obsidian_types::EmbeddingProvider::OpenAiCompatible) => {
             Some(IndexEmbeddingProvider::OpenAiCompatible)
@@ -270,6 +291,7 @@ fn index_artifact_embedding_config(
         chars_per_token: DEFAULT_CHARS_PER_TOKEN,
         // Artifacts are intentionally out of scope for query-instruction wrapping.
         query_instruction: None,
+        scheduling: config.artifact_embedding.scheduling.clone(),
     }
     .with_context_tokens(
         config

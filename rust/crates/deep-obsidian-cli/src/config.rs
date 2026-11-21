@@ -259,6 +259,10 @@ pub fn resolve_runtime_config(options: &ServiceOptions) -> Result<ResolvedRuntim
             interval_ms: Some(auto_reindex_interval_ms),
         }),
         embedding: Some(EmbeddingConfigInput {
+            scheduling: config_file
+                .as_ref()
+                .and_then(|config| config.embedding.as_ref())
+                .and_then(|embedding| embedding.scheduling.clone()),
             provider: embedding_provider,
             model: embedding_model,
             base_url: embedding_base_url,
@@ -662,7 +666,8 @@ mod tests {
         fs::write(
             &path,
             serde_json::json!({
-                "embedding": { "contextTokens": 1024, "maxConcurrency": 1, "timeoutSeconds": 180 }
+                "embedding": { "contextTokens": 1024, "maxConcurrency": 1, "timeoutSeconds": 180, "scheduling":{"maxInFlight":1} },
+                "artifactEmbedding": {"scheduling":{"group":"artifact-gpu", "maxInFlight":2}}
             })
             .to_string(),
         )
@@ -678,6 +683,12 @@ mod tests {
         assert!(json["embedding"].get("maxChars").is_none());
         assert_eq!(json["embedding"]["maxConcurrency"], 1);
         assert_eq!(json["embedding"]["timeoutSeconds"], 180);
+        assert_eq!(json["embedding"]["scheduling"]["maxInFlight"], 1);
+        assert_eq!(json["artifactEmbedding"]["scheduling"]["maxInFlight"], 2);
+        assert_eq!(
+            json["artifactEmbedding"]["scheduling"]["group"],
+            "artifact-gpu"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
