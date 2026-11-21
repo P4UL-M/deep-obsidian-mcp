@@ -316,21 +316,31 @@ pub fn register_backend(
         return Ok(());
     };
     validate(policy)?;
-    if policy.max_in_flight.is_none() {
-        return Ok(());
-    }
     let endpoint = endpoint(base_url);
-    let key = policy_key(base_url, Some(policy));
     let mut registry = registry().lock().unwrap_or_else(|e| e.into_inner());
-    if registry
-        .endpoints
-        .get(&endpoint)
-        .is_some_and(|existing| existing != &key)
-    {
-        return Err(SchedulingError::Configuration(
-            "one endpoint declares conflicting resource groups; restart after changing policies"
-                .into(),
-        ));
+    let declared_key = policy_key(base_url, Some(policy));
+    let key = match registry.endpoints.get(&endpoint) {
+        Some(existing) if policy.group.is_some() && existing != &declared_key => {
+            return Err(SchedulingError::Configuration(
+                "one endpoint declares conflicting resource groups; restart after changing policies".into(),
+            ));
+        }
+        Some(existing) => existing.clone(),
+        None => declared_key,
+    };
+    // A group-only declaration inherits an existing resource policy. It must
+    // never shadow a finite endpoint with a new, unregistered (unlimited) group.
+    if policy.max_in_flight.is_none() {
+        if registry.groups.contains_key(&key) {
+            if !registry.endpoints.contains_key(&endpoint) && registry.endpoints.len() >= MAX_GROUPS
+            {
+                return Err(SchedulingError::Configuration(
+                    "too many embedding endpoint aliases".into(),
+                ));
+            }
+            registry.endpoints.insert(endpoint, key);
+        }
+        return Ok(());
     }
     if let Some(group) = registry.groups.get(&key) {
         let mut old = group.policy.clone();
@@ -363,15 +373,13 @@ pub fn register_backend(
 }
 fn lookup(base_url: &str, policy: Option<&EmbeddingSchedulingConfig>) -> Option<Arc<Group>> {
     let registry = registry().lock().unwrap_or_else(|e| e.into_inner());
-    let key = if policy.and_then(|p| p.group.as_ref()).is_some() {
-        policy_key(base_url, policy)
-    } else {
-        registry
-            .endpoints
-            .get(&endpoint(base_url))
-            .cloned()
-            .unwrap_or_else(|| policy_key(base_url, policy))
-    };
+    // Registered endpoint capacity is authoritative even for helpers called
+    // before admission. register_backend rejects an explicitly conflicting group.
+    let key = registry
+        .endpoints
+        .get(&endpoint(base_url))
+        .cloned()
+        .unwrap_or_else(|| policy_key(base_url, policy));
     registry.groups.get(&key).cloned()
 }
 pub fn diagnostics_for_backend(
@@ -598,6 +606,86 @@ mod tests {
         let printed = serde_json::to_string(&a.diagnostics()).unwrap();
         assert!(!printed.contains("scheduler-a"));
         assert!(!printed.contains("credential"));
+    }
+    #[test]
+    fn group_only_config_cannot_bypass_finite_endpoint_in_either_order() {
+        for group_first in [false, true] {
+            let base = format!("https://scheduler-conflict-{group_first}.invalid/v1");
+            let group_only = EmbeddingSchedulingConfig {
+                group: Some(format!("scheduler-conflicting-group-{group_first}")),
+                ..Default::default()
+            };
+            if group_first {
+                register_backend(&base, Some(&group_only)).unwrap();
+            }
+            register_backend(&base, Some(&policy())).unwrap();
+            assert!(matches!(
+                register_backend(&base, Some(&group_only)),
+                Err(SchedulingError::Configuration(_))
+            ));
+            let registered = lookup(&base, None).unwrap();
+            assert!(Arc::ptr_eq(
+                &registered,
+                &lookup(&base, Some(&group_only)).unwrap()
+            ));
+            let config = EmbeddingConfig {
+                base_url: Some(base),
+                scheduling: Some(group_only),
+                ..Default::default()
+            };
+            assert!(matches!(
+                acquire(&config, Priority::Background),
+                Err(SchedulingError::Configuration(_))
+            ));
+            assert_eq!(registered.diagnostics().active, 0);
+        }
+    }
+    #[test]
+    fn group_only_alias_registers_shared_capacity_for_unconfigured_callers() {
+        let p = EmbeddingSchedulingConfig {
+            group: Some("scheduler-group-only-alias".into()),
+            ..policy()
+        };
+        let a = "https://scheduler-group-only-a.invalid/v1";
+        let b = "https://scheduler-group-only-b.invalid/v1";
+        register_backend(a, Some(&p)).unwrap();
+        let group_only = EmbeddingSchedulingConfig {
+            group: p.group.clone(),
+            ..Default::default()
+        };
+        register_backend(b, Some(&group_only)).unwrap();
+        assert!(Arc::ptr_eq(
+            &lookup(a, None).unwrap(),
+            &lookup(b, None).unwrap()
+        ));
+        let held = acquire(
+            &EmbeddingConfig {
+                base_url: Some(a.into()),
+                ..Default::default()
+            },
+            Priority::Background,
+        )
+        .unwrap();
+        assert_eq!(lookup(b, None).unwrap().diagnostics().active, 1);
+        drop(held);
+    }
+    #[test]
+    fn finite_policy_without_explicit_group_inherits_registered_alias() {
+        let base = "https://scheduler-inherited-finite.invalid/v1";
+        let p = EmbeddingSchedulingConfig {
+            group: Some("scheduler-inherited-finite".into()),
+            ..policy()
+        };
+        register_backend(base, Some(&p)).unwrap();
+        register_backend(base, Some(&policy())).unwrap();
+        let changed = EmbeddingSchedulingConfig {
+            max_in_flight: Some(2),
+            ..policy()
+        };
+        assert!(matches!(
+            register_backend(base, Some(&changed)),
+            Err(SchedulingError::Configuration(_))
+        ));
     }
     #[test]
     fn unlimited_is_default_and_adds_no_admission_cap() {

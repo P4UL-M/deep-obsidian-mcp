@@ -327,7 +327,9 @@ are defaults. All limits must be positive. `group` is optional: without it, the
 normalized base URL identifies the resource. Give aliases/tunnels to the same
 backend the same group and policy. Credentials, models and vaults do not create
 separate admission capacities. Calls using the same registered endpoint inherit
-its finite policy even when their embedding configuration omits scheduling.
+its finite policy even when their embedding configuration omits scheduling. A group-only
+declaration can bind another URL to an existing finite group; an explicit group
+conflicting with that endpoint's registered group is rejected, even without a cap.
 
 The query-vector cache and in-flight deduplication run **before** admission.
 Cache hits do not queue or count toward the burst. Interactive requests cover note
