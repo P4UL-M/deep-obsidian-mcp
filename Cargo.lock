@@ -744,6 +744,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "sqlite-vec",
  "thiserror",
  "tracing",

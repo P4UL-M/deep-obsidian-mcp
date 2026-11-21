@@ -4,6 +4,20 @@ All notable changes to deep-obsidian-mcp are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Incremental indexing reuses stored embeddings for unchanged chunk inputs inside
+  an edited note, including chunks whose line positions moved. Changed inputs or
+  embedding identities are embedded again; missing vectors remain retryable.
+- Query embeddings are reused across vault retrieval and final reranking through a
+  bounded, in-memory cache. Identical concurrent queries share an upstream request,
+  while different models, endpoints, credentials and input settings remain separate.
+  Empty local indexes no longer request an embedding.
+- Multi-vault `hybrid_search` honors `semanticWeight` and `bm25Weight` in retrieval
+  and final ranking. Keyword-only searches skip embedding requests; setting both
+  weights to zero returns no matches. Native backends that cannot apply custom
+  weights are reported explicitly rather than silently using their own ranking.
+
 ## v0.2.0-alpha.12 — 2026-11-20
 
 ### Added

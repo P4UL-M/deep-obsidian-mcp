@@ -1510,8 +1510,8 @@ fn tool_definitions(
                 vec![
                     ("query", json!({"type":"string","description":"Natural-language or lexical query."})),
                     ("limit", json!({"type":"integer","exclusiveMinimum":0,"maximum":50,"default":8})),
-                    ("semanticWeight", json!({"type":"number","minimum":0,"maximum":1,"default":1.0,"description":"RRF weight for the semantic list (multiplies its 1/(k+rank) contribution). Default 1.0 (unweighted)."})),
-                    ("bm25Weight", json!({"type":"number","minimum":0,"maximum":1,"default":1.0,"description":"RRF weight for the BM25 list (multiplies its 1/(k+rank) contribution). Default 1.0 (unweighted)."})),
+                    ("semanticWeight", json!({"type":"number","minimum":0,"maximum":1,"default":1.0,"description":"RRF weight for the semantic list, applied to local retrieval and federated reranking. Zero disables semantic retrieval and query embedding. Both weights zero returns no matches. Non-default weights require locally indexed mounts; native recall backends cannot enforce them. Default 1.0 (unweighted)."})),
+                    ("bm25Weight", json!({"type":"number","minimum":0,"maximum":1,"default":1.0,"description":"RRF weight for the BM25 list, applied to local retrieval and federated reranking. Zero disables lexical retrieval. Both weights zero returns no matches. Default 1.0 (unweighted)."})),
                     ("includeText", json!({"type":"boolean","default":true})),
                     ("maxTextChars", json!({"type":"integer","minimum":0,"default":DEFAULT_SEARCH_SNIPPET_CHARS})),
                     ("format", json!({"type":"string","enum":["pretty","compact"],"default":"pretty"})),
@@ -2001,6 +2001,7 @@ struct FederatedRecallSource<'a> {
     mounts: &'a mut Vec<FederatedRecallMount>,
     query: String,
     retrieval: FederatedRetrieval,
+    ranking: RankingOptions,
 }
 
 /// What a fetch needs, lifted out of the mount so nothing is borrowed across the await.
@@ -2022,6 +2023,12 @@ impl federation::CandidateSource for FederatedRecallSource<'_> {
         list_index: usize,
         page_size: usize,
     ) -> Result<federation::CandidatePage, String> {
+        if self.ranking.semantic_weight <= 0.0 && self.ranking.bm25_weight <= 0.0 {
+            return Ok(federation::CandidatePage {
+                keys: Vec::new(),
+                exhausted: true,
+            });
+        }
         let query = self.query.clone();
         let plan = match &self.mounts[list_index].kind {
             FederatedRecallKind::Local { runtime, queried } => {
@@ -2060,7 +2067,7 @@ impl federation::CandidateSource for FederatedRecallSource<'_> {
                             query,
                             RankingOptions {
                                 limit: page_size,
-                                ..RankingOptions::default()
+                                ..self.ranking.clone()
                             },
                         )
                         .await?;
@@ -2120,6 +2127,12 @@ impl federation::CandidateSource for FederatedRecallSource<'_> {
                 })
             }
             FederatedFetchPlan::Native(backend, cursor) => {
+                if self.ranking.semantic_weight != 1.0 || self.ranking.bm25_weight != 1.0 {
+                    return Err(concat!(
+                        "native backend recall does not support semanticWeight/bm25Weight; ",
+                        "this mount was not searched because the requested weights cannot be enforced"
+                    ).to_string());
+                }
                 let response = backend
                     .execute(BackendRequest::recall_search_page(query, page_size, cursor))
                     .await
@@ -2275,13 +2288,15 @@ async fn federated_recall(
     state: &AppState,
     retrieval: FederatedRetrieval,
     query: &str,
-    limit: usize,
+    ranking: RankingOptions,
 ) -> (federation::FederationOutcome, Vec<FederatedRecallMount>) {
+    let limit = ranking.limit;
     let (mut mounts, lists) = federated_recall_mounts(state, retrieval);
     let mut source = FederatedRecallSource {
         mounts: &mut mounts,
         query: query.to_string(),
         retrieval,
+        ranking,
     };
     // Fused to the RERANK WINDOW rather than to `limit`: the rerank can only reorder what it
     // is given, and a candidate fusion placed just outside the answer is exactly what rank
@@ -2307,13 +2322,14 @@ async fn finish_federated_recall(
     outcome: &mut federation::FederationOutcome,
     mounts: &[FederatedRecallMount],
     query: &str,
-    limit: usize,
+    ranking: RankingOptions,
 ) -> federation::RerankOutcome {
+    let limit = ranking.limit;
     if !state.config.federated_rerank {
         outcome.hits.truncate(limit.max(1));
         return federation::RerankOutcome::not_applicable();
     }
-    apply_federated_rerank(outcome, mounts, query, limit).await
+    apply_federated_rerank(outcome, mounts, query, ranking).await
 }
 
 /// Gather the rerank's per-candidate signals and apply it, in place.
@@ -2347,8 +2363,9 @@ async fn apply_federated_rerank(
     outcome: &mut federation::FederationOutcome,
     mounts: &[FederatedRecallMount],
     query: &str,
-    limit: usize,
+    ranking: RankingOptions,
 ) -> federation::RerankOutcome {
+    let limit = ranking.limit;
     if outcome.hits.is_empty() {
         outcome.hits.truncate(limit);
         return federation::RerankOutcome::not_applicable();
@@ -2356,120 +2373,142 @@ async fn apply_federated_rerank(
     // Any embedding-backed mount can embed the query: they share one configured model, so the
     // vector is valid against all of them. `None` means this vault has no dense retrieval at
     // all, which is the lexical-only no-op rather than a fault.
-    let Some(scorer) = mounts.iter().find_map(|mount| {
-        mount.index.as_ref().filter(|index| {
-            index.semantic_backend == deep_obsidian_index::index::SemanticBackend::Embedding
+    // Prefer an index that actually retrieved candidates and knows its vector dimensions.
+    // An empty mount can be embedding-backed with dimensions=None; using it here would
+    // create a different query-cache key from the populated mount's retrieval.
+    let scorer = mounts
+        .iter()
+        .filter_map(|mount| {
+            mount
+                .index
+                .as_ref()
+                .filter(|index| {
+                    index.semantic_backend == deep_obsidian_index::index::SemanticBackend::Embedding
+                })
+                .map(|index| {
+                    (
+                        mount.hits.is_empty(),
+                        index.embedding_dimensions.is_none(),
+                        index,
+                    )
+                })
         })
-    }) else {
+        .min_by_key(|(empty, unknown_dimensions, _)| (*empty, *unknown_dimensions))
+        .map(|(_, _, index)| index);
+    if ranking.semantic_weight > 0.0 && scorer.is_none() {
         outcome.hits.truncate(limit);
         return federation::RerankOutcome::not_applicable();
-    };
-
-    let freshness_level = scorer.freshness;
+    }
+    let freshness_level = scorer
+        .or_else(|| mounts.iter().find_map(|mount| mount.index.as_ref()))
+        .map(|index| index.freshness)
+        .unwrap_or_default();
     let freshness_now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    let scorer = scorer.clone();
-    let query_owned = query.to_string();
-    let query_vector = match tokio::task::spawn_blocking(move || {
-        index_search::embed_query_vector(&scorer, &query_owned)
-    })
-    .await
-    {
-        Ok(Ok(vector)) => vector,
-        Ok(Err(error)) => {
-            outcome.hits.truncate(limit);
-            return federation::RerankOutcome::unavailable(format!(
-                "the federated results could not be reranked because the query could not be \
+    let mut semantic: Vec<Option<f64>> = vec![None; outcome.hits.len()];
+    if ranking.semantic_weight > 0.0 {
+        let scorer = scorer.expect("semantic scorer checked above").clone();
+        let query_owned = query.to_string();
+        let query_vector = match tokio::task::spawn_blocking(move || {
+            index_search::embed_query_vector(&scorer, &query_owned)
+        })
+        .await
+        {
+            Ok(Ok(vector)) => vector,
+            Ok(Err(error)) => {
+                outcome.hits.truncate(limit);
+                return federation::RerankOutcome::unavailable(format!(
+                    "the federated results could not be reranked because the query could not be \
                  embedded ({error}), so they are in pure rank-fusion order: with several mounts \
                  that order interleaves each mount's best hits rather than ranking them against \
                  each other"
-            ));
-        }
-        Err(error) => {
-            outcome.hits.truncate(limit);
-            return federation::RerankOutcome::unavailable(error.to_string());
-        }
-    };
-
-    // --- semantic: stored vectors per mount, one batch embed for the rest ---------------
-    let mut semantic: Vec<Option<f64>> = vec![None; outcome.hits.len()];
-    for mount in mounts {
-        let Some(index) = mount.index.clone() else {
-            continue;
-        };
-        // This mount's candidates, as ITS index spells them: the fused key is logical.
-        let positions: Vec<usize> = outcome
-            .hits
-            .iter()
-            .enumerate()
-            .filter(|(_, hit)| hit.mount_id == mount.id)
-            .map(|(position, _)| position)
-            .collect();
-        if positions.is_empty() {
-            continue;
-        }
-        let keys: Vec<(String, usize)> = positions
-            .iter()
-            .map(|position| {
-                let hit = &outcome.hits[*position];
-                (mount.to_mount_relative(&hit.key.0), hit.key.1)
-            })
-            .collect();
-        let vector = query_vector.clone();
-        // A failure here costs those candidates their semantic score and nothing else.
-        let scores = tokio::task::spawn_blocking(move || {
-            index_search::semantic_scores_for_chunks(&index, &vector, &keys)
-        })
-        .await
-        .ok()
-        .and_then(Result::ok);
-        if let Some(scores) = scores {
-            for (position, score) in positions.iter().zip(scores) {
-                semantic[*position] = score;
+                ));
             }
-        }
-    }
+            Err(error) => {
+                outcome.hits.truncate(limit);
+                return federation::RerankOutcome::unavailable(error.to_string());
+            }
+        };
 
-    // Candidates still without a vector: a native-recall mount's hits. Embedded server-side
-    // from the same text the payload will carry, in ONE batched call.
-    let unscored: Vec<usize> = (0..outcome.hits.len())
-        .filter(|position| semantic[*position].is_none())
-        .collect();
-    if !unscored.is_empty() {
-        let texts: Vec<String> = unscored
-            .iter()
-            .map(|position| federated_hit_text(outcome, mounts, *position))
-            .collect();
-        if texts.iter().any(|text| !text.trim().is_empty()) {
-            let scorer = mounts
+        // --- semantic: stored vectors per mount, one batch embed for the rest ---------------
+        for mount in mounts {
+            let Some(index) = mount.index.clone() else {
+                continue;
+            };
+            // This mount's candidates, as ITS index spells them: the fused key is logical.
+            let positions: Vec<usize> = outcome
+                .hits
                 .iter()
-                .find_map(|mount| mount.index.clone())
-                .expect("a scorer index was found above");
-            let vector = query_vector.clone();
-            let embedded = tokio::task::spawn_blocking(move || {
-                index_search::embed_texts_for_index(&scorer, &texts).map(|vectors| {
-                    vectors
-                        .iter()
-                        .map(|document| {
-                            index_search::semantic_score_for_vectors_with_freshness(
-                                &vector,
-                                document,
-                                freshness_level,
-                                0,
-                                freshness_now,
-                            )
-                        })
-                        .collect::<Vec<f64>>()
+                .enumerate()
+                .filter(|(_, hit)| hit.mount_id == mount.id)
+                .map(|(position, _)| position)
+                .collect();
+            if positions.is_empty() {
+                continue;
+            }
+            let keys: Vec<(String, usize)> = positions
+                .iter()
+                .map(|position| {
+                    let hit = &outcome.hits[*position];
+                    (mount.to_mount_relative(&hit.key.0), hit.key.1)
                 })
+                .collect();
+            let vector = query_vector.clone();
+            // A failure here costs those candidates their semantic score and nothing else.
+            let scores = tokio::task::spawn_blocking(move || {
+                index_search::semantic_scores_for_chunks(&index, &vector, &keys)
             })
             .await
             .ok()
             .and_then(Result::ok);
-            if let Some(scores) = embedded {
-                for (position, score) in unscored.iter().zip(scores) {
-                    semantic[*position] = Some(score);
+            if let Some(scores) = scores {
+                for (position, score) in positions.iter().zip(scores) {
+                    semantic[*position] = score;
+                }
+            }
+        }
+
+        // Candidates still without a vector: a native-recall mount's hits. Embedded server-side
+        // from the same text the payload will carry, in ONE batched call.
+        let unscored: Vec<usize> = (0..outcome.hits.len())
+            .filter(|position| semantic[*position].is_none())
+            .collect();
+        if !unscored.is_empty() {
+            let texts: Vec<String> = unscored
+                .iter()
+                .map(|position| federated_hit_text(outcome, mounts, *position))
+                .collect();
+            if texts.iter().any(|text| !text.trim().is_empty()) {
+                let scorer = mounts
+                    .iter()
+                    .find_map(|mount| mount.index.clone())
+                    .expect("a scorer index was found above");
+                let vector = query_vector.clone();
+                let embedded = tokio::task::spawn_blocking(move || {
+                    index_search::embed_texts_for_index(&scorer, &texts).map(|vectors| {
+                        vectors
+                            .iter()
+                            .map(|document| {
+                                index_search::semantic_score_for_vectors_with_freshness(
+                                    &vector,
+                                    document,
+                                    freshness_level,
+                                    0,
+                                    freshness_now,
+                                )
+                            })
+                            .collect::<Vec<f64>>()
+                    })
+                })
+                .await
+                .ok()
+                .and_then(Result::ok);
+                if let Some(scores) = embedded {
+                    for (position, score) in unscored.iter().zip(scores) {
+                        semantic[*position] = Some(score);
+                    }
                 }
             }
         }
@@ -2545,10 +2584,12 @@ async fn apply_federated_rerank(
         })
         .collect();
 
-    federation::rerank(
+    federation::rerank_with_weights(
         &mut outcome.hits,
         &federation::RerankSignals { semantic, lexical },
         limit,
+        ranking.semantic_weight,
+        ranking.bm25_weight,
     )
 }
 
@@ -2675,7 +2716,11 @@ fn insert_federation_provenance(
     if rerank.stage != federation::RerankStage::None {
         result.insert(
             "rerankedCandidates".to_string(),
-            json!(rerank.semantic_signals),
+            json!(if rerank.stage == federation::RerankStage::Lexical {
+                rerank.lexical_signals
+            } else {
+                rerank.semantic_signals
+            }),
         );
     }
     let mut degraded = false;
@@ -2758,17 +2803,20 @@ fn insert_federation_provenance(
 async fn federated_hybrid_search_payload(
     state: &AppState,
     query: &str,
-    limit: usize,
+    ranking: RankingOptions,
     options: TextPayloadOptions,
 ) -> Result<Value, String> {
     let (mut outcome, mounts) =
-        federated_recall(state, FederatedRetrieval::Chunks, query, limit).await;
-    let rerank = finish_federated_recall(state, &mut outcome, &mounts, query, limit).await;
+        federated_recall(state, FederatedRetrieval::Chunks, query, ranking.clone()).await;
+    let rerank =
+        finish_federated_recall(state, &mut outcome, &mounts, query, ranking.clone()).await;
     let mut match_values = federated_matches_json(&outcome, &mounts, options);
     let response_truncated =
         apply_response_text_budget(&mut match_values, "text", RESPONSE_TEXT_BUDGET_CHARS);
     let mut result = Map::new();
     result.insert("query".to_string(), json!(query));
+    result.insert("semanticWeight".to_string(), json!(ranking.semantic_weight));
+    result.insert("bm25Weight".to_string(), json!(ranking.bm25_weight));
     insert_federation_provenance(&mut result, &outcome, &mounts, &rerank);
     result.insert("count".to_string(), json!(match_values.len()));
     result.insert("matches".to_string(), json!(match_values));
@@ -2838,8 +2886,16 @@ async fn federated_search_artifacts_payload(
     query: &str,
     limit: usize,
 ) -> Result<Value, String> {
-    let (mut outcome, mounts) =
-        federated_recall(state, FederatedRetrieval::Artifacts, query, limit).await;
+    let (mut outcome, mounts) = federated_recall(
+        state,
+        FederatedRetrieval::Artifacts,
+        query,
+        RankingOptions {
+            limit,
+            ..RankingOptions::default()
+        },
+    )
+    .await;
     // Artifacts go through the same rerank, but on a WEAKER signal than chunks do, and the
     // difference is worth knowing rather than discovering.
     //
@@ -2851,7 +2907,17 @@ async fn federated_search_artifacts_payload(
     // thinner one than a chunk rerank, and the recall gates do not exercise it (the eval corpus
     // holds one dummy artifact that no gold query matches). Reranking artifacts against their
     // own stored vectors is a follow-up, not a claim this code makes.
-    let rerank = finish_federated_recall(state, &mut outcome, &mounts, query, limit).await;
+    let rerank = finish_federated_recall(
+        state,
+        &mut outcome,
+        &mounts,
+        query,
+        RankingOptions {
+            limit,
+            ..RankingOptions::default()
+        },
+    )
+    .await;
     let askable = outcome
         .mounts
         .iter()
@@ -2929,9 +2995,27 @@ async fn federated_load_knowledge_payload(
         .flatten()
         .collect::<Vec<_>>()
         .join(" ");
-    let (mut outcome, mounts) =
-        federated_recall(state, FederatedRetrieval::Chunks, &query, limit_chunks).await;
-    let rerank = finish_federated_recall(state, &mut outcome, &mounts, &query, limit_chunks).await;
+    let (mut outcome, mounts) = federated_recall(
+        state,
+        FederatedRetrieval::Chunks,
+        &query,
+        RankingOptions {
+            limit: limit_chunks,
+            ..RankingOptions::default()
+        },
+    )
+    .await;
+    let rerank = finish_federated_recall(
+        state,
+        &mut outcome,
+        &mounts,
+        &query,
+        RankingOptions {
+            limit: limit_chunks,
+            ..RankingOptions::default()
+        },
+    )
+    .await;
 
     let mut chunks = federated_matches_json(&outcome, &mounts, options);
     for chunk in chunks.iter_mut() {
@@ -4769,6 +4853,11 @@ async fn call_tool_inner(
             let query = string_arg(arguments, "query")?;
             validate_format_arg(arguments)?;
             let limit = clamped_usize_arg(arguments, "limit", 8, 1, 50);
+            let ranking = RankingOptions {
+                limit,
+                semantic_weight: clamped_f64_arg(arguments, "semanticWeight", 1.0, 0.0, 1.0),
+                bm25_weight: clamped_f64_arg(arguments, "bm25Weight", 1.0, 0.0, 1.0),
+            };
             // A mount that ranks for itself: served by its backend, in the same payload
             // shape, with its provenance stated. See `insert_native_recall_provenance`.
             let scoped = match target {
@@ -4779,12 +4868,29 @@ async fn call_tool_inner(
                         TextPayloadOptions::search_snippet_from_arguments(arguments, true);
                     return Ok(json_text_result_from_arguments(
                         arguments,
-                        federated_hybrid_search_payload(state, &query, limit, text_options).await?,
+                        federated_hybrid_search_payload(state, &query, ranking, text_options)
+                            .await?,
                     ));
                 }
                 RecallTarget::Native(mount) => {
                     let text_options =
                         TextPayloadOptions::search_snippet_from_arguments(arguments, true);
+                    if ranking.semantic_weight <= 0.0 && ranking.bm25_weight <= 0.0 {
+                        return Ok(json_text_result_from_arguments(
+                            arguments,
+                            json!({
+                                "query": query, "count": 0, "matches": [], "degraded": false,
+                                "mountId": mount.id, "nativeRecall": false, "exhausted": true
+                            }),
+                        ));
+                    }
+                    if ranking.semantic_weight != 1.0 || ranking.bm25_weight != 1.0 {
+                        return Err(concat!(
+                            "native backend recall does not support semanticWeight/bm25Weight; ",
+                            "use a locally indexed scope to enforce these weights"
+                        )
+                        .to_string());
+                    }
                     let response = native_recall_search(&mount, &query, limit).await?;
                     let mut match_values = response
                         .hits
@@ -4814,22 +4920,28 @@ async fn call_tool_inner(
                     ));
                 }
             };
-            // RRF per-list weights; default to 1.0 (unweighted, scale-free fusion).
-            let semantic_weight = clamped_f64_arg(arguments, "semanticWeight", 1.0, 0.0, 1.0);
-            let bm25_weight = clamped_f64_arg(arguments, "bm25Weight", 1.0, 0.0, 1.0);
+            // Neither retriever is enabled: target resolution above still enforces the
+            // caller's mount access, but an empty result needs no index snapshot. In
+            // particular it must also succeed while this mount is loading or unavailable.
+            if ranking.semantic_weight <= 0.0 && ranking.bm25_weight <= 0.0 {
+                return Ok(json_text_result_from_arguments(
+                    arguments,
+                    json!({
+                        "query": query,
+                        "rebuilt": false,
+                        "semanticWeight": ranking.semantic_weight,
+                        "bm25Weight": ranking.bm25_weight,
+                        "degraded": false,
+                        "count": 0,
+                        "matches": []
+                    }),
+                ));
+            }
             let text_options = TextPayloadOptions::search_snippet_from_arguments(arguments, true);
             let snapshot = scoped.runtime.serving_snapshot()?;
             let index = snapshot.index;
-            let outcome = hybrid_search_matches(
-                index.clone(),
-                query.clone(),
-                RankingOptions {
-                    limit,
-                    semantic_weight,
-                    bm25_weight,
-                },
-            )
-            .await?;
+            let outcome =
+                hybrid_search_matches(index.clone(), query.clone(), ranking.clone()).await?;
             let degraded = outcome.degraded;
             let degradation_reason = outcome.degradation_reason.clone();
             let count = outcome.matches.len();
@@ -4853,8 +4965,8 @@ async fn call_tool_inner(
                 "semanticBackend".to_string(),
                 json!(index.semantic_backend.as_str()),
             );
-            result.insert("semanticWeight".to_string(), json!(semantic_weight));
-            result.insert("bm25Weight".to_string(), json!(bm25_weight));
+            result.insert("semanticWeight".to_string(), json!(ranking.semantic_weight));
+            result.insert("bm25Weight".to_string(), json!(ranking.bm25_weight));
             // Non-fatal degradation flag: when the embedding backend was unavailable the
             // matches above are BM25-only lexical results. `degraded` is always present
             // (false on the healthy path) so callers can branch without probing.
@@ -6161,6 +6273,104 @@ mod tests {
         .await
         .unwrap();
         fs::remove_dir_all(vault).ok();
+    }
+
+    /// No retrieval is requested, so snapshot readiness must not gate the empty answer.
+    /// Exercise both the initial loading state and a refresh failure with no serving index.
+    async fn assert_zero_weights_need_no_local_snapshot(multi_mount: bool) {
+        let vault = temp_dir("zero-weights-no-snapshot");
+        let index_dir = temp_dir("zero-weights-no-snapshot-index");
+        let team = vault.join("team-vault");
+        fs::create_dir_all(&team).unwrap();
+        let mut config = test_config(vault.clone());
+        config.index_dir = index_dir.clone();
+        if multi_mount {
+            config.experimental.multi_vault = true;
+            config.mounts = vec![
+                deep_obsidian_types::MountConfig {
+                    unknown: Default::default(),
+                    id: "vault".to_string(),
+                    mount_at: String::new(),
+                    recall_weight: None,
+                    backend: deep_obsidian_types::MountBackendConfig::Filesystem {
+                        vault_path: vault.clone(),
+                        index_dir: None,
+                    },
+                },
+                deep_obsidian_types::MountConfig {
+                    unknown: Default::default(),
+                    id: "team".to_string(),
+                    mount_at: "Team".to_string(),
+                    recall_weight: None,
+                    backend: deep_obsidian_types::MountBackendConfig::Filesystem {
+                        vault_path: team.clone(),
+                        index_dir: None,
+                    },
+                },
+            ];
+        }
+        let backends = crate::mounts::MountBackends::build(&config);
+        let runtimes = MountRuntimes::new(&config, &backends);
+        let runtime = if multi_mount {
+            runtimes.for_mount("team").unwrap()
+        } else {
+            runtimes.root().unwrap()
+        }
+        .clone();
+        let state = AppState::with_backends(config, runtimes, &backends);
+        let mut arguments = json!({"query":"body", "semanticWeight":0, "bm25Weight":0});
+        if multi_mount {
+            arguments["scope"] = json!("Team");
+        }
+        for unavailable in [false, true] {
+            if unavailable {
+                fs::remove_dir_all(if multi_mount { &team } else { &vault }).unwrap();
+                assert!(runtime.refresh("missing-vault").await.is_err());
+                assert!(runtime.diagnostics().last_error.is_some());
+            }
+            assert!(runtime.snapshot().is_err());
+            let result = call_tool(&state, "hybrid_search", &arguments)
+                .await
+                .unwrap();
+            let payload = &result.structured_content;
+            assert_eq!(payload["query"], "body");
+            assert_eq!(payload["count"], json!(0), "{payload}");
+            assert_eq!(payload["matches"], json!([]), "{payload}");
+            assert_eq!(payload["semanticWeight"], json!(0.0), "{payload}");
+            assert_eq!(payload["bm25Weight"], json!(0.0), "{payload}");
+            assert_eq!(payload["rebuilt"], json!(false), "{payload}");
+            assert_eq!(payload["degraded"], json!(false), "{payload}");
+            assert!(
+                payload.get("semanticBackend").is_none(),
+                "no backend was used: {payload}"
+            );
+            assert!(
+                runtime.snapshot().is_err(),
+                "zero weights must not build the missing index"
+            );
+            assert!(!runtime.diagnostics().refresh_in_flight);
+        }
+        if multi_mount {
+            arguments["scope"] = json!("Unknown");
+            assert!(
+                call_tool(&state, "hybrid_search", &arguments)
+                    .await
+                    .is_err(),
+                "zero weights must still validate mount scope"
+            );
+        }
+        fs::remove_dir_all(vault).ok();
+        fs::remove_dir_all(index_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn zero_weight_single_mount_search_succeeds_without_a_ready_local_index() {
+        assert_zero_weights_need_no_local_snapshot(false).await;
+    }
+
+    #[tokio::test]
+    async fn zero_weight_scoped_search_succeeds_without_a_ready_local_index() {
+        assert_zero_weights_need_no_local_snapshot(true).await;
     }
 
     #[tokio::test]

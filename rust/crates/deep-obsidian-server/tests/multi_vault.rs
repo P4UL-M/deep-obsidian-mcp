@@ -5228,3 +5228,64 @@ async fn a_remote_root_down_at_startup_starts_degraded_and_recovers_without_a_re
         axum::http::StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn native_recall_refuses_unenforceable_nondefault_weights_and_federation_reports_the_gap() {
+    let fixture = AlgoliaFixture::new("native-weight-controls").await;
+    let state = fixture.state_writable(true).await;
+    // Keep the native backend down: an unsupported request must be rejected before contacting it.
+    fixture.mock.begin_outage();
+    for weights in [
+        json!({"semanticWeight":0}),
+        json!({"bm25Weight":0}),
+        json!({"semanticWeight":0.2,"bm25Weight":0.8}),
+    ] {
+        let mut arguments = weights.clone();
+        arguments["query"] = json!("shared");
+        arguments["scope"] = json!("_Shared");
+        let response = tool_call(&state, "hybrid_search", arguments).await;
+        let message = error_message(&response);
+        assert!(
+            message.contains("does not support semanticWeight/bm25Weight"),
+            "{message}"
+        );
+
+        let mut arguments = weights;
+        arguments["query"] = json!("shared");
+        let response = tool_call(&state, "hybrid_search", arguments).await;
+        let payload = structured(&response);
+        assert_eq!(payload["degraded"], json!(true), "{payload}");
+        assert_eq!(payload["missingBackends"], json!(["shared"]), "{payload}");
+        assert!(
+            payload["degradationReason"]
+                .as_str()
+                .unwrap()
+                .contains("requested weights cannot be enforced"),
+            "{payload}"
+        );
+        assert!(payload["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["mountId"] != "shared"));
+    }
+}
+
+#[tokio::test]
+async fn both_zero_weights_do_not_require_native_backend_recall() {
+    let fixture = AlgoliaFixture::new("native-zero-weights").await;
+    let state = fixture.state_writable(true).await;
+    fixture.mock.begin_outage();
+    for scope in [None, Some("_Shared")] {
+        let mut arguments = json!({"query":"shared", "semanticWeight":0, "bm25Weight":0});
+        if let Some(scope) = scope {
+            arguments["scope"] = json!(scope);
+        }
+        let response = tool_call(&state, "hybrid_search", arguments).await;
+        let payload = structured(&response);
+        assert_eq!(payload["count"], json!(0), "{payload}");
+        assert_eq!(payload["matches"], json!([]), "{payload}");
+        assert_eq!(payload["degraded"], json!(false), "{payload}");
+        assert!(payload.get("missingBackends").is_none(), "{payload}");
+    }
+}

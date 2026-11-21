@@ -74,7 +74,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 use deep_obsidian_index::index::tokenize;
@@ -157,19 +158,30 @@ fn pseudo_embedding(text: &str) -> Vec<f64> {
     vector.iter().map(|value| value / norm).collect()
 }
 
-fn spawn_pseudo_embedding_server() -> String {
+fn spawn_observed_embedding_server() -> (String, Arc<AtomicU64>, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind eval embedding server");
     let address = listener.local_addr().expect("server address");
+    let requests = Arc::new(AtomicU64::new(0));
+    let reject = Arc::new(AtomicBool::new(false));
+    let observed_requests = requests.clone();
+    let reject_requests = reject.clone();
     // Detached: serves an arbitrary number of requests. Process exit reaps it.
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
-                Ok(stream) => handle_embedding_request(stream),
+                Ok(mut stream) => {
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    if reject_requests.load(Ordering::SeqCst) {
+                        let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                    } else {
+                        handle_embedding_request(stream);
+                    }
+                }
                 Err(_) => break,
             }
         }
     });
-    format!("http://{address}")
+    (format!("http://{address}"), requests, reject)
 }
 
 fn handle_embedding_request(mut stream: TcpStream) {
@@ -716,6 +728,8 @@ struct Harness {
     base: PathBuf,
     layout: Layout,
     state: AppState,
+    embedding_requests: Arc<AtomicU64>,
+    reject_embeddings: Arc<AtomicBool>,
 }
 
 fn unique_base(label: &str) -> PathBuf {
@@ -857,6 +871,8 @@ impl Harness {
             })
             .collect();
 
+        let (embedding_url, embedding_requests, reject_embeddings) =
+            spawn_observed_embedding_server();
         let config = ResolvedServiceConfig {
             freshness: Default::default(),
             federated_rerank: rerank,
@@ -880,7 +896,7 @@ impl Harness {
                 debounce_ms: 0,
                 interval_ms: 0,
             },
-            embedding: eval_embedding(&spawn_pseudo_embedding_server()),
+            embedding: eval_embedding(&embedding_url),
             artifact_embedding: EmbeddingConfig::default(),
             auth: AuthConfig::default(),
             config_file_path: None,
@@ -895,6 +911,8 @@ impl Harness {
             base,
             layout,
             state,
+            embedding_requests,
+            reject_embeddings,
         };
         if broken.is_empty() {
             harness.assert_every_mount_is_embedding_backed().await;
@@ -1503,7 +1521,7 @@ async fn a_mount_that_cannot_hold_artifacts_is_skipped_rather_than_reported_miss
     )
     .expect("write artifact");
 
-    let embedding_url = spawn_pseudo_embedding_server();
+    let (embedding_url, embedding_requests, reject_embeddings) = spawn_observed_embedding_server();
     let (algolia_url, _mock) = deep_obsidian_algolia::mock::spawn_mock().await;
     let secrets = base.join("secrets.json");
     let resolver =
@@ -1586,6 +1604,8 @@ async fn a_mount_that_cannot_hold_artifacts_is_skipped_rather_than_reported_miss
         base: base.clone(),
         layout: Layout::TwoMounts,
         state: AppState::with_backends(config, runtimes, &backends),
+        embedding_requests,
+        reject_embeddings,
     };
 
     let payload = harness
@@ -1637,4 +1657,164 @@ async fn a_mount_that_cannot_hold_artifacts_is_skipped_rather_than_reported_miss
     assert_eq!(shared_recall["source"], json!("native-recall"), "{recall}");
     assert!(shared_recall.get("skipped").is_none(), "{shared_recall}");
     assert_eq!(recall["degraded"], json!(false), "{recall}");
+}
+
+/// Explicit keyword-only search must never contact the dense backend, in either scoped
+/// retrieval or the final multi-mount rerank. A 503 backend catches accidental fallbacks;
+/// request counts catch calls whose failure was swallowed into degradation.
+#[tokio::test]
+async fn zero_semantic_weight_is_keyword_only_across_mounts_without_embedding_requests() {
+    let harness = Harness::new("keyword-only", Layout::TwoMounts, &[]).await;
+    let before = harness.embedding_requests.load(Ordering::SeqCst);
+    harness.reject_embeddings.store(true, Ordering::SeqCst);
+    for scope in [None, Some("Team")] {
+        let mut arguments = json!({"query":"car", "semanticWeight":0, "limit":20});
+        if let Some(scope) = scope {
+            arguments["scope"] = json!(scope);
+        }
+        let payload = harness.structured("hybrid_search", arguments).await;
+        assert_eq!(payload["degraded"], json!(false), "{payload}");
+        let hits = payload["matches"].as_array().unwrap();
+        assert!(
+            !hits.is_empty(),
+            "keyword retrieval must remain available: {payload}"
+        );
+        assert!(hits
+            .iter()
+            .any(|hit| hit["path"] == "Team/Library/Car Care Basics.md"));
+        assert!(
+            hits.iter()
+                .all(|hit| hit["path"] != "Team/Library/Automobile Maintenance.md"),
+            "a semantic-only paraphrase must not leak into lexical recall: {payload}"
+        );
+        if scope.is_none() {
+            assert_eq!(payload["rerank"], json!("lexical"));
+            assert!(payload["rerankedCandidates"].as_u64().unwrap() > 0);
+        }
+        assert_eq!(
+            harness.embedding_requests.load(Ordering::SeqCst),
+            before,
+            "semanticWeight=0 must make exactly zero embedding calls"
+        );
+    }
+}
+
+#[tokio::test]
+async fn both_zero_weights_return_no_matches_without_embedding_requests() {
+    let harness = Harness::new("zero-weights", Layout::TwoMounts, &[]).await;
+    let before = harness.embedding_requests.load(Ordering::SeqCst);
+    harness.reject_embeddings.store(true, Ordering::SeqCst);
+    for scope in [None, Some("/")] {
+        let mut arguments = json!({"query":"car", "semanticWeight":0, "bm25Weight":0});
+        if let Some(scope) = scope {
+            arguments["scope"] = json!(scope);
+        }
+        let payload = harness.structured("hybrid_search", arguments).await;
+        assert_eq!(payload["count"], json!(0), "{payload}");
+        assert_eq!(payload["matches"], json!([]), "{payload}");
+        assert_eq!(payload["degraded"], json!(false), "{payload}");
+        assert_eq!(harness.embedding_requests.load(Ordering::SeqCst), before);
+    }
+}
+
+#[tokio::test]
+async fn semantic_only_weights_propagate_through_federated_retrieval_and_rerank() {
+    let harness = Harness::new("semantic-only", Layout::TwoMounts, &[]).await;
+    let payload = harness
+        .structured(
+            "hybrid_search",
+            json!({
+                "query":"car", "bm25Weight":0, "limit":20
+            }),
+        )
+        .await;
+    assert_eq!(payload["degraded"], json!(false), "{payload}");
+    assert_eq!(payload["rerank"], json!("semantic"), "{payload}");
+    let hits = payload["matches"].as_array().unwrap();
+    assert!(
+        hits.iter()
+            .any(|hit| hit["path"] == "Team/Library/Automobile Maintenance.md"),
+        "semantic paraphrases remain retrievable: {payload}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit["bm25Score"] == json!(0.0)),
+        "disabled BM25 must not contribute in per-mount retrieval: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_default_weights_preserve_federated_ranking() {
+    let harness = Harness::new("default-weights", Layout::ThreeMounts, &[]).await;
+    let implicit = harness
+        .structured("hybrid_search", json!({"query":"car", "limit":20}))
+        .await;
+    let explicit = harness
+        .structured(
+            "hybrid_search",
+            json!({
+                "query":"car", "limit":20, "semanticWeight":1, "bm25Weight":1
+            }),
+        )
+        .await;
+    // Freshness depends on wall-clock milliseconds, so raw component scores can drift
+    // between calls. Candidate order and discrete RRF contributions must be identical.
+    let ranking = |payload: &Value| {
+        payload["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| {
+                json!([
+                    hit["path"],
+                    hit["chunkIndex"],
+                    hit["mountId"],
+                    hit["score"],
+                    hit["rrfScore"]
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ranking(&implicit), ranking(&explicit));
+    assert_eq!(explicit["rerank"], json!("semantic+lexical"));
+}
+
+#[tokio::test]
+async fn an_empty_first_mount_does_not_duplicate_the_federated_query_embedding() {
+    let mut harness = Harness::new("empty-query-cache", Layout::TwoMounts, &[]).await;
+    let empty_vault = harness.base.join("empty-vault");
+    fs::create_dir_all(&empty_vault).unwrap();
+    let mut config = harness.state.config.as_ref().clone();
+    config.mounts.push(MountConfig {
+        unknown: Default::default(),
+        id: "aaa-empty".to_string(),
+        mount_at: "Empty".to_string(),
+        backend: MountBackendConfig::Filesystem {
+            vault_path: empty_vault,
+            index_dir: None,
+        },
+        recall_weight: None,
+    });
+    let backends = MountBackends::build(&config);
+    let (runtimes, _auto_reindex) = MountRuntimes::bootstrap(&config, &backends).await.unwrap();
+    harness.state = AppState::with_backends(config, runtimes, &backends);
+    let before = harness.embedding_requests.load(Ordering::SeqCst);
+    let payload = harness
+        .structured(
+            "hybrid_search",
+            json!({
+                "query":"car query cache empty first mount", "limit":20
+            }),
+        )
+        .await;
+    assert_eq!(payload["degraded"], json!(false), "{payload}");
+    assert_eq!(payload["rerank"], json!("semantic+lexical"), "{payload}");
+    let empty = payload["mounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|mount| mount["id"] == "aaa-empty")
+        .unwrap();
+    assert_eq!(empty["candidateCount"], json!(0));
+    assert_eq!(harness.embedding_requests.load(Ordering::SeqCst) - before, 1,
+        "populated mounts and final reranking must share one query vector; empty mount must not embed");
 }
