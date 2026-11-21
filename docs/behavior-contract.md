@@ -412,6 +412,25 @@ It never silently substitutes the native backend's default ranking.
   could only be fixed by editing the config is not retried at all; see "Startup failure"
   above.
 
+### Embedding admission contract
+
+- Query cache hits bypass admission; identical cacheable misses share one queued
+  computation. Artifact queries use the same vector cache.
+- Omitted `scheduling.maxInFlight` adds no global concurrency limit for any provider.
+  Existing indexing producer limits and provider quotas remain independent.
+- Finite policies share process-wide capacity by normalized endpoint or explicit
+  resource group, independent of vault, model and API credential.
+- Each class is FIFO; under contention `interactiveBurst` searches (default eight)
+  dispatch before a background job. Cached hits do not count. Running requests are
+  nonpreemptive and retries acquire a new permit.
+- Pending queues are bounded separately. Background producers wait for space;
+  interactive overflow and admission expiry follow the existing backend-unavailable
+  fallback, with BM25 only when enabled. Zero semantic weight never embeds.
+- Dropping a tool future removes abandoned pending work; a shared query continues
+  while any waiter remains. The scheduler does not abort a request already sent.
+- Scheduling never changes embedding payloads, instructions or index identity.
+  Overview counters contain only opaque resource IDs and aggregate measurements.
+
 ## Fixture Vault Contract
 
 Verification scripts use a tiny fixture vault with these invariants:

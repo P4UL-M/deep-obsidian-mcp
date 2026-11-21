@@ -1,6 +1,7 @@
 pub mod embedding_activity;
 pub mod embedding_context;
 pub mod embeddings;
+pub mod embedding_scheduler;
 pub mod freshness;
 pub mod graph;
 pub mod index;

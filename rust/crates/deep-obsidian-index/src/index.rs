@@ -1758,6 +1758,7 @@ pub fn embedding_runtime_config(index: &SearchIndex) -> Option<EmbeddingConfig> 
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction,
+            scheduling: None,
         }
         .normalize(),
     )
@@ -1795,6 +1796,7 @@ pub fn artifact_embedding_runtime_config(index: &SearchIndex) -> Option<Embeddin
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             // Artifacts are intentionally out of scope for query-instruction wrapping.
             query_instruction: None,
+            scheduling: None,
         }
         .normalize(),
     )
@@ -5545,6 +5547,7 @@ mod tests {
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .normalize();
 
@@ -5627,6 +5630,7 @@ mod tests {
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .with_context_tokens(1024);
 
@@ -5791,6 +5795,7 @@ mod tests {
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .normalize();
         let (updated, rebuilt) =
@@ -6037,6 +6042,7 @@ mod tests {
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .normalize();
 
@@ -6223,6 +6229,7 @@ mod tests {
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .normalize();
 
@@ -6311,6 +6318,7 @@ mod tests {
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .normalize();
 
@@ -6408,6 +6416,7 @@ mod tests {
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .normalize();
 
@@ -6452,6 +6461,7 @@ mod tests {
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .normalize();
 
@@ -6544,6 +6554,7 @@ mod tests {
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .normalize()
     }
@@ -6826,6 +6837,7 @@ mod tests {
             context_tokens: embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: Some("Custom task".to_string()),
+            scheduling: None,
         };
 
         apply_runtime_embedding_config(&mut index, Some(&user_config));

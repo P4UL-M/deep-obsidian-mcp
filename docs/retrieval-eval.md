@@ -132,3 +132,18 @@ For each query, compare **before** vs **after** top-5:
 Record a one-line verdict per query (better / same / worse) and a short note on any
 worse case. If anything regresses, reproduce it in the deterministic eval as a new gold
 query where feasible, so CI catches it next time.
+
+## Embedding admission contention microbenchmark
+
+```bash
+cargo test -p deep-obsidian-index priority_scheduler_contention_benchmark -- --ignored --nocapture
+```
+
+This manual test uses one simulated backend slot, 16 queued background requests
+of 20 ms each, then 32 queued searches of 2 ms each. It prints search completion
+p50/p95 for FIFO and 8:1 priority admission while indexing remains active. It makes
+no HTTP/provider calls and measures admission policy rather than model speed;
+wall-clock numbers depend on host load and are not CI thresholds. The ordinary
+scheduler tests assert dispatch order, fairness, capacity, cancellation and deadlines
+without asserting benchmark timings. HTTP fixtures separately verify search priority,
+background batch sizes, retry permit release and lexical fallback.

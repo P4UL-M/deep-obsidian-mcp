@@ -52,6 +52,30 @@ freshness and ranking still run for every search. See
 [embedding reuse](../CONFIGURATION.md#reusing-embeddings) for retention and identity
 boundaries.
 
+## Embedding admission
+
+`deep-obsidian-index::embedding_scheduler` sits between the vector cache and the
+HTTP adapters. It knows resource identity, capacity and job class; it does not
+select providers, inspect model names, construct payloads or manage authentication.
+The registry shares a finite capacity across vaults, text/artifact paths, models,
+credentials and explicitly grouped endpoint aliases in this process.
+
+By default there is no additional global concurrency cap. An explicit finite
+policy enables bounded interactive/background FIFO queues with an 8:1 contention
+burst, background producer backpressure, and an interactive admission deadline.
+A request-scoped cancellation check crosses blocking search workers; coalesced
+queries combine caller liveness so one abandoned caller cannot cancel another's
+vector. RAII releases one capacity slot after each actual HTTP attempt, including
+errors and unwinding. Retries reacquire, and small background batches create
+opportunities to admit searches between requests. There is no preemption or
+cross-process/backend-native queue control.
+
+Scheduler configuration does not invalidate vector identity, chunk reuse or stored
+indexes. Read-only overview diagnostics report queue time separately from backend
+time without exposing inputs or credentials. See the
+[policy configuration](../CONFIGURATION.md#embedding-search-priority) for limits,
+restart semantics and fallback behavior.
+
 ## Freshness encoding
 
 `freshness` defaults to `classic`; presets and formulas are documented in

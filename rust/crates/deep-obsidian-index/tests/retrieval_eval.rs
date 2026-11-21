@@ -605,6 +605,7 @@ fn eval_config(base_url: String) -> EmbeddingConfig {
         // Generic (non-qwen3) eval model => no auto-default; queries stay plain so the
         // baseline rankings are unchanged.
         query_instruction: None,
+        scheduling: None,
     }
     .normalize()
 }

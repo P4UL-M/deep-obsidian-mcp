@@ -5,6 +5,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::embedding_scheduler::{self, Priority};
 use crate::index::SemanticBackend;
 
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 32;
@@ -67,6 +68,8 @@ pub struct EmbeddingConfig {
     /// query is wrapped as `Instruct: {instruction}\nQuery: {query}` before embedding.
     /// Document/index embedding never acts on this field, so documents stay plain.
     pub query_instruction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<deep_obsidian_types::EmbeddingSchedulingConfig>,
 }
 
 /// The qwen3-embedding default task description for retrieval search queries.
@@ -106,6 +109,7 @@ impl EmbeddingConfig {
             context_tokens: DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
     }
 
@@ -253,6 +257,8 @@ impl EmbeddingBatchOptions {
 
 #[derive(Debug, Error)]
 pub enum EmbeddingError {
+    #[error(transparent)]
+    Scheduling(#[from] embedding_scheduler::SchedulingError),
     #[error("embedding backend is not configured")]
     NotConfigured,
     #[error("unsupported embedding provider: {0}")]
@@ -295,6 +301,11 @@ impl EmbeddingError {
                     // treat this specific body as transient even though the status is 400.
                     || body.contains("process no longer running")
             }
+            EmbeddingError::Scheduling(
+                embedding_scheduler::SchedulingError::QueueTimeout
+                | embedding_scheduler::SchedulingError::QueueFull,
+            ) => true,
+            EmbeddingError::Scheduling(_) => false,
             EmbeddingError::NotConfigured
             | EmbeddingError::UnsupportedProvider(_)
             | EmbeddingError::MissingBaseUrl
@@ -331,6 +342,22 @@ pub fn embed_texts(
     texts: &[String],
     config: &EmbeddingConfig,
 ) -> Result<EmbeddingResult, EmbeddingError> {
+    embed_texts_with_priority(texts, config, Priority::Background)
+}
+
+/// An embedding needed to answer an interactive request. Cache/coalescence is upstream.
+pub fn embed_texts_for_search(
+    texts: &[String],
+    config: &EmbeddingConfig,
+) -> Result<EmbeddingResult, EmbeddingError> {
+    embed_texts_with_priority(texts, config, Priority::Interactive)
+}
+
+fn embed_texts_with_priority(
+    texts: &[String],
+    config: &EmbeddingConfig,
+    priority: Priority,
+) -> Result<EmbeddingResult, EmbeddingError> {
     // Bound every request so a hung backend can't stall the caller indefinitely.
     // Source the timeout from the same plumbing the batch path uses, defaulting to
     // the configured timeout, falling back to 60s for existing configurations.
@@ -341,7 +368,7 @@ pub fn embed_texts(
             status: 0,
             body: error.to_string(),
         })?;
-    embed_texts_with_client(texts, config, &client)
+    embed_texts_with_client_priority(texts, config, &client, priority)
 }
 
 pub(crate) fn embed_text_batches(
@@ -381,6 +408,13 @@ pub(crate) fn embed_text_batches_with_client(
     }
 
     let options = options.clone().normalized();
+    if let Some(base) = config.base_url() {
+        embedding_scheduler::register_backend(base, config.scheduling.as_ref())?;
+    }
+    let mut options = options;
+    if let Some(size) = embedding_scheduler::background_batch_size(config) {
+        options.batch_size = options.batch_size.min(size);
+    }
     let batches = pack_batches(texts, config, &options);
     let batch_count = batches.len();
     let mut batch_results = Vec::with_capacity(batch_count);
@@ -492,7 +526,7 @@ fn embed_batch_with_bisect(
     match embed_texts_with_client(texts, config, client) {
         Ok(result) => Ok(result),
         Err(error) => {
-            if texts.len() <= 1 {
+            if texts.len() <= 1 || matches!(error, EmbeddingError::Scheduling(_)) {
                 return Err(error);
             }
             let mid = texts.len() / 2;
@@ -527,6 +561,52 @@ pub fn embed_texts_with_client(
     config: &EmbeddingConfig,
     client: &reqwest::blocking::Client,
 ) -> Result<EmbeddingResult, EmbeddingError> {
+    embed_texts_with_client_priority(texts, config, client, Priority::Background)
+}
+
+fn combine_results(
+    results: impl Iterator<Item = Result<EmbeddingResult, EmbeddingError>>,
+) -> Result<EmbeddingResult, EmbeddingError> {
+    let mut vectors = Vec::new();
+    let mut dimensions = None;
+    for result in results {
+        let result = result?;
+        if let Some(expected) = dimensions {
+            if result.dimensions != expected {
+                return Err(EmbeddingError::DimensionsMismatch {
+                    expected,
+                    actual: result.dimensions,
+                });
+            }
+        }
+        dimensions = Some(result.dimensions);
+        vectors.extend(result.vectors);
+    }
+    Ok(EmbeddingResult {
+        vectors,
+        dimensions: dimensions.unwrap_or(0),
+    })
+}
+
+fn embed_texts_with_client_priority(
+    texts: &[String],
+    config: &EmbeddingConfig,
+    client: &reqwest::blocking::Client,
+    priority: Priority,
+) -> Result<EmbeddingResult, EmbeddingError> {
+    if let Some(base) = config.base_url() {
+        embedding_scheduler::register_backend(base, config.scheduling.as_ref())?;
+    }
+    if priority == Priority::Background {
+        if let Some(size) = embedding_scheduler::background_batch_size(config) {
+            if texts.len() > size {
+                return combine_results(texts.chunks(size).map(|chunk| {
+                    embed_texts_with_client_priority(chunk, config, client, priority)
+                }));
+            }
+        }
+    }
+
     if texts.is_empty() {
         return Ok(EmbeddingResult {
             vectors: Vec::new(),
@@ -570,6 +650,13 @@ pub fn embed_texts_with_client(
         request = request.header("authorization", format!("Bearer {api_key}"));
     }
 
+    let mut permit = embedding_scheduler::acquire(config, priority)?;
+    let estimated_tokens = texts
+        .iter()
+        .map(|t| config.estimate_tokens(&clamp_input(t, config)))
+        .sum::<usize>();
+    permit.record_inputs(texts.len(), estimated_tokens);
+    tracing::debug!(priority = ?priority, input_count = texts.len(), estimated_tokens, "embedding HTTP request");
     let response =
         request
             .json(&request_body)
@@ -633,6 +720,7 @@ pub fn embed_texts_with_client(
         vectors,
         dimensions,
     };
+    permit.success();
     crate::embedding_activity::record_success(config, &result);
     Ok(result)
 }
@@ -659,6 +747,18 @@ pub fn embed_artifacts_with_client(
     config: &EmbeddingConfig,
     client: &reqwest::blocking::Client,
 ) -> Result<EmbeddingResult, EmbeddingError> {
+    if let Some(base) = config.base_url() {
+        embedding_scheduler::register_backend(base, config.scheduling.as_ref())?;
+    }
+    if let Some(size) = embedding_scheduler::background_batch_size(config) {
+        if artifacts.len() > size {
+            return combine_results(
+                artifacts
+                    .chunks(size)
+                    .map(|chunk| embed_artifacts_with_client(chunk, config, client)),
+            );
+        }
+    }
     if artifacts.is_empty() {
         return Ok(EmbeddingResult {
             vectors: Vec::new(),
@@ -708,6 +808,12 @@ pub fn embed_artifacts_with_client(
         request = request.header("authorization", format!("Bearer {api_key}"));
     }
 
+    let mut permit = embedding_scheduler::acquire(config, Priority::Background)?;
+    permit.record_inputs(artifacts.len(), 0);
+    tracing::debug!(
+        input_count = artifacts.len(),
+        "artifact embedding HTTP request"
+    );
     let response =
         request
             .json(&request_body)
@@ -734,6 +840,7 @@ pub fn embed_artifacts_with_client(
                 body: error.to_string(),
             })?;
     let result = parse_embedding_payload(payload, artifacts.len())?;
+    permit.success();
     crate::embedding_activity::record_success(config, &result);
     Ok(result)
 }
@@ -885,6 +992,7 @@ mod tests {
             context_tokens: DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
     }
 
@@ -986,6 +1094,102 @@ mod tests {
         let body_start = header_end + 4;
         (request.len() >= body_start + content_length)
             .then(|| &request[body_start..body_start + content_length])
+    }
+
+    #[test]
+    fn scheduled_http_search_overtakes_indexing_and_batches_stay_small() {
+        use crate::embedding_scheduler::{acquire, diagnostics_for_backend};
+        let (base, requests, server) = spawn_embedding_server(vec![2, 2, 2]);
+        let mut cfg = test_config(base);
+        cfg.scheduling = Some(deep_obsidian_types::EmbeddingSchedulingConfig {
+            max_in_flight: Some(1),
+            ..Default::default()
+        });
+        let held = acquire(&cfg, Priority::Background).unwrap();
+        let background_config = cfg.clone();
+        let background = thread::spawn(move || {
+            embed_texts(&["index-a".into(), "index-b".into()], &background_config).unwrap()
+        });
+        let search_config = cfg.clone();
+        let search = thread::spawn(move || {
+            embed_texts_for_search(&["search".into()], &search_config).unwrap()
+        });
+        let began = std::time::Instant::now();
+        loop {
+            let d =
+                diagnostics_for_backend(cfg.base_url().unwrap(), cfg.scheduling.as_ref()).unwrap();
+            if d.queued_interactive == 1 && d.queued_background == 1 {
+                break;
+            }
+            assert!(began.elapsed() < Duration::from_secs(3));
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(held);
+        assert_eq!(search.join().unwrap().vectors.len(), 1);
+        assert_eq!(background.join().unwrap().vectors.len(), 2);
+        server.join().unwrap();
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                vec!["search".to_string()],
+                vec!["index-a".to_string()],
+                vec!["index-b".to_string()]
+            ]
+        );
+        let d = diagnostics_for_backend(cfg.base_url().unwrap(), cfg.scheduling.as_ref()).unwrap();
+        assert_eq!(d.active, 0);
+        assert_eq!(d.interactive.inputs, 1);
+        assert_eq!(d.background.inputs, 2);
+    }
+
+    #[test]
+    fn finite_scheduler_splits_artifact_batches_without_changing_inputs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = test_config(format!("http://{}", listener.local_addr().unwrap()));
+        cfg.scheduling = Some(deep_obsidian_types::EmbeddingSchedulingConfig {
+            max_in_flight: Some(1),
+            ..Default::default()
+        });
+        let server = thread::spawn(move || {
+            let mut captured = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while request_body(&request).is_none() {
+                    let mut buffer = [0; 2048];
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(request_body(&request).unwrap()).unwrap();
+                assert_eq!(body["input"].as_array().unwrap().len(), 1);
+                captured.push(body["input"][0].clone());
+                let body = r#"{"data":[{"index":0,"embedding":[1,2]}]}"#;
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            captured
+        });
+        let inputs: Vec<_> = ["a.pdf", "b.pdf"]
+            .iter()
+            .map(|path| ArtifactEmbeddingInput {
+                path: (*path).into(),
+                kind: "pdf".into(),
+                mime_type: "application/pdf".into(),
+                bytes: vec![1, 2, 3],
+            })
+            .collect();
+        let result = embed_artifacts(&inputs, &cfg).unwrap();
+        assert_eq!(result.vectors, vec![vec![1., 2.], vec![1., 2.]]);
+        let captured = server.join().unwrap();
+        for (payload, input) in captured.iter().zip(inputs.iter()) {
+            assert_eq!(payload["path"], input.path);
+            assert_eq!(payload["data"], BASE64_STANDARD.encode(&input.bytes));
+            assert_eq!(payload["type"], "file");
+        }
     }
 
     #[test]
@@ -1331,7 +1535,12 @@ mod tests {
         // texts of len 2: request [alpha, beta] -> 500, then [alpha] -> 200,
         // [beta] -> 200 = 3 connections, preserving 1:1 input order.
         let (base_url, handle) = spawn_bisecting_server(3);
-        let config = test_config(base_url);
+        let mut config = test_config(base_url);
+        config.scheduling = Some(deep_obsidian_types::EmbeddingSchedulingConfig {
+            max_in_flight: Some(1),
+            background_batch_size: 2,
+            ..Default::default()
+        });
         let client = reqwest::blocking::Client::builder()
             .build()
             .expect("client");
@@ -1339,6 +1548,14 @@ mod tests {
 
         let result = embed_batch_with_bisect(&texts, &config, &client).expect("bisect");
         handle.join().expect("join bisect server");
+        let d = embedding_scheduler::diagnostics_for_backend(
+            config.base_url().unwrap(),
+            config.scheduling.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(d.active, 0);
+        assert_eq!(d.background.started, 3);
+        assert_eq!(d.background.failed, 1);
 
         assert_eq!(result.dimensions, 1);
         assert_eq!(result.vectors.len(), 2);

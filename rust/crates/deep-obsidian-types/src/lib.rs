@@ -110,6 +110,51 @@ pub enum SecretRef {
     EncryptedFile { id: String },
 }
 
+/// Optional process-wide admission policy for one embedding resource group.
+/// Unset maxInFlight adds no global concurrency limit, for every provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EmbeddingSchedulingConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_in_flight: Option<usize>,
+    #[serde(default = "default_interactive_burst")]
+    pub interactive_burst: usize,
+    #[serde(default = "default_embedding_queue_capacity")]
+    pub queue_capacity: usize,
+    #[serde(default = "default_interactive_wait_timeout_ms")]
+    pub interactive_wait_timeout_ms: u64,
+    #[serde(default = "default_background_batch_size")]
+    pub background_batch_size: usize,
+}
+
+fn default_interactive_burst() -> usize {
+    8
+}
+fn default_embedding_queue_capacity() -> usize {
+    128
+}
+fn default_interactive_wait_timeout_ms() -> u64 {
+    5_000
+}
+fn default_background_batch_size() -> usize {
+    1
+}
+
+impl Default for EmbeddingSchedulingConfig {
+    fn default() -> Self {
+        Self {
+            group: None,
+            max_in_flight: None,
+            interactive_burst: 8,
+            queue_capacity: 128,
+            interactive_wait_timeout_ms: 5_000,
+            background_batch_size: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddingConfig {
@@ -136,6 +181,9 @@ pub struct EmbeddingConfig {
     /// Per-request text embedding timeout in seconds (60 when unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    /// Optional shared provider-independent scheduling policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<EmbeddingSchedulingConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -159,6 +207,9 @@ pub struct EmbeddingConfigInput {
     /// Per-request text embedding timeout in seconds (60 when unset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    /// Optional shared provider-independent scheduling policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<EmbeddingSchedulingConfig>,
 }
 
 /// Additive single-owner OAuth authority, enabled by the presence of `auth.oauth`.
