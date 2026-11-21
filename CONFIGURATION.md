@@ -297,6 +297,77 @@ These settings are config-file only and survive config rewrites. In Docker, edit
 or mount the persistent config and recreate the MCP container; its config survives
 image upgrades. There are no new CLI flags or environment overrides.
 
+### Embedding search priority
+
+Admission is provider-independent and disabled by default: an omitted
+`scheduling.maxInFlight` adds **no process-wide concurrency cap**, for any provider.
+The existing `maxConcurrency` still bounds each indexing producer's parallel batches;
+provider rate limits and HTTP timeouts still apply.
+
+For a shared inference server, add a finite policy to `embedding` and/or
+`artifactEmbedding`:
+
+```json
+{
+  "embedding": {
+    "scheduling": {
+      "group": "shared-inference",
+      "maxInFlight": 1,
+      "interactiveBurst": 8,
+      "queueCapacity": 128,
+      "interactiveWaitTimeoutMs": 5000,
+      "backgroundBatchSize": 1
+    }
+  }
+}
+```
+
+Only `maxInFlight` is needed to enable admission; the other numeric values shown
+are defaults. All limits must be positive. `group` is optional: without it, the
+normalized base URL identifies the resource. Give aliases/tunnels to the same
+backend the same group and policy. Credentials, models and vaults do not create
+separate admission capacities. Calls using the same registered endpoint inherit
+its finite policy even when their embedding configuration omits scheduling. A group-only
+declaration can bind another URL to an existing finite group; an explicit group
+conflicting with that endpoint's registered group is rejected, even without a cap.
+
+The query-vector cache and in-flight deduplication run **before** admission.
+Cache hits do not queue or count toward the burst. Interactive requests cover note
+and artifact queries, federated query embeddings and candidate reranking; indexing
+and rebuilds enter the background class. Each class is FIFO. While both classes
+wait, eight interactive HTTP requests are admitted, then one background request.
+The ratio counts dispatched work, not search invocations. Available parallel slots
+remain usable; no global cap or artificial ordering is added in unlimited mode.
+
+The finite policy splits background batches into at most `backgroundBatchSize`
+inputs without changing any input, model, instruction or stored vector identity.
+Each HTTP attempt holds one permit through the response body. Failed/bisected
+batches release it before retrying. Requests already sent are not preempted: a
+search can still wait for the current background request or its HTTP timeout.
+Only this MCP process participates; external clients and other MCP processes do
+not share its admission state.
+
+`queueCapacity` bounds each waiting class separately. A full interactive queue
+fails immediately; background producers wait for space. Interactive queue waits
+expire after `interactiveWaitTimeoutMs`, separately from the HTTP timeout. Hybrid
+search then uses its existing degraded BM25 response only when lexical retrieval
+is enabled; semantic-only requests never re-enable BM25. A dropped tool future
+cancels work still waiting for admission. A coalesced query continues while any
+caller still needs its vector. Requests already executing complete normally.
+
+`vault_overview` exposes `embeddingScheduler` / `artifactEmbeddingScheduler` for
+registered finite backends: active and queued counts, per-class starts, completions,
+failures, cancellations, deadlines, rejections, cumulative queue/backend milliseconds,
+input counts and estimated text tokens (zero for binary artifacts). These process-local
+counters reset on restart. Resource IDs are opaque fingerprints; scheduler diagnostics
+and debug events contain no query text, credentials or payloads.
+
+These config-file settings survive JSON/TOML rewrites. Restart the service after
+changing or removing a registered finite policy: conflicting group policies fail
+explicitly rather than silently creating a second capacity. At most 128 finite
+groups and endpoint aliases may be registered per process. No index rebuild is
+needed to enable admission.
+
 ### Reusing embeddings
 
 Incremental indexing reuses valid stored chunk vectors when their exact embedding
@@ -318,8 +389,9 @@ scope, instructed input, input limits and expected dimensions. The cache is held
 memory and cleared on process restart; it does not bypass mount authorization or
 cache search results.
 
-These optimizations do not add search priority to Ollama's queue. Background indexing
-and interactive searches still share the configured embedding backend.
+Admission can prioritize cache misses before they reach the backend; see
+[embedding search priority](#embedding-search-priority). Scheduling settings are not
+part of the query vector's identity. Artifact query vectors use the same cache.
 
 ## Authentication
 

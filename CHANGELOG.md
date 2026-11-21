@@ -2,6 +2,27 @@
 
 All notable changes to deep-obsidian-mcp are documented here.
 
+## Unreleased
+
+### Added
+
+- Optional provider-independent embedding admission with a shared finite capacity,
+  interactive search priority, configurable 8:1 fairness, small background batches,
+  bounded queues, admission deadlines and request cancellation. No additional global
+  concurrency cap is applied by default. Existing indexing batch limits still apply.
+- Read-only per-backend admission diagnostics in `vault_overview`, separating queue
+  wait and backend duration with per-class counts, without query or credential logging.
+
+### Fixed
+
+- A group-only embedding configuration cannot bypass a finite policy already
+  registered for its endpoint; group-only aliases inherit the shared capacity.
+- Coalesced query embeddings survive the originating caller's cancellation while
+  another caller still waits. Abandoned followers return without dropping the shared
+  result; a failed or panicking computation cannot leave followers waiting forever.
+- Artifact query vectors now share the bounded query cache. Scheduling policies do
+  not alter vector/cache identity or require an index rebuild.
+
 ## v0.2.0-alpha.13 — 2026-11-21
 
 ### Fixed

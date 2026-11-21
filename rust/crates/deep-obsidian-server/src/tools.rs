@@ -2411,7 +2411,7 @@ async fn apply_federated_rerank(
     if ranking.semantic_weight > 0.0 {
         let scorer = scorer.expect("semantic scorer checked above").clone();
         let query_owned = query.to_string();
-        let query_vector = match tokio::task::spawn_blocking(move || {
+        let query_vector = match crate::embedding_requests::spawn_blocking(move || {
             index_search::embed_query_vector(&scorer, &query_owned)
         })
         .await
@@ -2457,7 +2457,7 @@ async fn apply_federated_rerank(
                 .collect();
             let vector = query_vector.clone();
             // A failure here costs those candidates their semantic score and nothing else.
-            let scores = tokio::task::spawn_blocking(move || {
+            let scores = crate::embedding_requests::spawn_blocking(move || {
                 index_search::semantic_scores_for_chunks(&index, &vector, &keys)
             })
             .await
@@ -2486,7 +2486,7 @@ async fn apply_federated_rerank(
                     .find_map(|mount| mount.index.clone())
                     .expect("a scorer index was found above");
                 let vector = query_vector.clone();
-                let embedded = tokio::task::spawn_blocking(move || {
+                let embedded = crate::embedding_requests::spawn_blocking(move || {
                     index_search::embed_texts_for_index(&scorer, &texts).map(|vectors| {
                         vectors
                             .iter()
@@ -2852,7 +2852,7 @@ async fn artifact_search_matches(
     query: String,
     limit: usize,
 ) -> Result<Vec<index_search::ArtifactSearchMatch>, String> {
-    tokio::task::spawn_blocking(move || {
+    crate::embedding_requests::spawn_blocking(move || {
         index_search::artifact_semantic_search_with_options(
             index.as_ref(),
             &query,
@@ -4253,7 +4253,7 @@ async fn hybrid_search_matches(
     query: String,
     options: RankingOptions,
 ) -> Result<index_search::HybridSearchOutcome, String> {
-    tokio::task::spawn_blocking(move || {
+    crate::embedding_requests::spawn_blocking(move || {
         index_search::hybrid_search_with_options_degradable(index.as_ref(), &query, options)
             .map_err(|error| error.to_string())
     })
@@ -4279,6 +4279,14 @@ async fn wait_for_index_jobs(state: &AppState, timeout: std::time::Duration) -> 
 }
 
 pub async fn call_tool(
+    state: &AppState,
+    name: &str,
+    arguments: &Value,
+) -> Result<ToolCallResult, String> {
+    crate::embedding_requests::scope(call_tool_scoped(state, name, arguments)).await
+}
+
+async fn call_tool_scoped(
     state: &AppState,
     name: &str,
     arguments: &Value,

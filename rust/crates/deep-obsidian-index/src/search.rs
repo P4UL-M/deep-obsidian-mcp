@@ -285,8 +285,8 @@ pub fn embed_texts_for_index(index: &SearchIndex, texts: &[String]) -> Result<Ve
         return Ok(Vec::new());
     }
     let config = embedding_runtime_config(index).ok_or(IndexError::MissingEmbeddingConfig)?;
-    let result =
-        crate::embeddings::embed_texts(texts, &config).map_err(map_query_embedding_error)?;
+    let result = crate::embeddings::embed_texts_for_search(texts, &config)
+        .map_err(map_query_embedding_error)?;
     Ok(result
         .vectors
         .iter()
@@ -616,8 +616,9 @@ fn embed_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
         &input,
         index.embedding_dimensions,
         || {
-            let result = crate::embeddings::embed_texts(std::slice::from_ref(&input), &config)
-                .map_err(map_query_embedding_error)?;
+            let result =
+                crate::embeddings::embed_texts_for_search(std::slice::from_ref(&input), &config)
+                    .map_err(map_query_embedding_error)?;
             Ok(result.vectors.into_iter().next().unwrap_or_default())
         },
     )
@@ -631,18 +632,16 @@ fn embed_artifact_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
     }
     let config =
         artifact_embedding_runtime_config(index).ok_or(IndexError::MissingEmbeddingConfig)?;
-    let result = crate::embeddings::embed_texts(&[query.to_string()], &config)
-        .map_err(map_query_embedding_error)?;
-    let vector = result.vectors.into_iter().next().unwrap_or_default();
-    if let Some(expected) = index.artifact_embedding_dimensions {
-        if vector.len() != expected {
-            return Err(IndexError::EmbeddingDimensionsMismatch {
-                expected,
-                actual: vector.len(),
-            });
-        }
-    }
-    Ok(normalize_dense_vector(&vector))
+    crate::query_cache::query_cache().get_or_embed(
+        &config,
+        query,
+        index.artifact_embedding_dimensions,
+        || {
+            let result = crate::embeddings::embed_texts_for_search(&[query.to_string()], &config)
+                .map_err(map_query_embedding_error)?;
+            Ok(result.vectors.into_iter().next().unwrap_or_default())
+        },
+    )
 }
 
 fn artifact_search_with_query_vector_sql(
@@ -1921,6 +1920,7 @@ mod tests {
             context_tokens: crate::embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: crate::embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .normalize();
 
@@ -2081,6 +2081,7 @@ mod tests {
             context_tokens: crate::embeddings::DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: crate::embeddings::DEFAULT_CHARS_PER_TOKEN,
             query_instruction: None,
+            scheduling: None,
         }
         .normalize()
     }
@@ -2336,6 +2337,58 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_deadline_degrades_only_when_lexical_retrieval_is_enabled() {
+        use crate::embedding_scheduler::{self, Priority};
+        let (mut index, root) = embedding_backed_index();
+        let mut cfg = embedding_runtime_config(&index).unwrap();
+        cfg.scheduling = Some(deep_obsidian_types::EmbeddingSchedulingConfig {
+            max_in_flight: Some(1),
+            interactive_wait_timeout_ms: 30,
+            ..Default::default()
+        });
+        index.runtime_embedding_config = Some(cfg.clone());
+        let _held = embedding_scheduler::acquire(&cfg, Priority::Background).unwrap();
+        let hybrid = hybrid_search_with_options_degradable(
+            &index,
+            "install runtime queue deadline",
+            RankingOptions::default(),
+        )
+        .unwrap();
+        assert!(hybrid.degraded);
+        assert!(!hybrid.matches.is_empty());
+        let semantic = hybrid_search_with_options_degradable(
+            &index,
+            "install runtime queue deadline",
+            RankingOptions {
+                bm25_weight: 0.,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(semantic.degraded);
+        assert!(semantic.matches.is_empty());
+        let lexical = hybrid_search_with_options_degradable(
+            &index,
+            "install runtime",
+            RankingOptions {
+                semantic_weight: 0.,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!lexical.degraded);
+        assert!(!lexical.matches.is_empty());
+        let d = embedding_scheduler::diagnostics_for_backend(
+            cfg.base_url().unwrap(),
+            cfg.scheduling.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(d.interactive.timed_out, 2);
+        assert_eq!(d.interactive.started, 0);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn semantic_only_backend_failure_does_not_reenable_disabled_bm25() {
         let (mut index, root) = embedding_backed_index();
         index.embedding_base_url = Some(DEAD_BACKEND_URL.to_string());
@@ -2414,6 +2467,7 @@ mod tests {
             context_tokens: DEFAULT_EMBEDDING_CONTEXT_TOKENS,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
             query_instruction: instruction.map(str::to_string),
+            scheduling: None,
         }
     }
 
@@ -2503,7 +2557,7 @@ mod tests {
         let mut config = embedding_config_with_instruction(Some(DEFAULT_SEARCH_QUERY_INSTRUCTION));
         config.base_url = Some(format!("http://{address}"));
         let input = query_embedding_input(&config, "ranking signals");
-        crate::embeddings::embed_texts(&[input], &config).expect("embed");
+        crate::embeddings::embed_texts_for_search(&[input], &config).expect("embed");
         handle.join().expect("join mock server");
 
         let sent = captured.lock().unwrap().clone();
