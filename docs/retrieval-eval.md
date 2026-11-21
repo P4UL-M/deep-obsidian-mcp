@@ -94,6 +94,13 @@ MCP integration, or a raw JSON-RPC client over the stdio/http transport). For ea
 capture the **top-5** paths from the default `hybrid_search` and from a semantic-only run
 (`bm25Weight:0`).
 
+For a multi-mount configuration, also exercise `semanticWeight:0` and verify that
+it returns keyword-ranked results without calling the embedding service. Both
+weights set to zero return no matches. A native backend that cannot apply custom
+weights must be reported as unsupported rather than silently returning its default
+ranking; a federated response may contain partial local-index results with that
+backend named as missing.
+
 Use the **same fixed query list** before and after the change so the comparison is
 apples-to-apples. Suggested list (adapt the nouns to your vault, keep the intent):
 

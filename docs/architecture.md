@@ -37,6 +37,21 @@ forces an explicit rebuild.
 - **Embedding-backed** — an OpenAI-compatible `/embeddings` endpoint with
   `sqlite-vec` similarity ranking.
 
+Incremental note refreshes reconstruct each previous chunk's exact embedding
+input and reuse its valid stored semantic coordinates when that input and the
+recorded embedding identity still match. Chunk positions and line numbers are
+not cache keys. New or changed inputs are embedded; deleted inputs are removed.
+The existing metadata table records per-note reuse identities, without changing
+the index schema. Notes indexed by an older version without a reuse identity are
+embedded once on their next edit to establish a safe baseline.
+
+Query vectors use a separate bounded, process-local cache. It coalesces matching
+in-flight requests and reuses successful vectors across local mounts and final
+federated reranking. It stores vectors, not result sets, so routing, permissions,
+freshness and ranking still run for every search. See
+[embedding reuse](../CONFIGURATION.md#reusing-embeddings) for retention and identity
+boundaries.
+
 ## Freshness encoding
 
 `freshness` defaults to `classic`; presets and formulas are documented in

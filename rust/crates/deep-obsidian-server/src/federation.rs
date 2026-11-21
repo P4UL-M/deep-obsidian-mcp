@@ -409,6 +409,10 @@ pub enum RerankStage {
     None,
     /// Reranked by a mount-independent semantic + lexical scorer.
     SemanticAndLexical,
+    /// Explicit lexical-only ranking; no semantic signal was requested.
+    Lexical,
+    /// Explicit semantic-only ranking; no lexical signal was requested.
+    Semantic,
 }
 
 impl RerankStage {
@@ -417,6 +421,8 @@ impl RerankStage {
         match self {
             RerankStage::None => "none",
             RerankStage::SemanticAndLexical => "semantic+lexical",
+            RerankStage::Lexical => "lexical",
+            RerankStage::Semantic => "semantic",
         }
     }
 }
@@ -441,6 +447,8 @@ pub struct RerankOutcome {
     /// How many candidates carried a semantic score. `0` with `stage: None` on a lexical-only
     /// deployment is the ordinary case, not a fault.
     pub semantic_signals: usize,
+    /// How many candidates carried positive lexical evidence before truncation.
+    pub lexical_signals: usize,
 }
 
 impl RerankOutcome {
@@ -451,6 +459,7 @@ impl RerankOutcome {
             degraded: false,
             reason: None,
             semantic_signals: 0,
+            lexical_signals: 0,
         }
     }
 
@@ -461,6 +470,7 @@ impl RerankOutcome {
             degraded: true,
             reason: Some(reason.into()),
             semantic_signals: 0,
+            lexical_signals: 0,
         }
     }
 }
@@ -514,6 +524,23 @@ pub struct RerankSignals {
 /// fusion rather than replacing it: two candidates the scorer cannot separate stay in the
 /// order fusion chose.
 pub fn rerank(hits: &mut Vec<FusedHit>, signals: &RerankSignals, limit: usize) -> RerankOutcome {
+    rerank_with_weights(hits, signals, limit, 1.0, 1.0)
+}
+
+/// Apply the caller's retriever weights at the final, mount-independent ranking stage.
+/// Zero-weight lists contribute no score; explicit lexical-only ranking also excludes
+/// candidates with no keyword evidence and works without an embedding-backed mount.
+pub fn rerank_with_weights(
+    hits: &mut Vec<FusedHit>,
+    signals: &RerankSignals,
+    limit: usize,
+    semantic_weight: f64,
+    bm25_weight: f64,
+) -> RerankOutcome {
+    if semantic_weight <= 0.0 && bm25_weight <= 0.0 {
+        hits.clear();
+        return RerankOutcome::not_applicable();
+    }
     let limit = limit.max(1);
     if hits.is_empty() {
         return RerankOutcome::not_applicable();
@@ -557,7 +584,7 @@ pub fn rerank(hits: &mut Vec<FusedHit>, signals: &RerankSignals, limit: usize) -
         .collect();
 
     let semantic_signals = semantic.iter().filter(|score| score.is_some()).count();
-    if semantic_signals == 0 {
+    if semantic_weight > 0.0 && semantic_signals == 0 {
         // Nothing to rerank WITH. The lexical list alone would re-order the answer using a
         // candidate-set-local BM25 and no dense signal, which is a different ranking from
         // either the fusion order or the unified baseline — worse than leaving fusion's
@@ -570,15 +597,22 @@ pub fn rerank(hits: &mut Vec<FusedHit>, signals: &RerankSignals, limit: usize) -
     // contribution from the lists it appears in. A candidate absent from a list gets no term
     // from it -- the same rule `fuse` and the local ranker both follow.
     let mut score = vec![0.0_f64; hits.len()];
-    for (rank, index) in ranked_by(&semantic).into_iter().enumerate() {
-        score[index] += 1.0 / (FEDERATION_RRF_K + (rank + 1) as f64);
+    if semantic_weight > 0.0 {
+        for (rank, index) in ranked_by(&semantic).into_iter().enumerate() {
+            score[index] += semantic_weight / (FEDERATION_RRF_K + (rank + 1) as f64);
+        }
     }
-    for (rank, index) in ranked_by(&lexical).into_iter().enumerate() {
-        score[index] += 1.0 / (FEDERATION_RRF_K + (rank + 1) as f64);
+    if bm25_weight > 0.0 {
+        for (rank, index) in ranked_by(&lexical).into_iter().enumerate() {
+            score[index] += bm25_weight / (FEDERATION_RRF_K + (rank + 1) as f64);
+        }
     }
 
     for (index, hit) in hits.iter_mut().enumerate() {
         hit.rerank_score = Some(score[index]);
+    }
+    if semantic_weight <= 0.0 {
+        hits.retain(|hit| hit.rerank_score.unwrap_or(0.0) > 0.0);
     }
     hits.sort_by(|left, right| {
         let left_score = left.rerank_score.unwrap_or(0.0);
@@ -595,10 +629,17 @@ pub fn rerank(hits: &mut Vec<FusedHit>, signals: &RerankSignals, limit: usize) -
     });
     hits.truncate(limit);
     RerankOutcome {
-        stage: RerankStage::SemanticAndLexical,
+        stage: if semantic_weight <= 0.0 {
+            RerankStage::Lexical
+        } else if bm25_weight <= 0.0 {
+            RerankStage::Semantic
+        } else {
+            RerankStage::SemanticAndLexical
+        },
         degraded: false,
         reason: None,
         semantic_signals,
+        lexical_signals: lexical.iter().filter(|score| score.is_some()).count(),
     }
 }
 
@@ -1267,6 +1308,44 @@ mod tests {
     // -----------------------------------------------------------------------
     // The final rerank
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn explicit_retriever_weights_control_final_ranking() {
+        let original: Vec<FusedHit> = ["semantic.md", "lexical.md"]
+            .into_iter()
+            .map(|path| FusedHit {
+                key: (path.to_string(), 0),
+                mount_id: path.to_string(),
+                mount_rank: 0,
+                score: 1.0,
+                rerank_score: None,
+            })
+            .collect();
+        let signals = RerankSignals {
+            semantic: vec![Some(0.9), Some(0.1)],
+            lexical: vec![0.1, 0.9],
+        };
+        for (semantic_weight, bm25_weight, expected, stage) in [
+            (1.0, 0.0, "semantic.md", RerankStage::Semantic),
+            (0.0, 1.0, "lexical.md", RerankStage::Lexical),
+            (0.2, 0.8, "lexical.md", RerankStage::SemanticAndLexical),
+            (0.8, 0.2, "semantic.md", RerankStage::SemanticAndLexical),
+        ] {
+            let mut hits = original.clone();
+            let result = rerank_with_weights(&mut hits, &signals, 2, semantic_weight, bm25_weight);
+            assert_eq!(result.stage, stage);
+            assert_eq!(hits[0].key.0, expected);
+            let expected_score = if semantic_weight > bm25_weight {
+                semantic_weight / 61.0 + bm25_weight / 62.0
+            } else {
+                bm25_weight / 61.0 + semantic_weight / 62.0
+            };
+            assert!((hits[0].rerank_score.unwrap() - expected_score).abs() < 1e-12);
+        }
+        let mut hits = original;
+        rerank_with_weights(&mut hits, &signals, 2, 0.0, 0.0);
+        assert!(hits.is_empty());
+    }
 
     #[test]
     fn the_rerank_promotes_a_candidate_fusion_ranked_last() {

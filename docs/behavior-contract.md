@@ -383,6 +383,19 @@ fix it sends the reader to the wrong place. See
 
 ### What multi-mount does not promise
 
+For `hybrid_search`, caller-supplied `semanticWeight` and `bm25Weight` apply to
+local-index retrieval and final federated ranking. `semanticWeight: 0` performs no
+query embedding or semantic reranking; `bm25Weight: 0` removes the keyword ranking
+contribution. Both weights set to zero return an empty answer without contacting
+retrievers. Default weights keep the existing hybrid behavior. The final `rerank`
+field distinguishes `lexical`, `semantic`, `semantic+lexical` and `none`.
+
+Native recall backends do not expose these weights through their search API.
+Scoped native searches with custom weights therefore refuse the unsupported
+request. An unscoped weighted search skips such a backend and reports it in the
+existing degraded/missing-backend provenance, alongside any local-index results.
+It never silently substitutes the native backend's default ranking.
+
 - **A write is never fanned out.** A write lands in the single mount owning its path.
 - **No content crosses a backend boundary.** Mounts meet as *ranks*: fusion consumes a
   logical path, a chunk index, a rank and a mount id, and nothing else. The final rerank

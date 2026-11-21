@@ -611,18 +611,16 @@ fn map_query_embedding_error(error: crate::embeddings::EmbeddingError) -> IndexE
 fn embed_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
     let config = embedding_runtime_config(index).ok_or(IndexError::MissingEmbeddingConfig)?;
     let input = query_embedding_input(&config, query);
-    let result =
-        crate::embeddings::embed_texts(&[input], &config).map_err(map_query_embedding_error)?;
-    let vector = result.vectors.into_iter().next().unwrap_or_default();
-    if let Some(expected) = index.embedding_dimensions {
-        if vector.len() != expected {
-            return Err(IndexError::EmbeddingDimensionsMismatch {
-                expected,
-                actual: vector.len(),
-            });
-        }
-    }
-    Ok(normalize_dense_vector(&vector))
+    crate::query_cache::query_cache().get_or_embed(
+        &config,
+        &input,
+        index.embedding_dimensions,
+        || {
+            let result = crate::embeddings::embed_texts(std::slice::from_ref(&input), &config)
+                .map_err(map_query_embedding_error)?;
+            Ok(result.vectors.into_iter().next().unwrap_or_default())
+        },
+    )
 }
 
 fn embed_artifact_query(index: &SearchIndex, query: &str) -> Result<Vec<f64>> {
@@ -997,6 +995,11 @@ pub fn semantic_search_with_options(
     query: &str,
     options: RankingOptions,
 ) -> Result<Vec<SearchMatch>> {
+    // Empty mounts cannot contribute semantic candidates; avoid a remote query
+    // embedding (and opening a vector index) when there is nothing to search.
+    if index.chunk_count == 0 {
+        return Ok(Vec::new());
+    }
     let mut matches = if index.semantic_backend == SemanticBackend::Embedding {
         let query_embedding = embed_query(index, query)?;
         semantic_search_with_query_vector_sql(index, &query_embedding, options.limit.max(1))?
@@ -1068,7 +1071,7 @@ pub fn artifact_semantic_search_with_options(
 ///
 /// When the embedding backend is unavailable at query time (`EmbeddingBackendUnavailable`
 /// from the semantic-candidate step), `hybrid_search_with_options_degradable` returns the
-/// BM25-only ranking with `degraded = true` and a short, human-readable
+/// BM25-only ranking (or no matches when BM25 is disabled) with `degraded = true` and a short, human-readable
 /// `degradation_reason` instead of erroring. On the healthy path `degraded` is `false`,
 /// `degradation_reason` is `None`, and `matches` are byte-identical to the pre-existing
 /// hybrid output.
@@ -1120,6 +1123,15 @@ fn hybrid_degraded_to_bm25(
     options: &RankingOptions,
     requested_limit: usize,
 ) -> Result<HybridSearchOutcome> {
+    if options.bm25_weight <= 0.0 {
+        return Ok(HybridSearchOutcome {
+            matches: Vec::new(),
+            degraded: true,
+            degradation_reason: Some(
+                "embedding backend unavailable; lexical (BM25) retrieval is disabled".to_string(),
+            ),
+        });
+    }
     let bm25_matches = bm25_search_with_options(
         index,
         query,
@@ -1144,32 +1156,47 @@ fn hybrid_search_with_candidate_limit(
 ) -> Result<HybridSearchOutcome> {
     let requested_limit = options.limit.max(1);
     let candidate_limit = candidate_limit.max(1);
-    let semantic_matches = match semantic_search_with_options(
-        index,
-        query,
-        RankingOptions {
-            limit: candidate_limit,
-            semantic_weight: options.semantic_weight,
-            bm25_weight: options.bm25_weight,
-        },
-    ) {
-        Ok(matches) => matches,
-        // The embedding backend died mid-query: fall back to BM25-only ranking and flag
-        // the response as degraded rather than surfacing the raw upstream error.
-        Err(IndexError::EmbeddingBackendUnavailable(_)) => {
-            return hybrid_degraded_to_bm25(index, query, &options, requested_limit);
+    if index.chunk_count == 0 || (options.semantic_weight <= 0.0 && options.bm25_weight <= 0.0) {
+        return Ok(HybridSearchOutcome {
+            matches: Vec::new(),
+            degraded: false,
+            degradation_reason: None,
+        });
+    }
+    let semantic_matches = if options.semantic_weight <= 0.0 {
+        Vec::new()
+    } else {
+        match semantic_search_with_options(
+            index,
+            query,
+            RankingOptions {
+                limit: candidate_limit,
+                semantic_weight: options.semantic_weight,
+                bm25_weight: options.bm25_weight,
+            },
+        ) {
+            Ok(matches) => matches,
+            // The embedding backend died mid-query: fall back to BM25-only ranking and flag
+            // the response as degraded rather than surfacing the raw upstream error.
+            Err(IndexError::EmbeddingBackendUnavailable(_)) => {
+                return hybrid_degraded_to_bm25(index, query, &options, requested_limit);
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
     };
-    let bm25_matches = bm25_search_with_options(
-        index,
-        query,
-        RankingOptions {
-            limit: candidate_limit,
-            semantic_weight: options.semantic_weight,
-            bm25_weight: options.bm25_weight,
-        },
-    )?;
+    let bm25_matches = if options.bm25_weight <= 0.0 {
+        Vec::new()
+    } else {
+        bm25_search_with_options(
+            index,
+            query,
+            RankingOptions {
+                limit: candidate_limit,
+                semantic_weight: options.semantic_weight,
+                bm25_weight: options.bm25_weight,
+            },
+        )?
+    };
 
     // Reciprocal Rank Fusion: rank each retriever independently by its own score
     // (the lists arrive already sorted, so enumeration position is the 0-based rank),
@@ -1234,12 +1261,14 @@ fn hybrid_search_with_candidate_limit(
     // The re-rank runs over the full oversampled candidate set BEFORE truncation, so a
     // 1-hop neighbor that fusion left just outside `requested_limit` can still surface.
     sort_by_fused_score(&mut matches);
-    apply_graph_proximity_rerank(
-        index,
-        &mut matches,
-        GRAPH_RERANK_TOP_N,
-        GRAPH_PROXIMITY_BONUS,
-    );
+    if options.semantic_weight > 0.0 {
+        apply_graph_proximity_rerank(
+            index,
+            &mut matches,
+            GRAPH_RERANK_TOP_N,
+            GRAPH_PROXIMITY_BONUS,
+        );
+    }
     sort_by_fused_score(&mut matches);
     matches.truncate(requested_limit);
     Ok(HybridSearchOutcome {
@@ -1918,6 +1947,12 @@ mod tests {
     /// derived from input length so distinct chunks get distinct vectors. Used to build a
     /// real Embedding-backed index; the caller then points the backend down for query-time.
     fn start_healthy_embedding_server() -> String {
+        start_counting_embedding_server().0
+    }
+
+    fn start_counting_embedding_server() -> (String, std::sync::Arc<AtomicUsize>) {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind healthy server");
         let address = listener.local_addr().expect("server address");
         thread::spawn(move || {
@@ -1960,6 +1995,7 @@ mod tests {
                 let body = &buffer[header_end..header_end + content_length];
                 let payload: serde_json::Value =
                     serde_json::from_slice(body).expect("json request");
+                observed_calls.fetch_add(1, Ordering::SeqCst);
                 let inputs = payload
                     .get("input")
                     .and_then(serde_json::Value::as_array)
@@ -1988,7 +2024,7 @@ mod tests {
                     .expect("write response");
             }
         });
-        format!("http://{}", address)
+        (format!("http://{}", address), calls)
     }
 
     #[test]
@@ -2070,6 +2106,82 @@ mod tests {
             crate::index::build_index(&root, None, Some(&config)).expect("embedding-backed build");
         assert_eq!(index.semantic_backend, SemanticBackend::Embedding);
         (index, root)
+    }
+
+    #[test]
+    fn query_embedding_is_reused_across_mounts_rerank_and_repeated_searches() {
+        let (base_url, calls) = start_counting_embedding_server();
+        let config = embedding_backend_config(base_url);
+        let roots = [
+            unique_temp_dir("query-cache-a"),
+            unique_temp_dir("query-cache-b"),
+        ];
+        let indexes: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                fs::create_dir_all(root).unwrap();
+                write_fixture(root, "Note.md", "# Note\n\nInstall the service runtime.\n");
+                crate::index::build_index(root, None, Some(&config)).unwrap()
+            })
+            .collect();
+        let before = calls.load(Ordering::SeqCst);
+        for index in &indexes {
+            assert!(!hybrid_search(index, "install runtime").unwrap().is_empty());
+        }
+        let vector = embed_query_vector(&indexes[0], "install runtime").unwrap();
+        assert_eq!(vector.len(), 3);
+        hybrid_search(&indexes[1], "install runtime").unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - before,
+            1,
+            "per-mount retrieval, final rerank and repeated searches share one vector"
+        );
+
+        let mut empty = indexes[0].clone();
+        empty.chunk_count = 0;
+        assert!(semantic_search(&empty, "uncached empty query")
+            .unwrap()
+            .is_empty());
+        assert!(hybrid_search(&empty, "uncached empty query")
+            .unwrap()
+            .is_empty());
+        let before_keyword = calls.load(Ordering::SeqCst);
+        let options = RankingOptions {
+            semantic_weight: 0.0,
+            bm25_weight: 2.5,
+            ..RankingOptions::default()
+        };
+        let keyword =
+            hybrid_search_with_options_degradable(&indexes[0], "service", options.clone()).unwrap();
+        assert!(!keyword.degraded);
+        let bm25 = bm25_search_with_options(&indexes[0], "service", options).unwrap();
+        assert_eq!(keyword.matches.len(), bm25.len());
+        for (position, (hybrid, lexical)) in keyword.matches.iter().zip(&bm25).enumerate() {
+            assert_eq!(hybrid.path, lexical.path);
+            assert_eq!(hybrid.chunk_index, lexical.chunk_index);
+            assert_eq!(hybrid.semantic_score, 0.0);
+            assert_eq!(hybrid.bm25_score, lexical.bm25_score);
+            assert_eq!(hybrid.score, rrf_contribution(position + 1, 2.5, RRF_K));
+        }
+        assert!(hybrid_search_with_options(
+            &indexes[0],
+            "uncached query",
+            RankingOptions {
+                semantic_weight: 0.0,
+                bm25_weight: 0.0,
+                ..RankingOptions::default()
+            }
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before_keyword,
+            "empty indexes and disabled semantic retrieval never call the backend"
+        );
+        for root in roots {
+            fs::remove_dir_all(root).ok();
+        }
     }
 
     /// `semantic_scores_for_chunks` must ORDER chunks exactly as `semantic_search` does.
@@ -2220,6 +2332,28 @@ mod tests {
             .expect("bm25");
         assert_eq!(degraded.matches, bm25);
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn semantic_only_backend_failure_does_not_reenable_disabled_bm25() {
+        let (mut index, root) = embedding_backed_index();
+        index.embedding_base_url = Some(DEAD_BACKEND_URL.to_string());
+        let result = hybrid_search_with_options_degradable(
+            &index,
+            "install runtime",
+            RankingOptions {
+                bm25_weight: 0.0,
+                ..RankingOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(result.degraded);
+        assert!(result.matches.is_empty());
+        assert_eq!(
+            result.degradation_reason.as_deref(),
+            Some("embedding backend unavailable; lexical (BM25) retrieval is disabled")
+        );
         fs::remove_dir_all(root).ok();
     }
 

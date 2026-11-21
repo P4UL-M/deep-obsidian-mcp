@@ -4,6 +4,7 @@ pub mod embeddings;
 pub mod freshness;
 pub mod graph;
 pub mod index;
+mod query_cache;
 pub mod search;
 pub mod source;
 pub mod sqlite;

@@ -297,6 +297,30 @@ These settings are config-file only and survive config rewrites. In Docker, edit
 or mount the persistent config and recreate the MCP container; its config survives
 image upgrades. There are no new CLI flags or environment overrides.
 
+### Reusing embeddings
+
+Incremental indexing reuses valid stored chunk vectors when their exact embedding
+input and embedding configuration are unchanged. Moving an unchanged chunk within
+a note does not by itself require a new vector. Changing its text or embedding
+identity does. This preserves the normal automatic indexing behavior while reducing
+background work after small edits to long notes.
+Indexes created before chunk reuse was available establish that note's reuse
+identity on its next edit, which embeds that note once. No full index rebuild is
+required. Provider credential identity is fingerprinted rather than stored as a
+plaintext key in the reuse metadata.
+
+Text search also reuses successful query embeddings in a process-local cache, so
+the same effective query can serve several mounts and the final federated ranking.
+The cache is bounded to 128 entries with a five-minute lifetime. Identical concurrent
+queries share one in-flight request; backend failures are not retained as successful
+cache entries. Cache identity includes the provider, endpoint, model, credential
+scope, instructed input, input limits and expected dimensions. The cache is held in
+memory and cleared on process restart; it does not bypass mount authorization or
+cache search results.
+
+These optimizations do not add search priority to Ollama's queue. Background indexing
+and interactive searches still share the configured embedding backend.
+
 ## Authentication
 
 For recovery and replacement procedures, see the

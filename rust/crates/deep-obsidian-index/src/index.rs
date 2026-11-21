@@ -7,6 +7,7 @@ use chrono::{SecondsFormat, Utc};
 use deep_obsidian_core::describe_io_error;
 use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::embeddings::{self, EmbeddingBatchOptions, EmbeddingConfig, EmbeddingProvider};
@@ -1964,6 +1965,10 @@ fn prepare_note_from_snapshot(
     snapshot: &FileSnapshot,
 ) -> Result<PreparedNote> {
     let content = source.read_note(&snapshot.path)?;
+    Ok(prepare_note_from_content(snapshot, content))
+}
+
+fn prepare_note_from_content(snapshot: &FileSnapshot, content: String) -> PreparedNote {
     let stem = path_stem(&snapshot.path);
     let title = note_title(stem, &content);
     let term_counts = count_terms(&format!("{title}\n{content}"));
@@ -2038,12 +2043,12 @@ fn prepare_note_from_snapshot(
         chunk_texts.push(embedding_text);
     }
 
-    Ok(PreparedNote {
+    PreparedNote {
         snapshot: snapshot.clone(),
         note,
         chunks,
         chunk_texts,
-    })
+    }
 }
 
 fn path_title(path: &str) -> String {
@@ -2187,9 +2192,8 @@ fn ensure_embedding_dimensions(
 /// Result of embedding a batch of prepared notes.
 ///
 /// `dimensions` is the observed (or carried-forward expected) embedding width.
-/// `failed_paths` lists notes whose dense embedding could NOT be produced; those
-/// notes keep `embedding = None` on themselves and their chunks and fall back to
-/// BM25/sparse retrieval. The build stays usable and the caller can surface the
+/// `failed_paths` lists notes with missing dense chunk embeddings. Reused vectors
+/// remain available; chunks whose embedding failed fall back to BM25/sparse retrieval. The build stays usable and the caller can surface the
 /// partial result. When every note embeds successfully, `failed_paths` is empty and
 /// the assigned vectors are identical to the all-or-nothing path.
 #[derive(Debug)]
@@ -2217,15 +2221,21 @@ fn embed_prepared_notes(
         });
     }
 
-    // Fast path: embed every chunk across all notes in one batched call, sharing
+    // Fast path: embed missing chunks across all notes in one batched call, sharing
     // the request packing and concurrency. If this succeeds the assigned vectors
     // are byte-identical to the previous all-or-nothing behavior. Each chunk is
     // bounded to a safe size by `chunk_lines` (char budget) and `clamp_input`
     // (token/char budget), so no input can exceed the backend's context window.
     let chunk_texts = prepared_notes
         .iter()
-        .flat_map(|prepared| prepared.chunk_texts.iter().cloned())
+        .flat_map(missing_chunk_texts)
         .collect::<Vec<_>>();
+    if chunk_texts.is_empty() {
+        return Ok(NoteEmbeddingOutcome {
+            dimensions: expected_dimensions,
+            failed_paths: Vec::new(),
+        });
+    }
     match embeddings::embed_text_batches(&chunk_texts, index_config, None) {
         Ok(chunk_embedding_batch) => {
             let mut observed_dimensions = None;
@@ -2287,9 +2297,9 @@ fn embed_prepared_notes(
 }
 
 /// Per-note fallback used when the bulk embedding call fails transiently. Embeds each
-/// note's chunks in isolation with a TIGHT per-note `timeout` (much shorter than the
-/// bulk timeout) so one slow note can't stall the build: notes that fail to embed are
-/// recorded in `failed_paths` and left without a dense vector; notes that succeed are
+/// note's missing chunks in isolation with a TIGHT per-note `timeout` (much shorter
+/// than the bulk timeout) so one slow note can't stall the build: notes that fail
+/// are recorded in `failed_paths`, preserving any reused chunk vectors; notes that succeed are
 /// assigned and dimension-checked against the rest.
 ///
 /// Two cross-note safeguards keep this bounded against an unhealthy backend:
@@ -2320,7 +2330,8 @@ fn embed_prepared_notes_per_note(
 
     let mut notes = prepared_notes.iter_mut();
     for prepared in notes.by_ref() {
-        if prepared.chunk_texts.is_empty() {
+        let missing_texts = missing_chunk_texts(prepared).collect::<Vec<_>>();
+        if missing_texts.is_empty() {
             // No chunks to embed; matches the bulk path's "no vectors" outcome.
             // Neither a success nor a failure: leave the consecutive counter alone.
             prepared.note.embedding = None;
@@ -2328,7 +2339,7 @@ fn embed_prepared_notes_per_note(
         }
 
         match embeddings::embed_text_batches(
-            &prepared.chunk_texts,
+            &missing_texts,
             index_config,
             Some(per_note_options.clone()),
         ) {
@@ -2367,9 +2378,9 @@ fn embed_prepared_notes_per_note(
                 tracing::warn!(
                     path = %prepared.note.path,
                     error = %error,
-                    "embedding failed for note; leaving it without a dense vector (BM25/sparse only)"
+                    "embedding failed for missing note chunks; retaining reused vectors and BM25/sparse retrieval"
                 );
-                clear_note_embeddings(prepared);
+                // Preserve vectors reused from unchanged chunks on partial failure.
                 failed_paths.push(prepared.note.path.clone());
                 consecutive_failures += 1;
                 if consecutive_failures >= max_consecutive_failures {
@@ -2378,8 +2389,13 @@ fn embed_prepared_notes_per_note(
                     // sequential per-note timeouts.
                     let mut short_circuited = 0usize;
                     for remaining in notes.by_ref() {
-                        clear_note_embeddings(remaining);
-                        failed_paths.push(remaining.note.path.clone());
+                        if remaining
+                            .chunks
+                            .iter()
+                            .any(|chunk| chunk.embedding.is_none())
+                        {
+                            failed_paths.push(remaining.note.path.clone());
+                        }
                         short_circuited += 1;
                     }
                     tracing::error!(
@@ -2412,6 +2428,9 @@ fn assign_note_chunk_embeddings(
     chunk_iter: &mut impl Iterator<Item = Vec<f64>>,
 ) -> Result<()> {
     for chunk in &mut prepared.chunks {
+        if chunk.embedding.is_some() {
+            continue;
+        }
         let embedding = chunk_iter.next().ok_or_else(|| {
             IndexError::Embedding("embedding provider returned too few chunk vectors".to_string())
         })?;
@@ -2422,12 +2441,119 @@ fn assign_note_chunk_embeddings(
     Ok(())
 }
 
-/// Drop any dense vectors from a note and its chunks so it falls back to BM25/sparse.
-fn clear_note_embeddings(prepared: &mut PreparedNote) {
-    prepared.note.embedding = None;
-    for chunk in &mut prepared.chunks {
-        chunk.embedding = None;
+/// Only missing vectors are sent to the backend; cached vectors stay attached to the
+/// newly prepared chunk metadata even if another chunk fails to embed.
+fn missing_chunk_texts(prepared: &PreparedNote) -> impl Iterator<Item = String> + '_ {
+    prepared
+        .chunk_texts
+        .iter()
+        .zip(&prepared.chunks)
+        .filter(|(_, chunk)| chunk.embedding.is_none())
+        .map(|(text, _)| text.clone())
+}
+
+// Stored per note in the existing configuration table, so legacy notes are
+// conservatively embedded once on their first edit. No index rebuild is required.
+const CHUNK_REUSE_KEY_PREFIX: &str = "chunkReuse:";
+
+fn chunk_reuse_identity(config: &EmbeddingConfig) -> String {
+    let config = config.clone().normalize();
+    let credential_fingerprint = config.resolve_api_key().map(|key| {
+        let mut hash = Sha256::new();
+        hash.update(b"deep-obsidian-chunk-reuse-credential-v1\0");
+        hash.update(key.as_bytes());
+        format!("{:x}", hash.finalize())
+    });
+    serde_json::json!({
+        "format": "heading-prefix-v1",
+        "credential": credential_fingerprint,
+        "provider": config.provider.as_ref().map(EmbeddingProvider::as_str),
+        "model": config.model,
+        "baseUrl": config.base_url(),
+        "maxChars": config.effective_max_chars(),
+        "contextTokens": config.context_tokens,
+    })
+    .to_string()
+}
+
+fn reuse_unchanged_chunk_embeddings(
+    connection: &Connection,
+    existing: &SearchIndex,
+    prepared_notes: &mut [PreparedNote],
+    config: &EmbeddingConfig,
+) -> Result<()> {
+    if !config.supports_embeddings() || !same_semantic_config(existing, Some(config)) {
+        return Ok(());
     }
+    let Some(dimensions) = existing.embedding_dimensions else {
+        return Ok(());
+    };
+    let identity = chunk_reuse_identity(config);
+    for prepared in prepared_notes {
+        let key = format!("{CHUNK_REUSE_KEY_PREFIX}{}", prepared.note.path);
+        let persisted_identity: Option<String> = connection
+            .query_row(
+                "SELECT value FROM embedding_config WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        if persisted_identity.as_deref() != Some(identity.as_str()) {
+            continue;
+        }
+        let Some(old_note) = existing
+            .notes
+            .iter()
+            .find(|note| note.path == prepared.note.path)
+        else {
+            continue;
+        };
+        let old = prepare_note_from_content(&prepared.snapshot, old_note.content.clone());
+        let mut reusable = BTreeMap::new();
+        let mut statement = connection.prepare(
+            "SELECT c.chunk_index, c.start_line, c.end_line, c.text, v.embedding FROM chunks c JOIN chunk_embeddings_vec v ON v.rowid = c.id WHERE c.path = ?1"
+        ).map_err(|error| IndexError::Embedding(error.to_string()))?;
+        let rows = statement
+            .query_map(params![prepared.note.path], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as usize,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        for row in rows {
+            let (index, start, end, text, blob) =
+                row.map_err(|error| IndexError::Embedding(error.to_string()))?;
+            let Some(chunk) = old.chunks.get(index) else {
+                continue;
+            };
+            // Never infer an old prefix if the persisted chunk plan differs.
+            if chunk.text != text
+                || chunk.start_line != start
+                || chunk.end_line != end
+                || (blob.len() != dimensions * 4 && blob.len() != (dimensions + 2) * 4)
+            {
+                continue;
+            }
+            // Freshness-enabled tables append two coordinates. Reuse only the
+            // original semantic vector; insert_prepared_note regenerates freshness.
+            let vector = blob[..dimensions * 4]
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()) as f64)
+                .collect::<Vec<_>>();
+            if vector.iter().all(|value| value.is_finite()) {
+                reusable.insert(old.chunk_texts[index].clone(), vector);
+            }
+        }
+        for (chunk, text) in prepared.chunks.iter_mut().zip(&prepared.chunk_texts) {
+            chunk.embedding = reusable.get(text).cloned();
+        }
+    }
+    Ok(())
 }
 
 fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) -> Result<()> {
@@ -2533,6 +2659,21 @@ fn write_search_index_to_connection(conn: &mut Connection, index: &SearchIndex) 
         let mut insert_runtime_config = tx
             .prepare("INSERT INTO embedding_config (key, value) VALUES (?1, ?2)")
             .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        if let Some(config) = index
+            .runtime_embedding_config
+            .as_ref()
+            .filter(|config| config.supports_embeddings())
+        {
+            let identity = chunk_reuse_identity(config);
+            for note in &index.notes {
+                insert_runtime_config
+                    .execute(params![
+                        format!("{CHUNK_REUSE_KEY_PREFIX}{}", note.path),
+                        identity
+                    ])
+                    .map_err(|error| IndexError::Embedding(error.to_string()))?;
+            }
+        }
         if let Some(base_url) = &index.embedding_base_url {
             insert_runtime_config
                 .execute(params!["baseUrl", base_url])
@@ -3608,8 +3749,11 @@ fn replace_index_metadata(
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
     }
 
-    tx.execute("DELETE FROM embedding_config", [])
-        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    tx.execute(
+        "DELETE FROM embedding_config WHERE key NOT LIKE 'chunkReuse:%'",
+        [],
+    )
+    .map_err(|error| IndexError::Embedding(error.to_string()))?;
     if index_config.supports_embeddings() {
         if let Some(base_url) = index_config.base_url() {
             tx.execute(
@@ -3717,6 +3861,21 @@ fn refresh_index_incremental(
         .filter(|snapshot| changed_paths.contains(snapshot.path.as_str()))
         .map(|snapshot| prepare_note_from_snapshot(source, snapshot))
         .collect::<Result<Vec<_>>>()?;
+    // Read old vectors before any destructive writes, and close the reader before
+    // awaiting the backend / opening the incremental write transaction.
+    if index_config.supports_embeddings() && !prepared_notes.is_empty() {
+        let connection =
+            open_index_connection(index_file, true).map_err(|source| IndexError::Io {
+                path: index_file.to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, source),
+            })?;
+        reuse_unchanged_chunk_embeddings(
+            &connection,
+            &existing,
+            &mut prepared_notes,
+            &index_config,
+        )?;
+    }
     let note_embedding_outcome =
         embed_prepared_notes(&mut prepared_notes, &index_config, expected_dimensions)?;
     let embedding_dimensions = note_embedding_outcome.dimensions;
@@ -3724,7 +3883,7 @@ fn refresh_index_incremental(
         tracing::warn!(
             failed_count = note_embedding_outcome.failed_paths.len(),
             failed_paths = ?note_embedding_outcome.failed_paths,
-            "incremental index built with partial embeddings; listed notes fall back to BM25/sparse"
+            "incremental index built with partial embeddings; missing chunks fall back to BM25/sparse"
         );
     }
     if index_config.supports_embeddings() && embedding_dimensions != existing.embedding_dimensions {
@@ -3881,6 +4040,30 @@ fn refresh_index_incremental(
         artifact_embedding_error.as_deref(),
         &now_utc_string(),
     )?;
+    for path in diff
+        .deleted
+        .iter()
+        .chain(diff.modified.iter().map(|snapshot| &snapshot.path))
+    {
+        tx.execute(
+            "DELETE FROM embedding_config WHERE key = ?1",
+            params![format!("{CHUNK_REUSE_KEY_PREFIX}{path}")],
+        )
+        .map_err(|error| IndexError::Embedding(error.to_string()))?;
+    }
+    if index_config.supports_embeddings() {
+        let identity = chunk_reuse_identity(&index_config);
+        for prepared in &prepared_notes {
+            tx.execute(
+                "INSERT OR REPLACE INTO embedding_config (key, value) VALUES (?1, ?2)",
+                params![
+                    format!("{CHUNK_REUSE_KEY_PREFIX}{}", prepared.note.path),
+                    identity
+                ],
+            )
+            .map_err(|error| IndexError::Embedding(error.to_string()))?;
+        }
+    }
     tx.commit()
         .map_err(|error| IndexError::Embedding(error.to_string()))?;
 
@@ -5632,6 +5815,180 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    fn reusable_section(name: &str, word: &str) -> String {
+        format!("## {name}\n\n{}\n\n", vec![word; 130].join(" "))
+    }
+
+    #[test]
+    fn incremental_chunk_reuse_handles_appends_edits_moves_duplicates_and_deletes() {
+        let root = unique_temp_dir("incremental-chunk-reuse");
+        fs::create_dir_all(&root).unwrap();
+        let header = format!("# Journal\n\n{}\n\n", vec!["preface"; 130].join(" "));
+        let stable = reusable_section("Stable", "unchanged");
+        let mutable = reusable_section("Mutable", "original");
+        let added = reusable_section("Added", "newwords");
+        let intro = reusable_section("Intro", "introductory");
+        write_fixture(&root, "Journal.md", &format!("{header}{stable}{mutable}"));
+        let (url, requests) = start_embedding_server(4);
+        let config = embedding_test_config(url);
+        let mut initial = build_index(&root, None, Some(&config)).unwrap();
+        crate::freshness::configure(&mut initial, deep_obsidian_types::FreshnessLevel::Classic)
+            .unwrap();
+        assert_eq!(initial.chunk_count, 3);
+        let initial_vectors = {
+            let conn = open_index_connection(&index_file_path(&root, None), true).unwrap();
+            conn.query_row("SELECT embedding FROM chunk_embeddings_vec WHERE rowid = (SELECT id FROM chunks WHERE chunk_index = 1)", [], |row| row.get::<_, Vec<u8>>(0)).unwrap()
+        };
+        // Append embeds the new section and any boundary chunk whose exact input changed.
+        write_fixture(
+            &root,
+            "Journal.md",
+            &format!("{header}{stable}{mutable}{added}"),
+        );
+        let (appended, _) = get_search_index(&root, None, Some(&config)).unwrap();
+        assert_eq!(appended.chunk_count, 4);
+        assert_eq!(requests.lock().unwrap()[1].len(), 2);
+        assert!(requests.lock().unwrap()[1]
+            .iter()
+            .all(|input| !input.contains("unchanged")));
+        assert!(requests.lock().unwrap()[1]
+            .iter()
+            .any(|input| input.contains("newwords")));
+        // Editing one section does not resend its unchanged siblings.
+        let edited = reusable_section("Mutable", "modified");
+        write_fixture(
+            &root,
+            "Journal.md",
+            &format!("{header}{stable}{edited}{added}"),
+        );
+        get_search_index(&root, None, Some(&config)).unwrap();
+        assert_eq!(requests.lock().unwrap()[2].len(), 1);
+        assert!(requests.lock().unwrap()[2][0].contains("modified"));
+        // Move every existing chunk's offsets, and duplicate an unchanged section.
+        write_fixture(
+            &root,
+            "Journal.md",
+            &format!("{header}{intro}{stable}{edited}{stable}{added}"),
+        );
+        let (moved, _) = get_search_index(&root, None, Some(&config)).unwrap();
+        assert_eq!(moved.chunk_count, 6);
+        assert_eq!(requests.lock().unwrap()[3].len(), 1);
+        assert!(requests.lock().unwrap()[3][0].contains("introductory"));
+        let conn = open_index_connection(&index_file_path(&root, None), true).unwrap();
+        let retained: Vec<u8> = conn.query_row("SELECT embedding FROM chunk_embeddings_vec WHERE rowid = (SELECT id FROM chunks WHERE chunk_index = 2)", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            &retained[..12],
+            &initial_vectors[..12],
+            "semantic vectors survive unchanged"
+        );
+        assert_eq!(retained.len(), 20, "freshness coordinates are regenerated");
+        drop(conn);
+        // Removing sections needs no backend request; stale vectors are deleted.
+        write_fixture(
+            &root,
+            "Journal.md",
+            &format!("{header}{}\n", stable.trim_end()),
+        );
+        let (deleted, _) = get_search_index(&root, None, Some(&config)).unwrap();
+        assert_eq!(deleted.chunk_count, 2);
+        assert_eq!(vector_counts(&root), (0, 2));
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn incremental_chunk_reuse_rejects_changed_input_context_model_and_endpoint() {
+        let root = unique_temp_dir("chunk-reuse-identity");
+        fs::create_dir_all(&root).unwrap();
+        let stable = reusable_section("Stable", "unchanged");
+        write_fixture(&root, "Journal.md", &format!("# Journal\n\n{stable}"));
+        let (url, requests) = start_embedding_server(4);
+        let config = embedding_test_config(url);
+        let initial = build_index(&root, None, Some(&config)).unwrap();
+        // Identical raw chunk under a renamed ancestor has a different embedding prefix.
+        write_fixture(&root, "Journal.md", &format!("# Renamed\n\n{stable}"));
+        get_search_index(&root, None, Some(&config)).unwrap();
+        assert_eq!(requests.lock().unwrap()[1].len(), 1);
+        assert!(requests.lock().unwrap()[1][0].starts_with("Renamed"));
+        let mut changed_budget = config.clone();
+        changed_budget.max_chars = 200;
+        write_fixture(&root, "Journal.md", &format!("# Renamed\n\n{stable}\n"));
+        get_search_index(&root, None, Some(&changed_budget)).unwrap();
+        assert_eq!(requests.lock().unwrap()[2][0].chars().count(), 200);
+        let mut changed_model = changed_budget.clone();
+        changed_model.model = Some("other-model".to_string());
+        get_search_index(&root, None, Some(&changed_model)).unwrap();
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            4,
+            "model change embeds afresh"
+        );
+        assert_ne!(
+            chunk_reuse_identity(&config),
+            chunk_reuse_identity(&changed_model)
+        );
+        let mut other_endpoint = config.clone();
+        other_endpoint.base_url = Some("http://another-provider.example".to_string());
+        assert_ne!(
+            chunk_reuse_identity(&config),
+            chunk_reuse_identity(&other_endpoint)
+        );
+        let mut tenant_a = config.clone();
+        tenant_a.api_key = Some("test-tenant-a-secret".to_string());
+        let mut tenant_b = config.clone();
+        tenant_b.api_key = Some("test-tenant-b-secret".to_string());
+        assert_ne!(
+            chunk_reuse_identity(&tenant_a),
+            chunk_reuse_identity(&tenant_b)
+        );
+        assert!(!chunk_reuse_identity(&tenant_a).contains("test-tenant-a-secret"));
+        assert_ne!(
+            chunk_reuse_identity(&tenant_a),
+            chunk_reuse_identity(&config)
+        );
+        assert_eq!(initial.embedding_dimensions, Some(3));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn incremental_chunk_reuse_retries_missing_vectors_and_unmarked_legacy_notes() {
+        let root = unique_temp_dir("chunk-reuse-missing");
+        fs::create_dir_all(&root).unwrap();
+        let header = format!("# Journal\n\n{}\n\n", vec!["preface"; 130].join(" "));
+        let stable = reusable_section("Stable", "unchanged");
+        let other = reusable_section("Other", "second");
+        write_fixture(&root, "Journal.md", &format!("{header}{stable}{other}"));
+        let (url, requests) = start_embedding_server(3);
+        let config = embedding_test_config(url);
+        build_index(&root, None, Some(&config)).unwrap();
+        let conn = open_index_connection(&index_file_path(&root, None), false).unwrap();
+        conn.execute("DELETE FROM chunk_embeddings_vec WHERE rowid = (SELECT id FROM chunks WHERE chunk_index = 1)", []).unwrap();
+        drop(conn);
+        write_fixture(&root, "Journal.md", &format!("{header}{other}{stable}"));
+        get_search_index(&root, None, Some(&config)).unwrap();
+        assert_eq!(
+            requests.lock().unwrap()[1].len(),
+            2,
+            "missing vectors retry; valid siblings reuse"
+        );
+        assert_eq!(vector_counts(&root), (0, 3));
+        let conn = open_index_connection(&index_file_path(&root, None), false).unwrap();
+        conn.execute(
+            "DELETE FROM embedding_config WHERE key LIKE 'chunkReuse:%'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        write_fixture(&root, "Journal.md", &format!("{header}{other}{stable}\n"));
+        get_search_index(&root, None, Some(&config)).unwrap();
+        assert_eq!(
+            requests.lock().unwrap()[2].len(),
+            3,
+            "legacy identity is never guessed"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn chunk_lines_respects_max_chars() {
         // Three 10-char lines, no overlap, 15-char budget -> one line per chunk.
@@ -6189,6 +6546,28 @@ mod tests {
             query_instruction: None,
         }
         .normalize()
+    }
+
+    #[test]
+    fn incremental_chunk_reuse_preserves_cached_vectors_when_missing_chunks_fail() {
+        let mut prepared = single_chunk_note("Journal.md", "unchanged");
+        prepared.chunks[0].embedding = Some(vec![0.6, 0.8, 0.0]);
+        let mut missing = prepared.chunks[0].clone();
+        missing.chunk_index = 1;
+        missing.text = "new chunk".to_string();
+        missing.embedding = None;
+        prepared.chunks.push(missing);
+        prepared.chunk_texts.push("new chunk".to_string());
+        let result = embed_prepared_notes(
+            std::slice::from_mut(&mut prepared),
+            &embedding_test_config(closed_local_url()),
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(result.dimensions, Some(3));
+        assert_eq!(result.failed_paths, vec!["Journal.md"]);
+        assert_eq!(prepared.chunks[0].embedding, Some(vec![0.6, 0.8, 0.0]));
+        assert_eq!(prepared.chunks[1].embedding, None);
     }
 
     /// Server that accepts connections but NEVER responds, counting how many requests
